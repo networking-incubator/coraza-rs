@@ -8,6 +8,8 @@
 
 mod phase;
 mod severity;
+mod variables;
 
 pub use phase::{ParsePhaseError, RulePhase};
 pub use severity::{ParseSeverityError, RuleSeverity};
+pub use variables::{ParseVariableError, RuleVariable};
