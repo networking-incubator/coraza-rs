@@ -346,6 +346,143 @@ impl TryFrom<char> for AuditLogPart {
     }
 }
 
+/// Audit log parts selected for an entry.
+pub type AuditLogParts = Vec<AuditLogPart>;
+
+/// Canonical order for configurable audit log parts.
+const ORDERED_AUDIT_LOG_PARTS: &[AuditLogPart] = &[
+    AuditLogPart::RequestHeaders,
+    AuditLogPart::RequestBody,
+    AuditLogPart::IntermediaryResponseHeaders,
+    AuditLogPart::IntermediaryResponseBody,
+    AuditLogPart::ResponseHeaders,
+    AuditLogPart::ResponseBody,
+    AuditLogPart::Trailer,
+    AuditLogPart::RequestBodyAlternative,
+    AuditLogPart::UploadedFiles,
+    AuditLogPart::RulesMatched,
+];
+
+/// Error returned when audit log parts cannot be parsed or modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseAuditLogPartsError {
+    /// Message describing the parse or modification failure.
+    message: String,
+}
+
+impl fmt::Display for ParseAuditLogPartsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseAuditLogPartsError {}
+
+/// Parses an absolute audit log parts value such as `ABCDEFGHIJKZ`.
+///
+/// # Errors
+///
+/// Returns an error if the value omits mandatory parts A or Z or contains an
+/// unsupported part identifier.
+pub fn parse_audit_log_parts(opts: &str) -> Result<AuditLogParts, ParseAuditLogPartsError> {
+    if !opts.starts_with('A') {
+        return Err(ParseAuditLogPartsError {
+            message: "audit log parts is required to start with A".to_owned(),
+        });
+    }
+    if !opts.ends_with('Z') {
+        return Err(ParseAuditLogPartsError {
+            message: "audit log parts is required to end with Z".to_owned(),
+        });
+    }
+
+    let Some(middle) = opts.strip_prefix('A').and_then(|value| value.strip_suffix('Z')) else {
+        return Err(ParseAuditLogPartsError {
+            message: format!("invalid audit log parts {opts:?}"),
+        });
+    };
+    for part in middle.chars() {
+        let Some(part) = AuditLogPart::from_char(part) else {
+            return Err(ParseAuditLogPartsError {
+                message: format!("invalid audit log parts {opts:?}"),
+            });
+        };
+        if !ORDERED_AUDIT_LOG_PARTS.contains(&part) {
+            return Err(ParseAuditLogPartsError {
+                message: format!("invalid audit log parts {opts:?}"),
+            });
+        }
+    }
+
+    opts.chars()
+        .map(|part| {
+            AuditLogPart::from_char(part).ok_or_else(|| ParseAuditLogPartsError {
+                message: format!("invalid audit log parts {opts:?}"),
+            })
+        })
+        .collect()
+}
+
+/// Applies an addition, removal, or absolute value to audit log parts.
+///
+/// # Errors
+///
+/// Returns an error if the modification is empty, contains an unsupported
+/// part identifier, or attempts to modify mandatory part A or Z.
+pub fn apply_audit_log_parts(
+    base: &[AuditLogPart],
+    modification: &str,
+) -> Result<AuditLogParts, ParseAuditLogPartsError> {
+    if modification.is_empty() {
+        return Err(ParseAuditLogPartsError {
+            message: "modification string cannot be empty".to_owned(),
+        });
+    }
+
+    let (is_addition, parts_to_modify) = if let Some(parts) = modification.strip_prefix('+') {
+        (true, parts)
+    } else if let Some(parts) = modification.strip_prefix('-') {
+        (false, parts)
+    } else {
+        return parse_audit_log_parts(modification);
+    };
+
+    for part in parts_to_modify.chars() {
+        if matches!(part, 'A' | 'Z') {
+            return Err(ParseAuditLogPartsError {
+                message: "audit log parts A and Z are mandatory and cannot be modified".to_owned(),
+            });
+        }
+        let Some(part) = AuditLogPart::from_char(part) else {
+            return Err(ParseAuditLogPartsError {
+                message: format!("invalid audit log part {part:?}"),
+            });
+        };
+        if !ORDERED_AUDIT_LOG_PARTS.contains(&part) {
+            return Err(ParseAuditLogPartsError {
+                message: format!("invalid audit log part {part:?}"),
+            });
+        }
+    }
+
+    let mut selected: std::collections::HashSet<AuditLogPart> = base.iter().copied().collect();
+    for part in parts_to_modify.chars() {
+        if let Some(part) = AuditLogPart::from_char(part) {
+            if is_addition {
+                selected.insert(part);
+            } else {
+                selected.remove(&part);
+            }
+        }
+    }
+
+    Ok(ORDERED_AUDIT_LOG_PARTS
+        .iter()
+        .filter(|part| selected.contains(part))
+        .copied()
+        .collect())
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests assert successful parsing")]
 mod tests {
@@ -501,5 +638,44 @@ mod tests {
             let parsed = AuditLogPart::from_char(c).unwrap();
             assert_eq!(parsed, *part);
         }
+    }
+
+    #[test]
+    fn audit_log_parts_parse_and_apply() {
+        let parsed = parse_audit_log_parts("ABCDEFGHIJKZ").unwrap();
+        assert_eq!(parsed.len(), 12);
+        assert!(parse_audit_log_parts("").is_err());
+        assert!(parse_audit_log_parts("DEFGHZ").is_err());
+        assert!(parse_audit_log_parts("ABCD").is_err());
+        assert!(parse_audit_log_parts("AMZ").is_err());
+        assert!(parse_audit_log_parts("A\u{1f600}Z").is_err());
+
+        let base = [AuditLogPart::RequestHeaders, AuditLogPart::RequestBody];
+        assert_eq!(
+            apply_audit_log_parts(&base, "+EF").unwrap(),
+            [
+                AuditLogPart::RequestHeaders,
+                AuditLogPart::RequestBody,
+                AuditLogPart::IntermediaryResponseBody,
+                AuditLogPart::ResponseHeaders,
+            ]
+        );
+        assert_eq!(apply_audit_log_parts(&base, "-B").unwrap(), [AuditLogPart::RequestBody]);
+        assert_eq!(
+            apply_audit_log_parts(&base, "ABCDEFZ").unwrap(),
+            [
+                AuditLogPart::Header,
+                AuditLogPart::RequestHeaders,
+                AuditLogPart::RequestBody,
+                AuditLogPart::IntermediaryResponseHeaders,
+                AuditLogPart::IntermediaryResponseBody,
+                AuditLogPart::ResponseHeaders,
+                AuditLogPart::EndMarker,
+            ]
+        );
+        assert!(apply_audit_log_parts(&base, "").is_err());
+        assert!(apply_audit_log_parts(&base, "+X").is_err());
+        assert!(apply_audit_log_parts(&base, "+A").is_err());
+        assert!(apply_audit_log_parts(&base, "-Z").is_err());
     }
 }
