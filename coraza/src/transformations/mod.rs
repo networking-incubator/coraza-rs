@@ -23,8 +23,10 @@
 //! Transformations accept and return bytes so decoding can preserve values
 //! that are not valid UTF-8.
 
+mod encoding;
 mod simple;
 
+pub use encoding::{base64_encode, hex_decode, hex_encode, length, none, remove_nulls, replace_nulls, url_encode};
 pub use simple::{
     compress_whitespace, lowercase, remove_whitespace, trim, trim_left, trim_right, uppercase, url_decode,
 };
