@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core types for a separate Rust implementation of the Coraza WAF"
+description = "Core types and transformations for a separate Rust implementation of Coraza"
 
 [dependencies]
 libperfusion = { version = "0.1.0", path = "../libperfusion" }

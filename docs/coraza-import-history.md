@@ -17,8 +17,8 @@ trailer. The repository owner approved a narrow exception for the following
 14 commits from `coraza-rs-alex` snapshot
 `77c11c26201ab77b205f4ae861396fa088640269`, which have no source signoff. Keep
 their original messages unchanged when importing them; do not add a signoff
-that suggests an upstream attestation. None of these commits are included in
-the current core-types PR 1 slice.
+that suggests an upstream attestation. None of these commits were included in
+the PR 1 core-types slice.
 
 | Source commit | Date | Subject |
 | --- | --- | --- |
