@@ -20,6 +20,9 @@
 
 //! Byte-oriented encoding transformations.
 
+use md5::{Digest as _, Md5};
+use sha1::Sha1;
+
 use crate::{
     transformations::{TransformationError, TransformationResult},
     utils::strings::x2c,
@@ -144,6 +147,82 @@ pub fn base64_encode(input: &[u8]) -> TransformationResult {
     (transformed, true, None)
 }
 
+/// Computes the MD5 digest as raw bytes. Follow it with `hex_encode` for hex output.
+pub fn md5_hash(input: &[u8]) -> TransformationResult {
+    (Md5::digest(input).to_vec(), true, None)
+}
+
+/// Computes the SHA1 digest as raw bytes. Follow it with `hex_encode` for hex output.
+pub fn sha1_hash(input: &[u8]) -> TransformationResult {
+    (Sha1::digest(input).to_vec(), true, None)
+}
+
+/// Decodes Base64 up to the first invalid byte. CR and LF are ignored.
+pub fn base64_decode(input: &[u8]) -> TransformationResult {
+    (do_base64_decode(input, false), true, None)
+}
+
+/// Decodes Base64 up to the first invalid byte, ignoring ASCII whitespace and dots.
+pub fn base64_decode_ext(input: &[u8]) -> TransformationResult {
+    (do_base64_decode(input, true), true, None)
+}
+
+/// Base64 values for ASCII bytes. 127 marks an invalid byte.
+const BASE64_DEC_MAP: [u8; 128] = [
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 62, 127, 127,
+    127, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 127, 127, 127, 64, 127, 127, 127, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 127, 127, 127, 127, 127, 127, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 127, 127, 127, 127, 127,
+];
+
+/// Decodes Base64 with the partial decoding behavior used by Coraza.
+fn do_base64_decode(input: &[u8], extended: bool) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut count = 0;
+    let mut bits = 0_u32;
+
+    for &byte in input {
+        if extended && (byte.is_ascii_whitespace() || byte == b'.') {
+            continue;
+        }
+        if matches!(byte, b'\r' | b'\n') {
+            continue;
+        }
+        if byte == b'=' || byte == b' ' || byte > 127 {
+            break;
+        }
+
+        let value = BASE64_DEC_MAP.get(usize::from(byte)).copied().unwrap_or(127);
+        if value == 127 {
+            break;
+        }
+
+        bits = (bits << 6) | u32::from(value & 0x3F);
+        count += 1;
+        if count == 4 {
+            let decoded = bits.to_be_bytes();
+            output.extend_from_slice(decoded.get(1..).unwrap_or_default());
+            count = 0;
+            bits = 0;
+        }
+    }
+
+    match count {
+        2 => {
+            let decoded = (bits << 12).to_be_bytes();
+            output.push(decoded.get(1).copied().unwrap_or_default());
+        },
+        3 => {
+            let decoded = (bits << 6).to_be_bytes();
+            output.extend_from_slice(decoded.get(1..3).unwrap_or_default());
+        },
+        _ => {},
+    }
+
+    output
+}
+
 /// Converts a nibble to a lowercase hexadecimal digit.
 fn hex_digit(value: u8) -> u8 {
     match value {
@@ -165,7 +244,10 @@ fn base64_digit(value: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, hex_decode, hex_encode, length, none, remove_nulls, replace_nulls, url_encode};
+    use super::{
+        base64_decode, base64_decode_ext, base64_encode, hex_decode, hex_encode, length, md5_hash, none, remove_nulls,
+        replace_nulls, sha1_hash, url_encode,
+    };
 
     #[test]
     fn length_and_identity_use_input_bytes() {
@@ -214,5 +296,82 @@ mod tests {
         assert_eq!(base64_encode(b"ABC"), (b"QUJD".to_vec(), true, None));
         assert_eq!(base64_encode(b"\x00\xff"), (b"AP8=".to_vec(), true, None));
         assert_eq!(base64_encode(b""), (Vec::new(), true, None));
+    }
+
+    #[test]
+    fn hashes_return_raw_binary_digests() {
+        assert_eq!(hex_encode(&md5_hash(b"hello").0).0, b"5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            hex_encode(&sha1_hash(b"hello").0).0,
+            b"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+        assert_eq!(hex_encode(&md5_hash(b"").0).0, b"d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            hex_encode(&sha1_hash(b"").0).0,
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert!(md5_hash(b"hello").1);
+        assert!(sha1_hash(b"hello").1);
+    }
+
+    #[test]
+    fn base64_decoding_preserves_partial_and_binary_results() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"VGVzdENhc2U=", b"TestCase"),
+            (b"VGVzdABDYXNl", b"Test\x00Case"),
+            (b"VGVzdENhc2U", b"TestCase"),
+            (b"PA==", b"<"),
+            (b"PFRFU1Q+", b"<TEST>"),
+            (b"PHNjcmlwd", b"<scrip"),
+            (b"PFR FU1Q+", b"<T"),
+            (b"P.HNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==", b""),
+            (b"PHNjcmlwd.D5hbGVydCgxKTwvc2NyaXB0Pg==", b"<scrip"),
+            (b"PHNjcmlwdD.5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script"),
+            (b"PFRFU1Q-", b"<TEST"),
+            (b"FPucA9l+", b"\x14\xfb\x9c\x03\xd9\x7e"),
+            (b"FPucA9k=", b"\x14\xfb\x9c\x03\xd9"),
+            (b"FPucAw==", b"\x14\xfb\x9c\x03"),
+            (b"", b""),
+            (b"Zg==", b"f"),
+            (b"Zm8=", b"fo"),
+            (b"Zm9v", b"foo"),
+            (b"Zm9vYg==", b"foob"),
+            (b"Zm9vYmE=", b"fooba"),
+            (b"Zm9vYmFy", b"foobar"),
+            (b"c3VyZS4=", b"sure."),
+            (b"c3VyZQ==", b"sure"),
+            (b"c3Vy", b"sur"),
+            (b"c3U=", b"su"),
+            (b"bGVhc3VyZS4=", b"leasure."),
+            (b"ZWFzdXJlLg==", b"easure."),
+            (b"YXN1cmUu", b"asure."),
+            (b"SGVs\nbG8=", b"Hello"),
+        ];
+        for (input, expected) in cases {
+            let (result, changed, error) = base64_decode(input);
+            assert_eq!(result, *expected, "input: {input:?}");
+            assert!(changed, "input: {input:?}");
+            assert_eq!(error, None, "input: {input:?}");
+        }
+        assert_eq!(base64_decode(b"\xffSGVsbG8=").0, b"");
+    }
+
+    #[test]
+    fn extended_base64_decoding_ignores_dots_and_ascii_whitespace() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"VGVzdENhc2U=", b"TestCase"),
+            (b"VGVzdABDYXNl", b"Test\x00Case"),
+            (b"P.HNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script>alert(1)</script>"),
+            (b"PFR FU1Q+", b"<TEST>"),
+            (b"PHNjcmlwd.D5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script>alert(1)</script>"),
+            (b"PHNjcmlwdD.5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script>alert(1)</script>"),
+            (b"SGVs\n bG8=", b"Hello"),
+        ];
+        for (input, expected) in cases {
+            let (result, changed, error) = base64_decode_ext(input);
+            assert_eq!(result, *expected, "input: {input:?}");
+            assert!(changed, "input: {input:?}");
+            assert_eq!(error, None, "input: {input:?}");
+        }
     }
 }
