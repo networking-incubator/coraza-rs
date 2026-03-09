@@ -6,6 +6,8 @@
 //! This module contains fundamental types used throughout the WAF including
 //! severity levels, processing phases, and variable identifiers.
 
+mod phase;
 mod severity;
 
+pub use phase::{ParsePhaseError, RulePhase};
 pub use severity::{ParseSeverityError, RuleSeverity};
