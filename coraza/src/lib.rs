@@ -19,6 +19,9 @@
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
 //! the OWASP Coraza contributors.
 
+mod rules;
 pub mod transformations;
 pub mod types;
 pub mod utils;
+
+pub use rules::TransformationChain;

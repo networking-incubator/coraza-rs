@@ -43,6 +43,9 @@ pub use simple::{
 /// changed the input, and an optional error for logging.
 pub type TransformationResult = (Vec<u8>, bool, Option<TransformationError>);
 
+/// A transformation function used by a rule's transformation chain.
+pub type Transformation = fn(&[u8]) -> TransformationResult;
+
 /// Error reported by a transformation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformationError {
