@@ -53,12 +53,13 @@ audit:
 	cargo audit
 	cargo deny check
 
+# Legacy SQL parser coverage is supplied by the corpus tests in PR2.
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
-		--ignore-filename-regex 'src/main\.rs'
+		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
-		--ignore-filename-regex 'src/main\.rs'
+		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*'
 
 fmt:
 	cargo +$(NIGHTLY) fmt --all

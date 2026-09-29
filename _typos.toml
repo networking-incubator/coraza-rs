@@ -1,0 +1,21 @@
+[files]
+extend-exclude = ["libinjection-rs/data/sqli_keywords.txt"]
+
+[default.extend-words]
+# Libinjection fingerprint marker and browser event name.
+UE = "UE"
+SEEKED = "SEEKED"
+Unparseable = "Unparseable"
+unparseable = "unparseable"
+
+# Intentional upstream test names and fixture literals.
+Attribures = "Attribures"
+som = "som"
+fo = "fo"
+sur = "sur"
+leasure = "leasure"
+asure = "asure"
+caf = "caf"
+ue = "ue"
+OMMAND = "OMMAND"
+Nd = "Nd"
