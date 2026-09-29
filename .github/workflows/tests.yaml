@@ -42,11 +42,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-machete
-          key: cargo-machete-${{ runner.os }}
+          key: cargo-machete-${{ runner.os }}-0.9.2
 
       - name: Install cargo-machete
         if: steps.cache-machete.outputs.cache-hit != 'true'
-        run: cargo install cargo-machete --locked
+        run: cargo install cargo-machete --version 0.9.2 --locked
 
       - name: Lint
         run: make lint
@@ -127,11 +127,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-hack
-          key: cargo-hack-${{ runner.os }}
+          key: cargo-hack-${{ runner.os }}-0.6.45
 
       - name: Install cargo-hack
         if: steps.cache-hack.outputs.cache-hit != 'true'
-        run: cargo install cargo-hack --locked
+        run: cargo install cargo-hack --version 0.6.45 --locked
 
       - name: Clippy each feature
         run: cargo hack clippy --workspace --each-feature --all-targets -- -D warnings
