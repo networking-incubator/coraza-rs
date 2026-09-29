@@ -309,7 +309,7 @@ fn is_safe_workspace_member(member: &str) -> bool {
 
 /// Extract `[workspace].members` paths from a `Cargo.toml` string.
 fn extract_workspace_members(content: &str) -> Option<Vec<String>> {
-    let document = content.parse::<toml::Value>().ok()?;
+    let document = toml::from_str::<toml::Value>(content).ok()?;
     let members = document.get("workspace")?.get("members")?.as_array()?;
     let members = members.iter().map(toml::Value::as_str).collect::<Option<Vec<_>>>()?;
 
