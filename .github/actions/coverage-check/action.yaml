@@ -15,24 +15,24 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cargo/bin/cargo-llvm-cov
-        key: cargo-llvm-cov-${{ runner.os }}
+        key: cargo-llvm-cov-${{ runner.os }}-0.9.1
 
     - name: Install cargo-llvm-cov
       if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install cargo-llvm-cov --locked
+      run: cargo install cargo-llvm-cov --version 0.9.1 --locked
 
     - name: Cache cargo-nextest
       id: cache-nextest
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cargo/bin/cargo-nextest
-        key: cargo-nextest-${{ runner.os }}
+        key: cargo-nextest-${{ runner.os }}-0.9.145
 
     - name: Install cargo-nextest
       if: steps.cache-nextest.outputs.cache-hit != 'true'
       shell: bash
-      run: cargo install cargo-nextest --locked
+      run: cargo install cargo-nextest --version 0.9.145 --locked
 
     - name: Run coverage gate
       shell: bash

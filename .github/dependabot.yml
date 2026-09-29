@@ -13,9 +13,14 @@ updates:
       prefix: "deps"
       include: "scope"
     groups:
-      cargo-patch-updates:
-        update-types:
-          - "patch"
+      cargo-workspace:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+      cargo-security:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
