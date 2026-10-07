@@ -10,6 +10,12 @@ runs:
       with:
         cache-suffix: coverage
 
+    - name: Install nightly branch coverage tools
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: nightly-2026-10-06
+        components: llvm-tools-preview
+
     - name: Cache cargo-llvm-cov
       id: cache-llvm-cov
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

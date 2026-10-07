@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod corpus;
-pub(crate) mod drivers;
-pub(crate) mod subprocess;
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+
+mod support;
+
+fuzz_target!(|data: &[u8]| {
+    let input = support::html_grammar(data);
+    support::exercise_html(&input);
+});

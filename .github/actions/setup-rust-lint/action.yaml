@@ -6,7 +6,7 @@ inputs:
   nightly:
     description: Nightly toolchain version for rustfmt.
     required: false
-    default: nightly
+    default: nightly-2026-10-06
 
 runs:
   using: composite

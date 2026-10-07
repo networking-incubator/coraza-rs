@@ -1,5 +1,11 @@
 [files]
-extend-exclude = ["libinjection-rs/data/sqli_keywords.txt"]
+extend-exclude = [
+  "libinjection-rs/data/sqli_keywords.txt",
+  # These are byte-pinned upstream fixtures, not repository prose.
+  "libinjection-rs/tests/corpus/*.txt",
+  # This generated report embeds raw disassembly operands and addresses.
+  "libinjection-rs/docs/evidence/stack-matrix.json",
+]
 
 [default.extend-words]
 # Libinjection fingerprint marker and browser event name.
@@ -19,3 +25,7 @@ caf = "caf"
 ue = "ue"
 OMMAND = "OMMAND"
 Nd = "Nd"
+
+[type.rust]
+# Preserve the upstream HTML regression payload's comment-split javascript token.
+extend-ignore-re = ["javas<!-- -->cript"]

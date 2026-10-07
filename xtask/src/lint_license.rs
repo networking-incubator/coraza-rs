@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn workspace_member_dirs_errors_when_cargo_toml_is_missing() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         let err = workspace_member_dirs(&root).unwrap_err();
         assert!(matches!(
             err,
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn workspace_member_dirs_errors_when_members_are_missing() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nresolver = \"3\"\n").unwrap();
         let err = workspace_member_dirs(&root).unwrap_err();
         assert_eq!(
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn workspace_member_dirs_rejects_parent_dir_components() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"../outside\"]\n").unwrap();
         let err = workspace_member_dirs(&root).unwrap_err();
         assert!(matches!(
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn workspace_member_dirs_rejects_absolute_members() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"/tmp/crate-a\"]\n").unwrap();
         let err = workspace_member_dirs(&root).unwrap_err();
         assert!(matches!(
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn workspace_member_dirs_errors_when_member_directory_is_missing() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"missing-crate\"]\n").unwrap();
         let err = workspace_member_dirs(&root).unwrap_err();
         assert!(matches!(
@@ -409,8 +409,8 @@ mod tests {
     fn workspace_member_dirs_rejects_members_outside_workspace_root() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile_dir();
-        let outside = tempfile_dir();
+        let root = tempfile_dir().unwrap();
+        let outside = tempfile_dir().unwrap();
         symlink(&outside, root.join("escape")).unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"escape\"]\n").unwrap();
 
@@ -427,7 +427,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = write_temp_workspace(&["crate-a"], &[("crate-a/src/lib.rs", LICENSE_HEADER)]);
-        let outside = tempfile_dir();
+        let outside = tempfile_dir().unwrap();
         fs::write(outside.join("escape.rs"), LICENSE_HEADER).unwrap();
         symlink(&outside, root.join("crate-a/escape")).unwrap();
 
@@ -458,14 +458,14 @@ mod tests {
 
     #[test]
     fn execute_lint_reports_workspace_errors_without_exiting() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         let err = execute_lint(&root).unwrap_err();
         assert!(matches!(err, LintLicenseError::Workspace { .. }));
     }
 
     #[test]
     fn walk_returns_empty_for_missing_directory() {
-        let dir = tempfile_dir().join("missing");
+        let dir = tempfile_dir().unwrap().join("missing");
         assert!(matches!(find_rs_files(&dir), Err(LintLicenseError::Workspace { .. })));
     }
 
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn file_with_header_passes() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         fs::write(dir.join("good.rs"), format!("{LICENSE_HEADER}\nfn main() {{}}\n")).unwrap();
         assert!(
             find_rs_files(&dir)
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn file_missing_header_fails() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         fs::write(dir.join("bad.rs"), "fn main() {}\n").unwrap();
         let content = fs::read_to_string(dir.join("bad.rs")).unwrap();
         assert!(!content.starts_with(LICENSE_HEADER));
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn skipped_dirs_are_not_walked() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         let target_dir = dir.join("target");
         fs::create_dir(&target_dir).unwrap();
         fs::write(target_dir.join("generated.rs"), "fn main() {}\n").unwrap();
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn walk_finds_nested_rs_files() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         let nested = dir.join("src/nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("mod.rs"), "fn nested() {}\n").unwrap();
@@ -553,7 +553,7 @@ mod tests {
     fn walk_skips_directory_symlinks_to_ancestors() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         let nested = dir.join("nested");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("mod.rs"), "fn nested() {}\n").unwrap();
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn walk_skips_hidden_directories() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         let hidden = dir.join(".hidden");
         fs::create_dir(&hidden).unwrap();
         fs::write(hidden.join("secret.rs"), "fn secret() {}\n").unwrap();
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn walk_ignores_non_rs_files() {
-        let dir = tempfile_dir();
+        let dir = tempfile_dir().unwrap();
         fs::write(dir.join("notes.txt"), "not rust\n").unwrap();
         assert!(find_rs_files(&dir).unwrap().is_empty());
     }
@@ -604,7 +604,7 @@ members = [
 
     #[test]
     fn workspace_member_dirs_expands_member_globs() {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         fs::create_dir_all(root.join("crates/crate-a")).unwrap();
         fs::create_dir_all(root.join("crates/crate-b")).unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
@@ -616,7 +616,7 @@ members = [
     }
 
     fn write_temp_workspace(members: &[&str], files: &[(&str, &str)]) -> PathBuf {
-        let root = tempfile_dir();
+        let root = tempfile_dir().unwrap();
         let member_list = members
             .iter()
             .map(|member| format!("\"{member}\""))
@@ -639,13 +639,32 @@ members = [
         root
     }
 
-    fn tempfile_dir() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    fn tempfile_dir() -> std::io::Result<PathBuf> {
+        use std::{
+            sync::atomic::{AtomicU64, Ordering},
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("xtask-lint-license-test-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..1024 {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "xtask-lint-license-test-{}-{timestamp}-{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "could not allocate a unique temporary license-test directory",
+        ))
     }
 }

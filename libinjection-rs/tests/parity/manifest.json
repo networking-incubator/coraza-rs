@@ -2530,7 +2530,7 @@
     "sql_fingerprint_entries": 8367,
     "sql_keyword_entries": 9352,
     "xss_table_sha256": {
-      "attributes": "56ea15a57614cf0f138edb25bfdf15e0951a8a89615279b086d5411c100d9f3c",
+      "attributes": "f6182c0a6a197aa07bdabb8fa969941a6a4e35eebbfec2282a39fac47b9c52bc",
       "events": "745e347f29e0052ad0431d9149f721c30e6d3b1e68abdebca17db62a8febd9c1",
       "tags": "7c67dd16500749855f3752ea228ed62ce3d8bb68b5f7ef4b8d466975593419fe"
     },
