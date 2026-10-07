@@ -1,0 +1,7 @@
+--TEST--
+smoke (updated: 10.e without exponent is now ignored per MySQL behavior)
+--INPUT--
+SELECT 10.e;
+--EXPECTED--
+E SELECT
+; ;
