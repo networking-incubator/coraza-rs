@@ -11,6 +11,13 @@ This repository uses GitHub Actions to block risky changes early.
 - Meta-lint: `make lint-extra`
 - Feature matrix: test and lint each feature combo with `cargo-hack`
 
+### Performance assurance
+
+CI checks hostile-input and analyzer scaling, along with stack and fuzz
+assurance. The paired Go/Rust latency matrix is a local check (`make
+perf-check`); CI does not gate on nanosecond-scale timings because shared
+runners can make them noisy.
+
 ### `supply-chain`
 
 - `cargo audit`
@@ -38,9 +45,16 @@ make lint-extra
 make test
 make audit
 make coverage-check
+make package-check
+make miri-check
+make perf-check
+make perf-scaling-check
 ```
 
-To run the full gate set:
+`make all` runs the common build, format, lint, test, audit, and coverage gates.
+The commands above include the package, Miri, and performance checks separately.
+
+To run the common gate set:
 
 ```console
 make all
