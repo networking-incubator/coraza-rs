@@ -40,16 +40,18 @@ pub(crate) struct SqliState<'a> {
     pub(crate) fingerprint: [u8; 5],
     /// Length of valid fingerprint bytes.
     pub(crate) fingerprint_len: u8,
+    /// Lazily cached MSSQL password marker search across fingerprint passes.
+    pub(crate) has_sp_password: Option<bool>,
 
     // -- Stats (accumulated across tokenize/fold calls) --
     /// `--[not-white]` comments (ANSI).
-    pub(crate) stats_comment_ddx: u16,
+    pub(crate) stats_comment_ddx: usize,
     /// `#` operator/comment occurrences.
-    pub(crate) stats_comment_hash: u16,
+    pub(crate) stats_comment_hash: usize,
     /// Tokens folded away.
-    pub(crate) stats_folds: u16,
+    pub(crate) stats_folds: usize,
     /// Total tokens emitted.
-    pub(crate) stats_tokens: u16,
+    pub(crate) stats_tokens: usize,
 
     /// Write-sink for out-of-bounds mutable token access (defensive fallback).
     overflow_token: SqliToken,
@@ -74,6 +76,7 @@ impl<'a> SqliState<'a> {
             current_idx: 0,
             fingerprint: [0; 5],
             fingerprint_len: 0,
+            has_sp_password: None,
             stats_comment_ddx: 0,
             stats_comment_hash: 0,
             stats_folds: 0,
@@ -85,7 +88,9 @@ impl<'a> SqliState<'a> {
     /// Go `reset`: re-initialize with the same input but new flags.
     pub(crate) fn reset(&mut self, flags: u32) {
         let input = self.input;
+        let has_sp_password = self.has_sp_password;
         *self = Self::new(input, flags);
+        self.has_sp_password = has_sp_password;
     }
 
     /// Go `tokenize`: emit the next token, or `false` at EOF.
@@ -143,5 +148,22 @@ impl<'a> SqliState<'a> {
     /// Go `reparseAsMySQL`: true if `MySQL` reparse is needed.
     pub(crate) fn reparse_as_mysql(&self) -> bool {
         self.stats_comment_ddx != 0 || self.stats_comment_hash != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliState;
+
+    #[test]
+    fn fingerprint_reset_preserves_the_lazy_password_marker_result() {
+        for cached in [Some(false), Some(true)] {
+            let mut state = SqliState::new(b"1--sp_password", 0);
+            state.has_sp_password = cached;
+
+            state.reset(1);
+
+            assert_eq!(state.has_sp_password, cached);
+        }
     }
 }

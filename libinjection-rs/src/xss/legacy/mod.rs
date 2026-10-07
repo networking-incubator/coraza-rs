@@ -14,9 +14,23 @@
 
 //! Legacy XSS path: HTML5 tokenizer helpers and deny-lists.
 //!
-//! Enabled only with the `legacy` feature.
+//! Shared byte-oriented HTML5/XSS compatibility parser.
 
 use deny::{DenyAttrKind, is_deny_attr, is_deny_comment, is_deny_tag, is_deny_url};
+use memchr::{memchr, memchr2, memchr3};
+
+/// Bit marking that the single-quote delimiter was seen.
+const SINGLE_QUOTE: u8 = 1;
+/// Bit marking that the double-quote delimiter was seen.
+const DOUBLE_QUOTE: u8 = 2;
+/// Bit marking that the backtick delimiter was seen.
+const BACK_QUOTE: u8 = 4;
+/// Mask for contexts already delimited by a single and double quote.
+const SINGLE_AND_DOUBLE_QUOTES: u8 = SINGLE_QUOTE | DOUBLE_QUOTE;
+/// Mask for contexts already delimited by a single quote and backtick.
+const SINGLE_AND_BACK_QUOTES: u8 = SINGLE_QUOTE | BACK_QUOTE;
+/// Mask for contexts already delimited by a double quote and backtick.
+const DOUBLE_AND_BACK_QUOTES: u8 = DOUBLE_QUOTE | BACK_QUOTE;
 
 /// Deny-list helpers for legacy XSS (Go `isBlackTag` / related).
 mod deny;
@@ -37,28 +51,27 @@ pub(crate) enum Html5Flags {
 #[must_use]
 pub(crate) fn is_xss(input: &[u8], flags: Html5Flags) -> bool {
     let mut h5 = Html5State::new(input, flags);
-    // Go: remember attr type from AttrName until AttrValue (or reset).
     let mut attr_kind = DenyAttrKind::None;
     while let Some(tok) = h5.next_token() {
+        // Go clears the prior attribute classification before every token
+        // except its value. A deny/style attribute is only decisive once an
+        // AttrValue token is emitted.
+        if tok.kind != Html5Type::AttrValue {
+            attr_kind = DenyAttrKind::None;
+        }
         match tok.kind {
             Html5Type::DocType => return true,
             Html5Type::TagComment if is_deny_comment(tok.value) => return true,
             Html5Type::TagNameOpen if is_deny_tag(tok.value) => return true,
             Html5Type::AttrName => {
                 attr_kind = is_deny_attr(tok.value);
-                match attr_kind {
-                    DenyAttrKind::Deny | DenyAttrKind::Style => return true,
-                    // Url / Indirect: wait for AttrValue
-                    _ => {},
-                }
             },
             Html5Type::AttrValue => {
                 let hit = match attr_kind {
+                    DenyAttrKind::Deny | DenyAttrKind::Style => true,
                     DenyAttrKind::Url => is_deny_url(tok.value),
-                    DenyAttrKind::Indirect => {
-                        matches!(is_deny_attr(tok.value), DenyAttrKind::Deny | DenyAttrKind::Style)
-                    },
-                    _ => false,
+                    DenyAttrKind::Indirect => is_deny_attr(tok.value) == DenyAttrKind::Deny,
+                    DenyAttrKind::None => false,
                 };
                 attr_kind = DenyAttrKind::None;
                 if hit {
@@ -76,13 +89,114 @@ pub(crate) fn is_xss(input: &[u8], flags: Html5Flags) -> bool {
 /// Go `IsXSS`: true if any of the five contexts matches.
 #[must_use]
 pub(crate) fn detect(input: &[u8]) -> bool {
-    // DataState can only emit tag-related tokens after '<'. The four
-    // attribute-value contexts still detect payloads without it.
-    (input.contains(&b'<') && is_xss(input, Html5Flags::DataState))
+    // DataState can only emit an HTML token after an opening '<'. Avoid
+    // constructing and scanning that parser when the byte is absent.
+    if (memchr(b'<', input).is_some() && is_xss(input, Html5Flags::DataState))
         || is_xss(input, Html5Flags::ValueNoQuote)
-        || is_xss(input, Html5Flags::ValueSingleQuote)
-        || is_xss(input, Html5Flags::ValueDoubleQuote)
-        || is_xss(input, Html5Flags::ValueBackQuote)
+    {
+        return true;
+    }
+
+    // A quoted context with no raw delimiter emits one unclassified value,
+    // reaches EOF, and cannot detect. Visit only contexts with a delimiter.
+    let mut cursor = 0;
+    let mut seen_quotes = 0;
+    while let Some((next_cursor, quote)) = next_unseen_quote(input, cursor, seen_quotes) {
+        cursor = next_cursor;
+        seen_quotes |= quote;
+        let context = match quote {
+            SINGLE_QUOTE => Html5Flags::ValueSingleQuote,
+            DOUBLE_QUOTE => Html5Flags::ValueDoubleQuote,
+            _ => Html5Flags::ValueBackQuote,
+        };
+        if is_xss(input, context) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find the next quoted-value context delimiter not already encountered.
+fn next_unseen_quote(input: &[u8], cursor: usize, seen: u8) -> Option<(usize, u8)> {
+    let rest = input.get(cursor..)?;
+    let relative = match seen {
+        0 => memchr3(b'\'', b'"', b'`', rest),
+        SINGLE_QUOTE => memchr2(b'"', b'`', rest),
+        DOUBLE_QUOTE => memchr2(b'\'', b'`', rest),
+        SINGLE_AND_DOUBLE_QUOTES => memchr(b'`', rest),
+        BACK_QUOTE => memchr2(b'\'', b'"', rest),
+        SINGLE_AND_BACK_QUOTES => memchr(b'"', rest),
+        DOUBLE_AND_BACK_QUOTES => memchr(b'\'', rest),
+        _ => None,
+    }?;
+    let quote = match rest.get(relative).copied()? {
+        b'\'' => SINGLE_QUOTE,
+        b'"' => DOUBLE_QUOTE,
+        b'`' => BACK_QUOTE,
+        _ => return None,
+    };
+    Some((cursor + relative + 1, quote))
+}
+
+/// HTML5 token kind exposed to the corpus test driver.
+#[cfg(feature = "legacy")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Html5TokenKind {
+    /// Raw text / CDATA body.
+    DataText,
+    /// Opening tag name.
+    TagNameOpen,
+    /// `>` closing an open tag.
+    TagNameClose,
+    /// `/>` self-closing end.
+    TagNameSelfClose,
+    /// Close tag name.
+    TagClose,
+    /// Attribute name.
+    AttrName,
+    /// Attribute value.
+    AttrValue,
+    /// Comment or bogus comment body.
+    TagComment,
+    /// DOCTYPE declaration body.
+    DocType,
+}
+
+#[cfg(feature = "legacy")]
+impl From<Html5Type> for Html5TokenKind {
+    fn from(kind: Html5Type) -> Self {
+        match kind {
+            Html5Type::DataText => Self::DataText,
+            Html5Type::TagNameOpen | Html5Type::TagData => Self::TagNameOpen,
+            Html5Type::TagNameClose => Self::TagNameClose,
+            Html5Type::TagNameSelfClose => Self::TagNameSelfClose,
+            Html5Type::TagClose => Self::TagClose,
+            Html5Type::AttrName => Self::AttrName,
+            Html5Type::AttrValue => Self::AttrValue,
+            Html5Type::TagComment => Self::TagComment,
+            Html5Type::DocType => Self::DocType,
+        }
+    }
+}
+
+/// Visit HTML5 tokens as zero-copy slices into `input`.
+#[cfg(feature = "legacy")]
+pub fn html5_visit(
+    input: &[u8],
+    context: crate::snapshot::XssHtmlContext,
+    mut visit: impl FnMut(Html5TokenKind, &[u8]),
+) {
+    let flags = match context {
+        crate::snapshot::XssHtmlContext::Data => Html5Flags::DataState,
+        crate::snapshot::XssHtmlContext::AttrUnquoted => Html5Flags::ValueNoQuote,
+        crate::snapshot::XssHtmlContext::AttrSingle => Html5Flags::ValueSingleQuote,
+        crate::snapshot::XssHtmlContext::AttrDouble => Html5Flags::ValueDoubleQuote,
+        crate::snapshot::XssHtmlContext::AttrBacktick => Html5Flags::ValueBackQuote,
+    };
+    let mut state = Html5State::new(input, flags);
+    while let Some(token) = state.next_token() {
+        visit(token.kind.into(), token.value);
+    }
 }
 
 /// Go `html5Type*` token kinds.
@@ -105,19 +219,53 @@ pub(crate) enum Html5Type {
     DocType = 9,
 }
 
-/// Internal representation of the current Html state
+/// Iterative HTML states corresponding to libinjection-go's `h5State`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Html5ParseState {
-    /// Represents a state where just data is being parsed
+    /// Parse ordinary HTML text until the next `<` or EOF.
     Data,
-    /// Represents a state where a tag open was found (<)
-    InTag,
-    /// Entry / mid-tag attribute value.
-    /// `quote` is `None` for unquoted; `Some(q)` for delimiter `q` (`'`, `"`, or backtick).
-    InAttrValue {
-        /// Quote byte, or `None` if the value is unquoted.
-        quote: Option<u8>,
-    },
+    /// Inspect the byte following `<`.
+    TagOpen,
+    /// Inspect a possible close tag after `</`.
+    EndTagOpen,
+    /// Choose a doctype, comment, CDATA, or bogus-comment state after `<!`.
+    MarkupDeclarationOpen,
+    /// Parse a standard HTML comment body.
+    Comment,
+    /// Parse a CDATA body.
+    CData,
+    /// Parse a doctype body.
+    Doctype,
+    /// Skip separators and begin another attribute or close the tag.
+    BeforeAttributeName,
+    /// Resolve a slash after a tag name or attribute value.
+    SelfClosingStartTag,
+    /// Parse an opening or closing tag name.
+    TagName,
+    /// Emit the `>` ending an opening tag.
+    TagNameClose,
+    /// Parse one attribute name.
+    AttributeName,
+    /// Decide whether another attribute follows a name.
+    AfterAttributeName,
+    /// Select a quoted or unquoted attribute-value state.
+    BeforeAttributeValue,
+    /// Parse an unquoted attribute value.
+    AttributeValueNoQuote,
+    /// Parse a single-quoted attribute value.
+    AttributeValueSingleQuote,
+    /// Parse a double-quoted attribute value.
+    AttributeValueDoubleQuote,
+    /// Parse a backtick-quoted attribute value.
+    AttributeValueBackQuote,
+    /// Continue after a quoted attribute value.
+    AfterAttributeValueQuoted,
+    /// Parse a bogus comment through `>` or EOF.
+    BogusComment,
+    /// Parse the special `%` bogus-comment form.
+    BogusCommentPercent,
+    /// Parsing is complete.
+    Eof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,8 +287,6 @@ pub(crate) struct Html5State<'a> {
     pub(crate) state: Html5ParseState,
     /// Go `isClose`: parsing a close tag name (`</...>`).
     is_close: bool,
-    /// After `AttrName`, the next `=` begins a value; otherwise `=` can start a name.
-    expect_attr_equals: bool,
 }
 
 impl<'a> Html5State<'a> {
@@ -149,468 +295,582 @@ impl<'a> Html5State<'a> {
     pub(crate) fn new(input: &'a [u8], flags: Html5Flags) -> Self {
         let state = match flags {
             Html5Flags::DataState => Html5ParseState::Data,
-            // Go's unquoted value context starts at before-attribute-name,
-            // allowing inputs such as `onerror=alert(1)` without '<'.
-            Html5Flags::ValueNoQuote => Html5ParseState::InTag,
-            Html5Flags::ValueSingleQuote => Html5ParseState::InAttrValue { quote: Some(b'\'') },
-            Html5Flags::ValueDoubleQuote => Html5ParseState::InAttrValue { quote: Some(b'"') },
-            Html5Flags::ValueBackQuote => Html5ParseState::InAttrValue { quote: Some(b'`') },
+            Html5Flags::ValueNoQuote => Html5ParseState::BeforeAttributeName,
+            Html5Flags::ValueSingleQuote => Html5ParseState::AttributeValueSingleQuote,
+            Html5Flags::ValueDoubleQuote => Html5ParseState::AttributeValueDoubleQuote,
+            Html5Flags::ValueBackQuote => Html5ParseState::AttributeValueBackQuote,
         };
         Self {
             input,
             pos: 0,
             state,
             is_close: false,
-            expect_attr_equals: false,
         }
     }
 
     /// Go `h5.next()`: emit the next token, or `None` at EOF.
     pub(crate) fn next_token(&mut self) -> Option<Html5Token<'a>> {
         loop {
-            if self.pos >= self.input.len() {
-                return None;
-            }
             let token = match self.state {
-                Html5ParseState::InTag => self.next_in_tag(),
-                Html5ParseState::Data => self.next_in_data(),
-                Html5ParseState::InAttrValue { quote } => self.next_in_attr_value(quote),
+                Html5ParseState::Data => self.state_data(),
+                Html5ParseState::TagOpen => self.state_tag_open(),
+                Html5ParseState::EndTagOpen => self.state_end_tag_open(),
+                Html5ParseState::MarkupDeclarationOpen => self.state_markup_declaration_open(),
+                Html5ParseState::Comment => self.state_comment(),
+                Html5ParseState::CData => self.state_cdata(),
+                Html5ParseState::Doctype => self.state_doctype(),
+                Html5ParseState::BeforeAttributeName => self.state_before_attribute_name(),
+                Html5ParseState::SelfClosingStartTag => self.state_self_closing_start_tag(),
+                Html5ParseState::TagName => self.state_tag_name(),
+                Html5ParseState::TagNameClose => self.state_tag_name_close(),
+                Html5ParseState::AttributeName => self.state_attribute_name(),
+                Html5ParseState::AfterAttributeName => self.state_after_attribute_name(),
+                Html5ParseState::BeforeAttributeValue => self.state_before_attribute_value(),
+                Html5ParseState::AttributeValueNoQuote => self.state_attribute_value_no_quote(),
+                Html5ParseState::AttributeValueSingleQuote => self.state_attribute_value_quote(b'\''),
+                Html5ParseState::AttributeValueDoubleQuote => self.state_attribute_value_quote(b'"'),
+                Html5ParseState::AttributeValueBackQuote => self.state_attribute_value_quote(b'`'),
+                Html5ParseState::AfterAttributeValueQuoted => self.state_after_attribute_value_quoted(),
+                Html5ParseState::BogusComment => self.state_bogus_comment(),
+                Html5ParseState::BogusCommentPercent => self.state_bogus_comment_percent(),
+                Html5ParseState::Eof => return None,
             };
             if token.is_some() {
                 return token;
             }
-        }
-    }
-
-    /// Deal with `InTag` state
-    fn next_in_tag(&mut self) -> Option<Html5Token<'a>> {
-        self.skip_html_whitespace();
-
-        match self.current()? {
-            b'/' => self.handle_slash_in_tag(),
-            b'>' => self.tag_close(),
-            b'=' if self.expect_attr_equals => self.attr_value(),
-            _ => self.attr_name(),
-        }
-    }
-
-    /// Deal with `Data` state
-    fn next_in_data(&mut self) -> Option<Html5Token<'a>> {
-        if self.current()? == b'<' {
-            self.advance();
-            return self.after_lt();
-        }
-        let start = self.pos;
-        while self.current().is_some_and(|b| b != b'<') {
-            self.advance();
-        }
-        self.emit(Html5Type::DataText, start)
-    }
-
-    /// Deal with `InAttrValue` state
-    fn next_in_attr_value(&mut self, quote: Option<u8>) -> Option<Html5Token<'a>> {
-        let start = self.pos;
-        if let Some(q) = quote {
-            while self.current().is_some_and(|b| b != q) {
-                self.advance();
-            }
-            let value = self.slice_from(start)?;
-            if self.current() == Some(q) {
-                self.advance();
-            }
-            self.state = Html5ParseState::InTag;
-            Some(Html5Token {
-                kind: Html5Type::AttrValue,
-                value,
-            })
-        } else {
-            while self
-                .current()
-                .is_some_and(|b| !is_html_whitespace(b) && b != b'>' && b != b'/')
-            {
-                self.advance();
-            }
-            let value = self.slice_from(start)?;
-            self.state = Html5ParseState::InTag;
-            Some(Html5Token {
-                kind: Html5Type::AttrValue,
-                value,
-            })
-        }
-    }
-
-    /// Deal with the whole case after '<' character
-    fn after_lt(&mut self) -> Option<Html5Token<'a>> {
-        let first = self.current()?;
-
-        // <!-- ... -->  |  <!DOCTYPE ...>  |  <![CDATA[...]]>  |  <!...> bogus
-        if first == b'!' {
-            self.advance(); // consume '!'
-
-            // <!-- comment -->
-            if self.current() == Some(b'-') {
-                self.advance();
-                if self.current() == Some(b'-') {
-                    self.advance(); // past "<!--"
-                    return self.read_comment();
-                }
-                // single '-' after '!': fall through to bogus
-            }
-
-            // <![CDATA[...]]>
-            if self.input.get(self.pos..).is_some_and(|s| s.starts_with(b"[CDATA[")) {
-                self.pos += 7;
-                return self.read_cdata();
-            }
-
-            // <!DOCTYPE ...>
-            if self.starts_with_doctype() {
-                let value = self.take_until_gt()?;
-                return Some(Html5Token {
-                    kind: Html5Type::DocType,
-                    value,
-                });
-            }
-
-            // <!bogus ...>
-            return self.bogus_comment();
-        }
-
-        // </name> or bogus close
-        if first == b'/' {
-            self.advance();
-            if self.current() == Some(b'>') {
-                self.advance();
-                self.state = Html5ParseState::Data;
+            if self.state == Html5ParseState::Eof {
                 return None;
             }
-            if self.current().is_some_and(|c| c.is_ascii_alphabetic()) {
-                self.is_close = true;
-                return self.read_tag_name();
-            }
-            self.is_close = false;
-            return self.bogus_comment();
         }
-
-        // <?..>
-        if first == b'?' {
-            self.advance();
-            return self.bogus_comment();
-        }
-
-        // <%...%>
-        if first == b'%' {
-            self.advance();
-            let value = self.take_until_pct_gt()?;
-            self.state = Html5ParseState::Data;
-            return Some(Html5Token {
-                kind: Html5Type::TagComment,
-                value,
-            });
-        }
-
-        // <name ...  or  <\0name ... (IE)
-        if first.is_ascii_alphabetic() || first == 0 {
-            return self.read_tag_name();
-        }
-
-        // non-html tag opener (Go `stateTagOpen` default)
-        self.state = Html5ParseState::Data;
-        Some(Html5Token {
-            kind: Html5Type::DataText,
-            value: self.input.get(self.pos - 1..self.pos)?,
-        })
     }
 
-    /// Go `stateTagName`.
-    fn read_tag_name(&mut self) -> Option<Html5Token<'a>> {
+    /// Emit data text or transition into a tag after `<`.
+    fn state_data(&mut self) -> Option<Html5Token<'a>> {
+        if self.pos >= self.input.len() {
+            self.state = Html5ParseState::Eof;
+            return None;
+        }
+        if let Some(relative) = self.input.get(self.pos..)?.iter().position(|&b| b == b'<') {
+            let start = self.pos;
+            if relative == 0 {
+                self.pos += 1;
+                self.state = Html5ParseState::TagOpen;
+                return None;
+            }
+            self.pos += relative + 1;
+            self.state = Html5ParseState::TagOpen;
+            return self.token(Html5Type::DataText, start, start + relative);
+        }
         let start = self.pos;
-        while let Some(b) = self.current() {
-            match b {
-                0 => self.advance(),
-                b if is_html_whitespace(b) && b != 0 => {
-                    let name = self.slice_from(start)?;
-                    self.skip_html_whitespace();
-                    self.state = Html5ParseState::InTag;
-                    self.is_close = false;
-                    return Some(Html5Token {
-                        kind: Html5Type::TagNameOpen,
-                        value: name,
-                    });
+        self.pos = self.input.len();
+        self.state = Html5ParseState::Eof;
+        if start == self.pos {
+            None
+        } else {
+            self.token(Html5Type::DataText, start, self.pos)
+        }
+    }
+
+    /// Select the state following an opening `<`.
+    fn state_tag_open(&mut self) -> Option<Html5Token<'a>> {
+        let Some(ch) = self.current() else {
+            self.state = Html5ParseState::Eof;
+            return None;
+        };
+        match ch {
+            b'!' => {
+                self.pos += 1;
+                self.state = Html5ParseState::MarkupDeclarationOpen;
+                None
+            },
+            b'/' => {
+                self.pos += 1;
+                self.is_close = true;
+                self.state = Html5ParseState::EndTagOpen;
+                None
+            },
+            b'?' => {
+                self.pos += 1;
+                self.state = Html5ParseState::BogusComment;
+                None
+            },
+            b'%' => {
+                self.pos += 1;
+                self.state = Html5ParseState::BogusCommentPercent;
+                None
+            },
+            b if b.is_ascii_alphabetic() || b == 0 => {
+                self.state = Html5ParseState::TagName;
+                None
+            },
+            _ if self.pos > 0 => {
+                let start = self.pos - 1;
+                self.state = Html5ParseState::Data;
+                self.token(Html5Type::DataText, start, start + 1)
+            },
+            _ => {
+                self.state = Html5ParseState::Data;
+                None
+            },
+        }
+    }
+
+    /// Select a closing-tag name or bogus-comment state after `</`.
+    fn state_end_tag_open(&mut self) -> Option<Html5Token<'a>> {
+        let Some(ch) = self.current() else {
+            self.state = Html5ParseState::Eof;
+            return None;
+        };
+        if ch == b'>' {
+            self.state = Html5ParseState::Data;
+        } else if ch.is_ascii_alphabetic() {
+            self.state = Html5ParseState::TagName;
+        } else {
+            self.is_close = false;
+            self.state = Html5ParseState::BogusComment;
+        }
+        None
+    }
+
+    /// Recognize doctype, comment, and CDATA declarations.
+    fn state_markup_declaration_open(&mut self) -> Option<Html5Token<'a>> {
+        let rest = self.input.get(self.pos..)?;
+        if rest
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"DOCTYPE"))
+        {
+            self.state = Html5ParseState::Doctype;
+        } else if rest.starts_with(b"[CDATA[") {
+            self.pos += 7;
+            self.state = Html5ParseState::CData;
+        } else if rest.starts_with(b"--") {
+            self.pos += 2;
+            self.state = Html5ParseState::Comment;
+        } else {
+            self.state = Html5ParseState::BogusComment;
+        }
+        None
+    }
+
+    /// Emit a doctype token ending at `>` or EOF.
+    fn state_doctype(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        if let Some(relative) = self.input.get(self.pos..)?.iter().position(|&b| b == b'>') {
+            self.pos += relative + 1;
+            self.state = Html5ParseState::Data;
+            self.token(Html5Type::DocType, start, start + relative)
+        } else {
+            self.pos = self.input.len();
+            self.state = Html5ParseState::Eof;
+            self.token(Html5Type::DocType, start, self.pos)
+        }
+    }
+
+    /// Finish a self-closing tag or resume attribute parsing.
+    fn state_self_closing_start_tag(&mut self) -> Option<Html5Token<'a>> {
+        if self.pos >= self.input.len() {
+            self.state = Html5ParseState::Eof;
+            return None;
+        }
+        if self.current() == Some(b'>') {
+            let start = self.pos.saturating_sub(1);
+            self.pos += 1;
+            self.state = Html5ParseState::Data;
+            return self.token(Html5Type::TagNameSelfClose, start, self.pos);
+        }
+        self.state = Html5ParseState::BeforeAttributeName;
+        None
+    }
+
+    /// Emit the closing `>` token for an opening tag.
+    fn state_tag_name_close(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        if self.current() != Some(b'>') {
+            self.state = Html5ParseState::Eof;
+            return None;
+        }
+        self.pos += 1;
+        self.state = if self.pos < self.input.len() {
+            Html5ParseState::Data
+        } else {
+            Html5ParseState::Eof
+        };
+        self.is_close = false;
+        self.token(Html5Type::TagNameClose, start, self.pos)
+    }
+
+    /// Parse and emit an opening-tag or closing-tag name.
+    fn state_tag_name(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        let mut pos = self.pos;
+        while pos < self.input.len() {
+            let Some(&byte) = self.input.get(pos) else {
+                break;
+            };
+            match byte {
+                0 => pos += 1,
+                b if is_h5_whitespace(b) => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::BeforeAttributeName;
+                    return self.token(Html5Type::TagNameOpen, start, pos);
                 },
-                b'/' if !self.is_close => {
-                    let name = self.slice_from(start)?;
-                    self.state = Html5ParseState::InTag;
-                    return Some(Html5Token {
-                        kind: Html5Type::TagNameOpen,
-                        value: name,
-                    });
+                b'/' => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::SelfClosingStartTag;
+                    return self.token(Html5Type::TagNameOpen, start, pos);
+                },
+                b'>' if self.is_close => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::Data;
+                    self.is_close = false;
+                    return self.token(Html5Type::TagClose, start, pos);
                 },
                 b'>' => {
-                    let name = self.slice_from(start)?;
-                    if self.is_close {
-                        self.advance();
-                        self.state = Html5ParseState::Data;
-                        self.is_close = false;
-                        return Some(Html5Token {
-                            kind: Html5Type::TagClose,
-                            value: name,
-                        });
-                    }
-                    self.state = Html5ParseState::InTag;
-                    return Some(Html5Token {
-                        kind: Html5Type::TagNameOpen,
-                        value: name,
-                    });
+                    self.pos = pos;
+                    self.state = Html5ParseState::TagNameClose;
+                    return self.token(Html5Type::TagNameOpen, start, pos);
                 },
-                _ => self.advance(),
+                _ => pos += 1,
             }
         }
-
-        let name = self.slice_from(start)?;
-        self.state = Html5ParseState::InTag;
+        self.pos = self.input.len();
+        self.state = Html5ParseState::Eof;
         self.is_close = false;
-        Some(Html5Token {
-            kind: Html5Type::TagNameOpen,
-            value: name,
-        })
+        self.token(Html5Type::TagNameOpen, start, self.pos)
     }
 
-    /// Go `stateComment` (`-->` and `-!>` terminators).
-    fn read_comment(&mut self) -> Option<Html5Token<'a>> {
+    /// Skip separators before the next attribute or the tag close.
+    fn state_before_attribute_name(&mut self) -> Option<Html5Token<'a>> {
+        loop {
+            let Some(ch) = self.skip_white() else {
+                self.state = Html5ParseState::Eof;
+                return None;
+            };
+            match ch {
+                b'/' => {
+                    self.pos += 1;
+                    if self.current().is_some_and(|next| next != b'>') {
+                        continue;
+                    }
+                    self.state = Html5ParseState::SelfClosingStartTag;
+                    return None;
+                },
+                b'>' => {
+                    let start = self.pos;
+                    self.pos += 1;
+                    self.state = Html5ParseState::Data;
+                    return self.token(Html5Type::TagNameClose, start, self.pos);
+                },
+                _ => {
+                    self.state = Html5ParseState::AttributeName;
+                    return None;
+                },
+            }
+        }
+    }
+
+    /// Parse one attribute name through whitespace, `=`, `/`, `>`, or EOF.
+    fn state_attribute_name(&mut self) -> Option<Html5Token<'a>> {
         let start = self.pos;
-        let mut scan = self.pos;
-        while let Some(rest) = self.input.get(scan..) {
-            let Some(dash_idx) = rest.iter().position(|&b| b == b'-') else {
+        let mut pos = self.pos.saturating_add(1);
+        while pos < self.input.len() {
+            let Some(&byte) = self.input.get(pos) else {
                 break;
             };
-            let abs = scan + dash_idx;
-            if abs + 3 > self.input.len() {
-                break;
+            match byte {
+                b if is_h5_whitespace(b) => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::AfterAttributeName;
+                    return self.token(Html5Type::AttrName, start, pos);
+                },
+                b'/' => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::SelfClosingStartTag;
+                    return self.token(Html5Type::AttrName, start, pos);
+                },
+                b'=' => {
+                    self.pos = pos + 1;
+                    self.state = Html5ParseState::BeforeAttributeValue;
+                    return self.token(Html5Type::AttrName, start, pos);
+                },
+                b'>' => {
+                    self.pos = pos;
+                    self.state = Html5ParseState::TagNameClose;
+                    return self.token(Html5Type::AttrName, start, pos);
+                },
+                _ => pos += 1,
             }
-            let mut offset = 1_usize;
-            while self.input.get(abs + offset) == Some(&0) {
+        }
+        self.pos = self.input.len();
+        self.state = Html5ParseState::Eof;
+        self.token(Html5Type::AttrName, start, self.pos)
+    }
+
+    /// Continue an attribute name, begin its value, or close the tag.
+    fn state_after_attribute_name(&mut self) -> Option<Html5Token<'a>> {
+        let Some(ch) = self.skip_white() else {
+            self.state = Html5ParseState::Eof;
+            return None;
+        };
+        match ch {
+            b'/' => {
+                self.pos += 1;
+                self.state = Html5ParseState::SelfClosingStartTag;
+                None
+            },
+            b'=' => {
+                self.pos += 1;
+                self.state = Html5ParseState::BeforeAttributeValue;
+                None
+            },
+            b'>' => self.state_tag_name_close(),
+            _ => {
+                self.state = Html5ParseState::AttributeName;
+                None
+            },
+        }
+    }
+
+    /// Select the value parser from its opening quote or first byte.
+    fn state_before_attribute_value(&mut self) -> Option<Html5Token<'a>> {
+        let Some(ch) = self.skip_white() else {
+            self.state = Html5ParseState::Eof;
+            return None;
+        };
+        self.state = match ch {
+            b'"' => Html5ParseState::AttributeValueDoubleQuote,
+            b'\'' => Html5ParseState::AttributeValueSingleQuote,
+            b'`' => Html5ParseState::AttributeValueBackQuote,
+            _ => Html5ParseState::AttributeValueNoQuote,
+        };
+        None
+    }
+
+    /// Emit an unquoted attribute value through whitespace, `>`, or EOF.
+    fn state_attribute_value_no_quote(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        let mut pos = self.pos;
+        while pos < self.input.len() {
+            let Some(&ch) = self.input.get(pos) else {
+                break;
+            };
+            if is_h5_whitespace(ch) {
+                self.pos = pos + 1;
+                self.state = Html5ParseState::BeforeAttributeName;
+                return self.token(Html5Type::AttrValue, start, pos);
+            }
+            if ch == b'>' {
+                self.pos = pos;
+                self.state = Html5ParseState::TagNameClose;
+                return self.token(Html5Type::AttrValue, start, pos);
+            }
+            pos += 1;
+        }
+        self.pos = self.input.len();
+        self.state = Html5ParseState::Eof;
+        self.token(Html5Type::AttrValue, start, self.pos)
+    }
+
+    /// Emit a quoted attribute value through its matching delimiter or EOF.
+    fn state_attribute_value_quote(&mut self, quote: u8) -> Option<Html5Token<'a>> {
+        if self.pos > 0 {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        let relative = self.input.get(self.pos..)?.iter().position(|&b| b == quote);
+        if let Some(relative) = relative {
+            self.pos += relative + 1;
+            self.state = Html5ParseState::AfterAttributeValueQuoted;
+            self.token(Html5Type::AttrValue, start, start + relative)
+        } else {
+            self.pos = self.input.len();
+            self.state = Html5ParseState::Eof;
+            self.token(Html5Type::AttrValue, start, self.pos)
+        }
+    }
+
+    /// Continue after a quoted value or close the containing tag.
+    fn state_after_attribute_value_quoted(&mut self) -> Option<Html5Token<'a>> {
+        let Some(ch) = self.current() else {
+            self.state = Html5ParseState::Eof;
+            return None;
+        };
+        match ch {
+            b if is_h5_whitespace(b) => {
+                self.pos += 1;
+                self.state = Html5ParseState::BeforeAttributeName;
+                None
+            },
+            b'/' => {
+                self.pos += 1;
+                self.state = Html5ParseState::SelfClosingStartTag;
+                None
+            },
+            b'>' => self.state_tag_name_close(),
+            _ => {
+                self.state = Html5ParseState::BeforeAttributeName;
+                None
+            },
+        }
+    }
+
+    /// Emit a standard comment body through its ending marker or EOF.
+    fn state_comment(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        let mut scan = self.pos;
+        loop {
+            let rest = self.input.get(scan..)?;
+            let Some(relative) = rest.iter().position(|&b| b == b'-') else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            let dash = scan + relative;
+            // Preserve Go's state machine bounds check while remaining safe.
+            if dash.checked_add(3).is_none_or(|end| end > self.input.len()) {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            }
+            let mut offset = 1;
+            while self.input.get(dash + offset) == Some(&0) {
                 offset += 1;
             }
-            let Some(&ch) = self.input.get(abs + offset) else {
-                break;
+            let Some(&next) = self.input.get(dash + offset) else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
             };
-            if ch != b'-' && ch != b'!' {
-                scan = abs + 1;
+            if next != b'-' && next != b'!' {
+                scan = dash + 1;
                 continue;
             }
             offset += 1;
-            if self.input.get(abs + offset) != Some(&b'>') {
-                scan = abs + 1;
+            if self.input.get(dash + offset) != Some(&b'>') {
+                scan = dash + 1;
                 continue;
             }
-            offset += 1;
-            let body = self.input.get(start..abs)?;
-            self.pos = abs + offset;
+            self.pos = dash + offset + 1;
             self.state = Html5ParseState::Data;
-            return Some(Html5Token {
-                kind: Html5Type::TagComment,
-                value: body,
-            });
+            return self.token(Html5Type::TagComment, start, dash);
         }
-
-        let body = self.input.get(start..)?;
-        self.pos = self.input.len();
-        Some(Html5Token {
-            kind: Html5Type::TagComment,
-            value: body,
-        })
     }
 
-    /// Go `stateCData`.
-    fn read_cdata(&mut self) -> Option<Html5Token<'a>> {
+    /// Emit a CDATA body through `]]>` or EOF.
+    fn state_cdata(&mut self) -> Option<Html5Token<'a>> {
         let start = self.pos;
         let mut scan = self.pos;
-        while let Some(rest) = self.input.get(scan..) {
-            let Some(rb_idx) = rest.iter().position(|&b| b == b']') else {
-                break;
-            };
-            let abs = scan + rb_idx;
-            if self.input.get(abs..abs + 3) == Some(b"]]>") {
-                let value = self.input.get(start..abs)?;
-                self.pos = abs + 3;
-                self.state = Html5ParseState::Data;
-                return Some(Html5Token {
-                    kind: Html5Type::DataText,
-                    value,
-                });
-            }
-            scan = abs + 1;
-        }
-
-        let value = self.input.get(start..)?;
-        self.pos = self.input.len();
-        Some(Html5Token {
-            kind: Html5Type::DataText,
-            value,
-        })
-    }
-
-    /// Go `stateBogusComment`.
-    fn bogus_comment(&mut self) -> Option<Html5Token<'a>> {
-        let start = self.pos;
-        if let Some(rest) = self.input.get(self.pos..)
-            && let Some(idx) = rest.iter().position(|&b| b == b'>')
-        {
-            let body = self.input.get(start..self.pos + idx)?;
-            self.pos += idx + 1;
-            self.state = Html5ParseState::Data;
-            return Some(Html5Token {
-                kind: Html5Type::TagComment,
-                value: body,
-            });
-        }
-        let body = self.input.get(start..)?;
-        self.pos = self.input.len();
-        Some(Html5Token {
-            kind: Html5Type::TagComment,
-            value: body,
-        })
-    }
-
-    /// Go `stateBeforeAttributeName` / `stateSelfClosingStartTag` for `/`.
-    fn handle_slash_in_tag(&mut self) -> Option<Html5Token<'a>> {
-        let slash = self.pos;
-        self.advance();
-        self.skip_html_whitespace();
-        if self.current() == Some(b'>') {
-            self.advance();
-            let value = self.input.get(slash..self.pos)?;
-            self.state = Html5ParseState::Data;
-            return Some(Html5Token {
-                kind: Html5Type::TagNameSelfClose,
-                value,
-            });
-        }
-        // `<foo /junk>`: `/` not followed by `>` → attribute name
-        self.attr_name()
-    }
-
-    /// Deal with final tag close
-    fn tag_close(&mut self) -> Option<Html5Token<'a>> {
-        let start = self.pos;
-        self.advance();
-        self.state = Html5ParseState::Data;
-        self.expect_attr_equals = false;
-        self.emit(Html5Type::TagNameClose, start)
-    }
-
-    /// Deal with attribute names (after tag name)
-    fn attr_name(&mut self) -> Option<Html5Token<'a>> {
-        let start = self.pos;
-        self.advance();
-        while self.current().is_some_and(|b| !is_delimiter(b)) {
-            self.advance();
-        }
-        self.expect_attr_equals = true;
-        self.emit(Html5Type::AttrName, start)
-    }
-
-    /// Deal with attributes after '=' sign
-    fn attr_value(&mut self) -> Option<Html5Token<'a>> {
-        self.expect_attr_equals = false;
-        // We were called because current byte is '=' (from next_in_tag).
-        self.advance(); // consume '='
-        self.skip_html_whitespace();
-
-        let quote = match self.current()? {
-            q if matches!(q, b'\'' | b'"' | b'`') => {
-                self.advance(); // consume opener (same as flag entry: value starts after quote)
-                Some(q)
-            },
-            _ => None, // unquoted; pos stays on first value byte
-        };
-
-        self.state = Html5ParseState::InAttrValue { quote };
-        self.next_in_attr_value(quote)
-    }
-
-    /// Body until `>` (exclusive); consume `>` if present.
-    fn take_until_gt(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
-        while self.current().is_some_and(|b| b != b'>') {
-            self.advance();
-        }
-        let body = self.slice_from(start)?;
-        if self.current() == Some(b'>') {
-            self.advance();
-        }
-        Some(body)
-    }
-
-    /// Body until `%>` (exclusive); consume `%>` if present (IE).
-    fn take_until_pct_gt(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
         loop {
-            match self.current() {
-                None => break,
-                Some(b'%') if self.input.get(self.pos..).is_some_and(|s| s.starts_with(b"%>")) => {
-                    break;
-                },
-                _ => self.advance(),
+            let rest = self.input.get(scan..)?;
+            let Some(relative) = rest.iter().position(|&b| b == b']') else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::DataText, start, self.pos);
+            };
+            let bracket = scan + relative;
+            // Match Go's moving search cursor and bounded `]]>` check. Keep
+            // the check on a slice so malformed input remains panic-free.
+            if self.input.get(bracket..bracket.saturating_add(3)) == Some(b"]]>") {
+                self.pos = bracket + 3;
+                self.state = Html5ParseState::Data;
+                return self.token(Html5Type::DataText, start, bracket);
+            }
+            scan = bracket + 1;
+        }
+    }
+
+    /// Emit a bogus comment through `>` or EOF.
+    fn state_bogus_comment(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        if let Some(relative) = self.input.get(self.pos..)?.iter().position(|&b| b == b'>') {
+            self.pos += relative + 1;
+            self.state = Html5ParseState::Data;
+            self.token(Html5Type::TagComment, start, start + relative)
+        } else {
+            self.pos = self.input.len();
+            self.state = Html5ParseState::Eof;
+            self.token(Html5Type::TagComment, start, self.pos)
+        }
+    }
+
+    /// Emit the C-compatible `%` bogus-comment form through its terminator or EOF.
+    fn state_bogus_comment_percent(&mut self) -> Option<Html5Token<'a>> {
+        let start = self.pos;
+        let mut scan = self.pos;
+        loop {
+            let Some(rest) = self.input.get(scan..) else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            let Some(relative) = rest.iter().position(|&b| b == b'%') else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            let Some(percent) = scan.checked_add(relative) else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            let Some(next) = percent.checked_add(1) else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            if next >= self.input.len() {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            }
+            if self.input.get(next) != Some(&b'>') {
+                scan = next;
+                continue;
+            }
+            let Some(end) = next.checked_add(1) else {
+                self.pos = self.input.len();
+                self.state = Html5ParseState::Eof;
+                return self.token(Html5Type::TagComment, start, self.pos);
+            };
+            self.pos = end;
+            self.state = Html5ParseState::Data;
+            return self.token(Html5Type::TagComment, start, percent);
+        }
+    }
+
+    /// Skip HTML whitespace and NUL bytes, returning the next byte.
+    fn skip_white(&mut self) -> Option<u8> {
+        while let Some(ch) = self.current() {
+            if ch == 0 || is_h5_whitespace(ch) {
+                self.pos += 1;
+            } else {
+                return Some(ch);
             }
         }
-        let body = self.slice_from(start)?;
-        if self.input.get(self.pos..).is_some_and(|s| s.starts_with(b"%>")) {
-            self.pos += 2;
-        }
-        Some(body)
+        None
     }
 
-    /// check if input contains a doctype comment
-    fn starts_with_doctype(&self) -> bool {
-        let Some(s) = self.input.get(self.pos..) else {
-            return false;
-        };
-        s.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"DOCTYPE"))
-    }
-
-    /// Helper functions
-    /// skip all of the whitespaces
-    fn skip_html_whitespace(&mut self) {
-        while self.current().is_some_and(is_html_whitespace) {
-            self.advance();
-        }
-    }
-
-    /// advance to the next position of the state
-    fn advance(&mut self) {
-        self.pos += 1;
-    }
-
-    /// Slice from `start` to current `pos` (via `.get`).
-    fn slice_from(&self, start: usize) -> Option<&'a [u8]> {
-        self.input.get(start..self.pos)
-    }
-
-    /// get the current byte
+    /// Return the byte at the current cursor.
     fn current(&self) -> Option<u8> {
         self.input.get(self.pos).copied()
     }
 
-    /// emit a `Html5Token`
-    fn emit(&self, kind: Html5Type, start: usize) -> Option<Html5Token<'a>> {
+    /// Construct a token over a checked range in the original input.
+    fn token(&self, kind: Html5Type, start: usize, end: usize) -> Option<Html5Token<'a>> {
         Some(Html5Token {
             kind,
-            value: self.slice_from(start)?,
+            value: self.input.get(start..end)?,
         })
     }
 }
 
-/// HTML/libinjection whitespace: ASCII whitespace plus vertical tab.
-fn is_html_whitespace(b: u8) -> bool {
-    b == 0 || b.is_ascii_whitespace() || b == b'\x0b'
+/// Return whether a byte is HTML5 ASCII whitespace.
+fn is_h5_whitespace(b: u8) -> bool {
+    matches!(b, b'\n' | b'\t' | b'\x0b' | b'\x0c' | b'\r' | b' ')
 }
 
-/// Bytes that end an attribute name inside a tag.
-fn is_delimiter(b: u8) -> bool {
-    is_html_whitespace(b) || matches!(b, b'=' | b'/' | b'>')
-}
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -657,11 +917,19 @@ mod tests {
         assert_eq!(
             h5.next_token(),
             Some(Html5Token {
-                kind: Html5Type::TagNameOpen,
+                kind: Html5Type::DataText,
+                value: b">",
+            })
+        );
+        assert_eq!(
+            h5.next_token(),
+            Some(Html5Token {
+                kind: Html5Type::TagClose,
                 value: b"script",
             })
         );
-        assert!(is_xss(b"</><script>", Html5Flags::DataState));
+        assert!(!is_xss(b"</><script>", Html5Flags::DataState));
+        assert!(detect(b"</><script>"));
     }
 
     #[test]
@@ -707,8 +975,8 @@ mod tests {
                 value: b"hello",
             })
         );
-        assert_eq!(h5.pos, 5);
-        assert_eq!(h5.state, Html5ParseState::Data);
+        assert_eq!(h5.pos, 6);
+        assert_eq!(h5.state, Html5ParseState::TagOpen);
         assert_eq!(
             h5.next_token(),
             Some(Html5Token {
@@ -717,7 +985,7 @@ mod tests {
             })
         );
         assert_eq!(h5.pos, 12);
-        assert_eq!(h5.state, Html5ParseState::InTag);
+        assert_eq!(h5.state, Html5ParseState::TagNameClose);
         assert_eq!(
             h5.next_token(),
             Some(Html5Token {
@@ -726,7 +994,7 @@ mod tests {
             })
         );
         assert_eq!(h5.pos, 13);
-        assert_eq!(h5.state, Html5ParseState::Data);
+        assert_eq!(h5.state, Html5ParseState::Eof);
     }
 
     #[test]

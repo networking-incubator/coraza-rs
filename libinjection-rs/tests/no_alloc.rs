@@ -12,23 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-allocation gate for legacy `detect_*` hot paths.
-//! This is used only on the test to guarantee that no heap allocation happens
-//! on hot path
-
+//! Zero-allocation regression guard for the legacy compatibility hot paths.
 #![expect(clippy::tests_outside_test_module, reason = "integration test binary")]
 #![expect(unsafe_code, reason = "counting #[global_allocator] for no-alloc regression test")]
-#![expect(
-    clippy::let_underscore_must_use,
-    reason = "verdict return value intentionally discarded in alloc gate"
-)]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    hint::black_box,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use libinjection::{AnalyzeOptions, analyze_sqli, analyze_xss, detect_sqli, detect_sqli_with, detect_xss};
+use libinjection::{XssHtmlContext, detect_sqli, detect_xss, html5_visit};
 
 static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -51,32 +45,76 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
-fn assert_no_alloc<F: FnOnce()>(f: F) {
+const CONTEXTS: [XssHtmlContext; 5] = [
+    XssHtmlContext::Data,
+    XssHtmlContext::AttrUnquoted,
+    XssHtmlContext::AttrSingle,
+    XssHtmlContext::AttrDouble,
+    XssHtmlContext::AttrBacktick,
+];
+
+fn long_comment() -> Vec<u8> {
+    let mut input = Vec::with_capacity(65_537);
+    input.extend_from_slice(b"/*");
+    input.resize(65_535, b'x');
+    input.extend_from_slice(b"*/");
+    input
+}
+
+fn assert_no_alloc(label: &str, operation: impl FnOnce()) {
     let before = ALLOCATION_CALLS.load(Ordering::SeqCst);
-    f();
+    operation();
+    let after = ALLOCATION_CALLS.load(Ordering::SeqCst);
     assert_eq!(
-        ALLOCATION_CALLS.load(Ordering::SeqCst),
+        after,
         before,
-        "unexpected heap allocation on hot path"
+        "{label} allocated {delta} time(s)",
+        delta = after - before
     );
 }
 
+fn check_compatibility_hot_paths_and_html_contexts() {
+    static BENIGN: &[u8] = b"ordinary request value without parser markers";
+    static SQL_ATTACK: &[u8] = b"1' UNION SELECT password FROM users WHERE '1'='1";
+    static XSS_ATTACK: &[u8] = b"<a href=javascript:alert(1) onerror=alert(1)>";
+    static BINARY: &[u8] = &[0xFF, 0x00, b'\'', 0x80, b'<', b'>'];
+    static LONG_UNARY: [u8; 65_537] = [b'+'; 65_537];
+    static LONG_HTML: [u8; 65_537] = [b'/'; 65_537];
+    let long_comment = long_comment();
+
+    for input in [
+        black_box(BENIGN),
+        black_box(SQL_ATTACK),
+        black_box(BINARY),
+        black_box(&LONG_UNARY[..]),
+        black_box(long_comment.as_slice()),
+        black_box(&LONG_HTML[..]),
+    ] {
+        assert_no_alloc("detect_sqli", || {
+            black_box(detect_sqli(black_box(input)));
+        });
+        assert_no_alloc("detect_xss", || {
+            black_box(detect_xss(black_box(input)));
+        });
+    }
+
+    for context in CONTEXTS {
+        let input = black_box(XSS_ATTACK);
+        assert_no_alloc("html5_visit context", || {
+            let mut token_count = 0_usize;
+            html5_visit(black_box(input), black_box(context), |kind, value| {
+                token_count = token_count.wrapping_add(usize::from(kind as u8));
+                token_count = token_count.wrapping_add(value.len());
+                black_box(token_count);
+            });
+            black_box(token_count);
+        });
+    }
+}
+
+// Keep a single test case in this binary: independent Rust test threads would
+// include their harness allocations in the process-global allocation count.
 #[test]
-fn legacy_hot_paths_no_alloc() {
-    assert_no_alloc(|| {
-        let _ = detect_sqli(b"1' OR '1'='1");
-    });
-    assert_no_alloc(|| {
-        let _ = detect_xss(b"<script>alert(1)</script>");
-    });
-    assert_no_alloc(|| {
-        let input = [b'a'; 9000];
-        let _ = detect_sqli_with(&input, AnalyzeOptions::default());
-    });
-    assert_no_alloc(|| {
-        let _ = analyze_sqli(b"1' UNION SELECT 1");
-    });
-    assert_no_alloc(|| {
-        let _ = analyze_xss(b"<script>x</script>");
-    });
+fn legacy_hot_paths_do_not_allocate() {
+    check_compatibility_hot_paths_and_html_contexts();
 }

@@ -16,7 +16,7 @@
 
 use super::{
     consts::{BYTE_NULL, TOKEN_SIZE, TT_OPERATOR, TT_STRING},
-    helpers::{is_backslash_escaped, is_double_delimiter_escaped, to_upper_cmp},
+    helpers::to_upper_cmp,
 };
 
 /// One SQL token: category + position/length + optional string delimiters.
@@ -63,23 +63,25 @@ impl SqliToken {
 
     /// Go `assign`: set category, pos, truncate value to `TOKEN_SIZE - 1`.
     pub(crate) fn assign(&mut self, token_type: u8, pos: usize, length: usize, value: &[u8]) {
-        let last = length.min(TOKEN_SIZE - 1);
+        let last = length.min(TOKEN_SIZE - 1).min(value.len());
         self.category = token_type;
         self.pos = pos;
         self.len = last;
         self.val = [0; TOKEN_SIZE];
-        if last > 0 {
-            let src = value.get(..last).unwrap_or(value);
-            if let Some(dst) = self.val.get_mut(..last) {
-                dst.copy_from_slice(src);
-            }
+        if last > 0
+            && let Some(dst) = self.val.get_mut(..last)
+        {
+            dst.copy_from_slice(value.get(..last).unwrap_or(&[]));
         }
     }
 
-    /// Go `parseStringCore`: scan a quoted string starting at `input[pos+offset]`.
+    /// Scan a quoted string starting at `input[pos+offset]`.
     ///
     /// Returns the new position (past the closing delimiter, or at EOF).
-    #[expect(clippy::too_many_arguments, reason = "direct port of Go parseStringCore signature")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared scanner accepts explicit parser context"
+    )]
     pub(crate) fn parse_string_core(
         &mut self,
         input: &[u8],
@@ -98,34 +100,45 @@ impl SqliToken {
         let haystack = input.get(start..).unwrap_or(b"");
         let mut cursor = 0_usize;
 
-        loop {
-            let remaining = haystack.get(cursor..).unwrap_or(b"");
-            let idx = memchr::memchr(delimiter, remaining);
+        while let Some(remaining) = haystack.get(cursor..) {
+            let Some(relative) = memchr::memchr2(delimiter, b'\\', remaining) else {
+                break;
+            };
+            cursor += relative;
 
-            match idx {
-                None => {
-                    self.assign(TT_STRING, start, length - start, haystack);
-                    self.str_close = BYTE_NULL;
-                    return length;
-                },
-                Some(rel) => {
-                    let abs = cursor + rel;
-                    let before = haystack.get(..abs).unwrap_or(b"");
-                    if is_backslash_escaped(before) {
-                        cursor = abs + 1;
-                        continue;
-                    }
-                    let at_delim = haystack.get(abs..).unwrap_or(b"");
-                    if is_double_delimiter_escaped(at_delim) {
-                        cursor = abs + 2;
-                        continue;
-                    }
-                    self.assign(TT_STRING, start, abs, haystack);
-                    self.str_close = delimiter;
-                    return start + abs + 1;
-                },
+            if haystack.get(cursor).copied() == Some(b'\\') {
+                let slash_start = cursor;
+                while haystack.get(cursor).copied() == Some(b'\\') {
+                    cursor += 1;
+                }
+                let escaped = cursor.saturating_sub(slash_start) % 2 == 1;
+                if haystack.get(cursor).copied() != Some(delimiter) {
+                    continue;
+                }
+                if escaped {
+                    // The first delimiter after an odd backslash run is
+                    // escaped; a following delimiter is evaluated anew.
+                    cursor += 1;
+                    continue;
+                }
+            }
+
+            if haystack.get(cursor).copied() == Some(delimiter) {
+                if haystack.get(cursor + 1).copied() == Some(delimiter) {
+                    // SQL doubled delimiters represent one literal delimiter.
+                    cursor += 2;
+                    continue;
+                }
+
+                self.assign(TT_STRING, start, cursor, haystack);
+                self.str_close = delimiter;
+                return start + cursor + 1;
             }
         }
+
+        self.assign(TT_STRING, start, length.saturating_sub(start), haystack);
+        self.str_close = BYTE_NULL;
+        length
     }
 
     /// Go `isUnaryOp`.

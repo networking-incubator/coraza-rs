@@ -14,6 +14,9 @@
 
 use super::deny_list::{DENY_ATTRS, DENY_EVENTS, DENY_TAGS, DENY_URL_PREFIXES};
 
+/// Maximum normalized bytes retained for one tag or attribute name.
+const MAX_NORMALIZED_TOKEN_LEN: usize = 64;
+
 /// Go `attributeType*` (libinjection-go).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -32,30 +35,51 @@ pub(crate) enum DenyAttrKind {
 
 /// verifies if the name from a html tag is inside a deny list
 pub(crate) fn is_deny_tag(name: &[u8]) -> bool {
-    if DENY_TAGS.iter().any(|t| normalized_eq_ignore_ascii_case(name, t)) {
-        return true;
+    if name.len() < 3 {
+        return false;
     }
-    // Go: SVG* / XSL* prefix (length >= 3)
-    normalized_prefix_ignore_ascii_case(name, b"SVG") || normalized_prefix_ignore_ascii_case(name, b"XSL")
+    let Some((normalized, len)) = normalize_name(name) else {
+        return false;
+    };
+    let Some(normalized) = normalized.get(..len) else {
+        return false;
+    };
+    DENY_TAGS.contains(&normalized) || normalized.starts_with(b"SVG") || normalized.starts_with(b"XSL")
 }
 
 /// verifies if the name from a html tag is inside a deny list
 pub(crate) fn is_deny_attr(name: &[u8]) -> DenyAttrKind {
-    // Go: XMLNS* / XLINK* -> deny
-    if normalized_prefix_ignore_ascii_case(name, b"XMLNS") || normalized_prefix_ignore_ascii_case(name, b"XLINK") {
+    let Some((normalized, len)) = normalize_name(name) else {
+        return DenyAttrKind::None;
+    };
+    let Some(normalized) = normalized.get(..len) else {
+        return DenyAttrKind::None;
+    };
+    if normalized.len() < 2 {
+        return DenyAttrKind::None;
+    }
+
+    if normalized == b"XMLNS" {
         return DenyAttrKind::Deny;
     }
 
-    // Go: ON* -> match suffix against deny events
-    if normalized_prefix_ignore_ascii_case(name, b"ON") && normalized_suffix_ignore_ascii_case(name, b"ON", DENY_EVENTS)
-    {
-        return DenyAttrKind::Deny;
+    if normalized.starts_with(b"ON") {
+        if normalized.len() >= 5 {
+            let suffix = normalized.get(2..).unwrap_or(&[]);
+            if DENY_EVENTS.binary_search(&suffix).is_ok() {
+                return DenyAttrKind::Deny;
+            }
+        }
+        // No named deny-list attribute begins with ON; an event miss cannot
+        // match DENY_ATTRS, so avoid a second lookup on the common miss path.
+        return DenyAttrKind::None;
     }
 
     DENY_ATTRS
-        .iter()
-        .find(|(n, _)| normalized_eq_ignore_ascii_case(name, n))
-        .map_or(DenyAttrKind::None, |(_, k)| *k)
+        .binary_search_by(|(expected, _)| expected.cmp(&normalized))
+        .ok()
+        .and_then(|index| DENY_ATTRS.get(index))
+        .map_or(DenyAttrKind::None, |(_, kind)| *kind)
 }
 
 /// verifies if the name from a html tag is inside a deny list
@@ -82,17 +106,25 @@ pub(crate) fn is_deny_comment(body: &[u8]) -> bool {
         return true;
     }
 
-    // 2) IE conditional: len > 3 and "[IF" (ASCII case-insensitive on IF)
-    if normalized_prefix_ignore_ascii_case(body, b"[IF") && normalized_len(body) > 3 {
+    // Go checks raw positions and raw token length for these two prefixes.
+    if body.len() > 3
+        && body.first() == Some(&b'[')
+        && body.get(1).is_some_and(|b| b.eq_ignore_ascii_case(&b'I'))
+        && body.get(2).is_some_and(|b| b.eq_ignore_ascii_case(&b'F'))
+    {
         return true;
     }
 
-    // 3) XML prefix: len > 3 (Go v0.3.1 off-by-one fix)
-    if normalized_prefix_ignore_ascii_case(body, b"XML") && normalized_len(body) > 3 {
+    if body.len() > 3
+        && body.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'X'))
+        && body.get(1).is_some_and(|b| b.eq_ignore_ascii_case(&b'M'))
+        && body.get(2).is_some_and(|b| b.eq_ignore_ascii_case(&b'L'))
+    {
         return true;
     }
 
-    // 4) IMPORT / ENTITY after uppercase + strip nulls (first 6 meaningful bytes in Go)
+    // Match v0.3.3: check the full comment body after removing NUL bytes so
+    // embedded NULs cannot shift IMPORT / ENTITY past a fixed-width window.
     let mut buf = [0_u8; 6];
     let mut n = 0;
     for &b in body {
@@ -109,54 +141,19 @@ pub(crate) fn is_deny_comment(body: &[u8]) -> bool {
     prefix.starts_with(b"IMPORT") || prefix.starts_with(b"ENTITY")
 }
 
-/// Compare two byte strings after removing embedded NUL bytes.
-fn normalized_eq_ignore_ascii_case(input: &[u8], expected: &[u8]) -> bool {
-    normalized_len(input) == expected.len() && normalized_prefix_ignore_ascii_case(input, expected)
-}
-
-/// Compare an expected prefix while ignoring embedded NUL bytes.
-fn normalized_prefix_ignore_ascii_case(input: &[u8], expected: &[u8]) -> bool {
-    let mut input_pos = 0;
-    for &want in expected {
-        while input.get(input_pos) == Some(&0) {
-            input_pos += 1;
-        }
-        let Some(&got) = input.get(input_pos) else { return false };
-        if !got.eq_ignore_ascii_case(&want) {
-            return false;
-        }
-        input_pos += 1;
-    }
-    true
-}
-
-/// Match a deny-list suffix after a normalized attribute prefix.
-fn normalized_suffix_ignore_ascii_case(input: &[u8], prefix: &[u8], expected: &[&[u8]]) -> bool {
-    let mut prefix_len = 0;
-    for &byte in prefix {
-        if byte != 0 {
-            prefix_len += 1;
-        }
-    }
-    let mut compact = [0_u8; 64];
+/// Uppercase ASCII and remove NUL bytes into Go's fixed-size name buffer.
+fn normalize_name(input: &[u8]) -> Option<([u8; MAX_NORMALIZED_TOKEN_LEN], usize)> {
+    let mut normalized = [0_u8; MAX_NORMALIZED_TOKEN_LEN];
     let mut len = 0;
     for &byte in input {
         if byte == 0 {
             continue;
         }
-        let Some(slot) = compact.get_mut(len) else { return false };
-        *slot = byte;
+        let slot = normalized.get_mut(len)?;
+        *slot = byte.to_ascii_uppercase();
         len += 1;
     }
-    compact
-        .get(..len)
-        .and_then(|name| name.get(prefix_len..))
-        .is_some_and(|suffix| expected.iter().any(|event| suffix.eq_ignore_ascii_case(event)))
-}
-
-/// Count bytes after removing embedded NUL bytes.
-fn normalized_len(input: &[u8]) -> usize {
-    input.iter().filter(|&&byte| byte != 0).count()
+    Some((normalized, len))
 }
 
 /// Match an HTML entity-decoded, case-insensitive prefix.
@@ -165,106 +162,145 @@ fn html_entity_starts_with(input: &[u8], expected: &[u8]) -> bool {
     while input.get(pos).is_some_and(|byte| *byte <= 32 || *byte >= 127) {
         pos += 1;
     }
-    for &want in expected {
-        loop {
-            let Some(got) = next_html_byte(input, &mut pos) else {
-                return false;
-            };
-            if got == 0 || got == b'\n' {
-                continue;
-            }
-            if !got.eq_ignore_ascii_case(&want) {
-                return false;
-            }
+    let mut first = true;
+    let mut matched = 0;
+    while pos < input.len() {
+        let Some(input_suffix) = input.get(pos..) else {
+            return false;
+        };
+        let Some((mut value, consumed)) = decode_html_byte(input_suffix) else {
             break;
+        };
+        pos += consumed;
+        if first && value <= 32 {
+            continue;
         }
+        first = false;
+        if value == 0 || value == 10 {
+            continue;
+        }
+        if (u32::from(b'a')..=u32::from(b'z')).contains(&value) {
+            value -= 0x20;
+        }
+        if matched >= expected.len() {
+            return true;
+        }
+        let [value_low_byte, ..] = value.to_le_bytes();
+        let Some(expected_byte) = expected.get(matched).copied() else {
+            return true;
+        };
+        if value_low_byte != expected_byte {
+            return false;
+        }
+        matched += 1;
     }
-    true
+    matched >= expected.len()
 }
 
-/// Decode one raw or numeric HTML entity byte and advance the cursor.
-fn next_html_byte(input: &[u8], pos: &mut usize) -> Option<u8> {
-    if input.get(*pos..)?.starts_with(b"&#") {
-        let mut cursor = pos.saturating_add(2);
-        let hex = input.get(cursor) == Some(&b'x') || input.get(cursor) == Some(&b'X');
-        if hex {
-            cursor += 1;
-        }
-        let start = cursor;
-        let mut value = 0_u32;
-        while let Some(&byte) = input.get(cursor) {
-            if byte == b';' {
-                if cursor == start {
-                    return None;
-                }
-                *pos = cursor + 1;
-                return value_to_byte(value);
-            }
-            let digit = if hex {
-                match byte {
-                    b'0'..=b'9' => byte - b'0',
-                    b'a'..=b'f' => byte - b'a' + 10,
-                    b'A'..=b'F' => byte - b'A' + 10,
-                    _ => break,
-                }
-            } else {
-                match byte {
-                    b'0'..=b'9' => byte - b'0',
-                    _ => break,
-                }
-            };
-            value = value
-                .saturating_mul(if hex { 16 } else { 10 })
-                .saturating_add(u32::from(digit));
-            cursor += 1;
-        }
-        if cursor == start {
-            return None;
-        }
-        *pos = cursor;
-        return value_to_byte(value);
+/// Decode one HTML numeric character reference like Go's `htmlDecodeByteAt`.
+/// Return the full numeric value and number of bytes consumed.
+fn decode_html_byte(input: &[u8]) -> Option<(u32, usize)> {
+    let &first = input.first()?;
+    if first != b'&' || input.len() < 2 {
+        return Some((u32::from(first), 1));
     }
-    let byte = *input.get(*pos)?;
-    *pos += 1;
-    Some(byte)
+    if input.get(1) != Some(&b'#') || input.len() < 3 {
+        return Some((u32::from(b'&'), 1));
+    }
+
+    let mut cursor = 2;
+    let hex = input.get(cursor) == Some(&b'x') || input.get(cursor) == Some(&b'X');
+    if hex {
+        cursor += 1;
+        if cursor >= input.len() {
+            return Some((u32::from(b'&'), 1));
+        }
+    }
+    let Some(first_digit) = input.get(cursor).and_then(|&byte| entity_digit(byte, hex)) else {
+        return Some((u32::from(b'&'), 1));
+    };
+    let mut value = u32::from(first_digit);
+    cursor += 1;
+    while let Some(&byte) = input.get(cursor) {
+        if byte == b';' {
+            return Some((value, cursor + 1));
+        }
+        let Some(digit) = entity_digit(byte, hex) else {
+            return Some((value, cursor));
+        };
+        value = value * if hex { 16 } else { 10 } + u32::from(digit);
+        if value > 0x0010_00FF {
+            return Some((u32::from(b'&'), 1));
+        }
+        cursor += 1;
+    }
+    Some((value, cursor))
 }
 
-/// Convert an entity value without truncating values outside one byte.
-///
-/// This intentionally differs from current libinjection-go, which masks
-/// decoded values to eight bits to preserve C behavior. Rejecting them avoids
-/// treating an oversized entity as an unrelated byte in the Rust port.
-fn value_to_byte(value: u32) -> Option<u8> {
-    if value > 0x0010_00FF {
-        return None;
+/// Decode one ASCII decimal or hexadecimal digit.
+fn entity_digit(byte: u8, hex: bool) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' if hex => Some(byte - b'a' + 10),
+        b'A'..=b'F' if hex => Some(byte - b'A' + 10),
+        _ => None,
     }
-    u8::try_from(value).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_deny_url, next_html_byte};
+    use super::{DenyAttrKind, decode_html_byte, is_deny_attr, is_deny_tag, is_deny_url};
 
     #[test]
     fn semicolonless_numeric_entities_decode_and_leave_terminator() {
-        let mut pos = 0;
-        assert_eq!(next_html_byte(b"&#106avascript", &mut pos), Some(b'j'));
-        assert_eq!(pos, 5);
-        assert_eq!(next_html_byte(b"&#106avascript", &mut pos), Some(b'a'));
-
+        assert_eq!(decode_html_byte(b"&#106avascript"), Some((106, 5)));
+        assert_eq!(decode_html_byte(b"&#x6Avascript"), Some((106, 5)));
         assert!(is_deny_url(b"&#106avascript:"));
-        let mut pos = 0;
-        assert_eq!(next_html_byte(b"&#x6Avascript", &mut pos), Some(b'j'));
-        assert_eq!(pos, 5);
     }
 
     #[test]
-    fn oversized_numeric_entities_are_rejected() {
-        let mut pos = 0;
-        assert_eq!(next_html_byte(b"&#256;", &mut pos), None);
+    fn entity_consumption_matches_go_for_malformed_and_overflow_values() {
+        for (input, expected) in [
+            (b"&".as_slice(), (u32::from(b'&'), 1)),
+            (b"&#".as_slice(), (u32::from(b'&'), 1)),
+            (b"&#X".as_slice(), (u32::from(b'&'), 1)),
+            (b"&#x;".as_slice(), (u32::from(b'&'), 1)),
+            (b"&#12z".as_slice(), (12, 4)),
+            (b"&#x14a;".as_slice(), (330, 7)),
+            (b"&#16713216;".as_slice(), (u32::from(b'&'), 1)),
+        ] {
+            assert_eq!(decode_html_byte(input), Some(expected), "{input:?}");
+        }
+    }
 
-        let mut pos = 0;
-        assert_eq!(next_html_byte(b"&#x100100;", &mut pos), None);
+    #[test]
+    fn deny_names_use_go_exactness_and_normalization_limit() {
+        assert_eq!(is_deny_attr(b"onclick"), DenyAttrKind::Deny);
+        assert_eq!(is_deny_attr(b"onanimationstart"), DenyAttrKind::Deny);
+        assert_eq!(is_deny_attr(b"xmlns"), DenyAttrKind::Deny);
+        assert_eq!(is_deny_attr(b"xmlnsfoo"), DenyAttrKind::None);
+        assert_eq!(is_deny_attr(b"xmlns:xss"), DenyAttrKind::None);
+        assert_eq!(is_deny_attr(b"xlink"), DenyAttrKind::None);
+        assert_eq!(is_deny_attr(b"xlinkfoo"), DenyAttrKind::None);
+        assert_eq!(is_deny_attr(b"xlink:href"), DenyAttrKind::Url);
+        assert_eq!(is_deny_attr(b"xlink:hrefx"), DenyAttrKind::None);
+        assert_eq!(is_deny_attr(b"o\0nerror"), DenyAttrKind::Deny);
+
+        let long_event = [b"onclick".as_slice(), &[b'x'; 64]].concat();
+        assert_eq!(is_deny_attr(&long_event), DenyAttrKind::None);
+        assert!(is_deny_tag(b"svganimate"));
+        let long_svg = [b"svg".as_slice(), &[b'x'; 64]].concat();
+        assert!(!is_deny_tag(&long_svg));
+        assert!(!is_deny_tag(b"\0\0"));
+    }
+
+    #[test]
+    fn url_entity_matching_keeps_numeric_value_until_go_masks_it() {
+        assert!(is_deny_url(b"&#32;java:"));
+        assert!(is_deny_url(b"&#x14a;ava:"));
+        assert!(!is_deny_url(b"&#x100;avascript:"));
+        assert!(is_deny_url(b"j&#0;avascript:"));
+        assert!(!is_deny_url(b"https://example.com/javascript"));
     }
 
     #[test]

@@ -559,3 +559,22 @@ enum FoldAction {
     /// No match (or non-continuing match); proceed to 3-token rules.
     FallThrough,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SqliState;
+    use crate::sqli::legacy::consts::{FLAG_QUOTE_NONE, FLAG_SQL_ANSI, TT_UNION};
+
+    #[test]
+    fn phrase_merge_uses_go_unicode_uppercase_mapping() {
+        let mut state = SqliState::new("unıon all".as_bytes(), FLAG_QUOTE_NONE | FLAG_SQL_ANSI);
+        state.current_idx = 0;
+        assert!(state.tokenize());
+        assert_eq!(state.tc(0), TT_UNION);
+        state.current_idx = 1;
+        assert!(state.tokenize());
+        assert!(state.try_merge(0, 1));
+        assert_eq!(state.tc(0), TT_UNION);
+        assert_eq!(state.token_val_slice(0), "unıon all".as_bytes());
+    }
+}
