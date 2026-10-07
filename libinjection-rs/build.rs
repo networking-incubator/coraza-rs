@@ -18,10 +18,12 @@
 #![expect(clippy::missing_docs_in_private_items, reason = "build script")]
 #![expect(clippy::panic, reason = "build scripts must abort on error")]
 
-use std::{env, fs, io::Write as _, path::Path};
+use std::{collections::BTreeSet, env, fs, io::Write as _, path::Path};
 
-/// Must match `data/sqli_keywords.txt` (libinjection-go v0.3.2).
+/// Must match `data/sqli_keywords.txt` (libinjection-go v0.3.3).
 const EXPECTED_KEYWORD_COUNT: usize = 9_352;
+/// Number of fingerprint patterns in the pinned upstream lookup table.
+const EXPECTED_FINGERPRINT_COUNT: usize = 8_367;
 
 fn rust_byte_str_literal(s: &str) -> String {
     let mut out = String::from("b\"");
@@ -67,27 +69,45 @@ fn generate_sql_keywords(out_dir: &str) {
 
     let mut entries: Vec<(&str, u8)> = Vec::new();
 
-    for line in contents.lines() {
-        let line = line.trim();
+    let mut seen_keys = BTreeSet::new();
+    for (line_number, line) in contents.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let Some((key, val)) = line.split_once('\t') else {
-            continue;
+            panic!("malformed sqli_keywords.txt row {}: missing tab", line_number + 1);
         };
+        assert!(
+            !val.contains('\t'),
+            "malformed sqli_keywords.txt row {}: extra field",
+            line_number + 1
+        );
+        assert!(!key.is_empty(), "empty SQL keyword at row {}", line_number + 1);
         assert!(
             key.is_ascii()
                 && key
                     .bytes()
                     .all(|byte| !byte.is_ascii_alphabetic() || byte.is_ascii_uppercase()),
-            "sqli_keywords.txt key is not uppercase ASCII: {key:?}"
+            "sqli_keywords.txt key at row {} is not uppercase ASCII: {key:?}",
+            line_number + 1
         );
-        let Some(&val_byte) = val.as_bytes().first() else {
-            continue;
-        };
-        if val.len() != 1 {
-            continue;
-        }
+        assert_eq!(
+            val.len(),
+            1,
+            "sqli_keywords.txt value at row {} must be exactly one byte",
+            line_number + 1
+        );
+        let val_byte = val.as_bytes().first().copied().expect("one-byte value checked above");
+        assert!(
+            val_byte.is_ascii(),
+            "non-ASCII SQL lookup value at row {}",
+            line_number + 1
+        );
+        assert!(
+            seen_keys.insert(key),
+            "duplicate SQL lookup key at row {}: {key:?}",
+            line_number + 1
+        );
         entries.push((key, val_byte));
     }
 
@@ -97,6 +117,11 @@ fn generate_sql_keywords(out_dir: &str) {
         entries.len(),
         EXPECTED_KEYWORD_COUNT,
         "sqli_keywords.txt entry count drifted (expected {EXPECTED_KEYWORD_COUNT})"
+    );
+    let fingerprint_count = entries.iter().filter(|(_, value)| *value == b'F').count();
+    assert_eq!(
+        fingerprint_count, EXPECTED_FINGERPRINT_COUNT,
+        "sqli_keywords.txt fingerprint count drifted (expected {EXPECTED_FINGERPRINT_COUNT})"
     );
 
     let dest = Path::new(out_dir).join("sqli_keywords.rs");
@@ -120,7 +145,9 @@ fn generate_sql_keywords(out_dir: &str) {
 
 fn generate_accept_tables(out_dir: &str) {
     let word_bytes: &[u8] = b" []{}<>:\\?=@!#~+-*/&|^%(),';\t\n\x0b\x0c\r\"\xa0\x00";
-    let var_bytes: &[u8] = b" <>:\\?=@!#~+-*/&|^%(),';\t\n\x0b\x0c\r'`\"";
+    // NUL is a byte-level separator. Stop an @-variable there so scanning can
+    // resume after it instead of absorbing following SQL into the variable.
+    let var_bytes: &[u8] = b" <>:\\?=@!#~+-*/&|^%(),';\t\n\x0b\x0c\r'`\"\x00";
 
     let dest = Path::new(out_dir).join("accept_tables.rs");
     let mut file = fs::File::create(&dest).expect("create accept_tables.rs");

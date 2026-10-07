@@ -20,17 +20,40 @@ use super::consts::{BYTE_NULL, LOOKUP_FINGERPRINT, LOOKUP_OPERATOR, LOOKUP_WORD}
 
 include!(concat!(env!("OUT_DIR"), "/sqli_keywords.rs"));
 
-/// Uppercase `key`, look it up in the static sorted table.
-/// Returns the type byte or [`BYTE_NULL`] on miss.
+/// Apply Go `strings.ToUpper` behavior relevant to the ASCII-only table, then
+/// look up the result. Go's simple rune mapping has two non-ASCII inputs that
+/// uppercase to ASCII: dotless i (`U+0131`) and long s (`U+017F`). Other
+/// non-ASCII runes cannot match this table. Invalid UTF-8 also cannot match.
+/// Returns the type byte or [`BYTE_NULL`] on miss without allocating.
 pub(crate) fn search_keyword(key: &[u8]) -> u8 {
     let mut buf = [0_u8; 64];
-    let len = key.len().min(buf.len());
-    if let (Some(dst), Some(src)) = (buf.get_mut(..len), key.get(..len)) {
-        for (d, s) in dst.iter_mut().zip(src) {
-            *d = s.to_ascii_uppercase();
-        }
+    let mut written = 0_usize;
+    let mut pos = 0_usize;
+
+    while let Some(&byte) = key.get(pos) {
+        let (upper, consumed) = match byte {
+            b'a'..=b'z' => (byte - 0x20, 1),
+            0xC4 if key.get(pos + 1).copied() == Some(0xB1) => (b'I', 2), // U+0131
+            0xC5 if key.get(pos + 1).copied() == Some(0xBF) => (b'S', 2), // U+017F
+            0x00..=0x7F => (byte, 1),
+            // Go uppercases arbitrary invalid bytes as RuneError; that remains
+            // non-ASCII and therefore cannot match any table key.
+            _ => return BYTE_NULL,
+        };
+        let Some(slot) = buf.get_mut(written) else {
+            return BYTE_NULL;
+        };
+        *slot = upper;
+        written += 1;
+        pos += consumed;
     }
-    let slice = buf.get(..len).unwrap_or(&[]);
+
+    if pos != key.len() {
+        return BYTE_NULL;
+    }
+    let Some(slice) = buf.get(..written) else {
+        return BYTE_NULL;
+    };
     lookup_keyword_bytes(slice).unwrap_or(BYTE_NULL)
 }
 
@@ -64,4 +87,21 @@ fn lookup_keyword_bytes(key: &[u8]) -> Option<u8> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_keyword;
+    use crate::sqli::legacy::consts::{TT_EXPRESSION, TT_UNION};
+
+    #[test]
+    fn keyword_lookup_uses_go_simple_uppercase_mappings() {
+        assert_eq!(search_keyword("ſelect".as_bytes()), TT_EXPRESSION);
+        assert_eq!(search_keyword("unıon".as_bytes()), TT_UNION);
+        // Go's simple rune uppercase does not expand sharp s into "SS".
+        assert_eq!(search_keyword("ßelect".as_bytes()), 0);
+        assert_eq!(search_keyword(&[0xFF, b'S', b'E', b'L', b'E', b'C', b'T']), 0);
+        assert_eq!(search_keyword(b"select"), TT_EXPRESSION);
+        assert_eq!(search_keyword(b"not_a_keyword"), 0);
+    }
 }

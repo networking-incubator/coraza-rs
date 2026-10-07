@@ -12,23 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fixed-size analysis output: no heap fields.
-//! Spec: `docs/MODERNIZATION_PLAN.md` section [`AnalysisSnapshot`] API spec.
+//! Analysis output, with evidence storage owned by the returned snapshot.
 
-use crate::limits::MAX_EVIDENCE;
+use std::collections::HashSet;
 
-/// Stage-1 confidence hint for Coraza. Not a block/allow decision.
+/// Bounded-analysis hint for callers. It is not a compatibility verdict or
+/// block/allow decision.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VerdictHint {
-    /// No interesting constructs (or prefilter miss).
+    /// No configured constructs were found during a completed bounded pass.
+    /// This hint does not establish that the input is safe to allow.
     #[default]
     Benign = 0,
     /// Some constructs present; below built-in detect policy.
     Suspicious = 1,
-    /// Constructs match policy, or fail-closed truncation requires blocking.
+    /// An observed construct matches the analyzer's built-in hint mask.
     Decisive = 2,
-    /// Ambiguous, for example because the scan was truncated.
+    /// A prefilter skipped classification or the configured input budget truncated the scan.
+    /// This hint requires handling outside the bounded analyzer.
     Inconclusive = 3,
 }
 
@@ -192,21 +194,17 @@ impl ConstructFlags {
     }
 }
 
-/// Status flags for normalize/parse (truncation, prefilter, legacy FP, ...).
+/// Status flags for bounded analysis.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AnalysisFlags(pub u16);
 
 impl AnalysisFlags {
-    /// `legacy_fingerprint` is valid (`legacy` feature path).
-    pub const LEGACY_FP_AVAILABLE: u16 = 1 << 1;
     /// More than one quote/HTML context was tried.
     pub const MULTI_CONTEXT: u16 = 1 << 2;
-    /// Fast prefilter found nothing interesting.
+    /// Fast prefilter skipped detailed classification; no safety conclusion follows.
     pub const PREFILTER_MISS: u16 = 1 << 3;
-    /// Token buffer filled (`MAX_TOKEN_SLOTS`).
-    pub const TOKEN_LIMIT: u16 = 1 << 4;
-    /// Input or norm buffer exceeded a cap; only a prefix was used.
+    /// The caller's input scan budget excluded a suffix of the supplied input.
     pub const TRUNCATED: u16 = 1 << 0;
 
     /// No status bits set.
@@ -227,33 +225,31 @@ impl AnalysisFlags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct EvidenceSpan {
     /// Byte offset into the original input.
-    pub offset: u16,
+    pub offset: usize,
     /// Length in bytes from `offset`.
-    pub len: u16,
+    pub len: usize,
 }
 
-/// Fixed set of evidence spans (at most [`MAX_EVIDENCE`]).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Evidence spans indexing the original input.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EvidenceSet {
-    /// Span slots (only the first `count` are meaningful).
-    pub spans: [EvidenceSpan; MAX_EVIDENCE],
-    /// Number of valid spans in `spans`.
-    pub count: u8,
+    /// All distinct evidence spans reported by the completed scan.
+    pub spans: Vec<EvidenceSpan>,
 }
 
-impl Default for EvidenceSet {
-    fn default() -> Self {
-        Self {
-            spans: [EvidenceSpan { offset: 0, len: 0 }; MAX_EVIDENCE],
-            count: 0,
+impl EvidenceSet {
+    /// Remove duplicate spans while preserving the first encounter order.
+    pub(crate) fn deduplicate(&mut self) {
+        if self.spans.len() < 2 {
+            return;
         }
+
+        let mut seen = HashSet::with_capacity(self.spans.len());
+        self.spans.retain(|span| seen.insert((span.offset, span.len)));
     }
 }
 
-/// Legacy libinjection type-byte fingerprint (compat view for audit / corpus).
-///
-/// Not the primary signal; [`ConstructFlags`] is. Populated when `legacy` is enabled.
+/// Legacy libinjection type-byte fingerprint returned by [`SqliDetection`].
 ///
 /// # Examples
 ///
@@ -295,7 +291,8 @@ impl LegacyFingerprint {
 /// Result of one stage-1 analysis pass over a single field value.
 ///
 /// All evidence spans index into the original input passed to `analyze_*`.
-/// Fixed-size and [`Copy`]: safe for the zero-heap hot path.
+/// Evidence storage is owned by the snapshot and grows with the number of
+/// distinct matches.
 ///
 /// # Examples
 ///
@@ -305,27 +302,23 @@ impl LegacyFingerprint {
 /// let snap = AnalysisSnapshot::benign();
 /// assert_eq!(snap.verdict_hint, VerdictHint::Benign);
 /// assert!(!snap.constructs.any_sqli());
-/// assert!(snap.legacy_fingerprint.as_str().is_none());
 /// ```
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnalysisSnapshot {
     /// SQL/XSS constructs found (primary signal).
     pub constructs: ConstructFlags,
-    /// Normalize/parse status (truncation, prefilter, legacy FP, ...).
+    /// Analysis status, including caller-configured input truncation.
     pub flags: AnalysisFlags,
     /// Non-binding stage-1 hint for Coraza.
     pub verdict_hint: VerdictHint,
     /// Quote / HTML / dialect context for this pass.
     pub context: AnalysisContext,
-    /// Up to [`MAX_EVIDENCE`] regions in the original input.
+    /// Distinct evidence regions in the original input.
     pub evidence: EvidenceSet,
-    /// Derived legacy fingerprint when `legacy` produced one.
-    pub legacy_fingerprint: LegacyFingerprint,
 }
 
 impl AnalysisSnapshot {
-    /// Empty/clean snapshot: no constructs, [`VerdictHint::Benign`].
+    /// Empty snapshot with no observed constructs and a [`VerdictHint::Benign`] hint.
     #[must_use]
     pub const fn benign() -> Self {
         Self {
@@ -337,11 +330,7 @@ impl AnalysisSnapshot {
                 xss_html_context: XssHtmlContext::Data,
                 dialect: SqlDialect::Ansi,
             },
-            evidence: EvidenceSet {
-                spans: [EvidenceSpan { offset: 0, len: 0 }; MAX_EVIDENCE],
-                count: 0,
-            },
-            legacy_fingerprint: LegacyFingerprint { bytes: [0; 8], len: 0 },
+            evidence: EvidenceSet { spans: Vec::new() },
         }
     }
 }
@@ -352,37 +341,34 @@ impl Default for AnalysisSnapshot {
     }
 }
 
-/// Built-in minimal policy result for `@detectSQLi` / `@detectXSS`.
+/// Exact compatibility result from [`crate::detect_sqli`].
 ///
-/// `detected` is Coraza-facing convenience. Policy details live in `snapshot`.
-///
-/// # Examples
-///
-/// ```
-/// use libinjection::snapshot::DetectionVerdict;
-///
-/// let v = DetectionVerdict::benign();
-/// assert!(!v.detected);
-/// assert_eq!(
-///     v.snapshot,
-///     libinjection::snapshot::AnalysisSnapshot::benign()
-/// );
-/// ```
+/// On a miss, `fingerprint` is empty. This result deliberately contains no
+/// bounded-analysis constructs or inferred context.
+#[cfg(feature = "legacy")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DetectionVerdict {
-    /// Whether the built-in detect policy matched.
+pub struct SqliDetection {
+    /// Whether the pinned legacy-compatible SQL detector matched.
     pub detected: bool,
-    /// Full stage-1 analysis output.
-    pub snapshot: AnalysisSnapshot,
+    /// Exact legacy fingerprint on a hit, empty on a miss.
+    pub fingerprint: LegacyFingerprint,
 }
 
-impl DetectionVerdict {
-    /// No detection; snapshot is [`AnalysisSnapshot::benign`].
+#[cfg(feature = "legacy")]
+impl SqliDetection {
+    /// Benign result with no fingerprint.
     #[must_use]
     pub const fn benign() -> Self {
         Self {
             detected: false,
-            snapshot: AnalysisSnapshot::benign(),
+            fingerprint: LegacyFingerprint { bytes: [0; 8], len: 0 },
         }
+    }
+}
+
+#[cfg(feature = "legacy")]
+impl Default for SqliDetection {
+    fn default() -> Self {
+        Self::benign()
     }
 }

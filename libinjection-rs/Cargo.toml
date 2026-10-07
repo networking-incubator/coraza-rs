@@ -3,8 +3,23 @@ name = "libinjection"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0 AND BSD-3-Clause"
 repository.workspace = true
+description = "Pure Rust byte-oriented SQLi and XSS detection and bounded analysis."
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "data/**",
+    "docs/**",
+    "LICENSES/**",
+    "src/**",
+    "tests/**",
+    "THIRD_PARTY_NOTICES.md",
+    "tools/**",
+    "!tools/**/__pycache__/**",
+    "!tools/**/*.pyc",
+]
 
 [lib]
 crate-type = ["rlib"]
@@ -14,15 +29,14 @@ workspace = true
 
 [features]
 default = ["legacy"]
-std = ["memchr/std"]
 legacy = []
 
 [dependencies]
-memchr = { version = "2", default-features = false }
+memchr = { version = "2", default-features = false, features = ["std"] }
 
 [[test]]
-name = "no_alloc"
-path = "tests/no_alloc.rs"
+name = "detection_api"
+path = "tests/detection_api.rs"
 required-features = ["legacy"]
 
 [dev-dependencies]

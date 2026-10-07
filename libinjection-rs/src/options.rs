@@ -12,30 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Caller-facing analysis options (Coraza policy knobs).
+//! Caller-facing scan budget for construct analysis.
 
-use crate::limits::{DEFAULT_MAX_INPUT_LEN, clamp_max_input_len};
+use crate::limits::DEFAULT_MAX_INPUT_LEN;
 
-/// Policy for inputs that exceed the configured scan budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TruncationPolicy {
-    /// Treat an incomplete analysis as requiring blocking at the policy seam.
-    FailClosed,
-    /// Return [`crate::snapshot::VerdictHint::Inconclusive`] and let the caller continue inspection.
-    AllowInconclusive,
-}
-
-/// Options for stage-1 `analyze_*` / `detect_*`.
+/// Options for the bounded `analyze_*` APIs.
 ///
-/// Set at WAF init / operator config. Never from untrusted request metadata.
+/// Set at WAF initialization or operator configuration, never from request
+/// metadata. Inputs above the limit are analyzed as a prefix and the resulting
+/// snapshot sets [`crate::snapshot::AnalysisFlags::TRUNCATED`]. Normalization,
+/// token metadata, and evidence storage grow only with that selected prefix.
 ///
 /// # Examples
 ///
 /// ```
-/// use libinjection::{
-///     limits::{ABSOLUTE_MAX_INPUT_LEN, DEFAULT_MAX_INPUT_LEN},
-///     options::AnalyzeOptions,
-/// };
+/// use libinjection::{limits::DEFAULT_MAX_INPUT_LEN, options::AnalyzeOptions};
 ///
 /// let default_opts = AnalyzeOptions::default();
 /// assert_eq!(default_opts.max_input_len, DEFAULT_MAX_INPUT_LEN);
@@ -47,41 +38,27 @@ pub enum TruncationPolicy {
 /// let raised = AnalyzeOptions::with_max_input_len(16_384);
 /// assert_eq!(raised.effective_max_input_len(), 16_384);
 ///
-/// let too_large = AnalyzeOptions::with_max_input_len(usize::MAX);
-/// assert_eq!(too_large.effective_max_input_len(), ABSOLUTE_MAX_INPUT_LEN);
+/// let uncapped = AnalyzeOptions::with_max_input_len(usize::MAX);
+/// assert_eq!(uncapped.effective_max_input_len(), usize::MAX);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnalyzeOptions {
-    /// Requested scan budget in bytes.
-    /// Clamped to `ABSOLUTE_MAX_INPUT_LEN` when applied inside analyze.
+    /// Requested input-prefix scan budget in bytes.
+    /// The scan budget is trusted configuration and is not internally clamped.
     pub max_input_len: usize,
-    /// How to treat input that exceeds `max_input_len`.
-    pub truncation_policy: TruncationPolicy,
 }
 
 impl AnalyzeOptions {
-    /// Build options with an explicit scan budget (clamped on use).
+    /// Build options with an explicit scan budget.
     #[must_use]
     pub const fn with_max_input_len(max_input_len: usize) -> Self {
-        Self {
-            max_input_len,
-            truncation_policy: TruncationPolicy::FailClosed,
-        }
+        Self { max_input_len }
     }
 
-    /// Allow a caller to continue with an incomplete snapshot.
-    #[must_use]
-    pub const fn allow_truncation(self) -> Self {
-        Self {
-            truncation_policy: TruncationPolicy::AllowInconclusive,
-            ..self
-        }
-    }
-
-    /// Scan budget after applying the absolute clamp.
+    /// Configured scan budget.
     #[must_use]
     pub const fn effective_max_input_len(self) -> usize {
-        clamp_max_input_len(self.max_input_len)
+        self.max_input_len
     }
 }
 
@@ -90,7 +67,6 @@ impl Default for AnalyzeOptions {
     fn default() -> Self {
         Self {
             max_input_len: DEFAULT_MAX_INPUT_LEN,
-            truncation_policy: TruncationPolicy::FailClosed,
         }
     }
 }

@@ -14,35 +14,36 @@
 
 //! Map constructs + flags to [`VerdictHint`].
 
-use crate::{
-    policy::WEAK_SIGNAL,
-    snapshot::{AnalysisFlags, ConstructFlags, VerdictHint},
-};
+use crate::snapshot::{AnalysisFlags, ConstructFlags, VerdictHint};
 
-/// True when normalization or tokenization stopped before consuming the full input.
+/// True when the configured input budget omitted a suffix from analysis.
 fn scan_limited(flags: AnalysisFlags) -> bool {
-    flags.contains(AnalysisFlags::TRUNCATED) || flags.contains(AnalysisFlags::TOKEN_LIMIT)
+    flags.contains(AnalysisFlags::TRUNCATED)
 }
 
 /// Derive stage-1 verdict hint from constructs and status flags.
 ///
-/// Policy-level constructs stay [`VerdictHint::Decisive`] even when the scan was
-/// truncated. [`VerdictHint::Inconclusive`] is reserved for limited scans that
-/// only surfaced weak dialect hints.
+/// An observed construct in `detect_mask` stays [`VerdictHint::Decisive`] even
+/// when the configured input budget truncated the scan. Every other partial snapshot
+/// is [`VerdictHint::Inconclusive`], including one whose prefilter missed.
 #[must_use]
 pub(crate) fn verdict_hint(
     constructs: ConstructFlags,
     flags: AnalysisFlags,
     detect_mask: ConstructFlags,
 ) -> VerdictHint {
+    if scan_limited(flags) {
+        return if constructs.intersects(detect_mask) {
+            VerdictHint::Decisive
+        } else {
+            VerdictHint::Inconclusive
+        };
+    }
     if flags.contains(AnalysisFlags::PREFILTER_MISS) {
-        return VerdictHint::Benign;
+        return VerdictHint::Inconclusive;
     }
     if constructs.intersects(detect_mask) {
         return VerdictHint::Decisive;
-    }
-    if scan_limited(flags) && constructs.intersects(WEAK_SIGNAL) {
-        return VerdictHint::Inconclusive;
     }
     if constructs.any_sqli() || constructs.any_xss() {
         return VerdictHint::Suspicious;
@@ -56,12 +57,12 @@ mod tests {
     use crate::policy::{BUILTIN_SQLI_DETECT, BUILTIN_XSS_DETECT};
 
     #[test]
-    fn prefilter_miss_is_benign() {
+    fn prefilter_miss_is_inconclusive() {
         let flags = AnalysisFlags(AnalysisFlags::PREFILTER_MISS);
-        let constructs = ConstructFlags(ConstructFlags::SQL_UNION);
+        let constructs = ConstructFlags::empty();
         assert_eq!(
             verdict_hint(constructs, flags, BUILTIN_SQLI_DETECT),
-            VerdictHint::Benign
+            VerdictHint::Inconclusive
         );
     }
 
@@ -85,9 +86,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_match_stays_decisive_when_token_limit_hit() {
+    fn policy_match_stays_decisive_when_input_is_truncated() {
         let constructs = ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT);
-        let flags = AnalysisFlags(AnalysisFlags::TOKEN_LIMIT);
+        let flags = AnalysisFlags(AnalysisFlags::TRUNCATED);
         assert_eq!(
             verdict_hint(constructs, flags, BUILTIN_XSS_DETECT),
             VerdictHint::Decisive
@@ -95,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_dialect_only_is_inconclusive_when_truncated() {
+    fn partial_weak_dialect_is_inconclusive() {
         let constructs = ConstructFlags(ConstructFlags::SQL_DIALECT_MYSQL);
         let flags = AnalysisFlags(AnalysisFlags::TRUNCATED);
         assert_eq!(
@@ -114,28 +115,28 @@ mod tests {
     }
 
     #[test]
-    fn truncated_without_constructs_is_benign() {
+    fn truncated_without_constructs_is_inconclusive() {
         let flags = AnalysisFlags(AnalysisFlags::TRUNCATED);
         assert_eq!(
             verdict_hint(ConstructFlags::empty(), flags, BUILTIN_SQLI_DETECT),
-            VerdictHint::Benign
+            VerdictHint::Inconclusive
         );
     }
 
     #[test]
-    fn non_policy_construct_is_suspicious_when_truncated() {
+    fn non_policy_construct_is_inconclusive_when_truncated() {
         let constructs = ConstructFlags(ConstructFlags::SQL_NUMERIC_INJECTION);
         let flags = AnalysisFlags(AnalysisFlags::TRUNCATED);
         assert_eq!(
             verdict_hint(constructs, flags, BUILTIN_SQLI_DETECT),
-            VerdictHint::Suspicious
+            VerdictHint::Inconclusive
         );
     }
 
     #[test]
-    fn token_limit_with_weak_dialect_is_inconclusive() {
+    fn truncated_weak_dialect_is_inconclusive() {
         let constructs = ConstructFlags(ConstructFlags::SQL_DIALECT_ORACLE);
-        let flags = AnalysisFlags(AnalysisFlags::TOKEN_LIMIT);
+        let flags = AnalysisFlags(AnalysisFlags::TRUNCATED);
         assert_eq!(
             verdict_hint(constructs, flags, BUILTIN_SQLI_DETECT),
             VerdictHint::Inconclusive

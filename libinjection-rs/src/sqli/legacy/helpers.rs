@@ -27,24 +27,6 @@ pub(crate) fn flag2_delimiter(flags: u32) -> u8 {
     }
 }
 
-/// Go `isBackslashEscaped`: odd number of trailing backslashes → escaped.
-pub(crate) fn is_backslash_escaped(s: &[u8]) -> bool {
-    let mut count = 0_usize;
-    for &b in s.iter().rev() {
-        if b == b'\\' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    !count.is_multiple_of(2)
-}
-
-/// Go `isDoubleDelimiterEscaped`.
-pub(crate) fn is_double_delimiter_escaped(s: &[u8]) -> bool {
-    s.first().zip(s.get(1)).is_some_and(|(a, b)| a == b)
-}
-
 /// Go `isByteWhite`.
 pub(crate) fn is_byte_white(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | 0x0B | b'\x0c' | b'\r' | 0xA0 | 0x00)

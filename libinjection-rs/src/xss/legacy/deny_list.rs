@@ -16,7 +16,7 @@
 
 use super::deny::DenyAttrKind;
 
-/// Go `blackTags` (libinjection-go v0.3.2) migrated
+/// Go `blackTags` (libinjection-go v0.3.3) migrated
 pub(super) const DENY_TAGS: &[&[u8]] = &[
     b"APPLET",
     b"BASE",
@@ -52,14 +52,14 @@ pub(super) const DENY_URL_PREFIXES: &[&[u8]] = &[
 pub(super) const DENY_ATTRS: &[(&[u8], DenyAttrKind)] = &[
     (b"ACTION", DenyAttrKind::Url),
     (b"ATTRIBUTENAME", DenyAttrKind::Indirect),
-    (b"BY", DenyAttrKind::Url),
     (b"BACKGROUND", DenyAttrKind::Url),
+    (b"BY", DenyAttrKind::Url),
     (b"DATAFORMATAS", DenyAttrKind::Deny),
     (b"DATASRC", DenyAttrKind::Deny),
     (b"DYNSRC", DenyAttrKind::Url),
     (b"FILTER", DenyAttrKind::Style),
-    (b"FORMACTION", DenyAttrKind::Url),
     (b"FOLDER", DenyAttrKind::Url),
+    (b"FORMACTION", DenyAttrKind::Url),
     (b"FROM", DenyAttrKind::Url),
     (b"HANDLER", DenyAttrKind::Url),
     (b"HREF", DenyAttrKind::Url),
@@ -72,7 +72,8 @@ pub(super) const DENY_ATTRS: &[(&[u8], DenyAttrKind)] = &[
     (b"XLINK:HREF", DenyAttrKind::Url),
 ];
 
-/// Go `blackEvents` (suffix after ON). libinjection-go v0.3.2.
+/// Go `blackEvents` (suffix after ON). libinjection-go v0.3.3.
+/// Keep this byte-sorted: `deny.rs` binary-searches the event suffixes.
 pub(super) const DENY_EVENTS: &[&[u8]] = &[
     b"ABORT",
     b"ACCESSKEYNOTFOUND",

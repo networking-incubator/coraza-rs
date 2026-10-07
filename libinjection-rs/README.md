@@ -52,14 +52,10 @@ From the workspace (path dependency until published):
 
 ```toml
 [dependencies]
-libinjection = { path = "../libinjection-rs", features = ["legacy", "std"] }
+libinjection = { path = "../libinjection-rs" }
 ```
 
-Default features include `legacy`. For a minimal `no_std` build:
-
-```toml
-libinjection = { path = "../libinjection-rs", default-features = false }
-```
+The default features include `legacy`.
 
 ### Detect (boolean verdict)
 
@@ -149,17 +145,15 @@ Key types (re-exported from the crate root):
 | Feature | Default | Description |
 | --- | --- | --- |
 | `legacy` | yes | Static fingerprints/tables; corpus in PR2. |
-| `std` | no | Enables `memchr`'s `std` support. |
 
 ---
 
-## Hot-path contract
+## Hot-path guidance
 
 The default `analyze_*` / `detect_*` path is designed for per-field WAF scanning:
 
-- **Zero heap** on the default path (enforced by `tests/no_alloc.rs`).
-- **`no_std`** core (`std` is optional for embedders that want it).
-- **Stack-only**, bounded buffers (512 B normalize, 8 token slots, 4 evidence spans).
+- Avoid heap allocations on hot paths where practical. Call out new allocations
+  in code review; this is a best-effort goal, not an API guarantee.
 - **O(n)** over scanned bytes with early exit.
 - **No panic** on untrusted input (bounds-checked access throughout).
 - **Runtime dependency:** `memchr` only on the hot path.
@@ -174,14 +168,9 @@ WASM embedders: see [WASM portability](docs/WASM_PORTABILITY.md).
 # Unit tests + integration tests
 cargo test -p libinjection
 
-# Zero-alloc gate
-cargo test -p libinjection --test no_alloc
-
 # Workspace lint (from repo root)
 make lint
 
-# no_std / WASM smoke check
-cargo check -p libinjection --target wasm32-wasip1 --no-default-features
 ```
 
 ---
