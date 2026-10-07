@@ -1,5 +1,8 @@
 [files]
-extend-exclude = ["libinjection-rs/data/sqli_keywords.txt"]
+extend-exclude = [
+    "libinjection-rs/data/sqli_keywords.txt",
+    "libinjection-rs/tests/corpus/test-*.txt",
+]
 
 [default]
 extend-ignore-re = [
