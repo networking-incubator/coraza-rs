@@ -1,0 +1,1578 @@
+{
+  "schema_version": 1,
+  "status": "hash-bound indirect target registry; it does not claim native stack closure",
+  "profiles": {
+    "minimal": {
+      "binary_sha256": "7ee65b629cf655a1efe126641a38bf03a3231d89e96fff1d811f5ce1f7cb4043",
+      "code_section_sha256": "e038078d6952e29d12faae1242af1acac118e6e5934b56af9a3b726e51c07815",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/engine/prefilter.rs",
+          "sha256": "0791e14d319b7392543142b67c8224165452d94e276eb39b7b2819404b642487"
+        },
+        {
+          "path": "src/xss/legacy/mod.rs",
+          "sha256": "77750a51921f37b731892b2a295e09351c4fd2c9fbd893747526c67544c1f858"
+        },
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/sqli/legacy/state.rs",
+          "sha256": "714f583d56f006c3fd7985d335e771abbf0c891068fdb4dbec832118b4ce0cb2"
+        },
+        {
+          "path": "src/sqli/legacy/token.rs",
+          "sha256": "bd70b6402342d9605d219e21211a4a3652a255085e512fa3839341a09ba1b7e9"
+        },
+        {
+          "path": "src/sqli/legacy/parse.rs",
+          "sha256": "14271010ebddd480f2127c7da747807fa6a0126b2a34b73a7cdc8881d42803aa"
+        },
+        {
+          "path": "src/sqli/legacy/detect.rs",
+          "sha256": "3c2168e404d70b1173eea212b2686de44117c749ed6fe8314a1d9e1c64b81caa"
+        }
+      ],
+      "external_sources": {
+        "probe_source_sha256": "367c39af96cf17131b11d3a05c6479676c0691f06410466b07439aa58253c7b0",
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "memchr_arch_source_sha256": "4cf0611c926c3016d1b640880ef14e5654a8d1c1b480fe9a5965956be7eeeeef",
+        "memchr_searcher_source_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      },
+      "target_families": {
+        "memchr": [
+          {
+            "address": "0xf7c0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::detect"
+          },
+          {
+            "address": "0xf9a0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr_impl": [
+          {
+            "address": "0xf9a0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr2": [
+          {
+            "address": "0xfb70",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::detect"
+          },
+          {
+            "address": "0xfd20",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr2_impl": [
+          {
+            "address": "0xfd20",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr3": [
+          {
+            "address": "0xfec0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::detect"
+          },
+          {
+            "address": "0x100e0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "memchr3_impl": [
+          {
+            "address": "0x100e0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "fixed_deny_attr_bcmp": [
+          {
+            "address": "0x6a30",
+            "symbol": "bcmp"
+          }
+        ]
+      },
+      "bindings": [
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe7ea",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "modern-sqli-memchr3-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe815",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-sqli-memchr2-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe835",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe84e",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe867",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe880",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe899",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0xe8b2",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe5f1",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe608",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe61d",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe632",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe647",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe65c",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0xe790",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-xss-memchr2-minimal",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0xd167",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "legacy-xss-search-memchr3-minimal",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0xd1c9",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "legacy-xss-search-memchr2-minimal",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0xd1e7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-minimal",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0xd205",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-minimal",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::deny::is_deny_attr",
+          "address": "0xf18e",
+          "instruction_bytes_hex": "ffd5",
+          "family": "fixed_deny_attr_bcmp",
+          "proof_id": "deny_attr_bcmp-minimal",
+          "source_method": "fixed GOT relocation slot 0x13238 resolves to exact audited function entry 0x6a30"
+        }
+      ]
+    },
+    "std": {
+      "binary_sha256": "93eb3b27f1880a0e5b96f6cc81c3bc6ee8296db2fbae7e9d460101c3f55e1eae",
+      "code_section_sha256": "05d3077dceb99cc79d49ce7b06e0db65cdbf13ed92f416bf4526aab7f054f852",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/engine/prefilter.rs",
+          "sha256": "0791e14d319b7392543142b67c8224165452d94e276eb39b7b2819404b642487"
+        },
+        {
+          "path": "src/xss/legacy/mod.rs",
+          "sha256": "77750a51921f37b731892b2a295e09351c4fd2c9fbd893747526c67544c1f858"
+        },
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/sqli/legacy/state.rs",
+          "sha256": "714f583d56f006c3fd7985d335e771abbf0c891068fdb4dbec832118b4ce0cb2"
+        },
+        {
+          "path": "src/sqli/legacy/token.rs",
+          "sha256": "bd70b6402342d9605d219e21211a4a3652a255085e512fa3839341a09ba1b7e9"
+        },
+        {
+          "path": "src/sqli/legacy/parse.rs",
+          "sha256": "14271010ebddd480f2127c7da747807fa6a0126b2a34b73a7cdc8881d42803aa"
+        },
+        {
+          "path": "src/sqli/legacy/detect.rs",
+          "sha256": "3c2168e404d70b1173eea212b2686de44117c749ed6fe8314a1d9e1c64b81caa"
+        }
+      ],
+      "external_sources": {
+        "probe_source_sha256": "367c39af96cf17131b11d3a05c6479676c0691f06410466b07439aa58253c7b0",
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "memchr_arch_source_sha256": "4cf0611c926c3016d1b640880ef14e5654a8d1c1b480fe9a5965956be7eeeeef",
+        "memchr_searcher_source_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      },
+      "target_families": {
+        "memchr": [
+          {
+            "address": "0x202e0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::detect"
+          },
+          {
+            "address": "0x20340",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_avx2"
+          },
+          {
+            "address": "0x20380",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr_impl": [
+          {
+            "address": "0x20340",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_avx2"
+          },
+          {
+            "address": "0x20380",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr2": [
+          {
+            "address": "0x20550",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::detect"
+          },
+          {
+            "address": "0x205c0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_avx2"
+          },
+          {
+            "address": "0x20630",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr2_impl": [
+          {
+            "address": "0x205c0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_avx2"
+          },
+          {
+            "address": "0x20630",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr3": [
+          {
+            "address": "0x207d0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::detect"
+          },
+          {
+            "address": "0x20850",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_avx2"
+          },
+          {
+            "address": "0x208f0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "memchr3_impl": [
+          {
+            "address": "0x20850",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_avx2"
+          },
+          {
+            "address": "0x208f0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "fixed_deny_attr_bcmp": [
+          {
+            "address": "0x16c90",
+            "symbol": "bcmp"
+          }
+        ]
+      },
+      "bindings": [
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr_raw::detect",
+          "address": "0x20335",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr_impl",
+          "proof_id": "memchr-ifunc-dispatch-std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr2_raw::detect",
+          "address": "0x205b8",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr2_impl",
+          "proof_id": "memchr2-ifunc-dispatch-std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr3_raw::detect",
+          "address": "0x20840",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr3_impl",
+          "proof_id": "memchr3-ifunc-dispatch-std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1eb5a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "modern-sqli-memchr3-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1eb85",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-sqli-memchr2-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1eba5",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1ebbe",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1ebd7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1ebf0",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1ec09",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x1ec22",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e961",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e978",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e98d",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e9a2",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e9b7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1e9cc",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x1eb00",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-xss-memchr2-std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x1d4d7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "legacy-xss-search-memchr3-std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x1d539",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "legacy-xss-search-memchr2-std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x1d557",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x1d575",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::deny::is_deny_attr",
+          "address": "0x1f4fe",
+          "instruction_bytes_hex": "ffd5",
+          "family": "fixed_deny_attr_bcmp",
+          "proof_id": "deny_attr_bcmp-std",
+          "source_method": "fixed GOT relocation slot 0x5d5f8 resolves to exact audited function entry 0x16c90"
+        }
+      ]
+    },
+    "legacy": {
+      "binary_sha256": "24f09d61d5f1623b59c66d7acfedaea0751a3427a5e8d96307f5bc0cbc7425ca",
+      "code_section_sha256": "662f22899576a6fed3555151728400157b85a42395d8b54ef2ebba1f556c4268",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/engine/prefilter.rs",
+          "sha256": "0791e14d319b7392543142b67c8224165452d94e276eb39b7b2819404b642487"
+        },
+        {
+          "path": "src/xss/legacy/mod.rs",
+          "sha256": "77750a51921f37b731892b2a295e09351c4fd2c9fbd893747526c67544c1f858"
+        },
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/sqli/legacy/state.rs",
+          "sha256": "714f583d56f006c3fd7985d335e771abbf0c891068fdb4dbec832118b4ce0cb2"
+        },
+        {
+          "path": "src/sqli/legacy/token.rs",
+          "sha256": "bd70b6402342d9605d219e21211a4a3652a255085e512fa3839341a09ba1b7e9"
+        },
+        {
+          "path": "src/sqli/legacy/parse.rs",
+          "sha256": "14271010ebddd480f2127c7da747807fa6a0126b2a34b73a7cdc8881d42803aa"
+        },
+        {
+          "path": "src/sqli/legacy/detect.rs",
+          "sha256": "3c2168e404d70b1173eea212b2686de44117c749ed6fe8314a1d9e1c64b81caa"
+        }
+      ],
+      "external_sources": {
+        "probe_source_sha256": "367c39af96cf17131b11d3a05c6479676c0691f06410466b07439aa58253c7b0",
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "memchr_arch_source_sha256": "4cf0611c926c3016d1b640880ef14e5654a8d1c1b480fe9a5965956be7eeeeef",
+        "memchr_searcher_source_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      },
+      "target_families": {
+        "core_memchr": [
+          {
+            "address": "0x61710",
+            "symbol": "core::slice::memchr::memchr_aligned"
+          }
+        ],
+        "tokenize": [
+          {
+            "address": "0x59280",
+            "symbol": "<libinjection::sqli::legacy::state::SqliState>::tokenize"
+          }
+        ],
+        "bcmp": [
+          {
+            "address": "0x4e6b0",
+            "symbol": "bcmp"
+          }
+        ],
+        "rabinkarp_equal": [
+          {
+            "address": "0x5f570",
+            "symbol": "memchr::arch::all::rabinkarp::is_equal_raw"
+          }
+        ],
+        "parser_searcher": [
+          {
+            "address": "0x5eef0",
+            "symbol": "memchr::memmem::searcher::searcher_kind_one_byte"
+          },
+          {
+            "address": "0x5e360",
+            "symbol": "memchr::memmem::searcher::searcher_kind_sse2"
+          },
+          {
+            "address": "0x5eac0",
+            "symbol": "memchr::memmem::searcher::searcher_kind_two_way"
+          },
+          {
+            "address": "0x5ef20",
+            "symbol": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter"
+          }
+        ],
+        "password_searcher": [
+          {
+            "address": "0x5e360",
+            "symbol": "memchr::memmem::searcher::searcher_kind_sse2"
+          }
+        ],
+        "memmem_prefilter": [
+          {
+            "address": "0x5e810",
+            "symbol": "memchr::memmem::searcher::prefilter_kind_sse2"
+          }
+        ],
+        "memchr": [
+          {
+            "address": "0x5f5d0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::detect"
+          },
+          {
+            "address": "0x5f7b0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr_impl": [
+          {
+            "address": "0x5f7b0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr2": [
+          {
+            "address": "0x5f980",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::detect"
+          },
+          {
+            "address": "0x5fb30",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr2_impl": [
+          {
+            "address": "0x5fb30",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr3": [
+          {
+            "address": "0x5fcd0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::detect"
+          },
+          {
+            "address": "0x5fef0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "memchr3_impl": [
+          {
+            "address": "0x5fef0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "fixed_is_xss_next_token": [
+          {
+            "address": "0x5d120",
+            "symbol": "<libinjection::xss::legacy::Html5State>::next_token"
+          }
+        ],
+        "fixed_deny_attr_bcmp": [
+          {
+            "address": "0x4e6b0",
+            "symbol": "bcmp"
+          }
+        ]
+      },
+      "bindings": [
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x5341a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "modern-sqli-memchr3-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x53445",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-sqli-memchr2-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x53465",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x5347e",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x53497",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x534b0",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x534c9",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::sqli_may_be_interesting",
+          "address": "0x534e2",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x53221",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x53238",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x5324d",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x53262",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x53277",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x5328c",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::engine::prefilter::xss_may_be_interesting",
+          "address": "0x533c0",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-xss-memchr2-legacy",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x5e097",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "legacy-xss-search-memchr3-legacy",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x5e0f9",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "legacy-xss-search-memchr2-legacy",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x5e117",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-legacy",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x5e135",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-legacy",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::is_xss (.llvm.6938751472737551495)",
+          "address": "0x5e202",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "fixed_is_xss_next_token",
+          "proof_id": "is_xss_next_token-legacy",
+          "source_method": "fixed GOT relocation slot 0x9bc18 resolves to exact audited function entry 0x5d120"
+        },
+        {
+          "caller": "libinjection::xss::legacy::deny::is_deny_attr",
+          "address": "0x5a47e",
+          "instruction_bytes_hex": "ffd5",
+          "family": "fixed_deny_attr_bcmp",
+          "proof_id": "deny_attr_bcmp-legacy",
+          "source_method": "fixed GOT relocation slot 0x9bb18 resolves to exact audited function entry 0x4e6b0"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::check",
+          "address": "0x59b65",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::check",
+          "address": "0x59bbf",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x521da",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x5225c",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x5ab49",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x5ac6e",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x5ad7c",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_hash",
+          "address": "0x5af26",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_bword",
+          "address": "0x5b3d7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_money",
+          "address": "0x5b7cc",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "core_memchr",
+          "proof_id": "legacy-sqli-core_memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_xstring",
+          "address": "0x5c5c8",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "core_memchr",
+          "proof_id": "legacy-sqli-core_memchr-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::fold",
+          "address": "0x57974",
+          "instruction_bytes_hex": "ffd1",
+          "family": "tokenize",
+          "proof_id": "legacy-sqli-tokenize-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::find_subslice",
+          "address": "0x5c24a",
+          "instruction_bytes_hex": "ffd5",
+          "family": "bcmp",
+          "proof_id": "legacy-sqli-bcmp-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::detect::contains_sp_password",
+          "address": "0x536e8",
+          "instruction_bytes_hex": "41ffd5",
+          "family": "rabinkarp_equal",
+          "proof_id": "legacy-sqli-rabinkarp_equal-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x524a3",
+          "instruction_bytes_hex": "ff942488010000",
+          "family": "parser_searcher",
+          "proof_id": "legacy-sqli-parser_searcher-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::detect::contains_sp_password",
+          "address": "0x53749",
+          "instruction_bytes_hex": "ff942408010000",
+          "family": "password_searcher",
+          "proof_id": "legacy-sqli-password_searcher-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter",
+          "address": "0x5f18e",
+          "instruction_bytes_hex": "ff542408",
+          "family": "memmem_prefilter",
+          "proof_id": "legacy-sqli-memmem_prefilter-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter",
+          "address": "0x5f336",
+          "instruction_bytes_hex": "ff542440",
+          "family": "memmem_prefilter",
+          "proof_id": "legacy-sqli-memmem_prefilter-legacy",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        }
+      ]
+    },
+    "legacy_std": {
+      "binary_sha256": "cfb8fd8d57179b32abb2b3e1d217a5c768ce4013744c9e5147c5abdbc0a0c25f",
+      "code_section_sha256": "d422899c5b23ca6a762066c47fcc723e3e46213393d12131edd891fe5c1f44d5",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/engine/prefilter.rs",
+          "sha256": "0791e14d319b7392543142b67c8224165452d94e276eb39b7b2819404b642487"
+        },
+        {
+          "path": "src/xss/legacy/mod.rs",
+          "sha256": "77750a51921f37b731892b2a295e09351c4fd2c9fbd893747526c67544c1f858"
+        },
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/sqli/legacy/state.rs",
+          "sha256": "714f583d56f006c3fd7985d335e771abbf0c891068fdb4dbec832118b4ce0cb2"
+        },
+        {
+          "path": "src/sqli/legacy/token.rs",
+          "sha256": "bd70b6402342d9605d219e21211a4a3652a255085e512fa3839341a09ba1b7e9"
+        },
+        {
+          "path": "src/sqli/legacy/parse.rs",
+          "sha256": "14271010ebddd480f2127c7da747807fa6a0126b2a34b73a7cdc8881d42803aa"
+        },
+        {
+          "path": "src/sqli/legacy/detect.rs",
+          "sha256": "3c2168e404d70b1173eea212b2686de44117c749ed6fe8314a1d9e1c64b81caa"
+        }
+      ],
+      "external_sources": {
+        "probe_source_sha256": "367c39af96cf17131b11d3a05c6479676c0691f06410466b07439aa58253c7b0",
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "memchr_arch_source_sha256": "4cf0611c926c3016d1b640880ef14e5654a8d1c1b480fe9a5965956be7eeeeef",
+        "memchr_searcher_source_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      },
+      "target_families": {
+        "core_memchr": [
+          {
+            "address": "0xa8830",
+            "symbol": "core::slice::memchr::memchr_aligned"
+          }
+        ],
+        "tokenize": [
+          {
+            "address": "0x63640",
+            "symbol": "<libinjection::sqli::legacy::state::SqliState>::tokenize"
+          }
+        ],
+        "bcmp": [
+          {
+            "address": "0x5df50",
+            "symbol": "bcmp"
+          }
+        ],
+        "rabinkarp_equal": [
+          {
+            "address": "0x72310",
+            "symbol": "memchr::arch::all::rabinkarp::is_equal_raw"
+          }
+        ],
+        "parser_searcher": [
+          {
+            "address": "0x71c90",
+            "symbol": "memchr::memmem::searcher::searcher_kind_one_byte"
+          },
+          {
+            "address": "0x70f10",
+            "symbol": "memchr::memmem::searcher::searcher_kind_sse2"
+          },
+          {
+            "address": "0x70df0",
+            "symbol": "memchr::memmem::searcher::searcher_kind_avx2"
+          },
+          {
+            "address": "0x71860",
+            "symbol": "memchr::memmem::searcher::searcher_kind_two_way"
+          },
+          {
+            "address": "0x71cc0",
+            "symbol": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter"
+          }
+        ],
+        "password_searcher": [
+          {
+            "address": "0x70f10",
+            "symbol": "memchr::memmem::searcher::searcher_kind_sse2"
+          },
+          {
+            "address": "0x70df0",
+            "symbol": "memchr::memmem::searcher::searcher_kind_avx2"
+          }
+        ],
+        "memmem_prefilter": [
+          {
+            "address": "0x715b0",
+            "symbol": "memchr::memmem::searcher::prefilter_kind_sse2"
+          },
+          {
+            "address": "0x713c0",
+            "symbol": "memchr::memmem::searcher::prefilter_kind_avx2"
+          }
+        ],
+        "memchr": [
+          {
+            "address": "0x6fc20",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::detect"
+          },
+          {
+            "address": "0x6fc80",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_avx2"
+          },
+          {
+            "address": "0x6fcc0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr_impl": [
+          {
+            "address": "0x6fc80",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_avx2"
+          },
+          {
+            "address": "0x6fcc0",
+            "symbol": "memchr::arch::x86_64::memchr::memchr_raw::find_sse2"
+          }
+        ],
+        "memchr2": [
+          {
+            "address": "0x6fe90",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::detect"
+          },
+          {
+            "address": "0x6ff00",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_avx2"
+          },
+          {
+            "address": "0x6ff70",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr2_impl": [
+          {
+            "address": "0x6ff00",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_avx2"
+          },
+          {
+            "address": "0x6ff70",
+            "symbol": "memchr::arch::x86_64::memchr::memchr2_raw::find_sse2"
+          }
+        ],
+        "memchr3": [
+          {
+            "address": "0x70110",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::detect"
+          },
+          {
+            "address": "0x70190",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_avx2"
+          },
+          {
+            "address": "0x70230",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "memchr3_impl": [
+          {
+            "address": "0x70190",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_avx2"
+          },
+          {
+            "address": "0x70230",
+            "symbol": "memchr::arch::x86_64::memchr::memchr3_raw::find_sse2"
+          }
+        ],
+        "fixed_is_xss_next_token": [
+          {
+            "address": "0x6e2f0",
+            "symbol": "<libinjection::xss::legacy::Html5State>::next_token"
+          }
+        ],
+        "fixed_deny_attr_bcmp": [
+          {
+            "address": "0x5df50",
+            "symbol": "bcmp"
+          }
+        ]
+      },
+      "bindings": [
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr_raw::detect",
+          "address": "0x6fc75",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr_impl",
+          "proof_id": "memchr-ifunc-dispatch-legacy_std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr2_raw::detect",
+          "address": "0x6fef8",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr2_impl",
+          "proof_id": "memchr2-ifunc-dispatch-legacy_std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "memchr::arch::x86_64::memchr::memchr3_raw::detect",
+          "address": "0x70180",
+          "instruction_bytes_hex": "ffe0",
+          "family": "memchr3_impl",
+          "proof_id": "memchr3-ifunc-dispatch-legacy_std",
+          "source_method": "pinned memchr unsafe_ifunc! detector stores only target_feature-available SSE2 and/or AVX2 implementation; exact detector callsite and candidate entry addresses are hash-bound"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60ac7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "modern-sqli-memchr3-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60aeb",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-sqli-memchr2-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b0a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b22",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b3a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b52",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b6a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_sqli_with",
+          "address": "0x60b82",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-sqli-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e460",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e478",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e490",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e4a8",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e4c0",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e4d8",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "modern-xss-memchr-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::analyze_xss_with",
+          "address": "0x5e5f4",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "modern-xss-memchr2-legacy_std",
+          "source_method": "Rust prefilter operation with matching byte-search arity; bound to pinned memchr selector and emitted ELF addresses"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x6f267",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr3",
+          "proof_id": "legacy-xss-search-memchr3-legacy_std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x6f2c9",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr2",
+          "proof_id": "legacy-xss-search-memchr2-legacy_std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x6f2e7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-legacy_std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::detect",
+          "address": "0x6f305",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-xss-search-memchr-legacy_std",
+          "source_method": "source-bound quote mask dispatcher selects one-byte/two-byte/three-byte memchr operation"
+        },
+        {
+          "caller": "libinjection::xss::legacy::is_xss (.llvm.4650158060613914894)",
+          "address": "0x6f3d2",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "fixed_is_xss_next_token",
+          "proof_id": "is_xss_next_token-legacy_std",
+          "source_method": "fixed GOT relocation slot 0xe5f38 resolves to exact audited function entry 0x6e2f0"
+        },
+        {
+          "caller": "libinjection::xss::legacy::deny::is_deny_attr",
+          "address": "0x64d5e",
+          "instruction_bytes_hex": "ffd5",
+          "family": "fixed_deny_attr_bcmp",
+          "proof_id": "deny_attr_bcmp-legacy_std",
+          "source_method": "fixed GOT relocation slot 0xe5db0 resolves to exact audited function entry 0x5df50"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::check",
+          "address": "0x63e55",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::check",
+          "address": "0x63eaf",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x63f5a",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x63fdc",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x6bd19",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x6be3e",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_dash",
+          "address": "0x6bf4c",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_hash",
+          "address": "0x6c0f6",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_bword",
+          "address": "0x6c5a7",
+          "instruction_bytes_hex": "ffd0",
+          "family": "memchr",
+          "proof_id": "legacy-sqli-memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_money",
+          "address": "0x6c99c",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "core_memchr",
+          "proof_id": "legacy-sqli-core_memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::parse_xstring",
+          "address": "0x6d798",
+          "instruction_bytes_hex": "41ffd4",
+          "family": "core_memchr",
+          "proof_id": "legacy-sqli-core_memchr-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::state::SqliState>::fold",
+          "address": "0x62044",
+          "instruction_bytes_hex": "ffd1",
+          "family": "tokenize",
+          "proof_id": "legacy-sqli-tokenize-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::parse::find_subslice",
+          "address": "0x6d41a",
+          "instruction_bytes_hex": "ffd5",
+          "family": "bcmp",
+          "proof_id": "legacy-sqli-bcmp-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::detect::contains_sp_password",
+          "address": "0x66318",
+          "instruction_bytes_hex": "41ffd5",
+          "family": "rabinkarp_equal",
+          "proof_id": "legacy-sqli-rabinkarp_equal-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core",
+          "address": "0x6423a",
+          "instruction_bytes_hex": "ff942488010000",
+          "family": "parser_searcher",
+          "proof_id": "legacy-sqli-parser_searcher-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "libinjection::sqli::legacy::detect::contains_sp_password",
+          "address": "0x663a1",
+          "instruction_bytes_hex": "ff942408010000",
+          "family": "password_searcher",
+          "proof_id": "legacy-sqli-password_searcher-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter",
+          "address": "0x71f2e",
+          "instruction_bytes_hex": "ff542408",
+          "family": "memmem_prefilter",
+          "proof_id": "legacy-sqli-memmem_prefilter-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        },
+        {
+          "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter",
+          "address": "0x720d6",
+          "instruction_bytes_hex": "ff542440",
+          "family": "memmem_prefilter",
+          "proof_id": "legacy-sqli-memmem_prefilter-legacy_std",
+          "source_method": "pinned Rust source invariant plus exact GOT/IFUNC target set from STACK_CALL_PROOFS.md"
+        }
+      ]
+    }
+  }
+}

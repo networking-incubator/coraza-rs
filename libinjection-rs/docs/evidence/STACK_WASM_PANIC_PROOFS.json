@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "status": "exact-site source proof for pinned memchr panic origins; not a full WASM stack pass",
+  "binding": {
+    "libinjection_tree_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+    "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+    "memchr_version": "2.8.3",
+    "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+    "memchr_sources": [
+      {
+        "path": "src/arch/all/mod.rs",
+        "sha256": "05f3fc2b069682eb1545fc6366d167bb620a454365dac8b8dd6cde6cd64de18a"
+      },
+      {
+        "path": "src/arch/all/twoway.rs",
+        "sha256": "0b27eb1cd7402c1375a50466f8f66a68cb2806c3f69a647340b2759793eed4f8"
+      },
+      {
+        "path": "src/arch/all/packedpair/mod.rs",
+        "sha256": "292b66042c5b5c78bba33db6526aeae6904db803d601fcdd29032b87b3eb3754"
+      },
+      {
+        "path": "src/memmem/searcher.rs",
+        "sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      },
+      {
+        "path": "src/memmem/mod.rs",
+        "sha256": "d869159f0d0c1915d7acc42a6a4aa3c97c049ddc043e6566afeb78ad290995d1"
+      }
+    ],
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+    "profile": "legacy_std",
+    "target": "wasm32-wasip1",
+    "module_sha256": "e8f68b7391baa21b629326e58292f6ecdfedf69b63a3f6a092fb927a3dfef8b0",
+    "code_section_sha256": "e5b46010e508a7d84bed2e2a80b58ba75111cb318eb2e9efa56ea5bb3bfbb135",
+    "report": "/tmp/libinjection-stack-phase5/current-proof-2/report.json",
+    "entry": "libinjection::detect_sqli"
+  },
+  "input_contract": {
+    "callsite": "libinjection::sqli::legacy::token::SqliToken::parse_string_core",
+    "libinjection_source": {
+      "path": "src/sqli/legacy/token.rs",
+      "sha256": "bd70b6402342d9605d219e21211a4a3652a255085e512fa3839341a09ba1b7e9"
+    },
+    "source_rule": "The memmem needle is the nonempty input suffix beginning at a delimiter returned by memchr; the delimiter position is strictly less than the input length. The haystack is the original input slice.",
+    "same_needle_rule": "memchr 2.8.3 constructs each Searcher/Finder from the needle passed to that memmem::find call and invokes it with that same needle.",
+    "implication": "Searcher and Two-Way algorithms receive valid Rust slices. The proofs below also cover empty or short slices unless a site-specific precondition is stated."
+  },
+  "panic_sites": [
+    {
+      "function": "memchr::memmem::FinderBuilder::build_forward_with_ranker [wasm function 61]",
+      "sites": [
+        {
+          "offset": "0xf0e0",
+          "panic_target": "core::panicking::assert_failed::<u8, u8> [wasm function 73]",
+          "source": "Pair::with_ranker assert_ne!(index1, index2)",
+          "guard_proof": "Indices start as (0,1). A replacement installs the current monotonically increasing iterator index while the other index is an earlier value. They cannot become equal."
+        },
+        {
+          "offset": "0xf13c",
+          "panic_target": "core::result::unwrap_failed [wasm function 230]",
+          "source": "Pair::with_ranker u8::try_from(i).unwrap() in rare1 replacement",
+          "guard_proof": "The iterator is enumerate().take(255).skip(2), so each visited i is in 2..=254 and converts to u8."
+        },
+        {
+          "offset": "0xf357",
+          "panic_target": "core::result::unwrap_failed [wasm function 230]",
+          "source": "Pair::with_ranker u8::try_from(i).unwrap() in rare2 replacement",
+          "guard_proof": "The iterator is enumerate().take(255).skip(2), so each visited i is in 2..=254 and converts to u8."
+        },
+        {
+          "offset": "0xf369",
+          "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+          "source": "Pair::with_ranker initial needle[0] access",
+          "guard_proof": "Pair::with_ranker returns None when needle.len() <= 1 before these accesses."
+        },
+        {
+          "offset": "0xf37b",
+          "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+          "source": "Pair::with_ranker initial needle[1] access",
+          "guard_proof": "Pair::with_ranker returns None when needle.len() <= 1 before these accesses."
+        }
+      ]
+    },
+    {
+      "function": "memchr::arch::all::twoway::Finder::new [wasm function 63]",
+      "sites": [
+        {
+          "offset": "0xf6b3",
+          "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+          "source": "inlined Suffix::forward needle[suffix.pos + offset]",
+          "guard_proof": "The loop requires candidate_start + offset < needle.len(). The suffix invariant keeps suffix.pos <= candidate_start. Slice length is at most isize::MAX, so candidate_start + offset cannot overflow usize."
+        },
+        {
+          "offset": "0xf6c5",
+          "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+          "source": "inlined Suffix::forward needle[candidate_start + offset]",
+          "guard_proof": "The loop requires candidate_start + offset < needle.len(); the indexed position is exactly the checked expression."
+        }
+      ]
+    },
+    {
+      "function": "memchr::arch::all::twoway::Shift::forward [wasm function 89]",
+      "sites": [
+        {
+          "offset": "0x14b07",
+          "panic_target": "core::slice::index::slice_index_fail [wasm function 218]",
+          "source": "needle.split_at(critical_pos) and v[..period_lower_bound]",
+          "guard_proof": "Finder::new derives critical_pos from a Suffix whose pos is within needle. The shift branch returns when critical_pos * 2 >= needle.len(), so this path has critical_pos < needle.len(). The selected suffix period is at most needle.len() - critical_pos, hence no greater than v.len()."
+        },
+        {
+          "offset": "0x14b42",
+          "panic_target": "core::panicking::panic_fmt [wasm function 214]",
+          "source": "checked arithmetic in Shift::forward",
+          "guard_proof": "critical_pos is within needle; needle.len() - critical_pos is nonnegative. A Rust slice length is at most isize::MAX, so critical_pos * 2 cannot overflow usize."
+        }
+      ]
+    },
+    {
+      "function": "memchr::memmem::searcher::searcher_kind_two_way [wasm function 90]",
+      "sites": [
+        "0x14cd7", "0x14d3d", "0x14d9e", "0x14df5", "0x14e07",
+        "0x14e19", "0x14f0c", "0x14f2b", "0x14f9e", "0x14fb3"
+      ],
+      "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+      "source": "inlined Finder::find_small_imp/find_large_imp indexing of haystack[pos + last_byte_pos], needle[i], haystack[pos + i], needle[j], haystack[pos + j], and needle[shift]",
+      "guard_proof": "checked_sub(1) returns before the search when needle is empty. The outer loop bounds pos + needle.len() by haystack.len(); after a prefilter advances pos, the same length check is repeated. last_byte_pos < needle.len(); each forward comparison is guarded by i < needle.len(); each reverse comparison is guarded by j < critical_pos < needle.len(); shift is initialized to zero and later set to needle.len() - period with period in 1..=needle.len()."
+    },
+    {
+      "function": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 94]",
+      "sites": [
+        {
+          "offset": "0x15696",
+          "panic_target": "core::slice::index::slice_index_fail [wasm function 218]",
+          "source": "inlined prefilter search slice haystack[pos..]",
+          "guard_proof": "The search loop starts only while pos + needle.len() <= haystack.len(); the searcher needle is nonempty on this path, so pos <= haystack.len(). The prefilter result is relative to this suffix and cannot exceed its length."
+        },
+        {
+          "offset": "0x159a4",
+          "panic_target": "core::slice::index::slice_index_fail [wasm function 218]",
+          "source": "inlined prefilter search slice haystack[pos..] in the second Two-Way arm",
+          "guard_proof": "The same loop and suffix-result invariants as offset 0x15696 apply."
+        },
+        {
+          "offsets": [
+            "0x156b6", "0x1576b", "0x157cf", "0x1582a", "0x1583c", "0x1584e",
+            "0x159f7", "0x15a5c", "0x15acf", "0x15ae4"
+          ],
+          "panic_target": "core::panicking::panic_bounds_check [wasm function 219]",
+          "source": "inlined Two-Way search indexing in the prefilter specialization",
+          "guard_proof": "The same nonempty-needle, pos + needle.len() <= haystack.len(), checked prefilter suffix, i < needle.len(), critical_pos < needle.len(), and shift/period invariants documented for searcher_kind_two_way apply."
+        }
+      ]
+    }
+  ],
+  "exclusions_not_authorized": [
+    "Do not exclude core panic helpers, Rust std panic hooks, or WASI imports globally.",
+    "These per-origin source invariants only apply to the exact module and source hashes above.",
+    "The current report still has other recursive std panic/allocator paths downstream of these origins; an analyzer rerun must show exact-site rules applied and no remaining detector-reachable panic origin before any full-call bound can pass."
+  ]
+}

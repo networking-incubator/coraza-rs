@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "status": "source/hash-bound indexed stack accesses; only exact fixed-buffer write sites are accepted",
+  "profiles": {
+    "minimal": {
+      "binary_sha256": "7ee65b629cf655a1efe126641a38bf03a3231d89e96fff1d811f5ce1f7cb4043",
+      "code_section_sha256": "e038078d6952e29d12faae1242af1acac118e6e5934b56af9a3b726e51c07815",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/engine/token.rs",
+          "sha256": "fd9ec655e5f2323b9e06834eeba6c9e8f1b468b35fe7ffc74926e99f3998d608"
+        },
+        {
+          "path": "src/limits.rs",
+          "sha256": "d6387e34325784d87cea22c686b0710204a2468187ab6a901df934e4515bbd45"
+        }
+      ],
+      "sites": [
+        {
+          "function": "libinjection::xss::legacy::deny::is_deny_tag",
+          "function_address": "0xe9e0",
+          "address": "0xea37",
+          "instruction_bytes_hex": "88540cc0",
+          "base_displacement_bytes": -64,
+          "index_register": "rcx",
+          "index_value_max": 63,
+          "index_scale": 1,
+          "field_offset_bytes": 0,
+          "access_width_bytes": 1,
+          "array_size_bytes": 64,
+          "redzone_depth_bytes": 64,
+          "proof_id": "deny-tag-normalized-name-64",
+          "method": "normalize_name writes normalized[len] only through get_mut(len), with 64-byte fixed local array"
+        }
+      ]
+    },
+    "std": {
+      "binary_sha256": "93eb3b27f1880a0e5b96f6cc81c3bc6ee8296db2fbae7e9d460101c3f55e1eae",
+      "code_section_sha256": "05d3077dceb99cc79d49ce7b06e0db65cdbf13ed92f416bf4526aab7f054f852",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/engine/token.rs",
+          "sha256": "fd9ec655e5f2323b9e06834eeba6c9e8f1b468b35fe7ffc74926e99f3998d608"
+        },
+        {
+          "path": "src/limits.rs",
+          "sha256": "d6387e34325784d87cea22c686b0710204a2468187ab6a901df934e4515bbd45"
+        }
+      ],
+      "sites": [
+        {
+          "function": "libinjection::xss::legacy::deny::is_deny_tag",
+          "function_address": "0x1ed50",
+          "address": "0x1eda7",
+          "instruction_bytes_hex": "88540cc0",
+          "base_displacement_bytes": -64,
+          "index_register": "rcx",
+          "index_value_max": 63,
+          "index_scale": 1,
+          "field_offset_bytes": 0,
+          "access_width_bytes": 1,
+          "array_size_bytes": 64,
+          "redzone_depth_bytes": 64,
+          "proof_id": "deny-tag-normalized-name-64",
+          "method": "normalize_name writes normalized[len] only through get_mut(len), with 64-byte fixed local array"
+        }
+      ]
+    },
+    "legacy": {
+      "binary_sha256": "24f09d61d5f1623b59c66d7acfedaea0751a3427a5e8d96307f5bc0cbc7425ca",
+      "code_section_sha256": "662f22899576a6fed3555151728400157b85a42395d8b54ef2ebba1f556c4268",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/engine/token.rs",
+          "sha256": "fd9ec655e5f2323b9e06834eeba6c9e8f1b468b35fe7ffc74926e99f3998d608"
+        },
+        {
+          "path": "src/limits.rs",
+          "sha256": "d6387e34325784d87cea22c686b0710204a2468187ab6a901df934e4515bbd45"
+        }
+      ],
+      "sites": [
+        {
+          "function": "libinjection::xss::legacy::deny::is_deny_tag",
+          "function_address": "0x59cd0",
+          "address": "0x59d27",
+          "instruction_bytes_hex": "88540cc0",
+          "base_displacement_bytes": -64,
+          "index_register": "rcx",
+          "index_value_max": 63,
+          "index_scale": 1,
+          "field_offset_bytes": 0,
+          "access_width_bytes": 1,
+          "array_size_bytes": 64,
+          "redzone_depth_bytes": 64,
+          "proof_id": "deny-tag-normalized-name-64",
+          "method": "normalize_name writes normalized[len] only through get_mut(len), with 64-byte fixed local array"
+        },
+        {
+          "function": "libinjection::engine::token::tokenize",
+          "function_address": "0x52c10",
+          "address": "0x52c6f",
+          "instruction_bytes_hex": "6642895c5cc8",
+          "base_displacement_bytes": -56,
+          "index_value_max": 21,
+          "index_scale": 2,
+          "field_offset_bytes": 0,
+          "access_width_bytes": 2,
+          "array_size_bytes": 48,
+          "redzone_depth_bytes": 56,
+          "proof_id": "token-buffer-push-eight-slots",
+          "method": "TokenBuf::push returns before writing when idx >= MAX_TOKEN_SLOTS (8); idx is count, r11=idx*3, and repr(C) TokenMeta uses 6-byte stride, so r11 max 21 and all three field stores remain inside the 48-byte slots array",
+          "index_register": "r11"
+        },
+        {
+          "function": "libinjection::engine::token::tokenize",
+          "function_address": "0x52c10",
+          "address": "0x52c75",
+          "instruction_bytes_hex": "6646896c5cca",
+          "base_displacement_bytes": -56,
+          "index_value_max": 21,
+          "index_scale": 2,
+          "field_offset_bytes": 2,
+          "access_width_bytes": 2,
+          "array_size_bytes": 48,
+          "redzone_depth_bytes": 56,
+          "proof_id": "token-buffer-push-eight-slots",
+          "method": "TokenBuf::push returns before writing when idx >= MAX_TOKEN_SLOTS (8); idx is count, r11=idx*3, and repr(C) TokenMeta uses 6-byte stride, so r11 max 21 and all three field stores remain inside the 48-byte slots array",
+          "index_register": "r11"
+        },
+        {
+          "function": "libinjection::engine::token::tokenize",
+          "function_address": "0x52c10",
+          "address": "0x52c7b",
+          "instruction_bytes_hex": "42886c5ccc",
+          "base_displacement_bytes": -56,
+          "index_value_max": 21,
+          "index_scale": 2,
+          "field_offset_bytes": 4,
+          "access_width_bytes": 1,
+          "array_size_bytes": 48,
+          "redzone_depth_bytes": 56,
+          "proof_id": "token-buffer-push-eight-slots",
+          "method": "TokenBuf::push returns before writing when idx >= MAX_TOKEN_SLOTS (8); idx is count, r11=idx*3, and repr(C) TokenMeta uses 6-byte stride, so r11 max 21 and all three field stores remain inside the 48-byte slots array",
+          "index_register": "r11"
+        }
+      ]
+    },
+    "legacy_std": {
+      "binary_sha256": "cfb8fd8d57179b32abb2b3e1d217a5c768ce4013744c9e5147c5abdbc0a0c25f",
+      "code_section_sha256": "d422899c5b23ca6a762066c47fcc723e3e46213393d12131edd891fe5c1f44d5",
+      "source_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+      "source_files": [
+        {
+          "path": "src/xss/legacy/deny.rs",
+          "sha256": "b98bf7d09c65f8fafdb69ddb9ae30dee504de60dae1aa7eb3cfbc114c502b110"
+        },
+        {
+          "path": "src/engine/token.rs",
+          "sha256": "fd9ec655e5f2323b9e06834eeba6c9e8f1b468b35fe7ffc74926e99f3998d608"
+        },
+        {
+          "path": "src/limits.rs",
+          "sha256": "d6387e34325784d87cea22c686b0710204a2468187ab6a901df934e4515bbd45"
+        }
+      ],
+      "sites": [
+        {
+          "function": "libinjection::xss::legacy::deny::is_deny_tag",
+          "function_address": "0x645b0",
+          "address": "0x64607",
+          "instruction_bytes_hex": "88540cc0",
+          "base_displacement_bytes": -64,
+          "index_register": "rcx",
+          "index_value_max": 63,
+          "index_scale": 1,
+          "field_offset_bytes": 0,
+          "access_width_bytes": 1,
+          "array_size_bytes": 64,
+          "redzone_depth_bytes": 64,
+          "proof_id": "deny-tag-normalized-name-64",
+          "method": "normalize_name writes normalized[len] only through get_mut(len), with 64-byte fixed local array"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "libinjection-perf-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = ["legacy"]
+legacy = ["libinjection/legacy"]
+count-allocations = []
+
+[dependencies]
+libinjection = { path = "../..", default-features = false }

@@ -1,0 +1,742 @@
+{
+  "schema_version": 1,
+  "status": "source-and-binary-bound target audit; not a full native stack pass",
+  "source": {
+    "libinjection_tree_sha256": "7958e70c1107af787d5a3362d77864dd517a8bad26cfd29e44136b47ec17eb2f",
+    "probe_source_sha256": "367c39af96cf17131b11d3a05c6479676c0691f06410466b07439aa58253c7b0",
+    "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+    "memchr_version": "2.8.3",
+    "memchr_package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+    "memchr_searcher_source_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+  },
+  "profiles": {
+    "minimal": {
+      "elf_sha256": "7ee65b629cf655a1efe126641a38bf03a3231d89e96fff1d811f5ce1f7cb4043",
+      "text_sha256": "e038078d6952e29d12faae1242af1acac118e6e5934b56af9a3b726e51c07815",
+      "selectors": {
+        "memchr": {
+          "slot": "0x14288",
+          "targets": {
+            "detect": "0xf7c0",
+            "sse2": "0xf9a0"
+          }
+        },
+        "memchr2": {
+          "slot": "0x14290",
+          "targets": {
+            "detect": "0xfb70",
+            "sse2": "0xfd20"
+          }
+        },
+        "memchr3": {
+          "slot": "0x14298",
+          "targets": {
+            "detect": "0xfec0",
+            "sse2": "0x100e0"
+          }
+        }
+      },
+      "modern_prefilter_calls": {
+        "sqli": {
+          "memchr3": [
+            "0xe7ea"
+          ],
+          "memchr2": [
+            "0xe815"
+          ],
+          "memchr": [
+            "0xe835",
+            "0xe84e",
+            "0xe867",
+            "0xe880",
+            "0xe899",
+            "0xe8b2"
+          ]
+        },
+        "xss": {
+          "memchr": [
+            "0xe5f1",
+            "0xe608",
+            "0xe61d",
+            "0xe632",
+            "0xe647",
+            "0xe65c"
+          ],
+          "memchr2": [
+            "0xe790"
+          ]
+        }
+      },
+      "legacy_xss_detector_calls": {
+        "memchr3": [
+          "0xd167"
+        ],
+        "memchr2": [
+          "0xd1c9"
+        ],
+        "memchr": [
+          "0xd1e7",
+          "0xd205"
+        ]
+      },
+      "fixed_calls": {
+        "deny_attr_bcmp": {
+          "site": "0xf18e",
+          "slot": "0x13238",
+          "target": "0x6a30"
+        }
+      },
+      "local_xss_jump_sites": {
+        "within_function_tail_jumps": {
+          "xss_detect": [
+            "0xd145"
+          ],
+          "deny_attr": [
+            "0xf1b7"
+          ],
+          "is_xss_inlined_next_token_and_token_dispatch": [
+            "0xd2a4", "0xd655", "0xd67b", "0xd70b", "0xdc16",
+            "0xdca7", "0xde1e", "0xde48", "0xde72"
+          ]
+        },
+        "proof_scope": "Disassembly marks these as tail jmp *reg instructions, not calls; next_token is inlined into is_xss. The bounded target-entry arrays for this minimal ELF are not separately emitted here."
+      }
+    },
+    "std": {
+      "elf_sha256": "93eb3b27f1880a0e5b96f6cc81c3bc6ee8296db2fbae7e9d460101c3f55e1eae",
+      "text_sha256": "05d3077dceb99cc79d49ce7b06e0db65cdbf13ed92f416bf4526aab7f054f852",
+      "selectors": {
+        "memchr": {
+          "slot": "0x5edb0",
+          "targets": {
+            "detect": "0x202e0",
+            "avx2": "0x20340",
+            "sse2": "0x20380"
+          }
+        },
+        "memchr2": {
+          "slot": "0x5eda0",
+          "targets": {
+            "detect": "0x20550",
+            "avx2": "0x205c0",
+            "sse2": "0x20630"
+          }
+        },
+        "memchr3": {
+          "slot": "0x5eda8",
+          "targets": {
+            "detect": "0x207d0",
+            "avx2": "0x20850",
+            "sse2": "0x208f0"
+          }
+        }
+      },
+      "modern_prefilter_calls": {
+        "sqli": {
+          "memchr3": [
+            "0x1eb5a"
+          ],
+          "memchr2": [
+            "0x1eb85"
+          ],
+          "memchr": [
+            "0x1eba5",
+            "0x1ebbe",
+            "0x1ebd7",
+            "0x1ebf0",
+            "0x1ec09",
+            "0x1ec22"
+          ]
+        },
+        "xss": {
+          "memchr": [
+            "0x1e961",
+            "0x1e978",
+            "0x1e98d",
+            "0x1e9a2",
+            "0x1e9b7",
+            "0x1e9cc"
+          ],
+          "memchr2": [
+            "0x1eb00"
+          ]
+        }
+      },
+      "legacy_xss_detector_calls": {
+        "memchr3": [
+          "0x1d4d7"
+        ],
+        "memchr2": [
+          "0x1d539"
+        ],
+        "memchr": [
+          "0x1d557",
+          "0x1d575"
+        ]
+      },
+      "fixed_calls": {
+        "deny_attr_bcmp": {
+          "site": "0x1f4fe",
+          "slot": "0x5d5f8",
+          "target": "0x16c90"
+        }
+      },
+      "local_xss_jump_sites": {
+        "within_function_tail_jumps": {
+          "xss_detect": [
+            "0x1d4b5"
+          ],
+          "deny_attr": [
+            "0x1f527"
+          ],
+          "is_xss_inlined_next_token_and_token_dispatch": [
+            "0x1d614", "0x1d9c5", "0x1d9eb", "0x1da7b", "0x1df86",
+            "0x1e017", "0x1e18e", "0x1e1b8", "0x1e1e2"
+          ]
+        },
+        "proof_scope": "Disassembly marks these as tail jmp *reg instructions, not calls; next_token is inlined into is_xss. The bounded target-entry arrays for this std ELF are not separately emitted here."
+      }
+    },
+    "legacy": {
+      "elf_sha256": "24f09d61d5f1623b59c66d7acfedaea0751a3427a5e8d96307f5bc0cbc7425ca",
+      "text_sha256": "662f22899576a6fed3555151728400157b85a42395d8b54ef2ebba1f556c4268",
+      "selectors": {
+        "memchr": {
+          "slot": "0x9cc60",
+          "targets": {
+            "detect": "0x5f5d0",
+            "sse2": "0x5f7b0"
+          }
+        },
+        "memchr2": {
+          "slot": "0x9cc68",
+          "targets": {
+            "detect": "0x5f980",
+            "sse2": "0x5fb30"
+          }
+        },
+        "memchr3": {
+          "slot": "0x9cc70",
+          "targets": {
+            "detect": "0x5fcd0",
+            "sse2": "0x5fef0"
+          }
+        }
+      },
+      "modern_prefilter_calls": {
+        "sqli": {
+          "memchr3": [
+            "0x5341a"
+          ],
+          "memchr2": [
+            "0x53445"
+          ],
+          "memchr": [
+            "0x53465",
+            "0x5347e",
+            "0x53497",
+            "0x534b0",
+            "0x534c9",
+            "0x534e2"
+          ]
+        },
+        "xss": {
+          "memchr": [
+            "0x53221",
+            "0x53238",
+            "0x5324d",
+            "0x53262",
+            "0x53277",
+            "0x5328c"
+          ],
+          "memchr2": [
+            "0x533c0"
+          ]
+        }
+      },
+      "legacy_xss_detector_calls": {
+        "memchr3": [
+          "0x5e097"
+        ],
+        "memchr2": [
+          "0x5e0f9"
+        ],
+        "memchr": [
+          "0x5e117",
+          "0x5e135"
+        ]
+      },
+      "fixed_calls": {
+        "is_xss_next_token": {
+          "site": "0x5e202",
+          "slot": "0x9bc18",
+          "target": "0x5d120"
+        },
+        "deny_attr_bcmp": {
+          "site": "0x5a47e",
+          "slot": "0x9bb18",
+          "target": "0x4e6b0"
+        }
+      }
+    },
+    "legacy_std": {
+      "elf_sha256": "cfb8fd8d57179b32abb2b3e1d217a5c768ce4013744c9e5147c5abdbc0a0c25f",
+      "text_sha256": "d422899c5b23ca6a762066c47fcc723e3e46213393d12131edd891fe5c1f44d5",
+      "selectors": {
+        "memchr": {
+          "slot": "0xe75e8",
+          "targets": {
+            "detect": "0x6fc20",
+            "avx2": "0x6fc80",
+            "sse2": "0x6fcc0"
+          }
+        },
+        "memchr2": {
+          "slot": "0xe75d8",
+          "targets": {
+            "detect": "0x6fe90",
+            "avx2": "0x6ff00",
+            "sse2": "0x6ff70"
+          }
+        },
+        "memchr3": {
+          "slot": "0xe75e0",
+          "targets": {
+            "detect": "0x70110",
+            "avx2": "0x70190",
+            "sse2": "0x70230"
+          }
+        }
+      },
+      "modern_prefilter_calls": {
+        "sqli": {
+          "memchr3": [
+            "0x60ac7"
+          ],
+          "memchr2": [
+            "0x60aeb"
+          ],
+          "memchr": [
+            "0x60b0a",
+            "0x60b22",
+            "0x60b3a",
+            "0x60b52",
+            "0x60b6a",
+            "0x60b82"
+          ]
+        },
+        "xss": {
+          "memchr": [
+            "0x5e460",
+            "0x5e478",
+            "0x5e490",
+            "0x5e4a8",
+            "0x5e4c0",
+            "0x5e4d8"
+          ],
+          "memchr2": [
+            "0x5e5f4"
+          ]
+        }
+      },
+      "legacy_xss_detector_calls": {
+        "memchr3": [
+          "0x6f267"
+        ],
+        "memchr2": [
+          "0x6f2c9"
+        ],
+        "memchr": [
+          "0x6f2e7",
+          "0x6f305"
+        ]
+      },
+      "fixed_calls": {
+        "is_xss_next_token": {
+          "site": "0x6f3d2",
+          "slot": "0xe5f38",
+          "target": "0x6e2f0"
+        },
+        "deny_attr_bcmp": {
+          "site": "0x64d5e",
+          "slot": "0xe5db0",
+          "target": "0x5df50"
+        }
+      }
+    }
+  },
+  "local_xss_jump_tables": {
+    "target_contract": "Every listed in-range signed-relative entry was decoded from the named ELF and confirmed to be an instruction start inside the named function. These are local dispatch tables, not callback function pointers.",
+    "legacy": [
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d1a1",
+        "base": "0x4b4fc",
+        "count": 21,
+        "targets": [
+          "0x5d1a3",
+          "0x5d1d9",
+          "0x5d243",
+          "0x5d27f",
+          "0x5d2dc",
+          "0x5d347",
+          "0x5d36b",
+          "0x5d41e",
+          "0x5d46f",
+          "0x5d491",
+          "0x5d5c3",
+          "0x5d5e7",
+          "0x5d6ad",
+          "0x5d6e9",
+          "0x5d73b",
+          "0x5d76d",
+          "0x5d790",
+          "0x5d848",
+          "0x5d8a0",
+          "0x5d8eb",
+          "0x5dec9"
+        ],
+        "guard": "private Html5ParseState domain 0..=20; Eof=21 takes the pre-table exit"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d2d2",
+        "base": "0x4b62c",
+        "count": 40,
+        "targets": [
+          "0x5d2a0",
+          "0x5d2d4",
+          "0x5dcab",
+          "0x5dcd7"
+        ],
+        "guard": "input byte <= 0x27; other branch gates smaller values"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d336",
+        "base": "0x4b6cc",
+        "count": 31,
+        "targets": [
+          "0x5d300",
+          "0x5d338",
+          "0x5dbd1",
+          "0x5dc8e",
+          "0x5de76"
+        ],
+        "guard": "input byte minus 0x20 <= 0x1e"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d450",
+        "base": "0x4b820",
+        "count": 54,
+        "targets": [
+          "0x5d430",
+          "0x5d452",
+          "0x5dc04",
+          "0x5dc21"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d6d7",
+        "base": "0x4b8f8",
+        "count": 31,
+        "targets": [
+          "0x5d6da",
+          "0x5db3f",
+          "0x5db58",
+          "0x5db67",
+          "0x5db76"
+        ],
+        "guard": "input byte minus 0x21 <= 0x1e"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d762",
+        "base": "0x4b554",
+        "count": 54,
+        "targets": [
+          "0x5d764",
+          "0x5d784",
+          "0x5dbf5",
+          "0x5ded5"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy",
+        "site": "0x5d881",
+        "base": "0x4b748",
+        "count": 54,
+        "targets": [
+          "0x5d860",
+          "0x5d883",
+          "0x5dc53",
+          "0x5dc67",
+          "0x5dc7b"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "deny::is_deny_attr",
+        "elf": "legacy",
+        "site": "0x5a4a7",
+        "base": "0x49a60",
+        "count": 8,
+        "targets": [
+          "0x5a4a9",
+          "0x5a594",
+          "0x5a5f5",
+          "0x5a642",
+          "0x5a684",
+          "0x5a6b6"
+        ],
+        "guard": "normalized length minus 6 <= 7; unsigned overflow rejects shorter lengths"
+      },
+      {
+        "function": "xss::detect",
+        "elf": "legacy",
+        "site": "0x5e075",
+        "base": "0x4b974",
+        "count": 7,
+        "targets": [
+          "0x5e077",
+          "0x5e0a6",
+          "0x5e0bc",
+          "0x5e0cd",
+          "0x5e0de",
+          "0x5e101",
+          "0x5e11f"
+        ],
+        "guard": "quote-seen mask <= 6; source creates only bits 1, 2, 4 and mask 7 exits before table"
+      },
+      {
+        "function": "xss::is_xss",
+        "elf": "legacy",
+        "site": "0x5e233",
+        "base": "0x4b990",
+        "count": 9,
+        "targets": [
+          "0x5e1f4",
+          "0x5e1fc",
+          "0x5e235",
+          "0x5e240",
+          "0x5e24b",
+          "0x5e28a"
+        ],
+        "guard": "token kind minus 1 <= 8"
+      },
+      {
+        "function": "xss::is_xss",
+        "elf": "legacy",
+        "site": "0x5e25f",
+        "base": "0x4b9b4",
+        "count": 5,
+        "targets": [
+          "0x5e1fc",
+          "0x5e261",
+          "0x5e26c",
+          "0x5e28a"
+        ],
+        "guard": "private DenyAttrKind domain 0..=4"
+      }
+    ],
+    "legacy_std": [
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e371",
+        "base": "0x4fe4c",
+        "count": 21,
+        "targets": [
+          "0x6e373",
+          "0x6e3a9",
+          "0x6e413",
+          "0x6e44f",
+          "0x6e4ac",
+          "0x6e517",
+          "0x6e53b",
+          "0x6e5ee",
+          "0x6e63f",
+          "0x6e661",
+          "0x6e793",
+          "0x6e7b7",
+          "0x6e87d",
+          "0x6e8b9",
+          "0x6e90b",
+          "0x6e93d",
+          "0x6e960",
+          "0x6ea18",
+          "0x6ea70",
+          "0x6eabb",
+          "0x6f099"
+        ],
+        "guard": "private Html5ParseState domain 0..=20; Eof=21 takes the pre-table exit"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e4a2",
+        "base": "0x4ff7c",
+        "count": 40,
+        "targets": [
+          "0x6e470",
+          "0x6e4a4",
+          "0x6ee7b",
+          "0x6eea7"
+        ],
+        "guard": "input byte <= 0x27; other branch gates smaller values"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e506",
+        "base": "0x5001c",
+        "count": 31,
+        "targets": [
+          "0x6e4d0",
+          "0x6e508",
+          "0x6eda1",
+          "0x6ee5e",
+          "0x6f046"
+        ],
+        "guard": "input byte minus 0x20 <= 0x1e"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e620",
+        "base": "0x50170",
+        "count": 54,
+        "targets": [
+          "0x6e600",
+          "0x6e622",
+          "0x6edd4",
+          "0x6edf1"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e8a7",
+        "base": "0x50248",
+        "count": 31,
+        "targets": [
+          "0x6e8aa",
+          "0x6ed0f",
+          "0x6ed28",
+          "0x6ed37",
+          "0x6ed46"
+        ],
+        "guard": "input byte minus 0x21 <= 0x1e"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6e932",
+        "base": "0x4fea4",
+        "count": 54,
+        "targets": [
+          "0x6e934",
+          "0x6e954",
+          "0x6edc5",
+          "0x6f0a5"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "Html5State::next_token",
+        "elf": "legacy_std",
+        "site": "0x6ea51",
+        "base": "0x50098",
+        "count": 54,
+        "targets": [
+          "0x6ea30",
+          "0x6ea53",
+          "0x6ee23",
+          "0x6ee37",
+          "0x6ee4b"
+        ],
+        "guard": "input byte minus 9 <= 0x35"
+      },
+      {
+        "function": "deny::is_deny_attr",
+        "elf": "legacy_std",
+        "site": "0x64d87",
+        "base": "0x4d0a4",
+        "count": 8,
+        "targets": [
+          "0x64d89",
+          "0x64e74",
+          "0x64ed5",
+          "0x64f22",
+          "0x64f64",
+          "0x64f96"
+        ],
+        "guard": "normalized length minus 6 <= 7; unsigned overflow rejects shorter lengths"
+      },
+      {
+        "function": "xss::detect",
+        "elf": "legacy_std",
+        "site": "0x6f245",
+        "base": "0x502c4",
+        "count": 7,
+        "targets": [
+          "0x6f247",
+          "0x6f276",
+          "0x6f28c",
+          "0x6f29d",
+          "0x6f2ae",
+          "0x6f2d1",
+          "0x6f2ef"
+        ],
+        "guard": "quote-seen mask <= 6; source creates only bits 1, 2, 4 and mask 7 exits before table"
+      },
+      {
+        "function": "xss::is_xss",
+        "elf": "legacy_std",
+        "site": "0x6f403",
+        "base": "0x502e0",
+        "count": 9,
+        "targets": [
+          "0x6f3c4",
+          "0x6f3cc",
+          "0x6f405",
+          "0x6f410",
+          "0x6f41b",
+          "0x6f45a"
+        ],
+        "guard": "token kind minus 1 <= 8"
+      },
+      {
+        "function": "xss::is_xss",
+        "elf": "legacy_std",
+        "site": "0x6f42f",
+        "base": "0x50304",
+        "count": 5,
+        "targets": [
+          "0x6f3cc",
+          "0x6f431",
+          "0x6f43c",
+          "0x6f45a"
+        ],
+        "guard": "private DenyAttrKind domain 0..=4"
+      }
+    ]
+  },
+  "limitations": [
+    "Function-pointer targets are source and relocation bound only for these exact ELF hashes and Rust/memchr sources.",
+    "Local XSS table target addresses are complete for the listed bounded indices; this artifact does not prove their full caller stack bounds.",
+    "No native 4 KiB full-call stack pass is claimed."
+  ]
+}

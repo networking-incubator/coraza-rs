@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "proof_id": "memchr-searcher-kind-parse-string-core-wasm-legacy-2026-10",
+      "profile": "legacy",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "fae476837df53c760f3ad5d2cb1cf4ea52a6b1c197f69db19426e3aab47a7ae9",
+      "code_section_sha256": "0ca0d6265fbf7cca9f46c395859c8095e98513f2c46ec0ce83de80c4335f634d",
+      "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core [wasm function 18]",
+      "function_index": 18,
+      "address": "0xdb5",
+      "instruction_bytes_hex": "1180808080008080808000",
+      "type_index": 0,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::searcher_kind_one_byte [wasm function 83]",
+        "memchr::memmem::searcher::searcher_kind_two_way [wasm function 81]",
+        "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 85]"
+      ],
+      "method": "The remaining suffix is nonempty. Pinned memchr Searcher::new assigns the private Searcher call field to one_byte for length 1, two_way for multi-byte without a prefilter, or two_way_with_prefilter when a prefilter is present. The empty implementation is excluded by the nonempty suffix invariant. The WASM artifact has no SIMD128 constructor, so these are the complete source-constructible cases.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-searcher-kind-password-needle-wasm-legacy-2026-10",
+      "profile": "legacy",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "fae476837df53c760f3ad5d2cb1cf4ea52a6b1c197f69db19426e3aab47a7ae9",
+      "code_section_sha256": "0ca0d6265fbf7cca9f46c395859c8095e98513f2c46ec0ce83de80c4335f634d",
+      "caller": "libinjection::sqli::legacy::detect::contains_sp_password [wasm function 39]",
+      "function_index": 39,
+      "address": "0x7995",
+      "instruction_bytes_hex": "1180808080008080808000",
+      "type_index": 0,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::searcher_kind_two_way [wasm function 81]",
+        "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 85]"
+      ],
+      "method": "The detector constructs Finder with the fixed 11-byte password needle, so the empty and one-byte Searcher constructors are impossible. The pinned Searcher constructor selects the two-way implementation, with or without its source-constructed prefilter.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-prefilter-function-pointer-first-call-wasm-legacy-2026-10",
+      "profile": "legacy",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "fae476837df53c760f3ad5d2cb1cf4ea52a6b1c197f69db19426e3aab47a7ae9",
+      "code_section_sha256": "0ca0d6265fbf7cca9f46c395859c8095e98513f2c46ec0ce83de80c4335f634d",
+      "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 85]",
+      "function_index": 85,
+      "address": "0x14f25",
+      "instruction_bytes_hex": "1181808080008080808000",
+      "type_index": 1,
+      "table_index": 0,
+      "targets": ["memchr::memmem::searcher::prefilter_kind_fallback [wasm function 84]"],
+      "method": "For this WASM target, the pinned source has one compiled Prefilter constructor, the fallback implementation, which writes only prefilter_kind_fallback to the private call field.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-prefilter-function-pointer-second-call-wasm-legacy-2026-10",
+      "profile": "legacy",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "fae476837df53c760f3ad5d2cb1cf4ea52a6b1c197f69db19426e3aab47a7ae9",
+      "code_section_sha256": "0ca0d6265fbf7cca9f46c395859c8095e98513f2c46ec0ce83de80c4335f634d",
+      "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 85]",
+      "function_index": 85,
+      "address": "0x1523b",
+      "instruction_bytes_hex": "1181808080008080808000",
+      "type_index": 1,
+      "table_index": 0,
+      "targets": ["memchr::memmem::searcher::prefilter_kind_fallback [wasm function 84]"],
+      "method": "For this WASM target, the pinned source has one compiled Prefilter constructor, the fallback implementation, which writes only prefilter_kind_fallback to the private call field.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-searcher-kind-parse-string-core-wasm-2026-10",
+      "profile": "legacy_std",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "e8f68b7391baa21b629326e58292f6ecdfedf69b63a3f6a092fb927a3dfef8b0",
+      "code_section_sha256": "e5b46010e508a7d84bed2e2a80b58ba75111cb318eb2e9efa56ea5bb3bfbb135",
+      "caller": "<libinjection::sqli::legacy::token::SqliToken>::parse_string_core [wasm function 86]",
+      "function_index": 86,
+      "address": "0x1443f",
+      "instruction_bytes_hex": "1180808080008080808000",
+      "type_index": 0,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::searcher_kind_one_byte [wasm function 92]",
+        "memchr::memmem::searcher::searcher_kind_two_way [wasm function 90]",
+        "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 94]"
+      ],
+      "method": "The remaining suffix is nonempty. Pinned memchr Searcher::new assigns the private Searcher call field to one_byte for length 1, two_way for multi-byte without a prefilter, or two_way_with_prefilter when a prefilter is present. The empty implementation is excluded by the nonempty suffix invariant. The WASM artifact has no SIMD128 constructor, so these are the complete source-constructible cases.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-searcher-kind-password-needle-wasm-2026-10",
+      "profile": "legacy_std",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "e8f68b7391baa21b629326e58292f6ecdfedf69b63a3f6a092fb927a3dfef8b0",
+      "code_section_sha256": "e5b46010e508a7d84bed2e2a80b58ba75111cb318eb2e9efa56ea5bb3bfbb135",
+      "caller": "libinjection::sqli::legacy::detect::contains_sp_password [wasm function 69]",
+      "function_index": 69,
+      "address": "0x12afd",
+      "instruction_bytes_hex": "1180808080008080808000",
+      "type_index": 0,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::searcher_kind_two_way [wasm function 90]",
+        "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 94]"
+      ],
+      "method": "The detector constructs Finder with the fixed 11-byte password needle, so the empty and one-byte Searcher constructors are impossible. The pinned Searcher constructor selects the two-way implementation, with or without its source-constructed prefilter.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-prefilter-function-pointer-first-call-wasm-2026-10",
+      "profile": "legacy_std",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "e8f68b7391baa21b629326e58292f6ecdfedf69b63a3f6a092fb927a3dfef8b0",
+      "code_section_sha256": "e5b46010e508a7d84bed2e2a80b58ba75111cb318eb2e9efa56ea5bb3bfbb135",
+      "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 94]",
+      "function_index": 94,
+      "address": "0x155fc",
+      "instruction_bytes_hex": "1181808080008080808000",
+      "type_index": 1,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::prefilter_kind_fallback [wasm function 93]"
+      ],
+      "method": "Searcher::two_way_with_prefilter loads its private Prefilter::call field. Exhaustive pinned-source constructor/assignment analysis finds only the fallback constructor compiled for this WASM target; it writes only prefilter_kind_fallback. The ten other table entries only match the indirect-call signature and are not assigned to this private field.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    },
+    {
+      "proof_id": "memchr-prefilter-function-pointer-second-call-wasm-2026-10",
+      "profile": "legacy_std",
+      "target": "wasm32-wasip1",
+      "binary_sha256": "e8f68b7391baa21b629326e58292f6ecdfedf69b63a3f6a092fb927a3dfef8b0",
+      "code_section_sha256": "e5b46010e508a7d84bed2e2a80b58ba75111cb318eb2e9efa56ea5bb3bfbb135",
+      "caller": "memchr::memmem::searcher::searcher_kind_two_way_with_prefilter [wasm function 94]",
+      "function_index": 94,
+      "address": "0x15912",
+      "instruction_bytes_hex": "1181808080008080808000",
+      "type_index": 1,
+      "table_index": 0,
+      "targets": [
+        "memchr::memmem::searcher::prefilter_kind_fallback [wasm function 93]"
+      ],
+      "method": "Searcher::two_way_with_prefilter loads its private Prefilter::call field. Exhaustive pinned-source constructor/assignment analysis finds only the fallback constructor compiled for this WASM target; it writes only prefilter_kind_fallback. The ten other table entries only match the indirect-call signature and are not assigned to this private field.",
+      "source_provenance": {
+        "cargo_lock_sha256": "870b1ca1175524cd2690aee84d444ab4b85357206f8d1f24bb08bebab643d24e",
+        "package": "memchr 2.8.3",
+        "package_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+        "source_path": "memchr-2.8.3/src/memmem/searcher.rs",
+        "source_file_sha256": "84f6a23bef907696cb672e6898c15fb87008058abc100dde58519d8ec5ebca5d"
+      }
+    }
+  ]
+}
