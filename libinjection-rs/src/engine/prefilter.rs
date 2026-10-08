@@ -24,7 +24,15 @@ pub(crate) fn sqli_may_be_interesting(input: &[u8]) -> bool {
     if input.is_empty() {
         return false;
     }
+    // Normalization can expose markers hidden by one layer of percent
+    // encoding or by embedded NUL bytes. Do not skip that work in those cases.
+    if memchr::memchr2(b'%', 0, input).is_some() {
+        return true;
+    }
     if memchr3(b'\'', b'"', b';', input).is_some() {
+        return true;
+    }
+    if memchr::memchr(b'`', input).is_some() {
         return true;
     }
     // Secondary scan for comment/keyword triggers.
@@ -33,12 +41,16 @@ pub(crate) fn sqli_may_be_interesting(input: &[u8]) -> bool {
         || memchr::memchr(b'\\', input).is_some()
         || memchr::memchr(b'(', input).is_some()
         || memchr::memchr(b')', input).is_some()
-        || memchr::memchr(b'=', input).is_some()
+        || memchr3(b'=', b'<', b'>', input).is_some()
         || memchr::memchr(b'[', input).is_some()
+        || memchr::memmem::find(input, b"||").is_some()
+        || memchr::memmem::find(input, b"@@").is_some()
         || find_ignore_ascii_case(input, b"union").is_some()
         || find_ignore_ascii_case(input, b"select").is_some()
         || find_ignore_ascii_case(input, b" or ").is_some()
         || find_ignore_ascii_case(input, b" and ").is_some()
+        || find_ignore_ascii_case(input, b"or true").is_some()
+        || find_ignore_ascii_case(input, b"and true").is_some()
         || find_ignore_ascii_case(input, b"exec").is_some()
         || find_ignore_ascii_case(input, b"xp_cmdshell").is_some()
         || find_ignore_ascii_case(input, b"waitfor delay").is_some()
@@ -51,6 +63,11 @@ pub(crate) fn sqli_may_be_interesting(input: &[u8]) -> bool {
 pub(crate) fn xss_may_be_interesting(input: &[u8]) -> bool {
     if input.is_empty() {
         return false;
+    }
+    // The normalizer decodes one `%HH` layer and strips NUL bytes. Either can
+    // reveal an XSS marker that is absent from the raw input.
+    if memchr::memchr2(b'%', 0, input).is_some() {
+        return true;
     }
     memchr::memchr(b'<', input).is_some()
         || memchr::memchr(b'>', input).is_some()

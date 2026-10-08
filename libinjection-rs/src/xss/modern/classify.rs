@@ -21,15 +21,14 @@ use crate::{
         ascii::{
             find_ignore_ascii_case, for_each_ignore_ascii_case, is_space, word_boundary_after, word_boundary_before,
         },
-        normalize::{NormView, original_span_for_normalized},
+        normalize::{NormView, original_span_for_normalized, original_span_from_map},
     },
-    limits::MAX_EVIDENCE,
     snapshot::{ConstructFlags, EvidenceSet, EvidenceSpan, XssHtmlContext},
     xss::legacy,
 };
 
 /// Classification output for one XSS pass.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct XssClassifyResult {
     /// Matched construct bits.
     pub constructs: ConstructFlags,
@@ -39,33 +38,63 @@ pub(crate) struct XssClassifyResult {
     pub html_context: XssHtmlContext,
 }
 
+#[derive(Clone, Copy)]
+struct EvidenceSource<'a> {
+    original: &'a [u8],
+    original_spans: Option<&'a [(u32, u8)]>,
+}
+
 /// Run XSS construct detectors.
 #[must_use]
-pub(crate) fn classify(norm: NormView<'_>, html_context: XssHtmlContext) -> XssClassifyResult {
+pub(crate) fn classify(norm: &NormView<'_>, html_context: XssHtmlContext) -> XssClassifyResult {
+    let original_spans = norm.original_spans.as_deref();
+    let mut result = classify_in_context(norm, html_context, original_spans);
+    if html_context != XssHtmlContext::Data {
+        let data_result = classify_in_context(norm, XssHtmlContext::Data, original_spans);
+        result.constructs.0 |= data_result.constructs.0;
+        for span in &data_result.evidence.spans {
+            push_evidence(&mut result.evidence, norm.original, span.offset, span.len);
+        }
+    }
+    if !result.constructs.any_xss() && legacy::detect(norm.original) {
+        result.constructs.0 |= ConstructFlags::XSS_HTML_DENYLIST;
+    }
+    result.evidence.deduplicate();
+    result
+}
+
+fn classify_in_context(
+    norm: &NormView<'_>,
+    html_context: XssHtmlContext,
+    original_spans: Option<&[(u32, u8)]>,
+) -> XssClassifyResult {
     let mut out = XssClassifyResult {
         html_context,
         ..XssClassifyResult::default()
     };
     let orig = norm.original;
-    let norm_bytes = norm.bytes;
+    let norm_bytes = norm.bytes.as_ref();
 
-    detect_script(orig, norm_bytes, html_context, &mut out);
+    detect_script(orig, norm_bytes, html_context, original_spans, &mut out);
     detect_iframe(orig, norm_bytes, html_context, &mut out);
     detect_object(orig, norm_bytes, html_context, &mut out);
     detect_svg(orig, norm_bytes, html_context, &mut out);
-    detect_event_handlers(orig, norm_bytes, &mut out);
-    detect_javascript_url(orig, norm_bytes, &mut out);
-    detect_data_url(orig, norm_bytes, &mut out);
+    detect_event_handlers(orig, norm_bytes, original_spans, &mut out);
+    detect_javascript_url(orig, norm_bytes, original_spans, &mut out);
+    detect_data_url(orig, norm_bytes, original_spans, &mut out);
     detect_expression(orig, norm_bytes, &mut out);
     detect_comment_bypass(orig, html_context, &mut out);
-    detect_doctype(orig, norm_bytes, html_context, &mut out);
-    if !out.constructs.any_xss() && legacy::detect(orig) {
-        out.constructs.0 |= ConstructFlags::XSS_HTML_DENYLIST;
-    }
+    detect_doctype(orig, norm_bytes, html_context, original_spans, &mut out);
     out
 }
 
-fn detect_script(orig: &[u8], norm: &[u8], context: XssHtmlContext, out: &mut XssClassifyResult) {
+fn detect_script(
+    orig: &[u8],
+    norm: &[u8],
+    context: XssHtmlContext,
+    original_spans: Option<&[(u32, u8)]>,
+    out: &mut XssClassifyResult,
+) {
     if context != XssHtmlContext::Data {
         return;
     }
@@ -73,7 +102,16 @@ fn detect_script(orig: &[u8], norm: &[u8], context: XssHtmlContext, out: &mut Xs
         for_each_ignore_ascii_case(hay, b"<script", |pos| {
             if word_boundary_after(hay, pos + 1, 6) {
                 out.constructs.0 |= ConstructFlags::XSS_TAG_SCRIPT;
-                push_match_evidence(&mut out.evidence, orig, hay, pos, 7);
+                push_match_evidence(
+                    &mut out.evidence,
+                    EvidenceSource {
+                        original: orig,
+                        original_spans,
+                    },
+                    hay,
+                    pos,
+                    7,
+                );
             }
         });
         if out.constructs.0 & ConstructFlags::XSS_TAG_SCRIPT != 0 {
@@ -118,7 +156,7 @@ fn detect_svg(orig: &[u8], norm: &[u8], context: XssHtmlContext, out: &mut XssCl
     }
 }
 
-fn detect_event_handlers(orig: &[u8], norm: &[u8], out: &mut XssClassifyResult) {
+fn detect_event_handlers(orig: &[u8], norm: &[u8], original_spans: Option<&[(u32, u8)]>, out: &mut XssClassifyResult) {
     const EVENTS: &[&[u8]] = &[
         b"onerror",
         b"onload",
@@ -137,7 +175,16 @@ fn detect_event_handlers(orig: &[u8], norm: &[u8], out: &mut XssClassifyResult) 
             for_each_ignore_ascii_case(hay, ev, |pos| {
                 if word_boundary_before(hay, pos) && attr_assignment_after(hay, pos, ev.len()) {
                     out.constructs.0 |= ConstructFlags::XSS_EVENT_HANDLER;
-                    push_match_evidence(&mut out.evidence, orig, hay, pos, ev.len());
+                    push_match_evidence(
+                        &mut out.evidence,
+                        EvidenceSource {
+                            original: orig,
+                            original_spans,
+                        },
+                        hay,
+                        pos,
+                        ev.len(),
+                    );
                 }
             });
         }
@@ -147,32 +194,59 @@ fn detect_event_handlers(orig: &[u8], norm: &[u8], out: &mut XssClassifyResult) 
     }
 }
 
-fn detect_javascript_url(orig: &[u8], norm: &[u8], out: &mut XssClassifyResult) {
+fn detect_javascript_url(orig: &[u8], norm: &[u8], original_spans: Option<&[(u32, u8)]>, out: &mut XssClassifyResult) {
     for hay in [orig, norm] {
         if let Some(pos) = find_ignore_ascii_case(hay, b"javascript:")
             && word_boundary_before(hay, pos)
         {
             out.constructs.0 |= ConstructFlags::XSS_URL_JAVASCRIPT;
-            push_match_evidence(&mut out.evidence, orig, hay, pos, 11);
+            push_match_evidence(
+                &mut out.evidence,
+                EvidenceSource {
+                    original: orig,
+                    original_spans,
+                },
+                hay,
+                pos,
+                11,
+            );
             return;
         }
     }
 }
 
-fn detect_data_url(orig: &[u8], norm: &[u8], out: &mut XssClassifyResult) {
+fn detect_data_url(orig: &[u8], norm: &[u8], original_spans: Option<&[(u32, u8)]>, out: &mut XssClassifyResult) {
     for hay in [orig, norm] {
         if let Some(pos) = find_ignore_ascii_case(hay, b"data:text/html")
             && word_boundary_before(hay, pos)
         {
             out.constructs.0 |= ConstructFlags::XSS_URL_DATA;
-            push_match_evidence(&mut out.evidence, orig, hay, pos, 14);
+            push_match_evidence(
+                &mut out.evidence,
+                EvidenceSource {
+                    original: orig,
+                    original_spans,
+                },
+                hay,
+                pos,
+                14,
+            );
             return;
         }
         if let Some(pos) = find_ignore_ascii_case(hay, b"data:")
             && word_boundary_before(hay, pos)
         {
             out.constructs.0 |= ConstructFlags::XSS_URL_DATA;
-            push_match_evidence(&mut out.evidence, orig, hay, pos, 5);
+            push_match_evidence(
+                &mut out.evidence,
+                EvidenceSource {
+                    original: orig,
+                    original_spans,
+                },
+                hay,
+                pos,
+                5,
+            );
             return;
         }
     }
@@ -196,14 +270,29 @@ fn detect_comment_bypass(orig: &[u8], context: XssHtmlContext, out: &mut XssClas
     }
 }
 
-fn detect_doctype(orig: &[u8], norm: &[u8], context: XssHtmlContext, out: &mut XssClassifyResult) {
+fn detect_doctype(
+    orig: &[u8],
+    norm: &[u8],
+    context: XssHtmlContext,
+    original_spans: Option<&[(u32, u8)]>,
+    out: &mut XssClassifyResult,
+) {
     if context != XssHtmlContext::Data {
         return;
     }
     for hay in [orig, norm] {
         if let Some(pos) = find_ignore_ascii_case(hay, b"<!doctype") {
             out.constructs.0 |= ConstructFlags::XSS_DOCTYPE;
-            push_match_evidence(&mut out.evidence, orig, hay, pos, 9);
+            push_match_evidence(
+                &mut out.evidence,
+                EvidenceSource {
+                    original: orig,
+                    original_spans,
+                },
+                hay,
+                pos,
+                9,
+            );
             return;
         }
     }
@@ -230,25 +319,26 @@ fn attr_assignment_after(hay: &[u8], start: usize, len: usize) -> bool {
 }
 
 fn push_evidence(evidence: &mut EvidenceSet, hay: &[u8], pos: usize, len: usize) {
-    if usize::from(evidence.count) >= MAX_EVIDENCE {
-        return;
-    }
-    let offset = u16::try_from(pos).unwrap_or(u16::MAX);
-    let Ok(span_len) = u16::try_from(len.min(hay.len().saturating_sub(pos))) else {
-        return;
-    };
-    let idx = usize::from(evidence.count);
-    if let Some(slot) = evidence.spans.get_mut(idx) {
-        *slot = EvidenceSpan { offset, len: span_len };
-        evidence.count = evidence.count.saturating_add(1);
+    if hay.get(pos..).is_some() {
+        let span = EvidenceSpan {
+            offset: pos,
+            len: len.min(hay.len().saturating_sub(pos)),
+        };
+        evidence.spans.push(span);
     }
 }
 
-fn push_match_evidence(evidence: &mut EvidenceSet, original: &[u8], hay: &[u8], pos: usize, len: usize) {
-    if hay.as_ptr() == original.as_ptr() {
-        push_evidence(evidence, original, pos, len);
-    } else if let Some((offset, span_len)) = original_span_for_normalized(original, pos, len) {
-        push_evidence(evidence, original, offset, span_len);
+fn push_match_evidence(evidence: &mut EvidenceSet, source: EvidenceSource<'_>, hay: &[u8], pos: usize, len: usize) {
+    if hay.as_ptr() == source.original.as_ptr() {
+        push_evidence(evidence, source.original, pos, len);
+    } else {
+        let mapped = match source.original_spans {
+            Some(spans) => original_span_from_map(spans, pos, len),
+            None => original_span_for_normalized(source.original, pos, len),
+        };
+        if let Some((offset, span_len)) = mapped {
+            push_evidence(evidence, source.original, offset, span_len);
+        }
     }
 }
 

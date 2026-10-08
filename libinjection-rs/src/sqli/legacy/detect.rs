@@ -21,7 +21,7 @@ use super::{
     consts::{
         BYTE_DOUBLE, BYTE_NULL, BYTE_SINGLE, BYTE_TICK, FLAG_QUOTE_DOUBLE, FLAG_QUOTE_NONE, FLAG_QUOTE_SINGLE,
         FLAG_SQL_ANSI, FLAG_SQL_MYSQL, MAX_TOKENS, TT_BAREWORD, TT_COMMENT, TT_EVIL, TT_FINGERPRINT, TT_KEYWORD,
-        TT_LOGIC_OPERATOR, TT_LPAREN, TT_NUMBER, TT_STRING, TT_UNION, TT_VARIABLE,
+        TT_LOGIC_OPERATOR, TT_NUMBER, TT_STRING, TT_UNION, TT_VARIABLE,
     },
     data::search_keyword,
     helpers::to_upper_cmp,
@@ -49,18 +49,8 @@ impl SqliState<'_> {
 
         // Build fingerprint from token categories
         self.fingerprint_len = 0;
-        let skip_incomplete_exponent = length == 5
-            && self.tc(0) == TT_STRING
-            && self.tc(1) == TT_LOGIC_OPERATOR
-            && self.tc(2) == TT_BAREWORD
-            && self.tc(3) == TT_LPAREN
-            && self.tc(4) == TT_NUMBER
-            && is_incomplete_exponent(self.token_val_slice(2));
         let mut fingerprint_pos = 0;
         for i in 0..length {
-            if skip_incomplete_exponent && i == 2 {
-                continue;
-            }
             let c = self.tc(i);
             if c == TT_EVIL {
                 self.set_fp(0, TT_EVIL);
@@ -75,10 +65,6 @@ impl SqliState<'_> {
                 }
                 fingerprint_pos += 1;
             }
-        }
-        if skip_incomplete_exponent && self.input.last() == Some(&b')') {
-            self.set_fp(4, b')');
-            self.fingerprint_len = 5;
         }
     }
 
@@ -110,12 +96,21 @@ impl SqliState<'_> {
     }
 
     /// Go `notWhitelist`: returns `true` to confirm `SQLi` (not a false positive).
-    pub(crate) fn not_whitelist(&self) -> bool {
+    pub(crate) fn not_whitelist(&mut self) -> bool {
         let length = self.fingerprint_len as usize;
 
         // sp_password in trailing comment → force SQLi
-        if length > 1 && self.fp(length - 1) == TT_COMMENT && contains_sp_password(self.input) {
-            return true;
+        if length > 1 && self.fp(length - 1) == TT_COMMENT {
+            let has_sp_password = if let Some(cached) = self.has_sp_password {
+                cached
+            } else {
+                let found = memchr::memmem::find(self.input, b"sp_password").is_some();
+                self.has_sp_password = Some(found);
+                found
+            };
+            if has_sp_password {
+                return true;
+            }
         }
 
         match length {
@@ -135,28 +130,29 @@ impl SqliState<'_> {
                     return false;
                 }
 
-                // 1c: number + comment not starting with '/'
-                if self.tc(0) == TT_NUMBER && self.tc(1) == TT_COMMENT && self.token_val_byte(1, 0) != Some(b'/') {
+                // 1c ending in a slash comment is SQLi.
+                if self.tc(0) == TT_NUMBER && self.tc(1) == TT_COMMENT && self.token_val_byte(1, 0) == Some(b'/') {
                     return true;
                 }
 
-                // 1c base64 check (comment starts with '/')
+                // Additional 1c checks for folded numbers and suspicious suffixes.
                 if self.tc(0) == TT_NUMBER && self.tc(1) == TT_COMMENT {
                     if self.stats_tokens > 2 {
                         return true;
                     }
 
-                    // Check character after the number in the ORIGINAL input
-                    let num_end = self.token_pos(0).saturating_add(self.token_len(0));
-                    if num_end < self.input.len() {
-                        let ch = self.input.get(num_end).copied().unwrap_or(0);
+                    // Check the byte after the number in the ORIGINAL input.
+                    // Include the token's position because the input may have
+                    // leading whitespace.
+                    let number_end = self.token_pos(0).saturating_add(self.token_len(0));
+                    if let Some(ch) = self.input.get(number_end).copied() {
                         if ch <= 32 {
                             return true;
                         }
-                        if ch == b'/' && self.input.get(num_end + 1).copied() == Some(b'*') {
+                        if ch == b'/' && self.input.get(number_end.saturating_add(1)).copied() == Some(b'*') {
                             return true;
                         }
-                        if ch == b'-' && self.input.get(num_end + 1).copied() == Some(b'-') {
+                        if ch == b'-' && self.input.get(number_end.saturating_add(1)).copied() == Some(b'-') {
                             return true;
                         }
                     }
@@ -183,9 +179,6 @@ impl SqliState<'_> {
                         && self.token_str_close(0) == self.token_str_open(2)
                     {
                         return true;
-                    }
-                    if self.stats_tokens == 3 {
-                        return false;
                     }
                     return false;
                 }
@@ -217,7 +210,7 @@ impl SqliState<'_> {
     }
 
     /// Go `checkFingerprint`: blacklist AND notWhitelist.
-    pub(crate) fn check_fingerprint(&self) -> bool {
+    pub(crate) fn check_fingerprint(&mut self) -> bool {
         self.blacklist() && self.not_whitelist()
     }
 
@@ -285,23 +278,31 @@ pub(crate) fn is_sqli(input: &[u8]) -> (bool, [u8; 5], u8) {
     }
 }
 
-/// Check if input contains `sp_password` (case-sensitive, matching Go).
-fn contains_sp_password(input: &[u8]) -> bool {
-    memchr::memmem::find(input, b"sp_password").is_some()
-}
+#[cfg(test)]
+mod tests {
+    use std::vec;
 
-/// True when `value` is a numeric literal with an exponent marker but no digits after it.
-fn is_incomplete_exponent(value: &[u8]) -> bool {
-    let Some(exp) = value.iter().position(|byte| matches!(byte, b'E' | b'e')) else {
-        return false;
-    };
-    let prefix = value.get(..exp).unwrap_or(&[]);
-    if prefix.is_empty() || !prefix.iter().all(|byte| byte.is_ascii_digit() || *byte == b'.') {
-        return false;
+    use super::is_sqli;
+
+    #[test]
+    fn number_comment_detection_handles_leading_whitespace() {
+        assert_eq!(is_sqli(b" 1/*x*/"), (true, [b'1', b'c', 0, 0, 0], 2));
+        assert_eq!(is_sqli(b"1/*x*/"), (true, [b'1', b'c', 0, 0, 0], 2));
+        assert!(is_sqli(b"\t1/*").0);
+        assert!(is_sqli(b"\t1--").0);
     }
-    let mut suffix = value.get(exp + 1..).unwrap_or(&[]);
-    if suffix.first().is_some_and(|byte| matches!(byte, b'+' | b'-')) {
-        suffix = suffix.get(1..).unwrap_or(&[]);
+
+    #[test]
+    fn skipped_exponents_do_not_change_whitelist_token_statistics() {
+        assert_eq!(is_sqli(b"1e 1 union"), (false, [0; 5], 0));
     }
-    !suffix.iter().any(u8::is_ascii_digit)
+
+    #[test]
+    fn long_unary_streams_do_not_wrap_detection_statistics() {
+        let input = vec![b'+'; usize::from(u16::MAX) + 1];
+        let (detected, fingerprint, len) = is_sqli(&input);
+        assert!(!detected);
+        assert_eq!(fingerprint, [0; 5]);
+        assert_eq!(len, 0);
+    }
 }

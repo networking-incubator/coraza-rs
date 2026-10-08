@@ -42,8 +42,3 @@ pub(crate) const BUILTIN_XSS_DETECT: ConstructFlags = ConstructFlags(
         | ConstructFlags::XSS_DOCTYPE
         | ConstructFlags::XSS_HTML_DENYLIST,
 );
-
-/// Dialect-only hints: ambiguous when scan/normalize was limited.
-pub(crate) const WEAK_SIGNAL: ConstructFlags = ConstructFlags(
-    ConstructFlags::SQL_DIALECT_MYSQL | ConstructFlags::SQL_DIALECT_MSSQL | ConstructFlags::SQL_DIALECT_ORACLE,
-);

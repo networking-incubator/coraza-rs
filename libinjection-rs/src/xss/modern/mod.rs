@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Stage-1 XSS analysis (construct flags, zero heap).
+//! Stage-1 XSS construct analysis.
 
 mod classify;
 
 use classify::{classify, infer_html_context};
 
 use crate::{
-    engine::{normalize::normalize, prefilter::xss_may_be_interesting, verdict::verdict_hint},
-    limits::NORM_BUF_LEN,
+    engine::{normalize::normalize_for_analysis, prefilter::xss_may_be_interesting, verdict::verdict_hint},
     options::AnalyzeOptions,
     policy,
-    snapshot::{AnalysisContext, AnalysisFlags, AnalysisSnapshot, LegacyFingerprint, SqlDialect, SqliQuoteMode},
+    snapshot::{
+        AnalysisContext, AnalysisFlags, AnalysisSnapshot, ConstructFlags, SqlDialect, SqliQuoteMode, XssHtmlContext,
+    },
 };
 
 /// Analyze one input slice (caller applies scan budget).
@@ -33,22 +34,22 @@ pub(crate) fn analyze(input: &[u8], _opts: AnalyzeOptions) -> AnalysisSnapshot {
         return AnalysisSnapshot::benign();
     }
     if !xss_may_be_interesting(input) {
+        let flags = AnalysisFlags(AnalysisFlags::PREFILTER_MISS);
         return AnalysisSnapshot {
-            flags: AnalysisFlags(AnalysisFlags::PREFILTER_MISS),
+            flags,
+            verdict_hint: verdict_hint(ConstructFlags::empty(), flags, policy::BUILTIN_XSS_DETECT),
             ..AnalysisSnapshot::benign()
         };
     }
 
-    let html_context = infer_html_context(input);
-    let mut norm_buf = [0_u8; NORM_BUF_LEN];
-    let norm = normalize(input, &mut norm_buf);
-    let classified = classify(norm, html_context);
+    let norm = normalize_for_analysis(input);
+    let html_context = infer_html_context(norm.bytes.as_ref());
+    let classified = classify(&norm, html_context);
 
     let mut flags = AnalysisFlags::empty();
-    if norm.norm_truncated {
-        flags.0 |= AnalysisFlags::TRUNCATED;
+    if html_context != XssHtmlContext::Data {
+        flags.0 |= AnalysisFlags::MULTI_CONTEXT;
     }
-
     let verdict_hint = verdict_hint(classified.constructs, flags, policy::BUILTIN_XSS_DETECT);
 
     AnalysisSnapshot {
@@ -61,7 +62,6 @@ pub(crate) fn analyze(input: &[u8], _opts: AnalyzeOptions) -> AnalysisSnapshot {
             dialect: SqlDialect::Ansi,
         },
         evidence: classified.evidence,
-        legacy_fingerprint: LegacyFingerprint::default(),
     }
 }
 
@@ -87,6 +87,71 @@ mod tests {
             snap.constructs
                 .intersects(ConstructFlags(ConstructFlags::XSS_URL_JAVASCRIPT))
         );
+    }
+
+    #[test]
+    fn fully_percent_encoded_xss_reaches_normalization() {
+        let input = b"%68%72%65%66%3d%6a%61%76%61%73%63%72%69%70%74%3a%61%6c%65%72%74%28%31%29";
+        let snap = analyze(input, AnalyzeOptions::default());
+        assert!(!snap.flags.contains(AnalysisFlags::PREFILTER_MISS));
+        assert!(
+            snap.constructs
+                .intersects(ConstructFlags(ConstructFlags::XSS_URL_JAVASCRIPT)),
+            "snapshot={snap:?}"
+        );
+    }
+
+    #[test]
+    fn encoded_script_tags_are_classified_in_the_normalized_context() {
+        for input in [
+            b"%3Cscript%20src=//x%3E".as_slice(),
+            b"%3Cscript%20src=//x%3E%3C/script%3E",
+            b"x=%3Cscript%3E",
+        ] {
+            let snap = analyze(input, AnalyzeOptions::default());
+            assert!(
+                snap.constructs
+                    .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT)),
+                "input={input:?}, snapshot={snap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_attribute_escape_also_checks_data_context() {
+        let input = b"\"><script>alert(1)</script>";
+        let snap = analyze(input, AnalyzeOptions::default());
+        assert!(
+            snap.constructs
+                .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT)),
+            "snapshot={snap:?}"
+        );
+        assert!(snap.flags.contains(AnalysisFlags::MULTI_CONTEXT));
+        assert!(
+            snap.evidence.spans.iter().any(|span| {
+                let start = span.offset;
+                let end = start.saturating_add(span.len);
+                input
+                    .get(start..end)
+                    .is_some_and(|text| text.windows(b"<script".len()).any(|window| window == b"<script"))
+            }),
+            "evidence should identify the script tag in the original input: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn percent_decoded_nuls_are_removed_before_tag_classification() {
+        let input = b"%3Csc%00ript%3E";
+        let snap = analyze(input, AnalyzeOptions::default());
+        assert!(
+            snap.constructs
+                .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT)),
+            "snapshot={snap:?}"
+        );
+        let span = snap.evidence.spans.first().copied().unwrap_or_default();
+        let start = span.offset;
+        let end = start + span.len;
+        assert_eq!(input.get(start..end), Some(&b"%3Csc%00ript"[..]));
     }
 
     #[test]
@@ -180,14 +245,15 @@ mod tests {
             snap.constructs
                 .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT))
         );
-        let span = snap.evidence.spans[0];
-        let start = usize::from(span.offset);
-        let end = start + usize::from(span.len);
+        let span = snap.evidence.spans.first().copied().unwrap_or_default();
+        let start = span.offset;
+        let end = start + span.len;
         assert!(end <= input.len());
         assert_eq!(input.get(start..end), Some(&b"%3Cscript"[..]));
     }
 
     fn detect_xss_for_test(input: &[u8]) -> bool {
-        super::super::super::detect_xss(input).detected
+        let snapshot = analyze(input, AnalyzeOptions::default());
+        snapshot.constructs.intersects(policy::BUILTIN_XSS_DETECT)
     }
 }

@@ -17,8 +17,6 @@
 #![allow(clippy::missing_docs_in_private_items, reason = "internal tokenizer helpers")]
 
 use super::ascii::{is_alnum, is_alpha, is_digit, is_space};
-use crate::limits::MAX_TOKEN_SLOTS;
-
 /// Token kind for stage-1 construct classification.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -47,36 +45,24 @@ pub(crate) enum TokenKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct TokenMeta {
     /// Byte offset into original input.
-    pub offset: u16,
+    pub offset: usize,
     /// Length in bytes.
-    pub len: u16,
+    pub len: usize,
     /// Token classification.
     pub kind: TokenKind,
 }
 
-/// Fixed token buffer for one analysis pass.
-#[derive(Clone, Copy, Debug, Default)]
+/// Relevant token ranges for one analysis pass.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TokenBuf {
-    /// Stored tokens.
-    pub slots: [TokenMeta; MAX_TOKEN_SLOTS],
-    /// Number of valid entries in `slots`.
-    pub count: u8,
-    /// More tokens were present but dropped.
-    pub limit_hit: bool,
+    /// String, comment, and semicolon ranges consumed by the classifiers.
+    pub entries: Vec<TokenMeta>,
 }
 
 impl TokenBuf {
-    /// Push a token if capacity remains.
-    pub(crate) fn push(&mut self, offset: u16, len: u16, kind: TokenKind) {
-        let idx = usize::from(self.count);
-        if idx >= MAX_TOKEN_SLOTS {
-            self.limit_hit = true;
-            return;
-        }
-        if let Some(slot) = self.slots.get_mut(idx) {
-            *slot = TokenMeta { offset, len, kind };
-            self.count = self.count.saturating_add(1);
-        }
+    /// Store a relevant token range.
+    pub(crate) fn push(&mut self, offset: usize, len: usize, kind: TokenKind) {
+        self.entries.push(TokenMeta { offset, len, kind });
     }
 }
 
@@ -126,12 +112,13 @@ pub(crate) fn tokenize(original: &[u8]) -> TokenBuf {
             TokenKind::Operator
         };
         let len = i.saturating_sub(start);
-        if len > 0 {
-            let offset = u16::try_from(start).unwrap_or(u16::MAX);
-            let Ok(len_u16) = u16::try_from(len) else {
-                continue;
-            };
-            buf.push(offset, len_u16, kind);
+        if len > 0
+            && matches!(
+                kind,
+                TokenKind::Semicolon | TokenKind::Comment | TokenKind::StringSingle | TokenKind::StringDouble
+            )
+        {
+            buf.push(start, len, kind);
         }
     }
     buf
@@ -172,7 +159,7 @@ mod tests {
     #[test]
     fn terminal_escape_does_not_extend_string_span() {
         let tokens = tokenize(b"'\\");
-        assert_eq!(tokens.count, 1);
-        assert_eq!(tokens.slots.first().map(|token| token.len), Some(2));
+        assert_eq!(tokens.entries.len(), 1);
+        assert_eq!(tokens.entries.first().map(|token| token.len), Some(2));
     }
 }

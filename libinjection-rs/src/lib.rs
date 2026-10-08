@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
-//! SQL injection and XSS analysis for WAF hot paths (Coraza).
+//! Bounded SQLi/XSS construct analysis and optional libinjection compatibility detection.
 //!
-//! Stage 1 returns a fixed-size [`AnalysisSnapshot`] (zero heap).
-//! [`detect_sqli`] / [`detect_xss`] apply a built-in minimal policy for
-//! Coraza operators `@detectSQLi` / `@detectXSS`. Scan budget defaults are in
-//! [`limits`]; override via [`AnalyzeOptions`] (Coraza policy, not request input).
+//! [`analyze_sqli`] and [`analyze_xss`] return descriptive snapshots with owned
+//! evidence. Their configured input budget is reported in [`AnalysisFlags`].
+//! With the default `legacy` feature, [`detect_sqli`] and [`detect_xss`] expose
+//! the full-input byte-compatible detection APIs.
 
-pub mod error;
-pub mod flags;
 pub mod limits;
 pub mod options;
 pub mod snapshot;
@@ -32,162 +28,90 @@ mod policy;
 mod sqli;
 mod xss;
 
-pub use flags::SqliFlags;
-pub use limits::{
-    ABSOLUTE_MAX_INPUT_LEN, DEFAULT_MAX_INPUT_LEN, MAX_EVIDENCE, MAX_INPUT_LEN, MAX_STACK_BUDGET, MAX_TOKEN_SLOTS,
-    NORM_BUF_LEN, clamp_max_input_len, scan_prefix,
-};
-pub use options::{AnalyzeOptions, TruncationPolicy};
+pub use limits::{DEFAULT_MAX_INPUT_LEN, MAX_INPUT_LEN, scan_prefix};
+pub use options::AnalyzeOptions;
+#[cfg(feature = "legacy")]
+pub use snapshot::SqliDetection;
 pub use snapshot::{
-    AnalysisContext, AnalysisFlags, AnalysisSnapshot, ConstructFlags, DetectionVerdict, EvidenceSet, EvidenceSpan,
-    LegacyFingerprint, SqlDialect, SqliQuoteMode, VerdictHint, XssHtmlContext,
+    AnalysisContext, AnalysisFlags, AnalysisSnapshot, ConstructFlags, EvidenceSet, EvidenceSpan, LegacyFingerprint,
+    SqlDialect, SqliQuoteMode, VerdictHint, XssHtmlContext,
 };
+#[cfg(feature = "legacy")]
+pub use sqli::legacy::{SqliStatistics, SqliTokenInfo, sqli_fold_visit, sqli_tokenize_visit};
+#[cfg(feature = "legacy")]
+pub use xss::legacy::{Html5TokenKind, html5_visit};
 
-/// Primary hot-path `SQLi` analysis.
-///
-/// Uses [`AnalyzeOptions::default`] (`DEFAULT_MAX_INPUT_LEN`).
+/// Analyze one SQL input within the default byte budget.
 #[must_use]
 pub fn analyze_sqli(input: &[u8]) -> AnalysisSnapshot {
     analyze_sqli_with(input, AnalyzeOptions::default())
 }
 
-/// `SQLi` analysis with a caller scan budget.
+/// Analyze SQL constructs within the caller's bounded byte budget.
 #[must_use]
 pub fn analyze_sqli_with(input: &[u8], opts: AnalyzeOptions) -> AnalysisSnapshot {
     let (slice, truncated) = scan_prefix(input, opts.effective_max_input_len());
-    finish_sqli_snapshot(sqli::modern::analyze(slice, opts), truncated, opts.truncation_policy)
+    finish_bounded_snapshot(
+        sqli::modern::analyze(slice, opts),
+        truncated,
+        policy::BUILTIN_SQLI_DETECT,
+    )
 }
 
-/// XSS analysis with a caller scan budget.
-#[must_use]
-pub fn analyze_xss_with(input: &[u8], opts: AnalyzeOptions) -> AnalysisSnapshot {
-    let (slice, truncated) = scan_prefix(input, opts.effective_max_input_len());
-    finish_xss_snapshot(xss::modern::analyze(slice, opts), truncated, opts.truncation_policy)
-}
-
-/// Primary hot-path XSS analysis.
+/// Analyze XSS constructs within the default byte budget.
 #[must_use]
 pub fn analyze_xss(input: &[u8]) -> AnalysisSnapshot {
     analyze_xss_with(input, AnalyzeOptions::default())
 }
 
-/// Built-in minimal policy for Coraza `@detectSQLi`.
+/// Analyze XSS constructs within the caller's bounded byte budget.
 #[must_use]
-pub fn detect_sqli(input: &[u8]) -> DetectionVerdict {
-    detect_sqli_with(input, AnalyzeOptions::default())
-}
-
-/// Coraza `@detectSQLi` with caller scan budget.
-#[must_use]
-pub fn detect_sqli_with(input: &[u8], opts: AnalyzeOptions) -> DetectionVerdict {
+pub fn analyze_xss_with(input: &[u8], opts: AnalyzeOptions) -> AnalysisSnapshot {
     let (slice, truncated) = scan_prefix(input, opts.effective_max_input_len());
-    #[cfg(feature = "legacy")]
-    let mut snapshot = finish_sqli_snapshot(sqli::modern::analyze(slice, opts), truncated, opts.truncation_policy);
-    #[cfg(not(feature = "legacy"))]
-    let snapshot = finish_sqli_snapshot(sqli::modern::analyze(slice, opts), truncated, opts.truncation_policy);
-
-    let construct_hit = snapshot.constructs.intersects(policy::BUILTIN_SQLI_DETECT);
-
-    #[cfg(feature = "legacy")]
-    let legacy_hit = {
-        let mut hit = merge_legacy_sqli(&mut snapshot, slice);
-        if truncated && !hit {
-            hit = merge_legacy_sqli(&mut snapshot, input);
-            if !hit && !construct_hit && opts.truncation_policy == TruncationPolicy::AllowInconclusive {
-                snapshot.verdict_hint = VerdictHint::Inconclusive;
-            }
-        }
-        hit
-    };
-
-    #[cfg(not(feature = "legacy"))]
-    let legacy_hit = false;
-
-    let truncation_hit = truncated && opts.truncation_policy == TruncationPolicy::FailClosed && !legacy_hit;
-    let detected = construct_hit || legacy_hit || truncation_hit;
-    DetectionVerdict { detected, snapshot }
+    finish_bounded_snapshot(xss::modern::analyze(slice, opts), truncated, policy::BUILTIN_XSS_DETECT)
 }
 
-/// Built-in minimal policy for Coraza `@detectXSS`
-#[must_use]
-pub fn detect_xss(input: &[u8]) -> DetectionVerdict {
-    detect_xss_with(input, AnalyzeOptions::default())
-}
-
-/// Coraza `@detectXSS` with caller scan budget.
-#[must_use]
-pub fn detect_xss_with(input: &[u8], opts: AnalyzeOptions) -> DetectionVerdict {
-    let (slice, truncated) = scan_prefix(input, opts.effective_max_input_len());
-    let mut snapshot = finish_xss_snapshot(xss::modern::analyze(slice, opts), truncated, opts.truncation_policy);
-
-    let construct_hit = snapshot.constructs.intersects(policy::BUILTIN_XSS_DETECT);
-    let legacy_hit = if truncated && !construct_hit {
-        let hit = xss::legacy::detect(input);
-        if hit {
-            snapshot.constructs.0 |= ConstructFlags::XSS_HTML_DENYLIST;
-            snapshot.verdict_hint = VerdictHint::Decisive;
-        } else if opts.truncation_policy == TruncationPolicy::AllowInconclusive {
-            snapshot.verdict_hint = VerdictHint::Inconclusive;
-        }
-        hit
-    } else {
-        false
-    };
-
-    let truncation_hit = truncated && opts.truncation_policy == TruncationPolicy::FailClosed && !legacy_hit;
-    let detected = construct_hit || legacy_hit || truncation_hit;
-    DetectionVerdict { detected, snapshot }
-}
-
-/// Apply scan truncation flags and refresh verdict hint for `SQLi`.
-fn finish_sqli_snapshot(
-    mut snap: AnalysisSnapshot,
-    truncated: bool,
-    truncation_policy: TruncationPolicy,
-) -> AnalysisSnapshot {
-    if truncated {
-        snap.flags = AnalysisFlags(snap.flags.0 | AnalysisFlags::TRUNCATED);
-        snap.verdict_hint = engine::verdict::verdict_hint(snap.constructs, snap.flags, policy::BUILTIN_SQLI_DETECT);
-        if truncation_policy == TruncationPolicy::FailClosed {
-            snap.verdict_hint = VerdictHint::Decisive;
-        } else if !snap.constructs.any_sqli() {
-            snap.verdict_hint = VerdictHint::Inconclusive;
-        }
-    }
-    snap
-}
-
-/// Apply scan truncation flags and refresh verdict hint for XSS.
-fn finish_xss_snapshot(
-    mut snap: AnalysisSnapshot,
-    truncated: bool,
-    truncation_policy: TruncationPolicy,
-) -> AnalysisSnapshot {
-    if truncated {
-        snap.flags = AnalysisFlags(snap.flags.0 | AnalysisFlags::TRUNCATED);
-        snap.verdict_hint = engine::verdict::verdict_hint(snap.constructs, snap.flags, policy::BUILTIN_XSS_DETECT);
-        if truncation_policy == TruncationPolicy::FailClosed {
-            snap.verdict_hint = VerdictHint::Decisive;
-        } else if !snap.constructs.any_xss() {
-            snap.verdict_hint = VerdictHint::Inconclusive;
-        }
-    }
-    snap
-}
-
-/// Run legacy fingerprint detection and copy into `snapshot` when hit.
+/// Detect SQL injection using the pinned libinjection-compatible algorithm.
+///
+/// Scans the complete supplied byte slice. The fingerprint is populated only
+/// when `detected` is true; a miss returns an empty fingerprint.
 #[cfg(feature = "legacy")]
-fn merge_legacy_sqli(snapshot: &mut AnalysisSnapshot, slice: &[u8]) -> bool {
-    let (hit, fp_bytes, fp_len) = sqli::legacy::detect_with_fingerprint(slice);
-    if hit {
-        let end = usize::from(fp_len).min(8);
-        if let (Some(dst), Some(src)) = (snapshot.legacy_fingerprint.bytes.get_mut(..end), fp_bytes.get(..end)) {
-            dst.copy_from_slice(src);
-            snapshot.legacy_fingerprint.len = fp_len.min(8);
-            snapshot.flags = AnalysisFlags(snapshot.flags.0 | AnalysisFlags::LEGACY_FP_AVAILABLE);
-        }
+#[must_use]
+pub fn detect_sqli(input: &[u8]) -> SqliDetection {
+    let (detected, bytes, len) = sqli::legacy::detect_with_fingerprint(input);
+    if !detected {
+        return SqliDetection::default();
     }
-    hit
+
+    let mut fingerprint = LegacyFingerprint::default();
+    let len = usize::from(len).min(bytes.len()).min(fingerprint.bytes.len());
+    if let (Some(dst), Some(src)) = (fingerprint.bytes.get_mut(..len), bytes.get(..len)) {
+        dst.copy_from_slice(src);
+    }
+    fingerprint.len = u8::try_from(len).unwrap_or(0);
+    SqliDetection { detected, fingerprint }
+}
+
+/// Detect XSS using the pinned libinjection-compatible algorithm.
+///
+/// Scans the complete supplied byte slice in all five legacy HTML contexts.
+#[cfg(feature = "legacy")]
+#[must_use]
+pub fn detect_xss(input: &[u8]) -> bool {
+    xss::legacy::detect(input)
+}
+
+/// Add input-budget status and refresh the hint when analysis was partial.
+fn finish_bounded_snapshot(
+    mut snapshot: AnalysisSnapshot,
+    truncated: bool,
+    detect_mask: ConstructFlags,
+) -> AnalysisSnapshot {
+    if truncated {
+        snapshot.flags.0 |= AnalysisFlags::TRUNCATED;
+        snapshot.verdict_hint = engine::verdict::verdict_hint(snapshot.constructs, snapshot.flags, detect_mask);
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -195,159 +119,169 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_input_is_benign() {
-        let sqli = detect_sqli(b"");
-        assert!(!sqli.detected);
-        assert_eq!(sqli.snapshot.verdict_hint, VerdictHint::Benign);
-
-        let xss = detect_xss(b"");
-        assert!(!xss.detected);
-        assert_eq!(xss.snapshot.verdict_hint, VerdictHint::Benign);
-    }
-
-    #[test]
-    fn detect_sqli_detects_classic_injection() {
-        assert!(detect_sqli(b"1' OR '1'='1").detected);
-    }
-
-    #[test]
-    fn detect_xss_flags_deny_script() {
-        assert!(detect_xss(b"<script>alert(1)</script>").detected);
-    }
-
-    #[test]
-    fn analyze_sqli_populates_constructs() {
-        let snap = analyze_sqli(b"1' UNION SELECT null--");
-        assert!(snap.constructs.any_sqli());
-        assert!(!snap.flags.contains(AnalysisFlags::PREFILTER_MISS));
-    }
-
-    #[test]
-    fn analyze_xss_populates_constructs() {
-        let snap = analyze_xss(b"<script>alert(1)</script>");
-        assert!(snap.constructs.any_xss());
-    }
-
-    #[test]
-    fn analyze_returns_copy_snapshot() {
-        let a = analyze_sqli(b"hello");
-        let b = a;
-        assert_eq!(a, b);
-        assert!(!a.constructs.any_sqli());
-    }
-
-    #[test]
-    fn analyze_options_default_matches_limit() {
-        let opts = AnalyzeOptions::default();
-        assert_eq!(opts.max_input_len, DEFAULT_MAX_INPUT_LEN);
-        assert_eq!(opts.effective_max_input_len(), DEFAULT_MAX_INPUT_LEN);
-        assert_eq!(opts.truncation_policy, TruncationPolicy::FailClosed);
-    }
-
-    #[test]
-    fn analyze_sqli_requires_explicit_truncation_opt_in() {
-        let input = [b'a'; DEFAULT_MAX_INPUT_LEN + 1];
-        let fail_closed = analyze_sqli_with(&input, AnalyzeOptions::default());
-        assert_eq!(fail_closed.verdict_hint, VerdictHint::Decisive);
-        assert!(fail_closed.flags.contains(AnalysisFlags::TRUNCATED));
-
-        let allow_truncation = analyze_sqli_with(&input, AnalyzeOptions::default().allow_truncation());
-        assert_eq!(allow_truncation.verdict_hint, VerdictHint::Inconclusive);
-        assert!(allow_truncation.flags.contains(AnalysisFlags::TRUNCATED));
-    }
-
-    #[test]
-    fn analyze_xss_requires_explicit_truncation_opt_in() {
-        let input = [b'a'; DEFAULT_MAX_INPUT_LEN + 1];
-        let fail_closed = analyze_xss_with(&input, AnalyzeOptions::default());
-        assert_eq!(fail_closed.verdict_hint, VerdictHint::Decisive);
-        assert!(fail_closed.flags.contains(AnalysisFlags::TRUNCATED));
-
-        let allow_truncation = analyze_xss_with(&input, AnalyzeOptions::default().allow_truncation());
-        assert_eq!(allow_truncation.verdict_hint, VerdictHint::Inconclusive);
-        assert!(allow_truncation.flags.contains(AnalysisFlags::TRUNCATED));
-    }
-
-    #[test]
-    fn detect_sqli_fails_closed_without_truncation_opt_in() {
-        let long = [b'a'; DEFAULT_MAX_INPUT_LEN + 100];
-        let opts = AnalyzeOptions::default();
-        let verdict = detect_sqli_with(&long, opts);
-        assert!(verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Decisive);
-    }
-
-    #[test]
-    fn detect_sqli_allows_explicit_truncation_opt_in() {
-        let long = [b'a'; DEFAULT_MAX_INPUT_LEN + 100];
-        let verdict = detect_sqli_with(&long, AnalyzeOptions::default().allow_truncation());
-        assert!(!verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Inconclusive);
+    fn empty_analysis_is_benign() {
+        assert_eq!(analyze_sqli(b"").verdict_hint, VerdictHint::Benign);
+        assert_eq!(analyze_xss(b"").verdict_hint, VerdictHint::Benign);
     }
 
     #[cfg(feature = "legacy")]
     #[test]
-    fn detect_sqli_finds_attack_after_scan_budget_with_legacy_fallback() {
-        const ATTACK: &[u8] = b"' OR '1'='1";
-        let mut input = [b'a'; DEFAULT_MAX_INPUT_LEN + ATTACK.len()];
-        input[DEFAULT_MAX_INPUT_LEN..].copy_from_slice(ATTACK);
-        let verdict = detect_sqli_with(&input, AnalyzeOptions::default());
-        assert!(verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-    }
+    fn canonical_detection_matches_compatibility_examples() {
+        let sqli = detect_sqli(b"1' OR '1'='1");
+        assert!(sqli.detected);
+        assert_eq!(sqli.fingerprint.as_str(), Some("s&sos"));
 
-    #[cfg(not(feature = "legacy"))]
-    #[test]
-    fn detect_sqli_fails_closed_without_legacy_fallback() {
-        const ATTACK: &[u8] = b"' OR '1'='1";
-        let mut input = [b'a'; DEFAULT_MAX_INPUT_LEN + ATTACK.len()];
-        input[DEFAULT_MAX_INPUT_LEN..].copy_from_slice(ATTACK);
-        let verdict = detect_sqli_with(&input, AnalyzeOptions::default());
-        assert!(verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Decisive);
-    }
-
-    #[cfg(not(feature = "legacy"))]
-    #[test]
-    fn detect_sqli_allows_truncation_without_legacy_fallback() {
-        const ATTACK: &[u8] = b"' OR '1'='1";
-        let mut input = [b'a'; DEFAULT_MAX_INPUT_LEN + ATTACK.len()];
-        input[DEFAULT_MAX_INPUT_LEN..].copy_from_slice(ATTACK);
-        let verdict = detect_sqli_with(&input, AnalyzeOptions::default().allow_truncation());
-        assert!(!verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Inconclusive);
+        assert!(detect_xss(b"<script>alert(1)</script>"));
     }
 
     #[test]
-    fn detect_xss_fails_closed_without_truncation_opt_in() {
-        let long = [b'a'; DEFAULT_MAX_INPUT_LEN + 100];
+    fn bounded_options_default_and_explicit_budgets_are_preserved() {
         let opts = AnalyzeOptions::default();
-        let verdict = detect_xss_with(&long, opts);
-        assert!(verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Decisive);
+        assert_eq!(opts.max_input_len, DEFAULT_MAX_INPUT_LEN);
+        assert_eq!(opts.effective_max_input_len(), DEFAULT_MAX_INPUT_LEN);
+
+        let opts = AnalyzeOptions::with_max_input_len(usize::MAX);
+        assert_eq!(opts.effective_max_input_len(), usize::MAX);
     }
 
     #[test]
-    fn detect_xss_allows_explicit_truncation_opt_in() {
-        let long = [b'a'; DEFAULT_MAX_INPUT_LEN + 100];
-        let verdict = detect_xss_with(&long, AnalyzeOptions::default().allow_truncation());
-        assert!(!verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
-        assert_eq!(verdict.snapshot.verdict_hint, VerdictHint::Inconclusive);
+    fn truncated_prefilter_miss_is_inconclusive() {
+        let snapshot = analyze_sqli_with(b"benign prefix with SQL after", AnalyzeOptions::with_max_input_len(6));
+        assert!(snapshot.flags.contains(AnalysisFlags::TRUNCATED));
+        assert!(snapshot.flags.contains(AnalysisFlags::PREFILTER_MISS));
+        assert_eq!(snapshot.verdict_hint, VerdictHint::Inconclusive);
     }
 
     #[test]
-    fn detect_xss_finds_attack_after_scan_budget_with_legacy_fallback() {
-        const ATTACK: &[u8] = b"<script>alert(1)";
-        let mut input = [b'a'; DEFAULT_MAX_INPUT_LEN + ATTACK.len()];
-        input[DEFAULT_MAX_INPUT_LEN..].copy_from_slice(ATTACK);
-        let verdict = detect_xss_with(&input, AnalyzeOptions::default());
-        assert!(verdict.detected);
-        assert!(verdict.snapshot.flags.contains(AnalysisFlags::TRUNCATED));
+    fn complete_prefilter_skips_are_inconclusive_for_both_analyzers() {
+        let sqli = analyze_sqli(b"ordinary request text");
+        assert!(sqli.flags.contains(AnalysisFlags::PREFILTER_MISS));
+        assert_eq!(sqli.verdict_hint, VerdictHint::Inconclusive);
+
+        let xss = analyze_xss(b"ordinary request text");
+        assert!(xss.flags.contains(AnalysisFlags::PREFILTER_MISS));
+        assert_eq!(xss.verdict_hint, VerdictHint::Inconclusive);
+    }
+
+    #[test]
+    fn observed_decisive_construct_survives_partial_analysis_hint() {
+        let input = b"<script>omitted suffix";
+        let snapshot = analyze_xss_with(input, AnalyzeOptions::with_max_input_len(8));
+        assert!(snapshot.flags.contains(AnalysisFlags::TRUNCATED));
+        assert!(
+            snapshot
+                .constructs
+                .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT))
+        );
+        assert_eq!(snapshot.verdict_hint, VerdictHint::Decisive);
+    }
+
+    #[test]
+    fn evidence_reports_distinct_original_ranges() {
+        let snapshot = analyze_sqli(b"union union union union union");
+        assert_eq!(snapshot.evidence.spans.len(), 5);
+        assert!(
+            snapshot
+                .evidence
+                .spans
+                .iter()
+                .all(|span| span.offset + span.len <= b"union union union union union".len())
+        );
+    }
+
+    #[test]
+    fn encoded_sql_evidence_keeps_all_original_spans_and_decisive_hint() {
+        let input = b"= %75nion %75nion %75nion %75nion %75nion";
+        assert_eq!(
+            engine::normalize::original_span_for_normalized(input, 2, 5),
+            Some((2, 7))
+        );
+        let snapshot = analyze_sqli(input);
+
+        assert!(
+            snapshot
+                .constructs
+                .intersects(ConstructFlags(ConstructFlags::SQL_UNION))
+        );
+        assert_eq!(snapshot.evidence.spans.len(), 5);
+        assert_eq!(snapshot.verdict_hint, VerdictHint::Decisive);
+
+        let expected_offsets = [2, 10, 18, 26, 34];
+        for (span, expected_offset) in snapshot.evidence.spans.iter().zip(expected_offsets) {
+            assert_eq!(span.offset, expected_offset);
+            assert_eq!(span.len, b"%75nion".len(), "span={span:?}, input={input:?}");
+            assert_eq!(
+                input.get(expected_offset..expected_offset + span.len),
+                Some(&b"%75nion"[..]),
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_xss_evidence_keeps_all_original_spans_and_decisive_hint() {
+        let input = b"%3Cscript %3Cscript %3Cscript %3Cscript %3Cscript";
+        assert_eq!(
+            engine::normalize::original_span_for_normalized(input, 8, 7),
+            Some((10, 9))
+        );
+        let snapshot = analyze_xss(input);
+
+        assert!(
+            snapshot
+                .constructs
+                .intersects(ConstructFlags(ConstructFlags::XSS_TAG_SCRIPT))
+        );
+        assert_eq!(snapshot.evidence.spans.len(), 5);
+        assert_eq!(snapshot.verdict_hint, VerdictHint::Decisive);
+
+        let expected_offsets = [0, 10, 20, 30, 40];
+        for (span, expected_offset) in snapshot.evidence.spans.iter().zip(expected_offsets) {
+            assert_eq!(span.offset, expected_offset);
+            assert_eq!(span.len, b"%3Cscript".len(), "span={span:?}, input={input:?}");
+            assert_eq!(
+                input.get(expected_offset..expected_offset + span.len),
+                Some(&b"%3Cscript"[..]),
+            );
+        }
+    }
+
+    #[test]
+    fn long_token_stream_does_not_truncate_analysis_storage() {
+        let snapshot = analyze_sqli(b"1=1 1=1 1=1 1=1 1=1");
+        assert!(!snapshot.flags.contains(AnalysisFlags::TRUNCATED));
+    }
+
+    #[test]
+    fn evidence_beyond_u16_boundary_indexes_the_original_input() {
+        let mut input = [b'x'; 65_535];
+        let marker = b"<script>";
+        let start = input.len() - marker.len();
+        assert!(input.get_mut(start..).is_some_and(|dst| {
+            dst.copy_from_slice(marker);
+            true
+        }));
+
+        let snapshot = analyze_xss_with(&input, AnalyzeOptions::with_max_input_len(usize::MAX));
+        assert!(!snapshot.flags.contains(AnalysisFlags::TRUNCATED));
+        let span = snapshot.evidence.spans.first().copied().unwrap_or_default();
+        assert_eq!(span.offset, start);
+        assert_eq!(span.len, marker.len() - 1);
+        assert!(span.offset + span.len <= input.len());
+    }
+
+    #[test]
+    fn scan_budget_boundaries_report_only_real_prefix_truncation() {
+        for len in [
+            DEFAULT_MAX_INPUT_LEN - 1,
+            DEFAULT_MAX_INPUT_LEN,
+            DEFAULT_MAX_INPUT_LEN + 1,
+        ] {
+            let input = [b'x'; DEFAULT_MAX_INPUT_LEN + 1];
+            let snapshot = analyze_sqli_with(input.get(..len).unwrap_or_default(), AnalyzeOptions::default());
+            assert_eq!(
+                snapshot.flags.contains(AnalysisFlags::TRUNCATED),
+                len > DEFAULT_MAX_INPUT_LEN
+            );
+        }
     }
 }

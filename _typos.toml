@@ -1,6 +1,11 @@
 [files]
 extend-exclude = ["libinjection-rs/data/sqli_keywords.txt"]
 
+[default]
+extend-ignore-re = [
+    '<XML ID="xss"><I><B>&lt;IMG SRC="javas<!-- -->cript:javascript:alert\(1\)"&gt;</B></I></XML><SPAN DATASRC="#xss" DATAFLD="B" DATAFORMATAS="HTML"></SPAN>',
+]
+
 [default.extend-words]
 # Libinjection fingerprint marker and browser event name.
 UE = "UE"
