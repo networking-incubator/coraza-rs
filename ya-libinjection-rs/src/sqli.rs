@@ -11,7 +11,8 @@ use core::cmp::Ordering;
 use core::fmt;
 
 use self::keywords::{cstrcasecmp, lookup_word};
-use self::lexer::{Dialect, Lexer, Quote};
+pub use self::lexer::Dialect;
+use self::lexer::{Lexer, Quote};
 use self::token::{Token, TokenType};
 use crate::bytes::find_slice;
 
@@ -289,39 +290,46 @@ impl<'a> State<'a> {
     }
 
     /// [`check`](Self::check), then once more as MySQL if that could differ.
-    fn check_ansi_then_mysql(&mut self, quote: Quote) -> Option<Fingerprint> {
+    /// Returns the fingerprint and the dialect it was found in.
+    fn check_ansi_then_mysql_dialect(&mut self, quote: Quote) -> Option<(Fingerprint, Dialect)> {
         if let Some(fingerprint) = self.check(quote, Dialect::Ansi) {
-            return Some(fingerprint);
+            return Some((fingerprint, Dialect::Ansi));
         }
         if self.reparse_as_mysql() {
-            return self.check(quote, Dialect::Mysql);
+            return self.check(quote, Dialect::Mysql).map(|fp| (fp, Dialect::Mysql));
         }
         None
     }
 }
 
 pub(crate) fn detect(input: &[u8]) -> Option<Fingerprint> {
+    detect_with_dialect(input).map(|(fp, _)| fp)
+}
+
+pub(crate) fn detect_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)> {
     if input.is_empty() {
         return None;
     }
     let mut state = State::new(input, Quote::None, Dialect::Ansi);
 
     // The input as-is.
-    if let Some(fingerprint) = state.check_ansi_then_mysql(Quote::None) {
-        return Some(fingerprint);
+    if let Some(result) = state.check_ansi_then_mysql_dialect(Quote::None) {
+        return Some(result);
     }
 
     // If the input has a single quote, test it as if it sat inside a
     // single-quoted string: "1' = 1" is read as "'1' = 1".
     if input.contains(&b'\'')
-        && let Some(fingerprint) = state.check_ansi_then_mysql(Quote::Single)
+        && let Some(result) = state.check_ansi_then_mysql_dialect(Quote::Single)
     {
-        return Some(fingerprint);
+        return Some(result);
     }
 
     // The same with a double quote, which only MySQL uses for strings.
     if input.contains(&b'"') {
-        return state.check(Quote::Double, Dialect::Mysql);
+        return state
+            .check(Quote::Double, Dialect::Mysql)
+            .map(|fp| (fp, Dialect::Mysql));
     }
 
     None

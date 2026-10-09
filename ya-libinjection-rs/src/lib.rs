@@ -33,7 +33,7 @@ mod html5;
 mod sqli;
 mod xss;
 
-pub use sqli::Fingerprint;
+pub use sqli::{Dialect, Fingerprint};
 
 /// Implementation details, for this crate's own tests and their differential
 /// oracle. Not part of the API: anything in here can change in any release.
@@ -66,6 +66,12 @@ pub mod internals {
 #[must_use]
 pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
     sqli::detect(input)
+}
+
+/// Like [`sqli`], but also returns which [`Dialect`] the match was found in.
+#[must_use]
+pub fn sqli_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)> {
+    sqli::detect_with_dialect(input)
 }
 
 /// Checks `input` for SQL injection, scanning at most `max_bytes`.
