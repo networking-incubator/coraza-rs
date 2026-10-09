@@ -28,10 +28,29 @@ mod html5;
 mod sqli;
 mod xss;
 
-#[cfg(test)]
-mod corpus;
-
 pub use sqli::Fingerprint;
+
+/// Implementation details, for this crate's own tests and their differential
+/// oracle. Not part of the API: anything in here can change in any release.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod internals {
+    pub mod html5 {
+        pub use crate::html5::{Context, Token, TokenKind, Tokenizer};
+    }
+
+    pub mod sqli {
+        pub use crate::sqli::State;
+        pub use crate::sqli::keyword_table::SQL_KEYWORDS;
+        pub use crate::sqli::lexer::{Dialect, Lexer, Parser, Quote, Stats};
+        pub use crate::sqli::token::{Token, TokenType};
+    }
+
+    pub mod xss {
+        pub use crate::xss::events::BLACK_ATTR_EVENTS;
+        pub use crate::xss::{Attribute, BLACK_ATTRS, BLACK_TAGS, is_xss};
+    }
+}
 
 /// Checks `input` for SQL injection.
 ///

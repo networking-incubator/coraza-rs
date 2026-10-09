@@ -7,7 +7,7 @@ use crate::bytes::{byte_set, cspan, find_byte, find_pair, find_slice, span};
 
 /// How the input is assumed to sit inside the surrounding SQL statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Quote {
+pub enum Quote {
     /// The input is taken as-is.
     None,
     /// The input continues a string opened with `'` before it.
@@ -27,24 +27,24 @@ impl Quote {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Dialect {
+pub enum Dialect {
     Ansi,
     Mysql,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Stats {
+pub struct Stats {
     /// `--x` comments: a comment in ANSI SQL, two unary operators in MySQL.
-    pub(crate) comment_ddx: usize,
+    pub comment_ddx: usize,
     /// `#`: an operator in ANSI SQL, an end-of-line comment in MySQL.
-    pub(crate) comment_hash: usize,
+    pub comment_hash: usize,
     /// Tokens produced, before any folding.
-    pub(crate) tokens: usize,
+    pub tokens: usize,
 }
 
 /// The scanner a token's first byte selects (upstream's `char_parse_map`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Parser {
+pub enum Parser {
     White,
     Operator1,
     Operator2,
@@ -71,7 +71,7 @@ pub(crate) enum Parser {
 }
 
 impl Parser {
-    pub(crate) const fn for_byte(ch: u8) -> Self {
+    pub const fn for_byte(ch: u8) -> Self {
         match ch {
             0..=32 | 127 | 0xA0 => Parser::White,
             b'!' | b'&' | b'*' | b':' | b'<' | b'=' | b'>' | b'|' => Parser::Operator2,
@@ -154,16 +154,16 @@ fn parse_string_core(s: &[u8], pos: usize, st: &mut Token, delim: u8, offset: us
     }
 }
 
-pub(crate) struct Lexer<'a> {
+pub struct Lexer<'a> {
     s: &'a [u8],
     pos: usize,
     quote: Quote,
     dialect: Dialect,
-    pub(crate) stats: Stats,
+    pub stats: Stats,
 }
 
 impl<'a> Lexer<'a> {
-    pub(crate) fn new(s: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
+    pub fn new(s: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
         Self {
             s,
             pos: 0,
@@ -686,31 +686,5 @@ impl Iterator for Lexer<'_> {
             }
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dispatch_matches_upstream() {
-        let source = crate::corpus::upstream_source("src/libinjection_sqli_data.h");
-        let body = crate::corpus::c_array_body(&source, "char_parse_map[] = {");
-        // Each entry reads `&parse_white,`, in byte order.
-        let upstream: Vec<&str> = body
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("&parse_")?.strip_suffix(','))
-            .collect();
-        assert_eq!(upstream.len(), 256);
-
-        for (byte, name) in (0..=u8::MAX).zip(upstream) {
-            let parser = Parser::for_byte(byte);
-            if let Parser::Char(ty) = parser {
-                assert_eq!((name, ty.as_byte()), ("char", byte));
-            } else {
-                assert_eq!(format!("{parser:?}").to_lowercase(), name, "byte {byte}");
-            }
-        }
     }
 }

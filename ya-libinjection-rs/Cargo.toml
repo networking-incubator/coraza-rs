@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[features]
+# Exposes implementation details to this crate's own tests. Not part of the
+# API: anything behind it can change in any release.
+internals = []
+
+[dev-dependencies]
+# Turns `internals` on for the tests, and only for them.
+libinjection-rs = { path = ".", features = ["internals"] }

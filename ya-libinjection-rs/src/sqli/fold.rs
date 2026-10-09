@@ -118,7 +118,7 @@ impl State<'_> {
         clippy::if_same_then_else,
         reason = "one branch per upstream rule, in upstream's order"
     )]
-    pub(crate) fn fold(&mut self) -> usize {
+    pub fn fold(&mut self) -> usize {
         let mut last_comment = Token::default();
         // Where the next token goes.
         let mut pos = 0;

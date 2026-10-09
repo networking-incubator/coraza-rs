@@ -7,7 +7,7 @@
 use crate::bytes::find_byte;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TokenKind {
+pub enum TokenKind {
     DataText,
     TagNameOpen,
     TagNameClose,
@@ -20,14 +20,14 @@ pub(crate) enum TokenKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Token<'a> {
-    pub(crate) kind: TokenKind,
-    pub(crate) text: &'a [u8],
+pub struct Token<'a> {
+    pub kind: TokenKind,
+    pub text: &'a [u8],
 }
 
 /// Where in a document the input is assumed to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Context {
+pub enum Context {
     /// Between tags.
     Data,
     /// Inside a tag, in an unquoted attribute value.
@@ -62,7 +62,7 @@ fn is_white(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | 0)
 }
 
-pub(crate) struct Tokenizer<'a> {
+pub struct Tokenizer<'a> {
     s: &'a [u8],
     pos: usize,
     /// Set by `</`, so the tag name that follows is a closing one.
@@ -71,7 +71,7 @@ pub(crate) struct Tokenizer<'a> {
 }
 
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn new(s: &'a [u8], context: Context) -> Self {
+    pub fn new(s: &'a [u8], context: Context) -> Self {
         let state = match context {
             Context::Data => State::Data,
             Context::ValueNoQuote => State::BeforeAttributeName,

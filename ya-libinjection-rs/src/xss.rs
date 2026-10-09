@@ -2,14 +2,14 @@
 //! the contexts it could be injected into, and look for tags, attributes
 //! and URLs that can run script.
 
-mod events;
+pub(crate) mod events;
 
 use self::events::BLACK_ATTR_EVENTS;
 use crate::html5::{Context, TokenKind, Tokenizer};
 
 /// Why an attribute is of interest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Attribute {
+pub enum Attribute {
     /// Always banned.
     Black,
     /// Its value is a URL-like object.
@@ -19,7 +19,7 @@ pub(crate) enum Attribute {
     Indirect,
 }
 
-pub(crate) const BLACK_ATTRS: [(&str, Attribute); 20] = [
+pub const BLACK_ATTRS: [(&str, Attribute); 20] = [
     ("ACTION", Attribute::Url),             // form
     ("ATTRIBUTENAME", Attribute::Indirect), // SVG allows indirection of attribute names
     ("BY", Attribute::Url),                 // SVG
@@ -42,7 +42,7 @@ pub(crate) const BLACK_ATTRS: [(&str, Attribute); 20] = [
     ("XLINK:HREF", Attribute::Url),
 ];
 
-pub(crate) const BLACK_TAGS: [&str; 20] = [
+pub const BLACK_TAGS: [&str; 20] = [
     "APPLET", "BASE", "COMMENT", // IE, http://html5sec.org/#38
     "EMBED", "FRAME", "FRAMESET", "HANDLER", // Opera SVG, effectively a script tag
     "IFRAME", "IMPORT", "ISINDEX", "LINK", "LISTENER", "META", "NOSCRIPT", "OBJECT", "SCRIPT",
@@ -197,7 +197,7 @@ fn is_black_url(url: &[u8]) -> bool {
         .any(|scheme| htmlencode_startswith(scheme, url))
 }
 
-fn is_xss(input: &[u8], context: Context) -> bool {
+pub fn is_xss(input: &[u8], context: Context) -> bool {
     let mut attr = None;
     for token in Tokenizer::new(input, context) {
         let text = token.text;
@@ -271,50 +271,6 @@ pub(crate) fn detect(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The quoted strings of a C array body, each with the text that
-    /// follows it up to the next string.
-    fn c_strings(body: &str) -> Vec<(&str, &str)> {
-        body.split('"')
-            .skip(1)
-            .collect::<Vec<_>>()
-            .chunks(2)
-            .map(|pair| (pair[0], pair[1]))
-            .collect()
-    }
-
-    #[test]
-    fn tables_match_upstream() {
-        let source = crate::corpus::upstream_source("src/libinjection_xss.c");
-
-        let body = crate::corpus::c_array_body(&source, "BLACKATTREVENT[] = {");
-        let events: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
-        assert!(
-            BLACK_ATTR_EVENTS[..] == events[..],
-            "event table is out of date"
-        );
-
-        let body = crate::corpus::c_array_body(&source, " BLACKATTR[] = {");
-        let attrs: Vec<(&str, Attribute)> = c_strings(&body)
-            .into_iter()
-            .map(|(name, rest)| {
-                let ty = rest.trim_matches(|c: char| !c.is_ascii_alphabetic() && c != '_');
-                let attribute = match ty.split('}').next().unwrap().trim() {
-                    "TYPE_BLACK" => Attribute::Black,
-                    "TYPE_ATTR_URL" => Attribute::Url,
-                    "TYPE_STYLE" => Attribute::Style,
-                    "TYPE_ATTR_INDIRECT" => Attribute::Indirect,
-                    other => panic!("unknown attribute type {other}"),
-                };
-                (name, attribute)
-            })
-            .collect();
-        assert_eq!(BLACK_ATTRS[..], attrs[..]);
-
-        let body = crate::corpus::c_array_body(&source, "BLACKTAG[] = {");
-        let tags: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
-        assert_eq!(BLACK_TAGS[..], tags[..]);
-    }
 
     #[test]
     fn decodes_numeric_entities() {

@@ -2,7 +2,7 @@
 //! fingerprint against the known-bad list.
 
 mod fold;
-mod keyword_table;
+pub(crate) mod keyword_table;
 mod keywords;
 pub(crate) mod lexer;
 pub(crate) mod token;
@@ -100,17 +100,17 @@ impl PartialEq<&str> for Fingerprint {
     }
 }
 
-pub(crate) struct State<'a> {
+pub struct State<'a> {
     input: &'a [u8],
     lexer: Lexer<'a>,
     /// One more slot than a fingerprint needs, since a sixth token is
     /// sometimes read to decide the type of the fifth.
-    pub(crate) tokens: [Token; 8],
+    pub tokens: [Token; 8],
     fingerprint: Fingerprint,
 }
 
 impl<'a> State<'a> {
-    pub(crate) fn new(input: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
+    pub fn new(input: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
         Self {
             input,
             lexer: Lexer::new(input, quote, dialect),
@@ -120,7 +120,7 @@ impl<'a> State<'a> {
     }
 
     /// Fingerprints the input in the given context.
-    fn fingerprint(&mut self, quote: Quote, dialect: Dialect) -> Fingerprint {
+    pub fn fingerprint(&mut self, quote: Quote, dialect: Dialect) -> Fingerprint {
         *self = Self::new(self.input, quote, dialect);
         let tlen = self.fold();
 
@@ -273,7 +273,13 @@ impl<'a> State<'a> {
     /// fingerprint if it is SQLi there.
     fn check(&mut self, quote: Quote, dialect: Dialect) -> Option<Fingerprint> {
         let fingerprint = self.fingerprint(quote, dialect);
-        (self.blacklist() && self.not_whitelist()).then_some(fingerprint)
+        self.check_fingerprint().then_some(fingerprint)
+    }
+
+    /// Whether the fingerprint last taken is SQLi: a known pattern that the
+    /// false-positive checks let through.
+    pub fn check_fingerprint(&self) -> bool {
+        self.blacklist() && self.not_whitelist()
     }
 
     /// Whether the last pass met syntax that MySQL reads differently.

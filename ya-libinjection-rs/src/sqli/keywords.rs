@@ -61,27 +61,6 @@ mod tests {
     }
 
     #[test]
-    fn table_matches_upstream() {
-        let source = crate::corpus::upstream_source("src/libinjection_sqli_data.h");
-        let body = crate::corpus::c_array_body(&source, "sql_keywords[] = {");
-        // Each entry reads `{"WORD", 't'},`.
-        let upstream: Vec<(&str, u8)> = body
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("{\"")?.strip_suffix("'},"))
-            .map(|entry| {
-                let (word, ty) = entry.rsplit_once("\", '").unwrap();
-                (word, ty.as_bytes()[0])
-            })
-            .collect();
-
-        let table: Vec<(&str, u8)> = SQL_KEYWORDS
-            .iter()
-            .map(|&(word, ty)| (word, ty.as_byte()))
-            .collect();
-        assert!(table == upstream, "keyword table is out of date");
-    }
-
-    #[test]
     fn misses() {
         assert_eq!(lookup_word(b""), None);
         assert_eq!(lookup_word(b"SELEC"), None);

@@ -4,7 +4,7 @@
 use super::token::TokenType as T;
 
 #[rustfmt::skip]
-pub(super) static SQL_KEYWORDS: [(&str, T); 9352] = [
+pub static SQL_KEYWORDS: [(&str, T); 9352] = [
     ("!!", T::Operator),
     ("!<", T::Operator),
     ("!=", T::Operator),

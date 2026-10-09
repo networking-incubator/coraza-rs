@@ -9,7 +9,7 @@ pub(crate) const TOKEN_SIZE: usize = 32;
 /// fingerprint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum TokenType {
+pub enum TokenType {
     /// A cleared token slot (upstream's `CHAR_NULL`). Folding works on a fixed
     /// array of slots, so "no token here" has to be representable.
     #[default]
@@ -47,24 +47,24 @@ pub(crate) enum TokenType {
 }
 
 impl TokenType {
-    pub(crate) const fn as_byte(self) -> u8 {
+    pub const fn as_byte(self) -> u8 {
         self as u8
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Token {
+pub struct Token {
     /// Offset of the token in the input.
-    pub(crate) pos: usize,
+    pub pos: usize,
     /// Length of the (possibly truncated) value.
-    pub(crate) len: usize,
+    pub len: usize,
     /// Number of leading `@` on a variable.
-    pub(crate) count: u8,
-    pub(crate) ty: TokenType,
+    pub count: u8,
+    pub ty: TokenType,
     /// Opening delimiter of a string, if it had one.
-    pub(crate) str_open: Option<u8>,
+    pub str_open: Option<u8>,
     /// Closing delimiter of a string, if it had one.
-    pub(crate) str_close: Option<u8>,
+    pub str_close: Option<u8>,
     val: [u8; TOKEN_SIZE],
 }
 
@@ -85,12 +85,12 @@ impl Token {
         self.assign(ty, pos, &[value]);
     }
 
-    pub(crate) fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         &self.val[..self.len]
     }
 
     /// The value as C string functions see it: cut at the first NUL.
-    pub(crate) fn c_str(&self) -> &[u8] {
+    pub fn c_str(&self) -> &[u8] {
         let value = self.value();
         let end = value.iter().position(|&b| b == 0).unwrap_or(value.len());
         &value[..end]

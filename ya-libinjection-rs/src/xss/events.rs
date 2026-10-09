@@ -3,7 +3,7 @@
 
 /// Event handler names, without their `on` prefix.
 #[rustfmt::skip]
-pub(super) static BLACK_ATTR_EVENTS: [&str; 432] = [
+pub static BLACK_ATTR_EVENTS: [&str; 432] = [
     "ABORT",
     "ACCESSKEYNOTFOUND",
     "ACTIVATE",
