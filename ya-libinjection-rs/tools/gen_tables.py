@@ -5,8 +5,8 @@
 
 Reads the copy vendored in tests/upstream unless given a checkout. Writes
 src/sqli/keyword_table.rs (from src/libinjection_sqli_data.h) and
-src/xss/events.rs (from src/libinjection_xss.c). Entry order is preserved:
-the keyword lookup is the same binary search upstream uses.
+src/xss/events.rs (from src/libinjection_xss.c). Entry order is preserved,
+so that the tables read like upstream's.
 """
 
 import pathlib

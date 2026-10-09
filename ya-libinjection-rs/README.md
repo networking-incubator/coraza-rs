@@ -50,13 +50,13 @@ nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC 16.2 at
 
 | Workload                    | Inputs | Average bytes | libinjection |   Port | Port / C |
 | --------------------------- | -----: | ------------: | -----------: | -----: | -------: |
-| sqli: upstream's speed test |      8 |            28 |        416.2 |  351.9 |    0.85x |
-| sqli: attack samples        | 85,802 |           141 |       1062.4 |  880.8 |    0.83x |
-| sqli: benign samples        |    423 |            34 |        596.8 |  497.3 |    0.83x |
-| xss: upstream's speed test  |     26 |            30 |        222.4 |  100.5 |    0.45x |
-| xss: attack samples         | 81,417 |            74 |        152.6 |   67.0 |    0.44x |
-| xss: sqli attack samples    | 85,802 |           141 |       1484.1 |  760.3 |    0.51x |
-| xss: benign samples         |    423 |            34 |        375.0 |  222.7 |    0.59x |
+| sqli: upstream's speed test |      8 |            28 |        422.5 |  212.3 |    0.50x |
+| sqli: attack samples        | 85,802 |           141 |       1059.4 |  583.5 |    0.55x |
+| sqli: benign samples        |    423 |            34 |        604.7 |  331.7 |    0.55x |
+| xss: upstream's speed test  |     26 |            30 |        222.1 |  102.0 |    0.46x |
+| xss: attack samples         | 81,417 |            74 |        157.2 |   65.4 |    0.42x |
+| xss: sqli attack samples    | 85,802 |           141 |       1495.6 |  734.2 |    0.49x |
+| xss: benign samples         |    423 |            34 |        371.3 |  208.4 |    0.56x |
 
 The two sides run one after the other and nothing is pinned to a core, so
 small differences are noise: rebuilding alone can move a time by a tenth.
