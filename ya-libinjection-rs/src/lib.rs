@@ -68,6 +68,14 @@ pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
     sqli::detect(input)
 }
 
+/// Checks `input` for SQL injection, scanning at most `max_bytes`.
+///
+/// Equivalent to `sqli(&input[..max_bytes.min(input.len())])`.
+#[must_use]
+pub fn sqli_with_limit(input: &[u8], max_bytes: usize) -> Option<Fingerprint> {
+    sqli::detect(&input[..max_bytes.min(input.len())])
+}
+
 /// Checks `input` for cross-site scripting.
 ///
 /// The input is tested as HTML, and as if it continued an attribute value,
@@ -76,4 +84,12 @@ pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
 #[must_use]
 pub fn xss(input: &[u8]) -> bool {
     xss::detect(input)
+}
+
+/// Checks `input` for cross-site scripting, scanning at most `max_bytes`.
+///
+/// Equivalent to `xss(&input[..max_bytes.min(input.len())])`.
+#[must_use]
+pub fn xss_with_limit(input: &[u8], max_bytes: usize) -> bool {
+    xss::detect(&input[..max_bytes.min(input.len())])
 }
