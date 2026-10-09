@@ -296,7 +296,9 @@ impl<'a> State<'a> {
             return Some((fingerprint, Dialect::Ansi));
         }
         if self.reparse_as_mysql() {
-            return self.check(quote, Dialect::Mysql).map(|fp| (fp, Dialect::Mysql));
+            return self
+                .check(quote, Dialect::Mysql)
+                .map(|fp| (fp, Dialect::Mysql));
         }
         None
     }
