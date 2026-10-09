@@ -18,7 +18,7 @@
 
 #[cfg(test)]
 mod tests {
-    use libinjection::{detect_sqli, detect_xss};
+    use libinjection::{Html5TokenKind, XssHtmlContext, detect_sqli, detect_xss, html5_visit};
 
     #[test]
     fn sql_compatibility_result_has_exact_fingerprint_only_on_hit() {
@@ -51,6 +51,27 @@ mod tests {
         let hex = detect_sqli(b" 0x1/*");
         assert!(hex.detected);
         assert_eq!(hex.fingerprint.as_str(), Some("1c"));
+    }
+
+    #[test]
+    fn sqli_detection_matches_go_literal_and_whitelist_boundaries() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"1 -- sp_password", true),
+            (b"1+1/*comment*/", true),
+            (b"1 /*comment*/", true),
+            (b"SELECT B0101", false),
+            (b"SELECT b", false),
+            (b"b'0x", false),
+            (b"Q'{hello}'", false),
+            (b"q'{hello}'", false),
+            (b"Q'<hello>'", true),
+            (b"q'<hello>'", true),
+            (b"Q'\x01hello'", false),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(detect_sqli(input).detected, *expected, "input={input:?}");
+        }
     }
 
     #[test]
@@ -93,6 +114,44 @@ mod tests {
 
         let long_svg = [b"<svg".as_slice(), &[b'x'; 64], b">"].concat();
         assert!(!detect_xss(&long_svg));
+    }
+
+    #[test]
+    fn html5_visitor_matches_go_boundary_tokens() {
+        fn assert_tokens(input: &[u8], expected: &[(Html5TokenKind, &[u8])]) {
+            let mut actual = Vec::new();
+            html5_visit(input, XssHtmlContext::Data, |kind, value| {
+                actual.push((kind, value.to_vec()));
+            });
+            let actual: Vec<_> = actual.iter().map(|(kind, value)| (*kind, value.as_slice())).collect();
+            assert_eq!(actual.as_slice(), expected, "input={input:?}");
+        }
+
+        use Html5TokenKind::{AttrName, DataText, TagComment, TagNameClose, TagNameOpen, TagNameSelfClose};
+
+        assert_tokens(b"<div ", &[(TagNameOpen, b"div")]);
+        assert_tokens(b"<div foo ", &[(TagNameOpen, b"div"), (AttrName, b"foo")]);
+        assert_tokens(
+            b"<div foo />",
+            &[(TagNameOpen, b"div"), (AttrName, b"foo"), (TagNameSelfClose, b"/>")],
+        );
+        assert_tokens(
+            b"<div foo >",
+            &[(TagNameOpen, b"div"), (AttrName, b"foo"), (TagNameClose, b">")],
+        );
+        assert_tokens(b"<div href= ", &[(TagNameOpen, b"div"), (AttrName, b"href")]);
+        assert_tokens(
+            b"<div / foo>",
+            &[(TagNameOpen, b"div"), (AttrName, b"foo"), (TagNameClose, b">")],
+        );
+        assert_tokens(b"<%a%b>", &[(TagComment, b"a%b>")]);
+        assert_tokens(b"<!---\0->", &[(TagComment, b"")]);
+        assert_tokens(b"<!---\0\0", &[(TagComment, b"-\0\0")]);
+        assert_tokens(b"<!---\0-", &[(TagComment, b"-\0-")]);
+        assert_tokens(b"</", &[]);
+        assert_tokens(b"</0abc>", &[(TagComment, b"0abc")]);
+        assert_tokens(b"<\0div>", &[(TagNameOpen, b"\0div"), (TagNameClose, b">")]);
+        assert_tokens(b"<1foo>", &[(DataText, b"<"), (DataText, b"1foo>")]);
     }
 
     #[test]

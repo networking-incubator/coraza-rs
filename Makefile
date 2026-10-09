@@ -31,6 +31,7 @@ clean:
 # -------------------------------------------------------------------
 
 test:
+	cargo xtask corpus-check
 	cargo test --workspace $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
@@ -57,9 +58,9 @@ audit:
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
-		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*'
+		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*|xtask/src/corpus\.rs'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
-		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*'
+		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*|xtask/src/corpus\.rs'
 
 fmt:
 	cargo +$(NIGHTLY) fmt --all
@@ -93,7 +94,7 @@ help:
 	@echo "  clean      cargo clean"
 	@echo ""
 	@echo "Test:"
-	@echo "  test       run all tests"
+	@echo "  test       verify corpus and run all tests"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"

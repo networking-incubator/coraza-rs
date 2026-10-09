@@ -6,22 +6,21 @@ libinjection material under BSD-3-Clause. The package SPDX expression is
 [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
 
 The legacy SQL injection and XSS engines and their static lookup data in this
-crate are translations or derivatives of Coraza's `libinjection-go` v0.3.3 at
-commit [`f6c336efc0ddac2597fd27d3b1b7db9c87613e8d`](https://github.com/corazawaf/libinjection-go/tree/f6c336efc0ddac2597fd27d3b1b7db9c87613e8d).
+crate are translations or derivatives of Coraza's
+[`libinjection-go`](https://github.com/corazawaf/libinjection-go). The corpus
+source module version and checksum are recorded in
+[`tests/parity/manifest.json`](tests/parity/manifest.json).
 The upstream license is reproduced in
-[`LICENSES/libinjection-go-BSD-3-Clause.txt`](LICENSES/libinjection-go-BSD-3-Clause.txt).
+[the Go license file](LICENSES/libinjection-go-BSD-3-Clause.txt).
 
 The translated engine descends from Nick Galbreath's original libinjection C
-implementation. Its BSD-3-Clause notice is preserved in
-[`LICENSES/libinjection-C-BSD-3-Clause.txt`](LICENSES/libinjection-C-BSD-3-Clause.txt),
-from the upstream [`COPYING`](https://github.com/client9/libinjection/blob/master/COPYING).
+implementation. Its BSD-3-Clause notice is preserved in the
+[C license file](LICENSES/libinjection-C-BSD-3-Clause.txt), from the upstream
+[`COPYING`](https://github.com/client9/libinjection/blob/master/COPYING).
 
-The migrated corpus fixtures came from that same revision's `tests/` directory.
-Their names and SHA-256 hashes are recorded in
-[`tests/parity/manifest.json`](tests/parity/manifest.json). The pinned SQL lookup
-table and XSS classifications are checked against the Go source by
-[`tools/parity/check_manifest.py`](tools/parity/check_manifest.py).
+Fixture hashes and SQL oracle input hashes are checked by
+`cargo xtask corpus-check`. Refresh them from the version pinned in
+`xtask/tools/go.mod` with `cargo xtask corpus-refresh`.
 
-The Go oracle is development-only. It is built from the pinned source into a
-temporary directory by [`tools/parity/go-oracle`](tools/parity/go-oracle); Go is
-not a Rust runtime or crate dependency.
+The Go oracle is used only by the development corpus refresh tool; it adds no
+runtime or Rust crate dependency.

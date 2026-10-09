@@ -24,6 +24,7 @@
     reason = "development tooling"
 )]
 
+mod corpus;
 mod lint_license;
 
 use clap::{Parser, Subcommand};
@@ -47,6 +48,10 @@ enum Command {
     /// Check that every tracked `.rs` file starts with the required
     /// copyright header.
     LintLicense(lint_license::Args),
+    /// Verify fixture hashes and the SQL oracle inputs.
+    CorpusCheck,
+    /// Refresh fixtures and the SQL oracle from the pinned Go module version.
+    CorpusRefresh,
 }
 
 // -----------------------------------------------------------------------------
@@ -58,5 +63,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::LintLicense(args) => lint_license::run(args),
+        Command::CorpusCheck => corpus::check_or_exit(),
+        Command::CorpusRefresh => corpus::refresh_or_exit(),
     }
 }
