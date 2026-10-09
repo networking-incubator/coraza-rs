@@ -1,0 +1,29 @@
+[package]
+name = "libperfusion"
+version = "0.1.0"
+edition = "2024"
+description = "A pure Rust port of libinjection, which detects SQL injection and cross-site scripting"
+license = "BSD-3-Clause"
+keywords = ["libinjection", "sqli", "xss", "sql-injection", "waf"]
+# The tests come with 28 MB of files vendored from libinjection, which the
+# benchmark runs on as well.
+exclude = ["/benches", "/tests"]
+
+[lib]
+# `cargo bench` is for benches/speed.rs, not for running the unit tests.
+bench = false
+
+[dependencies]
+
+[features]
+# Exposes implementation details to this crate's own tests. Not part of the
+# API: anything behind it can change in any release.
+internals = []
+
+[dev-dependencies]
+# Turns `internals` on for the tests, and only for them.
+libperfusion = { path = ".", features = ["internals"] }
+
+[[bench]]
+name = "speed"
+harness = false
