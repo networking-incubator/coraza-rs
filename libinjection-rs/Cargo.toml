@@ -44,4 +44,9 @@ name = "detection_api"
 path = "tests/detection_api.rs"
 required-features = ["legacy"]
 
+[[test]]
+name = "fuzz_regressions"
+path = "tests/fuzz_regressions.rs"
+required-features = ["legacy"]
+
 [dev-dependencies]

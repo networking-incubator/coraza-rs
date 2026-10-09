@@ -1,0 +1,35 @@
+[package]
+name = "libinjection-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+libinjection = { path = "..", features = ["legacy"] }
+
+[[bin]]
+name = "raw_bytes"
+path = "fuzz_targets/raw_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_grammar"
+path = "fuzz_targets/sql_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "html_grammar"
+path = "fuzz_targets/html_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
