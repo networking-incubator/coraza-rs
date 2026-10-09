@@ -42,20 +42,24 @@ tables in `src` that are derived from it.
 ## Performance
 
 `cargo bench` times the port next to the C library on the same inputs: those
-of upstream's two speed tests, and its sample corpora. Below is the time per
-input, in nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC
-16.2 at `-O3` and the port by Rust 1.99.
+of upstream's two speed tests, and its sample corpora. The SQL corpora go
+through the XSS detection as well, as inputs that are not XSS: those cost the
+most, since nothing ends the search early. Below is the time per input, in
+nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC 16.2 at
+`-O3` and the port by Rust 1.99.
 
 | Workload                    | Inputs | Average bytes | libinjection |   Port | Port / C |
 | --------------------------- | -----: | ------------: | -----------: | -----: | -------: |
-| sqli: upstream's speed test |      8 |            28 |        417.7 |  353.4 |    0.85x |
-| sqli: attack samples        | 85,802 |           141 |       1061.0 |  883.9 |    0.83x |
-| sqli: benign samples        |    423 |            34 |        597.7 |  502.4 |    0.84x |
-| xss: upstream's speed test  |     26 |            30 |        223.3 |  172.9 |    0.77x |
-| xss: attack samples         | 81,417 |            74 |        156.4 |  117.1 |    0.75x |
+| sqli: upstream's speed test |      8 |            28 |        416.2 |  351.9 |    0.85x |
+| sqli: attack samples        | 85,802 |           141 |       1062.4 |  880.8 |    0.83x |
+| sqli: benign samples        |    423 |            34 |        596.8 |  497.3 |    0.83x |
+| xss: upstream's speed test  |     26 |            30 |        222.4 |  100.5 |    0.45x |
+| xss: attack samples         | 81,417 |            74 |        152.6 |   67.0 |    0.44x |
+| xss: sqli attack samples    | 85,802 |           141 |       1484.1 |  760.3 |    0.51x |
+| xss: benign samples         |    423 |            34 |        375.0 |  222.7 |    0.59x |
 
 The two sides run one after the other and nothing is pinned to a core, so
-small differences are noise.
+small differences are noise: rebuilding alone can move a time by a tenth.
 
 ## Open issues and decisions
 

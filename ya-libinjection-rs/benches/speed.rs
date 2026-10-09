@@ -8,8 +8,10 @@
 //!
 //! The workloads are the inputs of upstream's two speed tests,
 //! `src/test_speed_sqli.c` and `src/test_speed_xss.c`, and its sample
-//! corpora. A time is that of the best of a second's worth of rounds over a
-//! workload, each calling the detection once per input.
+//! corpora, the SQL ones through the XSS detection as well: it has no
+//! samples of its own that are not attacks. A time is that of the best of a
+//! second's worth of rounds over a workload, each calling the detection once
+//! per input.
 //!
 //! This is for a feel of where the port stands, not for small differences:
 //! nothing is pinned to a core, and the two sides run one after the other.
@@ -213,6 +215,18 @@ fn main() {
             name: "xss: attack samples",
             detection: Detection::Xss,
             inputs: samples("xss"),
+        },
+        // What is not XSS is the expensive case: nothing stops the search
+        // before every context has been tried.
+        Workload {
+            name: "xss: sqli attack samples",
+            detection: Detection::Xss,
+            inputs: samples("sqli-"),
+        },
+        Workload {
+            name: "xss: benign samples",
+            detection: Detection::Xss,
+            inputs: samples("false_"),
         },
     ];
 

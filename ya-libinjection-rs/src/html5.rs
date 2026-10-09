@@ -4,7 +4,7 @@
 //!
 //! Kept state-for-state with upstream's `libinjection_html5.c`.
 
-use crate::bytes::find_byte;
+use crate::bytes::{byte_set, cspan, find_byte};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
@@ -56,6 +56,11 @@ enum State {
     AttributeValueQuoted(u8),
     AfterAttributeValueQuoted,
 }
+
+/// What ends an attribute name: whitespace (see [`is_white`]), '/', '=' or '>'.
+static ATTRIBUTE_NAME_END: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r/=>");
+/// What ends an unquoted attribute value: whitespace or '>'.
+static UNQUOTED_VALUE_END: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r>");
 
 /// Upstream's `h5_is_white`, a `strchr` that also matches NUL.
 fn is_white(ch: u8) -> bool {
@@ -263,29 +268,16 @@ impl<'a> Tokenizer<'a> {
     fn state_attribute_name(&mut self) -> Option<Token<'a>> {
         let s = self.s;
         let start = self.pos;
-        let mut pos = start + 1;
-        while pos < s.len() {
-            let ch = s[pos];
-            let (state, next_pos) = if is_white(ch) {
-                (State::AfterAttributeName, pos + 1)
-            } else if ch == b'/' {
-                (State::SelfClosingStartTag, pos + 1)
-            } else if ch == b'=' {
-                (State::BeforeAttributeValue, pos + 1)
-            } else if ch == b'>' {
-                (State::TagNameClose, pos)
-            } else {
-                pos += 1;
-                continue;
-            };
-            self.state = state;
-            self.pos = next_pos;
-            return Some(self.token(TokenKind::AttrName, start, pos - start));
-        }
-
-        self.state = State::Eof;
-        self.pos = s.len();
-        Some(self.token(TokenKind::AttrName, start, s.len() - start))
+        // The first byte is part of the name, whatever it is.
+        let end = start + 1 + cspan(&s[start + 1..], &ATTRIBUTE_NAME_END);
+        (self.state, self.pos) = match s.get(end) {
+            None => (State::Eof, end),
+            Some(b'/') => (State::SelfClosingStartTag, end + 1),
+            Some(b'=') => (State::BeforeAttributeValue, end + 1),
+            Some(b'>') => (State::TagNameClose, end),
+            Some(_) => (State::AfterAttributeName, end + 1),
+        };
+        Some(self.token(TokenKind::AttrName, start, end - start))
     }
 
     /// 12.2.4.36
@@ -342,23 +334,14 @@ impl<'a> Tokenizer<'a> {
     fn state_attribute_value_no_quote(&mut self) -> Option<Token<'a>> {
         let s = self.s;
         let start = self.pos;
-        let mut pos = start;
-        while pos < s.len() {
-            let ch = s[pos];
-            if is_white(ch) {
-                self.pos = pos + 1;
-                self.state = State::BeforeAttributeName;
-                return Some(self.token(TokenKind::AttrValue, start, pos - start));
-            } else if ch == b'>' {
-                self.pos = pos;
-                self.state = State::TagNameClose;
-                return Some(self.token(TokenKind::AttrValue, start, pos - start));
-            }
-            pos += 1;
-        }
-
-        self.state = State::Eof;
-        Some(self.token(TokenKind::AttrValue, start, s.len() - start))
+        let end = start + cspan(&s[start..], &UNQUOTED_VALUE_END);
+        (self.state, self.pos) = match s.get(end) {
+            // Unlike elsewhere, upstream leaves the position where it was.
+            None => (State::Eof, start),
+            Some(b'>') => (State::TagNameClose, end),
+            Some(_) => (State::BeforeAttributeName, end + 1),
+        };
+        Some(self.token(TokenKind::AttrValue, start, end - start))
     }
 
     /// 12.2.4.41

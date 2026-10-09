@@ -49,6 +49,23 @@ pub const BLACK_TAGS: [&str; 20] = [
     "STYLE", "VMLFRAME", "XML", "XSS",
 ];
 
+/// Where in [`BLACK_ATTR_EVENTS`] the events starting with each letter are:
+/// from the first of them to the last. The table has them together, but a
+/// stray event would only widen a span, to be ruled out by the comparison.
+static EVENT_SPANS: [(usize, usize); 26] = {
+    let mut spans = [(0, 0); 26];
+    let mut i = 0;
+    while i < BLACK_ATTR_EVENTS.len() {
+        let letter = (BLACK_ATTR_EVENTS[i].as_bytes()[0] - b'A') as usize;
+        if spans[letter].1 == 0 {
+            spans[letter].0 = i;
+        }
+        spans[letter].1 = i + 1;
+        i += 1;
+    }
+    spans
+};
+
 /// URL schemes that can run script. "JAVA" covers `java:` and `javascript:`.
 const BLACK_URL_SCHEMES: [&[u8]; 4] = [b"DATA", b"VIEW-SOURCE", b"JAVA", b"VBSCRIPT"];
 
@@ -140,13 +157,36 @@ fn htmlencode_startswith(mut prefix: &[u8], mut src: &[u8]) -> bool {
     prefix.is_empty()
 }
 
+/// Whether `name` could be `known` by [`eq_ignoring_nulls`], going by its
+/// first byte alone. That byte is the first to be compared, unless it is a
+/// NUL, which says nothing about the ones that follow.
+///
+/// Most of the time spent on input that is not XSS used to go to comparing
+/// every word of it with every name of the tables below.
+fn may_be(known: &str, name: &[u8]) -> bool {
+    let first = name[0];
+    first == 0 || first.to_ascii_uppercase() == known.as_bytes()[0]
+}
+
+/// The events that the rest of an `on...` attribute name could start with:
+/// those with its first letter. A name going on with anything else is none
+/// of them, a NUL included: it is dropped, but leaves the name too short.
+fn events_starting_like(rest: &[u8]) -> &'static [&'static str] {
+    let first = rest[0].to_ascii_uppercase();
+    if !first.is_ascii_uppercase() {
+        return &[];
+    }
+    let (start, end) = EVENT_SPANS[usize::from(first - b'A')];
+    &BLACK_ATTR_EVENTS[start..end]
+}
+
 fn is_black_tag(name: &[u8]) -> bool {
     if name.len() < 3 {
         return false;
     }
     BLACK_TAGS
         .iter()
-        .any(|tag| eq_ignoring_nulls(tag.as_bytes(), name))
+        .any(|tag| may_be(tag, name) && eq_ignoring_nulls(tag.as_bytes(), name))
         // Anything SVG or XSL(T) related.
         || name[..3].eq_ignore_ascii_case(b"svg")
         || name[..3].eq_ignore_ascii_case(b"xsl")
@@ -162,7 +202,7 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
         // start with a known event.
         if name[..2].eq_ignore_ascii_case(b"on") {
             let event = &name[2..];
-            let is_event = BLACK_ATTR_EVENTS.iter().any(|known| {
+            let is_event = events_starting_like(event).iter().any(|known| {
                 let len = event.len().min(known.len());
                 eq_ignoring_nulls(known.as_bytes(), &event[..len])
             });
@@ -179,7 +219,7 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
 
     BLACK_ATTRS
         .iter()
-        .find(|(known, _)| eq_ignoring_nulls(known.as_bytes(), name))
+        .find(|(known, _)| may_be(known, name) && eq_ignoring_nulls(known.as_bytes(), name))
         .map(|&(_, attribute)| attribute)
 }
 
@@ -271,6 +311,48 @@ pub(crate) fn detect(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_spans_hold_every_event() {
+        for (i, event) in BLACK_ATTR_EVENTS.iter().enumerate() {
+            let (start, end) = EVENT_SPANS[usize::from(event.as_bytes()[0] - b'A')];
+            assert!((start..end).contains(&i), "{event}");
+        }
+    }
+
+    #[test]
+    fn attribute_names() {
+        assert_eq!(black_attr(b"onclick"), Some(Attribute::Black));
+        // The name only has to start with an event, in any case.
+        assert_eq!(black_attr(b"OnClIcKx"), Some(Attribute::Black));
+        assert_eq!(black_attr(b"oncli"), None);
+        assert_eq!(black_attr(b"on1click"), None);
+        assert_eq!(black_attr(b"on\0click"), None);
+
+        assert_eq!(black_attr(b"href"), Some(Attribute::Url));
+        assert_eq!(black_attr(b"style"), Some(Attribute::Style));
+        assert_eq!(black_attr(b"attributeName"), Some(Attribute::Indirect));
+        assert_eq!(black_attr(b"xmlns:x"), Some(Attribute::Black));
+        // NULs are dropped, wherever they are.
+        assert_eq!(black_attr(b"h\0REF"), Some(Attribute::Url));
+        assert_eq!(black_attr(b"\0href"), Some(Attribute::Url));
+        assert_eq!(black_attr(b"hrefs"), None);
+        assert_eq!(black_attr(b"title"), None);
+        assert_eq!(black_attr(b"h"), None);
+    }
+
+    #[test]
+    fn tag_names() {
+        assert!(is_black_tag(b"script"));
+        assert!(is_black_tag(b"ScRiPt"));
+        assert!(is_black_tag(b"scr\0ipt"));
+        assert!(is_black_tag(b"\0script"));
+        assert!(is_black_tag(b"svgfoo"));
+        assert!(is_black_tag(b"xsl:template"));
+        assert!(!is_black_tag(b"scripts"));
+        assert!(!is_black_tag(b"div"));
+        assert!(!is_black_tag(b"a"));
+    }
 
     #[test]
     fn decodes_numeric_entities() {
