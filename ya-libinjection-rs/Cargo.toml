@@ -3,6 +3,8 @@ name = "libinjection-rs"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
+# The tests come with 28 MB of files vendored from libinjection.
+exclude = ["/tests"]
 
 [dependencies]
 
