@@ -17,6 +17,9 @@ and SVG/XSL length boundaries. The previously recorded v0.3.2
 CDATA and NUL-containing IMPORT/ENTITY cases now compare exactly against
 v0.3.3 and are not exceptions.
 
+Inline payload examples use `\x20` to show a boundary ASCII space; the hex is
+the exact byte sequence.
+
 ## Fixed — ``test-tokens-words-020.txt``
 
 - **Layer:** SQL raw-token fixture formatting
@@ -41,7 +44,7 @@ v0.3.3 and are not exceptions.
   The separate malformed-quote case below shows that the scanner also changes
   public detection on a different malformed input.
 - **Security check:** The corresponding attack-shaped input
-  `275c2727204f5220313d31202d2d20` (`'\\'' OR 1=1 -- `) is included in the
+  `275c2727204f5220313d31202d2d20` (`'\\'' OR 1=1 --\x20`) is included in the
   differential suite. Both Go and Rust detect it with fingerprint
   `73263163:4`; a unit regression also asserts Rust detects it.
 - **Reason:** Rust scans each quote run once, tracks backslash parity, consumes
@@ -65,8 +68,8 @@ v0.3.3 and are not exceptions.
   position. Rust now recognizes the slash-comment case directly and includes
   the token position in the fallback offset. The upstream C check also treats
   a `1c` fingerprint ending in `/` as SQLi. The expanded differential test
-  also pins ` 1/*x*/`, ` 0x1/*`, and `\n1e5/*`; Rust returns detected with
-  fingerprint `1c`, while Go returns false.
+  also pins `\x20 1/*x*/`, `\x20 0x1/*`, and `\n1e5/*`; Rust returns detected
+  with fingerprint `1c`, while Go returns false.
 - **High-byte Oracle q-string delimiter** — Input
   `7127e92720756e696f6e202f2a21353030303073656c6563742a2f2031`
   (`q'\xe9' union /*!50000select*/ 1`) previously let Go and Rust consume the
@@ -81,10 +84,10 @@ v0.3.3 and are not exceptions.
   ends the variable at NUL, which its tokenizer treats as a separator, and
   detects the following `UNION SELECT` sequence.
 - **NUL inside a `0x` numeric prefix** — Input
-  `31206f7220307800313d312d2d20` (`1 or 0x<NUL>1=1-- `) is missed by Go v0.3.3
-  but detected by the reviewed C reference. Rust now preserves C's bounded
-  `strchr` behavior for this numeric span and detects the tautology with
-fingerprint `1&1c`.
+  `31206f7220307800313d312d2d20` (`1 or 0x<NUL>1=1--\x20`) is missed by Go
+  v0.3.3 but detected by the reviewed C reference. Rust now preserves C's
+  bounded `strchr` behavior for this numeric span and detects the tautology
+  with fingerprint `1&1c`.
   The exact public, raw-stream, and folded-stream differences are included in
   the differential allowlist.
 
