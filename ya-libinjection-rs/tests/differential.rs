@@ -35,9 +35,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use libinjection_rs::internals::html5::{Context, TokenKind, Tokenizer};
-use libinjection_rs::internals::sqli::{Dialect, Lexer, Quote, State, Token};
-use libinjection_rs::internals::xss::is_xss;
+use libperfusion::internals::html5::{Context, TokenKind, Tokenizer};
+use libperfusion::internals::sqli::{Dialect, Lexer, Quote, State, Token};
+use libperfusion::internals::xss::is_xss;
 
 /// How many fuzzed inputs to compare by default, over all the fuzz tests.
 const DEFAULT_FUZZ_INPUTS: usize = 500_000;
@@ -89,7 +89,7 @@ fn dump_token(out: &mut String, token: &Token) {
 /// What the port makes of `input`, in the format of `oracle.c`.
 fn dump(input: &[u8]) -> String {
     let mut out = String::new();
-    match libinjection_rs::sqli(input) {
+    match libperfusion::sqli(input) {
         Some(fingerprint) => write!(out, "S1:{fingerprint}").unwrap(),
         None => out.push_str("S0:"),
     }
@@ -119,7 +119,7 @@ fn dump(input: &[u8]) -> String {
         write!(out, " P{k}:{fingerprint},{is_sqli}").unwrap();
     }
 
-    write!(out, " X{}", u8::from(libinjection_rs::xss(input))).unwrap();
+    write!(out, " X{}", u8::from(libperfusion::xss(input))).unwrap();
     for (k, context) in HTML_CONTEXTS.into_iter().enumerate() {
         write!(out, " x{k}:{}:", u8::from(is_xss(input, context))).unwrap();
         for token in Tokenizer::new(input, context) {

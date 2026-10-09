@@ -1,14 +1,14 @@
-# libinjection-rs
+# libperfusion
 
 A pure Rust port of [libinjection](https://github.com/libinjection/libinjection),
 which detects SQL injection and cross-site scripting by tokenizing the input
 rather than matching regular expressions against it.
 
 ```rust
-let fingerprint = libinjection_rs::sqli(b"1' OR '1'='1").unwrap();
+let fingerprint = libperfusion::sqli(b"1' OR '1'='1").unwrap();
 assert_eq!(fingerprint, "s&sos");
 
-assert!(libinjection_rs::xss(b"<script>alert('xss')</script>"));
+assert!(libperfusion::xss(b"<script>alert('xss')</script>"));
 ```
 
 ## Status
@@ -17,6 +17,9 @@ The port is complete, and not published yet. It follows libinjection 4.0.0
 (`d88a8f8`): the SQL tokenizer, folding, fingerprints and false-positive
 checks, the HTML5 tokenizer, and the XSS checks. It has no dependencies and no
 `unsafe` code, and needs neither `std` nor an allocator.
+
+The name is a play on the original's: `libinjection` and `libinjection-rs` are
+taken on crates.io, by bindings to the C library.
 
 It is meant to give the same answer as the C library, as built on x86-64, on
 every input. Two things check that:
@@ -69,8 +72,7 @@ small differences are noise: rebuilding alone can move a time by a tenth.
 - **`char` signedness.** The port behaves like the C library built with a
   signed `char`. Where `char` is unsigned, as on ARM Linux, the C library
   itself answers differently on some inputs with bytes above 127.
-- **Crate name.** `libinjection-rs` is taken on crates.io, by bindings to the C
-  library. The manifest also lacks a description and a repository.
+- **Manifest.** It declares no repository.
 - **Public API.** Only `sqli` and `xss` are public. The tokenizers are behind
   `internals`, a hidden feature with no stability promise that the tests use.
   Upstream exposes them, along with a hook to replace the keyword lookup,

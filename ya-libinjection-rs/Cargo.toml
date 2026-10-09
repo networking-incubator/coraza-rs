@@ -1,8 +1,10 @@
 [package]
-name = "libinjection-rs"
+name = "libperfusion"
 version = "0.1.0"
 edition = "2024"
+description = "A pure Rust port of libinjection, which detects SQL injection and cross-site scripting"
 license = "BSD-3-Clause"
+keywords = ["libinjection", "sqli", "xss", "sql-injection", "waf"]
 # The tests come with 28 MB of files vendored from libinjection, which the
 # benchmark runs on as well.
 exclude = ["/benches", "/tests"]
@@ -20,7 +22,7 @@ internals = []
 
 [dev-dependencies]
 # Turns `internals` on for the tests, and only for them.
-libinjection-rs = { path = ".", features = ["internals"] }
+libperfusion = { path = ".", features = ["internals"] }
 
 [[bench]]
 name = "speed"

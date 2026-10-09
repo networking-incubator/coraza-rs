@@ -46,8 +46,8 @@ impl Detection {
 
     fn port(self, input: &[u8]) -> bool {
         match self {
-            Detection::Sqli => libinjection_rs::sqli(input).is_some(),
-            Detection::Xss => libinjection_rs::xss(input),
+            Detection::Sqli => libperfusion::sqli(input).is_some(),
+            Detection::Xss => libperfusion::xss(input),
         }
     }
 }

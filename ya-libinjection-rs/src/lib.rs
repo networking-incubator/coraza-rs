@@ -10,12 +10,12 @@
 //! application that will consume them does before checking them.
 //!
 //! ```
-//! let fingerprint = libinjection_rs::sqli(b"1' OR '1'='1").unwrap();
+//! let fingerprint = libperfusion::sqli(b"1' OR '1'='1").unwrap();
 //! assert_eq!(fingerprint, "s&sos");
-//! assert!(libinjection_rs::sqli(b"hello world 123").is_none());
+//! assert!(libperfusion::sqli(b"hello world 123").is_none());
 //!
-//! assert!(libinjection_rs::xss(b"<script>alert('xss')</script>"));
-//! assert!(!libinjection_rs::xss(b"<p>Hello World</p>"));
+//! assert!(libperfusion::xss(b"<script>alert('xss')</script>"));
+//! assert!(!libperfusion::xss(b"<p>Hello World</p>"));
 //! ```
 //!
 //! # License

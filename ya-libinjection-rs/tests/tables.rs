@@ -4,8 +4,8 @@
 
 mod common;
 
-use libinjection_rs::internals::sqli::{Parser, SQL_KEYWORDS};
-use libinjection_rs::internals::xss::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS};
+use libperfusion::internals::sqli::{Parser, SQL_KEYWORDS};
+use libperfusion::internals::xss::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS};
 
 /// The body of the C array introduced by `declaration`, comments removed.
 fn c_array_body(source: &str, declaration: &str) -> String {

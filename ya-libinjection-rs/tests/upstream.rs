@@ -7,8 +7,8 @@
 mod common;
 
 use common::Case;
-use libinjection_rs::internals::html5::{Context, TokenKind, Tokenizer};
-use libinjection_rs::internals::sqli::{Dialect, Lexer, Quote, State, Token, TokenType};
+use libperfusion::internals::html5::{Context, TokenKind, Tokenizer};
+use libperfusion::internals::sqli::{Dialect, Lexer, Quote, State, Token, TokenType};
 
 /// Runs every `tests/<prefix>*.txt` through `actual` and compares the
 /// output with the file's expectation.
@@ -89,7 +89,7 @@ fn sqli_folding() {
 #[test]
 fn sqli_detection() {
     run_cases("test-sqli-", |input| {
-        libinjection_rs::sqli(input)
+        libperfusion::sqli(input)
             .map_or_else(Vec::new, |fingerprint| fingerprint.as_bytes().to_vec())
     });
 }
@@ -137,19 +137,19 @@ fn count_samples(prefix: &str, detect: impl Fn(&[u8]) -> bool) -> (usize, usize)
 
 #[test]
 fn sqli_samples() {
-    let (flagged, missed) = count_samples("sqli-", |s| libinjection_rs::sqli(s).is_some());
+    let (flagged, missed) = count_samples("sqli-", |s| libperfusion::sqli(s).is_some());
     assert_eq!((flagged, missed), (85_785, 17));
 }
 
 #[test]
 fn sqli_false_positive_samples() {
-    let (flagged, passed) = count_samples("false_", |s| libinjection_rs::sqli(s).is_some());
+    let (flagged, passed) = count_samples("false_", |s| libperfusion::sqli(s).is_some());
     assert_eq!((flagged, passed), (21, 402));
 }
 
 #[test]
 fn xss_samples() {
-    let (flagged, missed) = count_samples("xss", libinjection_rs::xss);
+    let (flagged, missed) = count_samples("xss", libperfusion::xss);
     assert_eq!((flagged, missed), (81_397, 20));
 }
 
@@ -157,16 +157,16 @@ fn xss_samples() {
 /// no error result to return, so what is left is not panicking.
 #[test]
 fn edge_cases() {
-    assert!(libinjection_rs::sqli(b"hello world 123").is_none());
-    assert!(libinjection_rs::sqli(b"1' OR '1'='1").is_some());
-    assert!(libinjection_rs::xss(b"<script>alert('xss')</script>"));
-    assert!(!libinjection_rs::xss(b"<p>Hello World</p>"));
-    assert!(libinjection_rs::xss(b"<script>alert(1)</script>"));
-    assert!(!libinjection_rs::xss(b"hello world"));
+    assert!(libperfusion::sqli(b"hello world 123").is_none());
+    assert!(libperfusion::sqli(b"1' OR '1'='1").is_some());
+    assert!(libperfusion::xss(b"<script>alert('xss')</script>"));
+    assert!(!libperfusion::xss(b"<p>Hello World</p>"));
+    assert!(libperfusion::xss(b"<script>alert(1)</script>"));
+    assert!(!libperfusion::xss(b"hello world"));
 
-    assert!(libinjection_rs::sqli(b"").is_none());
-    assert!(libinjection_rs::sqli(&vec![b'A'; 99_999]).is_none());
-    assert!(libinjection_rs::sqli(b"\0\0\0\0").is_none());
+    assert!(libperfusion::sqli(b"").is_none());
+    assert!(libperfusion::sqli(&vec![b'A'; 99_999]).is_none());
+    assert!(libperfusion::sqli(b"\0\0\0\0").is_none());
 
     for pattern in [
         "'''''''''''",
@@ -179,8 +179,8 @@ fn edge_cases() {
         "<<<<<<<<",
         ">>>>>>>>",
     ] {
-        let _ = libinjection_rs::sqli(pattern.as_bytes());
-        let _ = libinjection_rs::xss(pattern.as_bytes());
+        let _ = libperfusion::sqli(pattern.as_bytes());
+        let _ = libperfusion::xss(pattern.as_bytes());
     }
 
     assert_eq!(Tokenizer::new(b"<div<div>", Context::Data).count(), 2);
