@@ -64,6 +64,43 @@ nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC 16.2 at
 The two sides run one after the other and nothing is pinned to a core, so
 small differences are noise: rebuilding alone can move a time by a tenth.
 
+## Missing quality of life APIs
+
+The public API covers detection and, for each detector, the dialect or HTML
+context that matched. Richer analysis found in comparable libraries is not yet
+exposed:
+
+- **Construct flags.** A bitset saying *which* constructs appeared in the
+  match: for SQLi, things like union, tautology, stacked queries, comments,
+  and functions; for XSS, script tags, event handlers, inline SVG, and URL
+  schemes. All the data is in `State.tokens` after folding — it is a post-fold
+  pass with no change to the hot path.
+
+- **Verdict confidence.** A coarser classification than `Option<Fingerprint>`:
+  something like `Decisive / Suspicious / Inconclusive` to let callers tune
+  their response. Requires defining which fingerprints or false-positive paths
+  map to each tier — new logic with no existing analogue in libinjection itself.
+
+- **Evidence spans.** Byte offsets into the original input marking the tokens
+  that made the call. Requires storing a start offset in `Token`, which the
+  lexer does not currently track. Adding it is one write per token in the hot
+  path and would need a fixed-size representation (no allocator) for the result.
+
+- **SQLi quote context.** Which quote mode — raw input, single-quoted, or
+  double-quoted — the matching parse was in. `sqli_with_dialect` returns the
+  SQL dialect but drops this. It is already determined by the control flow in
+  `detect_with_dialect` and costs nothing to surface.
+
+- **Run metadata flags.** Bits describing the detection run itself: whether the
+  input was truncated by a limit, whether multiple quote contexts were tried,
+  whether the result came from a re-parse as MySQL. These fall out naturally
+  from the existing control flow and pair well with the `_with_limit` variants.
+
+- **`scan_prefix`.** A helper that truncates an input to a byte budget while
+  respecting a token or character boundary, avoiding a cut mid-token. Useful
+  for callers that want to bound scan cost without the `_with_limit` variants'
+  hard slice.
+
 ## Open issues and decisions
 
 - **A 0xFF byte ends HTML tokenization.** `<img \xff onerror=alert(1)>` is not
