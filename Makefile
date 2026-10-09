@@ -9,7 +9,7 @@ ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build check clean test lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build check clean test parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -32,7 +32,16 @@ clean:
 
 test:
 	cargo xtask corpus-check
+	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
+
+parity-manifest-check:
+	python3 libinjection-rs/tools/parity/check_manifest.py
+	python3 libinjection-rs/tools/parity/test_manifest_semantics.py
+
+parity-differential:
+	cargo test -p libinjection --test oracle_differential -- --ignored --nocapture
+	cargo test -p libinjection --test generated_differential -- --ignored --nocapture
 
 # -------------------------------------------------------------------
 # Quality
@@ -95,6 +104,8 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test       verify corpus and run all tests"
+	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
+	@echo "  parity-differential   run ignored Go corpus and generated-byte parity gates"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"

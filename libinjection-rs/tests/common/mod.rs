@@ -14,3 +14,4 @@
 
 pub(crate) mod corpus;
 pub(crate) mod drivers;
+pub(crate) mod subprocess;
