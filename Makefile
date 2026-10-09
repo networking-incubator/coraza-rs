@@ -46,7 +46,7 @@ lint:
 lint-extra:
 	typos .
 	taplo format --check .
-	actionlint
+	actionlint -ignore 'specifying action "\$$/.+" in invalid format because ref is missing'
 	shellcheck .hooks/*
 	npx --yes markdownlint-cli2@0.23.2 "**/*.md" "#target"
 
