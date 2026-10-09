@@ -48,11 +48,11 @@ input, in nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC
 
 | Workload                    | Inputs | Average bytes | libinjection |   Port | Port / C |
 | --------------------------- | -----: | ------------: | -----------: | -----: | -------: |
-| sqli: upstream's speed test |      8 |            28 |        414.8 |  633.0 |    1.53x |
-| sqli: attack samples        | 85,802 |           141 |       1068.1 | 1572.8 |    1.47x |
-| sqli: benign samples        |    423 |            34 |        601.9 |  865.2 |    1.44x |
-| xss: upstream's speed test  |     26 |            30 |        223.9 |  162.2 |    0.72x |
-| xss: attack samples         | 81,417 |            74 |        164.2 |  108.9 |    0.66x |
+| sqli: upstream's speed test |      8 |            28 |        417.7 |  353.4 |    0.85x |
+| sqli: attack samples        | 85,802 |           141 |       1061.0 |  883.9 |    0.83x |
+| sqli: benign samples        |    423 |            34 |        597.7 |  502.4 |    0.84x |
+| xss: upstream's speed test  |     26 |            30 |        223.3 |  172.9 |    0.77x |
+| xss: attack samples         | 81,417 |            74 |        156.4 |  117.1 |    0.75x |
 
 The two sides run one after the other and nothing is pinned to a core, so
 small differences are noise.
@@ -73,8 +73,6 @@ small differences are noise.
   which was not ported.
 - **Copyright.** `LICENSE` carries libinjection's notice, as its license
   requires. No line was added for this port.
-- **Performance.** The port takes about 1.5 times as long as the C library on
-  SQL injection inputs (see above). Nothing has been optimized yet.
 - **Minimum Rust version.** None is declared or tested.
 - **Mutation testing** was done once, by hand: of 14 deliberately broken
   variants of the port, the tests caught 11, and the other 3 appear to be

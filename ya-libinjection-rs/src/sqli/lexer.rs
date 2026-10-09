@@ -633,14 +633,15 @@ impl<'a> Lexer<'a> {
         }
         pos
     }
-}
 
-impl Iterator for Lexer<'_> {
-    type Item = Token;
-
-    fn next(&mut self) -> Option<Token> {
+    /// Reads the next token into `cur`, clearing it first. Returns whether
+    /// there was a token.
+    ///
+    /// Folding has tokens written straight into its slots with this:
+    /// handing them over by value is a good part of what tokenizing costs.
+    pub(crate) fn next_into(&mut self, cur: &mut Token) -> bool {
         let s = self.s;
-        let mut cur = Token::default();
+        *cur = Token::default();
 
         // At the start of input in a quoted context, pretend the input
         // opens with that quote.
@@ -648,43 +649,52 @@ impl Iterator for Lexer<'_> {
             && !s.is_empty()
             && let Some(delim) = self.quote.delimiter()
         {
-            self.pos = parse_string_core(s, 0, &mut cur, delim, 0);
+            self.pos = parse_string_core(s, 0, cur, delim, 0);
             self.stats.tokens += 1;
-            return Some(cur);
+            return true;
         }
 
         while self.pos < s.len() {
             let pos = self.pos;
             self.pos = match Parser::for_byte(s[pos]) {
                 Parser::White => pos + 1,
-                Parser::Operator1 => self.parse_operator1(pos, &mut cur),
-                Parser::Operator2 => self.parse_operator2(pos, &mut cur),
-                Parser::Other => self.parse_other(pos, &mut cur),
-                Parser::Char(ty) => self.parse_char(pos, &mut cur, ty),
-                Parser::Hash => self.parse_hash(pos, &mut cur),
-                Parser::Dash => self.parse_dash(pos, &mut cur),
-                Parser::Slash => self.parse_slash(pos, &mut cur),
-                Parser::Backslash => self.parse_backslash(pos, &mut cur),
-                Parser::String => self.parse_string(pos, &mut cur),
-                Parser::Word => self.parse_word(pos, &mut cur),
-                Parser::Var => self.parse_var(pos, &mut cur),
-                Parser::Number => self.parse_number(pos, &mut cur),
-                Parser::Tick => self.parse_tick(pos, &mut cur),
-                Parser::Ustring => self.parse_ustring(pos, &mut cur),
-                Parser::Qstring => self.parse_qstring(pos, &mut cur),
-                Parser::Nqstring => self.parse_nqstring(pos, &mut cur),
-                Parser::Xstring => self.parse_radix_string(pos, &mut cur, &HEX_DIGITS),
-                Parser::Bstring => self.parse_radix_string(pos, &mut cur, &BINARY_DIGITS),
-                Parser::Estring => self.parse_estring(pos, &mut cur),
-                Parser::Bword => self.parse_bword(pos, &mut cur),
-                Parser::Money => self.parse_money(pos, &mut cur),
+                Parser::Operator1 => self.parse_operator1(pos, cur),
+                Parser::Operator2 => self.parse_operator2(pos, cur),
+                Parser::Other => self.parse_other(pos, cur),
+                Parser::Char(ty) => self.parse_char(pos, cur, ty),
+                Parser::Hash => self.parse_hash(pos, cur),
+                Parser::Dash => self.parse_dash(pos, cur),
+                Parser::Slash => self.parse_slash(pos, cur),
+                Parser::Backslash => self.parse_backslash(pos, cur),
+                Parser::String => self.parse_string(pos, cur),
+                Parser::Word => self.parse_word(pos, cur),
+                Parser::Var => self.parse_var(pos, cur),
+                Parser::Number => self.parse_number(pos, cur),
+                Parser::Tick => self.parse_tick(pos, cur),
+                Parser::Ustring => self.parse_ustring(pos, cur),
+                Parser::Qstring => self.parse_qstring(pos, cur),
+                Parser::Nqstring => self.parse_nqstring(pos, cur),
+                Parser::Xstring => self.parse_radix_string(pos, cur, &HEX_DIGITS),
+                Parser::Bstring => self.parse_radix_string(pos, cur, &BINARY_DIGITS),
+                Parser::Estring => self.parse_estring(pos, cur),
+                Parser::Bword => self.parse_bword(pos, cur),
+                Parser::Money => self.parse_money(pos, cur),
             };
 
             if cur.ty != TokenType::Null {
                 self.stats.tokens += 1;
-                return Some(cur);
+                return true;
             }
         }
-        None
+        false
+    }
+}
+
+impl Iterator for Lexer<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        let mut token = Token::default();
+        self.next_into(&mut token).then_some(token)
     }
 }

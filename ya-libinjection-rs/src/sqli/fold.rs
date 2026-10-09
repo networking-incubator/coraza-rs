@@ -32,9 +32,7 @@ impl State<'_> {
     /// Reads the next token into slot `index`, clearing the slot at the end
     /// of input. Returns whether there was a token.
     fn tokenize_into(&mut self, index: usize) -> bool {
-        let token = self.lexer.next();
-        self.tokens[index] = token.unwrap_or_default();
-        token.is_some()
+        self.lexer.next_into(&mut self.tokens[index])
     }
 
     /// Reads tokens into slot `pos` until `pos - left` reaches `want`,
@@ -63,7 +61,7 @@ impl State<'_> {
     /// Merges the tokens at `left` and `left + 1` if together they form a
     /// known phrase, e.g. "UNION" + "ALL".
     fn merge_words(&mut self, left: usize) -> bool {
-        let (a, b) = (self.tokens[left], self.tokens[left + 1]);
+        let (a, b) = (&self.tokens[left], &self.tokens[left + 1]);
         if !matches!(
             a.ty,
             T::Keyword
@@ -102,10 +100,11 @@ impl State<'_> {
         phrase[a.len] = b' ';
         phrase[a.len + 1..len].copy_from_slice(b.value());
         let phrase = &phrase[..len];
+        let pos = a.pos;
 
         match lookup_word(phrase) {
             Some(ty) => {
-                self.tokens[left].assign(ty, a.pos, phrase);
+                self.tokens[left].assign(ty, pos, phrase);
                 true
             }
             None => false,
@@ -197,7 +196,7 @@ impl State<'_> {
                 continue;
             }
 
-            let (a, b) = (self.tokens[left], self.tokens[left + 1]);
+            let (a, b) = (&self.tokens[left], &self.tokens[left + 1]);
 
             if a.ty == T::String && b.ty == T::String {
                 // "foo" "bar" is valid SQL: ignore the second string.
@@ -217,11 +216,18 @@ impl State<'_> {
                 pos -= 1;
                 left = left.saturating_sub(1);
                 continue;
-            } else if self.merge_words(left) {
+            }
+
+            if self.merge_words(left) {
                 pos -= 1;
                 left = left.saturating_sub(1);
                 continue;
-            } else if a.ty == T::Semicolon
+            }
+
+            // Merging borrows the tokens mutably, so the rules that come
+            // after it take a fresh look at them.
+            let (a, b) = (&self.tokens[left], &self.tokens[left + 1]);
+            if a.ty == T::Semicolon
                 && b.ty == T::Function
                 && matches!(b.byte(0), b'I' | b'i')
                 && matches!(b.byte(1), b'F' | b'f')
@@ -262,7 +268,7 @@ impl State<'_> {
                         | T::String
                 )
             {
-                self.tokens[left] = b;
+                self.tokens[left] = *b;
                 pos -= 1;
                 left = 0;
                 continue;
@@ -279,7 +285,7 @@ impl State<'_> {
                     self.tokens[left].ty = T::Number;
                 } else {
                     // ... and "\1" as "1": drop the backslash.
-                    self.tokens[left] = b;
+                    self.tokens[left] = *b;
                     pos -= 1;
                 }
                 left = 0;
@@ -316,9 +322,9 @@ impl State<'_> {
             }
 
             let (a, b, c) = (
-                self.tokens[left],
-                self.tokens[left + 1],
-                self.tokens[left + 2],
+                &self.tokens[left],
+                &self.tokens[left + 1],
+                &self.tokens[left + 2],
             );
 
             if a.ty == T::Number && b.ty == T::Operator && c.ty == T::Number {
@@ -368,7 +374,7 @@ impl State<'_> {
                 && c.ty == T::LeftParens
             {
                 // "SELECT + (", "LIMIT + (": remove the unary operator.
-                self.tokens[left + 1] = c;
+                self.tokens[left + 1] = *c;
                 pos -= 1;
                 left = 0;
                 continue;
@@ -380,7 +386,7 @@ impl State<'_> {
                 )
             {
                 // "select - 1": remove the unary operator.
-                self.tokens[left + 1] = c;
+                self.tokens[left + 1] = *c;
                 pos -= 1;
                 left = 0;
                 continue;
@@ -390,14 +396,14 @@ impl State<'_> {
             {
                 // ", -1" becomes ",1", and all three tokens are dropped to
                 // back up and see whether "1,-1" folds further into "1".
-                self.tokens[left + 1] = c;
+                self.tokens[left + 1] = *c;
                 left = 0;
                 pos -= 3;
                 continue;
             } else if a.ty == T::Comma && b.is_unary_op() && c.ty == T::Function {
                 // "1,-sin(1)" becomes "1,sin(1)": only the unary operator
                 // goes, or this would end up as "1 (1)".
-                self.tokens[left + 1] = c;
+                self.tokens[left + 1] = *c;
                 pos -= 1;
                 left = 0;
                 continue;
@@ -408,7 +414,7 @@ impl State<'_> {
                 continue;
             } else if a.ty == T::Expression && b.ty == T::Dot && c.ty == T::Bareword {
                 // "select . `foo`" is "select `foo`".
-                self.tokens[left + 1] = c;
+                self.tokens[left + 1] = *c;
                 pos -= 1;
                 left = 0;
                 continue;
