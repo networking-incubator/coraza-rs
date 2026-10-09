@@ -20,7 +20,7 @@
 
 use std::{collections::BTreeSet, env, fs, io::Write as _, path::Path};
 
-/// Must match `data/sqli_keywords.txt` (libinjection-go v0.3.3).
+/// Must match `data/sqli_keywords.txt` from the module pinned in xtask/tools/go.mod.
 const EXPECTED_KEYWORD_COUNT: usize = 9_352;
 /// Number of fingerprint patterns in the pinned upstream lookup table.
 const EXPECTED_FINGERPRINT_COUNT: usize = 8_367;

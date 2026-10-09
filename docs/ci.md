@@ -11,6 +11,26 @@ This repository uses GitHub Actions to block risky changes early.
 - Meta-lint: `make lint-extra`
 - Feature matrix: test and lint each feature combo with `cargo-hack`
 
+### `differential parity`
+
+- Checks the committed fixture manifest against the Go module pinned in
+  `xtask/tools/go.mod`.
+- Compares detector verdicts and fingerprints, SQL token and fold streams, and
+  HTML token streams with the Go oracle.
+- Runs on pull requests, pushes to `main` and release branches, and weekly.
+
+The oracle module version, checksum, and comparison format are documented in
+the [parity protocol](../libinjection-rs/tools/parity/PROTOCOL.md).
+
+### `focused-fuzz`
+
+- Runs short campaigns for raw bytes and SQL/HTML grammar inputs.
+- Uploads campaign logs and crash artifacts, including on failure.
+- Runs on pull requests, pushes to `main` and release branches, and weekly.
+
+See the [fuzzing guide](../libinjection-rs/docs/FUZZING.md) for local runs and
+regression promotion.
+
 ### `supply-chain`
 
 - `cargo audit`
@@ -44,6 +64,12 @@ To run the full gate set:
 
 ```console
 make all
+```
+
+The full differential suites use the module pinned in `xtask/tools/go.mod`:
+
+```console
+make parity-differential
 ```
 
 ## Signing requirements

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Copyright 2026 Coraza Kubernetes Operator contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+readonly module='github.com/corazawaf/libinjection-go'
+readonly expected_goos='linux'
+readonly expected_goarch='amd64'
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+readonly script_dir repo_root
+readonly tools_dir="$repo_root/xtask/tools"
+tmp_dir=''
+cleanup() {
+	if [[ -n "$tmp_dir" ]]; then
+		chmod -R u+w -- "$tmp_dir"
+		rm -rf -- "$tmp_dir"
+	fi
+}
+trap cleanup EXIT
+
+actual_go_version="$(go version | awk '{print $3}')"
+actual_go_experiment="$(go env GOEXPERIMENT)"
+actual_goos="$(go env GOOS)"
+actual_goarch="$(go env GOARCH)"
+case "$actual_go_version:$actual_go_experiment" in
+	'go1.27.1:') ;;
+	'go1.27.1-X:nodwarf5:nodwarf5') ;;
+	*)
+		printf 'oracle requires go1.27.1 with no experiment or GOEXPERIMENT=nodwarf5; got %s with GOEXPERIMENT=%s\n' \
+			"$actual_go_version" "${actual_go_experiment:-<empty>}" >&2
+		exit 2
+		;;
+esac
+if [[ "$actual_goos" != "$expected_goos" || "$actual_goarch" != "$expected_goarch" ]]; then
+	printf 'oracle target mismatch: expected %s/%s, got %s/%s\n' \
+		"$expected_goos" "$expected_goarch" "$actual_goos" "$actual_goarch" >&2
+	exit 2
+fi
+
+module_info="$(cd -- "$tools_dir" && go mod download -json "$module")"
+mapfile -t module_fields < <(python3 -c 'import json, sys; module = json.load(sys.stdin); print(module["Version"]); print(module["Sum"]); print(module["Dir"])' <<<"$module_info")
+module_version="${module_fields[0]}"
+module_sum="${module_fields[1]}"
+source_dir="${module_fields[2]}"
+printf 'oracle module=%s version=%s sum=%s go_version=%s GOEXPERIMENT=%s target=%s/%s\n' \
+	"$module" "$module_version" "$module_sum" "$actual_go_version" \
+	"${actual_go_experiment:-<empty>}" "$actual_goos" "$actual_goarch" >&2
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-go-oracle.XXXXXX")"
+for source_file in "$source_dir"/*.go; do
+	[[ "$source_file" == *_test.go ]] || cp --no-preserve=mode,ownership -- "$source_file" "$tmp_dir/"
+done
+cp --no-preserve=mode,ownership -- "$source_dir/go.mod" "$tmp_dir/"
+if [[ -f "$source_dir/go.sum" ]]; then
+	cp --no-preserve=mode,ownership -- "$source_dir/go.sum" "$tmp_dir/"
+fi
+cp -- "$script_dir/oracle_driver_test.go" "$tmp_dir/oracle_parity_driver_test.go"
+(cd -- "$tmp_dir" && go test -c -o "$tmp_dir/oracle.test" .)
+
+output_path="$tmp_dir/oracle.tsv"
+LIBINJECTION_ORACLE_OUTPUT="$output_path" "$tmp_dir/oracle.test" -test.run '^TestBinaryOracle$' >/dev/null
+cat -- "$output_path"

@@ -256,6 +256,12 @@ fn pinned_module(root: &Path) -> Result<(String, String), String> {
 
 fn refresh() -> Result<(), String> {
     let root = workspace_root();
+    let crate_root = root.join("libinjection-rs");
+    let previous_manifest: Value = serde_json::from_slice(
+        &fs::read(crate_root.join("tests/parity/manifest.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let previous_differential = previous_manifest.get("differential").cloned();
     let tools_dir = root.join("xtask/tools");
     let version = pinned_module_version(&tools_dir)?;
     let (source_root, downloaded_version, downloaded_sum) = download_module(&tools_dir, &version)?;
@@ -277,7 +283,13 @@ fn refresh() -> Result<(), String> {
     let go_version = run_output(Command::new("go").arg("version"), "read Go version")?;
     let oracle_rows = generate_oracle(&tools_dir, &temporary, &version, &fixtures)?;
 
-    let manifest = build_manifest(&version, &module_sum, &go_version, &temporary_corpus, &fixtures)?;
+    let mut manifest = build_manifest(&version, &module_sum, &go_version, &temporary_corpus, &fixtures)?;
+    if let Some(differential) = previous_differential {
+        manifest
+            .as_object_mut()
+            .ok_or_else(|| "generated manifest root is not an object".to_owned())?
+            .insert("differential".to_owned(), differential);
+    }
     let manifest_path = temporary_parity.join("manifest.json");
     fs::write(
         &manifest_path,
@@ -288,7 +300,6 @@ fn refresh() -> Result<(), String> {
     fs::write(&oracle_path, oracle_rows).map_err(|error| error.to_string())?;
     check_snapshot(&temporary_corpus, &manifest_path, &oracle_path, &version, &module_sum)?;
 
-    let crate_root = root.join("libinjection-rs");
     replace_fixture_files(&crate_root.join("tests/corpus"), &temporary_corpus, &fixtures)?;
     fs::copy(&manifest_path, crate_root.join("tests/parity/manifest.json")).map_err(|error| error.to_string())?;
     fs::copy(&oracle_path, crate_root.join("tests/parity/sqli_oracle.tsv")).map_err(|error| error.to_string())?;

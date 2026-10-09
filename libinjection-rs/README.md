@@ -1,43 +1,45 @@
 # libinjection-rs
 
-Pure-Rust **WAF hot-path analysis library** for SQL injection and XSS construct
-detection.
+Pure-Rust **WAF hot-path library** for SQL injection and XSS compatibility
+detection plus construct analysis.
 
 Designed as the analysis engine behind Coraza operators `@detectSQLi` and
-`@detectXSS`. The library classifies untrusted input and returns a fixed-size
+`@detectXSS`. The library classifies untrusted input and returns an owned
 [`AnalysisSnapshot`](src/snapshot.rs); **Coraza owns policy** (block, log,
 audit, CRS rules).
 
-**Status:** PR1 implements the bounded stage-1 engine and public `analyze_*` /
-`detect_*` API. Corpus fixtures and their harness are preserved for PR2.
-Coraza wiring is not yet in this repo.
+**Status:** The bounded analysis API, full-input compatibility API, and legacy
+corpus harness are implemented. Coraza wiring is not yet in this repo.
 
 ---
 
 ## What this library does
 
-On every call the library:
+The analysis API:
 
 1. **Prefilters** obvious non-candidates (fast reject).
-2. **Normalizes** input in a bounded stack buffer (NUL strip, one layer of
-   `%HH` decode, ASCII lowercasing).
+2. **Normalizes** the selected input prefix, borrowing unchanged input and
+   allocating an owned buffer only when normalization changes bytes (NUL
+   removal, one layer of `%HH` decode, ASCII lowercasing).
 3. **Tokenizes** and **classifies constructs** (UNION, tautology, `<script>`,
    event handlers, …).
-4. Returns an [`AnalysisSnapshot`](src/snapshot.rs): construct bitset, evidence
-   spans, status flags, and a [`VerdictHint`](src/snapshot.rs).
+4. Returns an [`AnalysisSnapshot`](src/snapshot.rs): construct bitset, owned
+   evidence spans, status flags, and a [`VerdictHint`](src/snapshot.rs).
 
-Two detection paths coexist:
+The crate exposes two separate APIs:
 
-| Path | Role |
-| --- | --- |
-| **Modern (stage 1)** | Construct flags + evidence — primary long-term API. |
-| **Legacy** (`legacy` feature) | Fingerprint-blacklist engine from [libinjection-go](https://github.com/corazawaf/libinjection-go) for corpus parity and audit field 0. |
+- **Construct analysis:** Construct flags, evidence, and partial-analysis
+  status in a snapshot. Storage grows with the selected input prefix and the
+  evidence found; it is not capped by internal token or evidence buffers.
+- **Compatibility detection** (`legacy` feature): Full-input byte-compatible
+  verdicts from [libinjection-go](https://github.com/corazawaf/libinjection-go),
+  including the SQL fingerprint.
 
-[`detect_sqli`](src/lib.rs) / [`detect_xss`](src/lib.rs) apply a **built-in
-minimal policy** on construct flags and OR in a legacy hit when `legacy` is
-enabled. [`analyze_sqli`](src/lib.rs) / [`analyze_xss`](src/lib.rs) return the
-full snapshot without applying that policy — use this when Coraza will match
-on specific constructs.
+[`detect_sqli`](src/lib.rs) and [`detect_xss`](src/lib.rs) call the legacy
+compatibility algorithms once on the complete raw byte slice. SQL detection
+returns its boolean and exact fingerprint; XSS detection returns a boolean.
+They do not return construct-analysis metadata. [`analyze_sqli`](src/lib.rs) and
+[`analyze_xss`](src/lib.rs) are separate bounded, descriptive APIs.
 
 **Not in scope for this crate:** SecRule actions, CRS rule packs, block/allow
 decisions, or full SQL parsing on the hot path.
@@ -52,12 +54,17 @@ From the workspace (path dependency until published):
 
 ```toml
 [dependencies]
-libinjection = { path = "../libinjection-rs" }
+libinjection = { path = "../libinjection-rs", features = ["legacy"] }
 ```
 
-The default features include `legacy`.
+The crate always uses Rust's standard library. Default features include the
+legacy compatibility API. To use only bounded analysis:
 
-### Detect (boolean verdict)
+```toml
+libinjection = { path = "../libinjection-rs", default-features = false }
+```
+
+### Detect with compatibility semantics
 
 Use when you want the same semantics as `@detectSQLi` / `@detectXSS`:
 
@@ -66,19 +73,19 @@ use libinjection::{detect_sqli, detect_xss};
 
 let sqli = detect_sqli(b"1' OR '1'='1");
 assert!(sqli.detected);
+assert_eq!(sqli.fingerprint.as_str(), Some("s&sos"));
 
 let xss = detect_xss(b"<script>alert(1)</script>");
-assert!(xss.detected);
+assert!(xss);
 
-// Inspect the underlying analysis:
-if sqli.snapshot.constructs.any_sqli() {
-    // construct bits, evidence spans, verdict hint, ...
-}
+let benign = detect_sqli(b"ordinary text");
+assert!(!benign.detected);
+assert!(benign.fingerprint.as_str().is_none());
 ```
 
-### Analyze (full snapshot)
+### Analyze within a configured input budget
 
-Use when policy lives in the caller (future CRS construct rules, custom masks, logging):
+Use when the caller needs bounded construct metadata, evidence, and status:
 
 ```rust
 use libinjection::{analyze_sqli, analyze_xss};
@@ -92,73 +99,112 @@ let xss = analyze_xss(b"<img src=x onerror=alert(1)>");
 assert!(xss.constructs.any_xss());
 ```
 
-### Scan budget
+`AnalysisFlags` reports when the caller's input budget omitted a suffix
+(`TRUNCATED`) or a fast prefilter skipped detailed classification
+(`PREFILTER_MISS`). Analysis storage grows to retain the normalized input,
+relevant token metadata, and all distinct evidence spans found in the selected
+prefix. Every evidence span indexes the original input. `Benign` means the pass
+completed without recognizing one of its configured constructs; it does not
+show that the input is safe. `Inconclusive` means a prefilter skipped detailed
+classification or the configured scan budget left input unexamined. Handle
+either hint through the surrounding policy. Use `detect_sqli` / `detect_xss`
+when a libinjection compatibility verdict is required.
 
-Stage-1 scans a prefix of the input (default **8192 bytes**, hard cap **64 KiB**).
-Set at WAF init — **never from untrusted request metadata**:
+### Analysis scan budget
+
+Analysis scans a prefix of the input (default **8192 bytes**). The configured
+budget is not internally capped: storage and work can grow with the selected
+prefix. Set it at WAF initialization from trusted configuration, never from
+untrusted request metadata:
 
 ```rust
-use libinjection::{AnalyzeOptions, detect_sqli_with, limits::DEFAULT_MAX_INPUT_LEN};
+use libinjection::{
+    limits::DEFAULT_MAX_INPUT_LEN, AnalyzeOptions, analyze_sqli_with,
+};
 
 let opts = AnalyzeOptions::with_max_input_len(16_384);
-let verdict = detect_sqli_with(large_payload, opts);
+let snapshot = analyze_sqli_with(large_payload, opts);
 
-if verdict.snapshot.flags.contains(libinjection::AnalysisFlags::TRUNCATED) {
-    // default policy: incomplete analysis is treated as a detection
-}
-
-let opts = AnalyzeOptions::with_max_input_len(16_384).allow_truncation();
-let verdict = detect_sqli_with(large_payload, opts);
-if verdict.snapshot.verdict_hint == libinjection::VerdictHint::Inconclusive {
-    // caller owns the continuation or deeper inspection policy
+if snapshot.flags.contains(libinjection::AnalysisFlags::TRUNCATED) {
+    // The snapshot describes only the configured prefix.
 }
 ```
 
-Constants: [`DEFAULT_MAX_INPUT_LEN`](src/limits.rs),
-[`ABSOLUTE_MAX_INPUT_LEN`](src/limits.rs), [`NORM_BUF_LEN`](src/limits.rs).
+Constants: [`DEFAULT_MAX_INPUT_LEN`](src/limits.rs) and its compatibility alias
+[`MAX_INPUT_LEN`](src/limits.rs).
 
 ---
 
 ## API overview
 
-| Function | Returns | Use when |
-| --- | --- | --- |
-| `analyze_sqli` / `analyze_xss` | `AnalysisSnapshot` | Analysis details. |
-| `analyze_*_with` | `AnalysisSnapshot` | A custom scan budget. |
-| `detect_sqli` / `detect_xss` | `DetectionVerdict` | Built-in policy. |
-| `detect_*_with` | `DetectionVerdict` | Policy with a custom budget. |
+- `analyze_sqli` / `analyze_xss` return `AnalysisSnapshot` for analysis
+  details.
+- `analyze_*_with` returns `AnalysisSnapshot` with a caller-configured scan
+  budget.
+- `detect_sqli` returns `SqliDetection` with the full-input compatibility
+  boolean and fingerprint.
+- `detect_xss` returns a full-input compatibility boolean.
 
 Key types (re-exported from the crate root):
 
-- [`AnalysisSnapshot`](src/snapshot.rs) — constructs, flags, `verdict_hint`,
-  context, evidence, optional legacy fingerprint.
-- [`DetectionVerdict`](src/snapshot.rs) — `detected: bool` + embedded snapshot.
+- [`AnalysisSnapshot`](src/snapshot.rs) — constructs, bounded-analysis status,
+  `verdict_hint`, context, and original-input evidence.
+- [`SqliDetection`](src/snapshot.rs) — compatibility `detected: bool` and exact
+  fingerprint, available with `legacy`.
 - [`ConstructFlags`](src/snapshot.rs) — SQL bits 0–15, XSS bits 16–27.
 - [`VerdictHint`](src/snapshot.rs) — `Benign` / `Suspicious` / `Decisive` /
-  `Inconclusive` (hint only, with fail-closed truncation configurable).
-- [`AnalyzeOptions`](src/options.rs) — scan budget and truncation policy.
+  `Inconclusive`; descriptive bounded-analysis output that must not serve as
+  an allow decision.
+- [`AnalyzeOptions`](src/options.rs) — bounded analysis scan budget.
 
 ---
 
 ## Features
 
-| Feature | Default | Description |
-| --- | --- | --- |
-| `legacy` | yes | Static fingerprints/tables; corpus in PR2. |
+- `legacy` (default): Canonical full-input `detect_*` APIs and public legacy
+  visitors. It is independent of the analysis storage policy.
+
+The crate always uses Rust's standard library. Without `legacy`, the canonical
+compatibility detection functions and legacy visitor exports are unavailable.
+XSS construct analysis still includes a private HTML denylist scanner used by
+its classifier.
 
 ---
 
-## Hot-path guidance
+## Hot-path contract
 
-The default `analyze_*` / `detect_*` path is designed for per-field WAF scanning:
+The `analyze_*` path is designed for per-field WAF scanning:
 
+- **Heap-backed analysis output.** Normalization, relevant token metadata, and
+  evidence storage grow with the configured input prefix and matches.
+- **Standard library required.** The parser uses no operating-system APIs.
+- **Configurable input budget.** The default is 8 KiB; callers may select a
+  larger trusted limit. The snapshot reports prefix truncation.
 - Avoid heap allocations on hot paths where practical. Call out new allocations
   in code review; this is a best-effort goal, not an API guarantee.
-- **O(n)** over scanned bytes with early exit.
-- **No panic** on untrusted input (bounds-checked access throughout).
+- **Bounds-checked parser paths** with panic regression tests over arbitrary
+  bytes; this is a tested property, not a formal proof for every input.
 - **Runtime dependency:** `memchr` only on the hot path.
 
-WASM embedders: see [WASM portability](docs/WASM_PORTABILITY.md).
+The full-input `detect_*` compatibility APIs do not use the `analyze_*` scan
+budget. Callers should enforce their own input-size limit.
+
+### Legacy XSS context dispatch
+
+`detect_xss` checks data and unquoted-value contexts first. It then enters a
+single-quote, double-quote, or backtick context only when that raw delimiter is
+present. In the Go module pinned by `xtask/tools/go.mod`, a quoted context
+without its delimiter emits one unclassified attribute value and reaches EOF,
+so it cannot produce a hit. The check is byte-oriented and preserves behavior
+with NUL and invalid UTF-8. The HTML tokenizer and `html5_visit` output are
+unchanged.
+
+Regression tests cover absent and late delimiters, NUL, invalid UTF-8, and
+malformed values in
+[`regression_tests.rs`](src/xss/legacy/regression_tests.rs).
+
+WASM embedders: the crate requires `std` and uses no operating-system APIs.
+See the [assurance guide](docs/ASSURANCE_REPORT.md) for build checks.
 
 ---
 
@@ -168,25 +214,33 @@ WASM embedders: see [WASM portability](docs/WASM_PORTABILITY.md).
 # Unit tests + integration tests
 cargo test -p libinjection
 
+# Legacy corpus parity
+cargo test -p libinjection --test corpus_parse
+
 # Workspace lint (from repo root)
 make lint
 
+# Optional WASI builds with the legacy API disabled and enabled
+cargo check -p libinjection --target wasm32-wasip1 \
+  --no-default-features
+cargo check -p libinjection --target wasm32-wasip1
+
+# Validate parity fixture inventory and hashes
+make parity-manifest-check
 ```
+
+The full Go differential suites use the module pinned in `xtask/tools/go.mod`;
+see the [assurance checks](docs/ASSURANCE_REPORT.md).
 
 ---
 
 ## Architecture
 
 ```text
-input
-  → scan_prefix (caller budget)
-  → prefilter
-  → normalize (bounded)
-  → tokenize
-  → classify constructs
-  → AnalysisSnapshot + VerdictHint
-
-detect_*  =  modern construct policy  OR  legacy fingerprint hit (if legacy)
+analyze_*  = bounded prefix → normalize → tokenize/classify
+             → AnalysisSnapshot + VerdictHint
+detect_sqli = full raw input → legacy-compatible boolean + fingerprint
+detect_xss  = full raw input → legacy-compatible boolean
 ```
 
 **Library** emits analysis. **Coraza** applies SecRules/CRS, audit, and
@@ -196,12 +250,12 @@ block/allow policy.
 
 ## Documentation
 
-| Document | Description |
-| ---------- | ------------- |
-| [Implementation plan](docs/IMPLEMENTATION_PLAN.md) | Current implementation scope and gates |
-| [Modernization plan](docs/MODERNIZATION_PLAN.md) | `AnalysisSnapshot` spec, hot-path contract, Coraza boundary |
-| [Research index](docs/README.md) | Go/C analyses, Rust guidelines |
-| [WASM portability](docs/WASM_PORTABILITY.md) | Embedder constraints |
+- [Assurance checks](docs/ASSURANCE_REPORT.md) — local validation and Go
+  differential commands.
+- [Fuzzing](docs/FUZZING.md) — fuzz targets and regression workflow.
+- [Parity protocol](tools/parity/PROTOCOL.md) — pinned Go oracle and byte-safe
+  comparison format.
+- [CI guide](../docs/ci.md) — workspace CI jobs and local commands.
 
 ---
 
@@ -210,13 +264,12 @@ block/allow policy.
 | Phase | Status |
 | --- | --- |
 | 0 – scaffold | Done |
-| 1 – corpus harness | Preserved for PR2 |
-| 2a – legacy compatibility | In PR1 |
+| 1 – corpus harness | Done |
+| 2a – legacy compatibility | Done |
 | 2b – modern engine + `analyze_*` | Done |
-| **3 – Coraza integration** | **Next** — `detection.rs`; CRS 941/942 |
-| 4 – construct rule-matching interface | Planned |
-| 5 – construct hardening | Planned |
-| PR2 – corpus fixtures and harness | Preserved for follow-up |
+| 3 – Coraza integration | Separate follow-up in `coraza-rs` |
+| 4 – construct rule-matching interface | Future consumer design |
+| 5 – construct hardening | Future consumer design |
 
 ---
 

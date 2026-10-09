@@ -1,0 +1,54 @@
+name: Differential parity
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main, "release/**"]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: differential
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: false
+
+      - name: Record Go toolchain and target
+        run: |
+          go version
+          go env GOEXPERIMENT GOOS GOARCH
+
+      - name: Download the Go module pinned by go.mod
+        run: |
+          cd xtask/tools
+          go mod download github.com/corazawaf/libinjection-go
+
+      - name: Compare fixtures and source hashes to pinned module
+        run: |
+          GO_SOURCE="$(cd xtask/tools && go list -m -f '{{.Dir}}' github.com/corazawaf/libinjection-go)"
+          python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
+
+      - name: Run corpus and generated-byte Go parity gates
+        run: make parity-differential
