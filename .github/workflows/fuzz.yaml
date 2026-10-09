@@ -1,0 +1,110 @@
+name: Fuzz and differential parity
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main, "release/**"]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-suffix: differential
+
+      - name: Set up pinned Go release
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: false
+
+      - name: Record Go toolchain and target
+        run: |
+          go version
+          go env GOEXPERIMENT GOOS GOARCH
+
+      - name: Check out pinned Go oracle source
+        env:
+          GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/corazawaf/libinjection-go.git "$GO_SOURCE"
+          git -C "$GO_SOURCE" fetch --depth=1 origin f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
+          git -C "$GO_SOURCE" checkout --detach f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
+          test "$(git -C "$GO_SOURCE" rev-parse HEAD)" = f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
+
+      - name: Compare fixtures and source hashes to pinned Go
+        env:
+          GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
+        run: python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
+
+      - name: Run corpus and generated-byte Go parity gates
+        env:
+          LIBINJECTION_GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
+        run: make parity-differential
+
+  focused-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-suffix: focused-fuzz
+
+      - name: Install nightly fuzz toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly-2026-10-06
+          components: rust-src
+
+      - name: Install cargo-fuzz
+        run: cargo +1.97.1 install --root "$RUNNER_TEMP/cargo-fuzz" --locked cargo-fuzz --version 0.13.2
+
+      - name: Run raw-byte and SQL/HTML grammar campaigns
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        working-directory: libinjection-rs
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/raw_bytes" "$RUNNER_TEMP/fuzz/corpus/sql_grammar" "$RUNNER_TEMP/fuzz/corpus/html_grammar"
+          mkdir -p "$RUNNER_TEMP/fuzz/artifacts/raw_bytes" "$RUNNER_TEMP/fuzz/artifacts/sql_grammar" "$RUNNER_TEMP/fuzz/artifacts/html_grammar"
+          export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
+          cargo +nightly-2026-10-06 fuzz run raw_bytes "$RUNNER_TEMP/fuzz/corpus/raw_bytes" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65535 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/raw_bytes/" > "$RUNNER_TEMP/fuzz/raw_bytes.log" 2>&1
+          cargo +nightly-2026-10-06 fuzz run sql_grammar "$RUNNER_TEMP/fuzz/corpus/sql_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/sql_grammar/" > "$RUNNER_TEMP/fuzz/sql_grammar.log" 2>&1
+          cargo +nightly-2026-10-06 fuzz run html_grammar "$RUNNER_TEMP/fuzz/corpus/html_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/html_grammar/" > "$RUNNER_TEMP/fuzz/html_grammar.log" 2>&1
+          tail -n 4 "$RUNNER_TEMP/fuzz/raw_bytes.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/sql_grammar.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/html_grammar.log"
+
+      - name: Upload fuzz logs and findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: focused-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/fuzz/*.log
+            ${{ runner.temp }}/fuzz/artifacts/**
+          if-no-files-found: warn
+          retention-days: 30

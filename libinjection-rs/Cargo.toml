@@ -40,8 +40,23 @@ path = "tests/corpus_parse.rs"
 required-features = ["legacy"]
 
 [[test]]
+name = "oracle_differential"
+path = "tests/oracle_differential.rs"
+required-features = ["legacy"]
+
+[[test]]
 name = "detection_api"
 path = "tests/detection_api.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "generated_differential"
+path = "tests/generated_differential.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "fuzz_regressions"
+path = "tests/fuzz_regressions.rs"
 required-features = ["legacy"]
 
 [dev-dependencies]

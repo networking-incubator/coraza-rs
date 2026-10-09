@@ -1,0 +1,4 @@
+# name<TAB>hex bytes[<TAB>sqli=0|1][<TAB>xss=0|1]
+percent-encoded-union	257537253665253639253666253665
+nul-split-union	756e00696f6e
+percent-encoded-script-tag	253363253733253633253732253639253730253734253365

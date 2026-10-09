@@ -1,4 +1,6 @@
 {
+  "exceptions": [],
+  "expected_oracle_errors": [],
   "fixtures": {
     "families": {
       "folding": 118,
@@ -2492,14 +2494,50 @@
     "total": 496
   },
   "oracle": {
-    "go_version": "go version go1.27.1-X:nodwarf5 linux/amd64",
-    "module_sum": "h1:jX2Tit2xZxYJJyVryNXucYBZtQqS7473x9Nc6lgRRbk=",
-    "version": "v0.3.4"
-  },
-  "schema": 2,
-  "source": {
-    "module_sum": "h1:jX2Tit2xZxYJJyVryNXucYBZtQqS7473x9Nc6lgRRbk=",
+    "driver": "tools/parity/oracle_driver_test.go",
+    "go_toolchain_flavors": [
+      {
+        "go_experiment": "",
+        "version": "go1.27.1"
+      },
+      {
+        "go_experiment": "nodwarf5",
+        "version": "go1.27.1-X:nodwarf5"
+      }
+    ],
+    "goarch": "amd64",
+    "goos": "linux",
     "repository": "https://github.com/corazawaf/libinjection-go",
-    "version": "v0.3.4"
+    "revision": "f6c336efc0ddac2597fd27d3b1b7db9c87613e8d",
+    "transport": "tab-separated case id and hex input; binary outputs are hex fields"
+  },
+  "schema": 1,
+  "source_sha256": {
+    "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023",
+    "data/sqli_keywords.txt": "3d3891cc5c0646d9a200ecf91b4f2c7b3423938a035b54c3d56bc5e05614235f",
+    "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
+    "sqli.go": "125ee3678c903bef570c8b705d59d530b188afa61ecd948bcc7467e8251bf9af",
+    "sqli_data.go": "89a21b2975ae341f94304cdf629c6145c29b23c6dd20abc85ceb7ad872a11c3e",
+    "sqli_parse.go": "8442fa562228890a3f1acbfbcfe8ad76d8d2b840be3b2cce776f2ce683972785",
+    "sqli_token.go": "3a0bc86e8b70a8c56b6f39f12be4be9a9caf85be0a2479b97f7a05808433b1e7",
+    "xss.go": "bbee3c683964044b7ce856e5c4587842a278b0c4e33c5bb710494a86e4afb29c",
+    "xss_decls.go": "e8ebb49b0fdeccdb2758f33a6d577a29872fe09709f72075df0f8d68e8efa1b7",
+    "xss_helpers.go": "d9b1e66d21d0d316a51cd1e547eef4352f99ed74f89fc5190f8d10d0753ea8a9"
+  },
+  "tables": {
+    "sql_dispatch_bytes": 256,
+    "sql_dispatch_sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e",
+    "sql_fingerprint_entries": 8367,
+    "sql_keyword_entries": 9352,
+    "xss_table_sha256": {
+      "attributes": "f6182c0a6a197aa07bdabb8fa969941a6a4e35eebbfec2282a39fac47b9c52bc",
+      "events": "745e347f29e0052ad0431d9149f721c30e6d3b1e68abdebca17db62a8febd9c1",
+      "tags": "7c67dd16500749855f3752ea228ed62ce3d8bb68b5f7ef4b8d466975593419fe"
+    },
+    "xss_tables": {
+      "attributes": 20,
+      "events": 432,
+      "tags": 20
+    }
   }
 }

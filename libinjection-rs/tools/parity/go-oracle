@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Copyright 2026 Coraza Kubernetes Operator contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+readonly oracle_commit='f6c336efc0ddac2597fd27d3b1b7db9c87613e8d'
+readonly expected_goos='linux'
+readonly expected_goarch='amd64'
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+owned_cache_dir=''
+tmp_dir=''
+
+cleanup() {
+	if [[ -n "$tmp_dir" ]]; then
+		rm -rf -- "$tmp_dir"
+	fi
+	if [[ -n "$owned_cache_dir" ]]; then
+		rm -rf -- "$owned_cache_dir"
+	fi
+}
+trap cleanup EXIT
+
+source_dir="${1:-${LIBINJECTION_GO_SOURCE:-}}"
+if [[ -z "$source_dir" ]]; then
+	if [[ -n "${LIBINJECTION_GO_CACHE:-}" ]]; then
+		cache_dir="$LIBINJECTION_GO_CACHE"
+		if [[ -L "$cache_dir" ]]; then
+			printf 'refusing symlinked Go oracle cache path: %s\n' "$cache_dir" >&2
+			exit 2
+		fi
+	else
+		owned_cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-go-v033.XXXXXX")"
+		cache_dir="$owned_cache_dir"
+	fi
+	if [[ ! -d "$cache_dir/.git" ]]; then
+		git clone --filter=blob:none --no-checkout https://github.com/corazawaf/libinjection-go.git "$cache_dir" >&2
+	fi
+	if ! git -C "$cache_dir" cat-file -e "$oracle_commit^{commit}" 2>/dev/null; then
+		git -C "$cache_dir" fetch --depth=1 origin "$oracle_commit" >&2
+	fi
+	git -C "$cache_dir" checkout --detach "$oracle_commit" >&2
+	source_dir="$cache_dir"
+fi
+
+actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
+if [[ "$actual_commit" != "$oracle_commit" ]]; then
+	printf 'expected libinjection-go commit %s, got %s\n' "$oracle_commit" "$actual_commit" >&2
+	exit 2
+fi
+
+actual_go_version="$(go version | awk '{print $3}')"
+actual_go_experiment="$(go env GOEXPERIMENT)"
+actual_goos="$(go env GOOS)"
+actual_goarch="$(go env GOARCH)"
+case "$actual_go_version:$actual_go_experiment" in
+	'go1.27.1:') ;;
+	'go1.27.1-X:nodwarf5:nodwarf5') ;;
+	*)
+		printf 'oracle Go version/experiment must be go1.27.1 with no experiment or go1.27.1-X:nodwarf5 with GOEXPERIMENT=nodwarf5; got %s with GOEXPERIMENT=%s\n' \
+			"$actual_go_version" "${actual_go_experiment:-<empty>}" >&2
+		exit 2
+		;;
+esac
+if [[ "$actual_goos" != "$expected_goos" || "$actual_goarch" != "$expected_goarch" ]]; then
+	printf 'oracle target mismatch: expected %s/%s, got %s/%s\n' \
+		"$expected_goos" "$expected_goarch" "$actual_goos" "$actual_goarch" >&2
+	exit 2
+fi
+printf 'oracle runtime: go_version=%s GOEXPERIMENT=%s target=%s/%s\n' \
+	"$actual_go_version" "${actual_go_experiment:-<empty>}" "$actual_goos" "$actual_goarch" >&2
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-oracle.XXXXXX")"
+
+git -C "$source_dir" archive "$oracle_commit" | tar -x -C "$tmp_dir"
+cp -- "$script_dir/oracle_driver_test.go" "$tmp_dir/oracle_parity_driver_test.go"
+(cd -- "$tmp_dir" && go test -c -o "$tmp_dir/oracle.test" .)
+
+output_path="$tmp_dir/oracle.tsv"
+LIBINJECTION_ORACLE_OUTPUT="$output_path" "$tmp_dir/oracle.test" -test.run '^TestBinaryOracle$' >/dev/null
+cat -- "$output_path"
