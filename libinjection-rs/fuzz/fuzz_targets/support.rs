@@ -133,7 +133,7 @@ pub(crate) fn compose_grammar(input: &[u8], fragments: &[&[u8]]) -> Vec<u8> {
             output.extend_from_slice(fragment);
         }
         if controls.get(1).is_some_and(|separator| *separator & 1 == 1) {
-            output.push(match controls.get(1).copied().unwrap_or_default() % 8 {
+            output.push(match (controls.get(1).copied().unwrap_or_default() >> 1) & 0b111 {
                 0 => b' ',
                 1 => b'\0',
                 2 => b'/',

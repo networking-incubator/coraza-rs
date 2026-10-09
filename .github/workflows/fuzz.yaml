@@ -31,7 +31,7 @@ jobs:
           cache-suffix: focused-fuzz
 
       - name: Install nightly fuzz toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: nightly-2026-10-06
           components: rust-src
