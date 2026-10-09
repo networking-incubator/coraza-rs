@@ -18,6 +18,11 @@
 //! assert!(!libinjection_rs::xss(b"<p>Hello World</p>"));
 //! ```
 //!
+//! # License
+//!
+//! Being derived from libinjection, this crate is distributed under the same
+//! BSD 3-Clause license, with libinjection's copyright notice: see `LICENSE`.
+//!
 //! [libinjection]: https://github.com/libinjection/libinjection
 
 #![cfg_attr(not(test), no_std)]
