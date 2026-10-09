@@ -297,6 +297,10 @@ pub fn is_xss(input: &[u8], context: Context) -> bool {
 }
 
 pub(crate) fn detect(input: &[u8]) -> bool {
+    detect_with_context(input).is_some()
+}
+
+pub(crate) fn detect_with_context(input: &[u8]) -> Option<Context> {
     [
         Context::Data,
         Context::ValueNoQuote,
@@ -305,7 +309,7 @@ pub(crate) fn detect(input: &[u8]) -> bool {
         Context::ValueBackQuote,
     ]
     .into_iter()
-    .any(|context| is_xss(input, context))
+    .find(|&context| is_xss(input, context))
 }
 
 #[cfg(test)]
