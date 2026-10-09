@@ -77,6 +77,9 @@ fn oracle() -> &'static Path {
         let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
         let cflags = env::var("CFLAGS").unwrap_or_else(|_| "-O2".to_owned());
         let status = Command::new(&cc)
+            // The port follows libinjection as built with a signed `char`:
+            // the default on x86, but not, for one, on ARM Linux.
+            .arg("-fsigned-char")
             .args(cflags.split_whitespace())
             // Upstream's headers declare static functions they do not define.
             .arg("-w")
