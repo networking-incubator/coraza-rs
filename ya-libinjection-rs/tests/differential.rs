@@ -28,7 +28,6 @@ mod common;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -66,42 +65,7 @@ const HTML_CONTEXTS: [Context; 5] = [
 /// The oracle binary, built on first use.
 fn oracle() -> &'static Path {
     static ORACLE: OnceLock<PathBuf> = OnceLock::new();
-    ORACLE.get_or_init(|| {
-        let sources = common::upstream().join("src");
-        let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        let binary = tmp.join("libinjection-oracle");
-        // Built aside and moved into place, so that another test run still
-        // executing the previous binary is left alone.
-        let building = tmp.join(format!("libinjection-oracle.{}", std::process::id()));
-
-        let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-        let cflags = env::var("CFLAGS").unwrap_or_else(|_| "-O2".to_owned());
-        let status = Command::new(&cc)
-            // The port follows libinjection as built with a signed `char`:
-            // the default on x86, but not, for one, on ARM Linux.
-            .arg("-fsigned-char")
-            .args(cflags.split_whitespace())
-            // Upstream's headers declare static functions they do not define.
-            .arg("-w")
-            .arg("-I")
-            .arg(&sources)
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracle/oracle.c"))
-            .args(
-                [
-                    "libinjection_sqli.c",
-                    "libinjection_html5.c",
-                    "libinjection_xss.c",
-                ]
-                .map(|source| sources.join(source)),
-            )
-            .arg("-o")
-            .arg(&building)
-            .status()
-            .unwrap_or_else(|e| panic!("cannot run the C compiler `{cc}` (set CC): {e}"));
-        assert!(status.success(), "`{cc}` failed to build the oracle");
-        fs::rename(&building, &binary).unwrap();
-        binary
-    })
+    ORACLE.get_or_init(|| common::build_with_libinjection("tests/oracle/oracle.c", "-O2"))
 }
 
 fn dump_token(out: &mut String, token: &Token) {

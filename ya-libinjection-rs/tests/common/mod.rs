@@ -1,5 +1,6 @@
-//! Helpers shared by the integration tests: access to the files vendored
-//! from libinjection, read the way its own test programs read them.
+//! Helpers shared by the integration tests and the benchmark: access to
+//! the files vendored from libinjection, read the way its own test programs
+//! read them, and a way to build the C library to run alongside the port.
 
 // Each test binary uses its own subset of these.
 #![allow(dead_code)]
@@ -7,6 +8,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// The libinjection files the tests run against: the copy vendored in
 /// `tests/upstream`, or the checkout `LIBINJECTION_DIR` points at.
@@ -46,6 +48,56 @@ fn files(dir: &str, prefix: &str) -> Vec<(String, Vec<u8>)> {
             (name, content)
         })
         .collect()
+}
+
+/// The C compiler: `CC`, or `cc`.
+pub fn c_compiler() -> String {
+    env::var("CC").unwrap_or_else(|_| "cc".to_owned())
+}
+
+/// The C compiler's flags: `CFLAGS`, or `default`.
+pub fn c_flags(default: &str) -> String {
+    env::var("CFLAGS").unwrap_or_else(|_| default.to_owned())
+}
+
+/// Compiles `program`, a C file of this repository, together with
+/// libinjection's sources, and returns the path of the binary.
+pub fn build_with_libinjection(program: &str, default_flags: &str) -> PathBuf {
+    let sources = upstream().join("src");
+    let program = Path::new(env!("CARGO_MANIFEST_DIR")).join(program);
+    let name = program.file_stem().unwrap().to_str().unwrap();
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let binary = tmp.join(format!("libinjection-{name}"));
+    // Built aside and moved into place, so that another run still executing
+    // the previous binary is left alone.
+    let building = tmp.join(format!("libinjection-{name}.{}", std::process::id()));
+
+    let cc = c_compiler();
+    let status = Command::new(&cc)
+        // The port follows libinjection as built with a signed `char`: the
+        // default on x86, but not, for one, on ARM Linux.
+        .arg("-fsigned-char")
+        .args(c_flags(default_flags).split_whitespace())
+        // Upstream's headers declare static functions they do not define.
+        .arg("-w")
+        .arg("-I")
+        .arg(&sources)
+        .arg(&program)
+        .args(
+            [
+                "libinjection_sqli.c",
+                "libinjection_html5.c",
+                "libinjection_xss.c",
+            ]
+            .map(|source| sources.join(source)),
+        )
+        .arg("-o")
+        .arg(&building)
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run the C compiler `{cc}` (set CC): {e}"));
+    assert!(status.success(), "`{cc}` failed to build {name}");
+    fs::rename(&building, &binary).unwrap();
+    binary
 }
 
 /// Upstream's `modp_rtrim`.

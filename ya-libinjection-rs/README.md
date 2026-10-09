@@ -39,6 +39,24 @@ the one with the C side under sanitizers.
 `tools/vendor_upstream.sh` refreshes it from a checkout and regenerates the
 tables in `src` that are derived from it.
 
+## Performance
+
+`cargo bench` times the port next to the C library on the same inputs: those
+of upstream's two speed tests, and its sample corpora. Below is the time per
+input, in nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC
+16.2 at `-O3` and the port by Rust 1.99.
+
+| Workload                    | Inputs | Average bytes | libinjection |   Port | Port / C |
+| --------------------------- | -----: | ------------: | -----------: | -----: | -------: |
+| sqli: upstream's speed test |      8 |            28 |        414.8 |  633.0 |    1.53x |
+| sqli: attack samples        | 85,802 |           141 |       1068.1 | 1572.8 |    1.47x |
+| sqli: benign samples        |    423 |            34 |        601.9 |  865.2 |    1.44x |
+| xss: upstream's speed test  |     26 |            30 |        223.9 |  162.2 |    0.72x |
+| xss: attack samples         | 81,417 |            74 |        164.2 |  108.9 |    0.66x |
+
+The two sides run one after the other and nothing is pinned to a core, so
+small differences are noise.
+
 ## Open issues and decisions
 
 - **A 0xFF byte ends HTML tokenization.** `<img \xff onerror=alert(1)>` is not
@@ -55,7 +73,8 @@ tables in `src` that are derived from it.
   which was not ported.
 - **Copyright.** `LICENSE` carries libinjection's notice, as its license
   requires. No line was added for this port.
-- **Performance** has not been measured: there are no benchmarks.
+- **Performance.** The port takes about 1.5 times as long as the C library on
+  SQL injection inputs (see above). Nothing has been optimized yet.
 - **Minimum Rust version.** None is declared or tested.
 - **Mutation testing** was done once, by hand: of 14 deliberately broken
   variants of the port, the tests caught 11, and the other 3 appear to be
