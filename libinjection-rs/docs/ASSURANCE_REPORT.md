@@ -23,17 +23,16 @@ checks above. CI runs these checks in separate jobs; see the repository's
 
 ## Differential parity
 
-The parity workflow checks the fixture manifest against the pinned Go source,
-then compares the Rust implementation with the Go oracle across detector
-results, SQL token and fold streams, and HTML token streams. The oracle revision
-and comparison format are recorded in the
+The parity workflow checks the fixture manifest against the Go module pinned in
+`xtask/tools/go.mod`, then compares Rust with that module across detector
+results, SQL token and fold streams, and HTML token streams. The module version,
+checksum, and comparison format are recorded in the
 [parity protocol](../tools/parity/PROTOCOL.md).
 
-To run the full differential suites locally, check out the pinned Go source and
-set `LIBINJECTION_GO_SOURCE` to its path:
+To run the full differential suites locally, install Go 1.27.1 and run:
 
 ```sh
-LIBINJECTION_GO_SOURCE=/path/to/libinjection-go make parity-differential
+make parity-differential
 ```
 
 The regular `make test` target does not require Go; it checks the committed

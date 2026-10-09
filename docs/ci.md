@@ -13,13 +13,14 @@ This repository uses GitHub Actions to block risky changes early.
 
 ### `differential parity`
 
-- Checks the committed fixture manifest against the pinned Go source.
+- Checks the committed fixture manifest against the Go module pinned in
+  `xtask/tools/go.mod`.
 - Compares detector verdicts and fingerprints, SQL token and fold streams, and
   HTML token streams with the Go oracle.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
 
-The oracle revision and comparison format are documented in the [parity
-protocol](../libinjection-rs/tools/parity/PROTOCOL.md).
+The oracle module version, checksum, and comparison format are documented in
+the [parity protocol](../libinjection-rs/tools/parity/PROTOCOL.md).
 
 ### `focused-fuzz`
 
@@ -65,10 +66,10 @@ To run the full gate set:
 make all
 ```
 
-The full differential suites use the pinned Go oracle checkout:
+The full differential suites use the module pinned in `xtask/tools/go.mod`:
 
 ```console
-LIBINJECTION_GO_SOURCE=/path/to/libinjection-go make parity-differential
+make parity-differential
 ```
 
 ## Signing requirements

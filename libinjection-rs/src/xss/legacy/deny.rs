@@ -123,7 +123,7 @@ pub(crate) fn is_deny_comment(body: &[u8]) -> bool {
         return true;
     }
 
-    // Match v0.3.3: check the full comment body after removing NUL bytes so
+    // Check the full comment body after removing NUL bytes so
     // embedded NULs cannot shift IMPORT / ENTITY past a fixed-width window.
     let mut buf = [0_u8; 6];
     let mut n = 0;

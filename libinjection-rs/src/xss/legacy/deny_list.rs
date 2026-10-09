@@ -16,7 +16,7 @@
 
 use super::deny::DenyAttrKind;
 
-/// Go `blackTags` (libinjection-go v0.3.3) migrated
+/// Migrated from Go `blackTags`.
 pub(super) const DENY_TAGS: &[&[u8]] = &[
     b"APPLET",
     b"BASE",
@@ -72,7 +72,7 @@ pub(super) const DENY_ATTRS: &[(&[u8], DenyAttrKind)] = &[
     (b"XLINK:HREF", DenyAttrKind::Url),
 ];
 
-/// Go `blackEvents` (suffix after ON). libinjection-go v0.3.3.
+/// Go `blackEvents` (suffix after ON).
 /// Keep this byte-sorted: `deny.rs` binary-searches the event suffixes.
 pub(super) const DENY_EVENTS: &[&[u8]] = &[
     b"ABORT",

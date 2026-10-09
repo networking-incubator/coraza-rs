@@ -24,10 +24,8 @@ import (
 	"testing"
 )
 
-// TestBinaryOracle is copied into a temporary checkout of the pinned Go
-// package by tools/parity/go-oracle. It is a data emitter, not an upstream
-// behavior change: every reported result comes from existing package APIs or
-// parser state.
+// TestBinaryOracle is copied into a temporary copy of the Go module selected
+// by xtask/tools/go.mod. It only emits existing package APIs and parser state.
 func TestBinaryOracle(t *testing.T) {
 	outputPath := os.Getenv("LIBINJECTION_ORACLE_OUTPUT")
 	if outputPath == "" {

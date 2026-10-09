@@ -35,7 +35,7 @@ fn assert_tokens(input: &[u8], expected: &[(Html5Type, &[u8])]) {
 }
 
 #[test]
-fn go_v033_xss_examples_match() {
+fn go_module_xss_examples_match() {
     let cases: &[(&[u8], bool)] = &[
         (b"<script>alert(1);</script>", true),
         (b"><script>alert(1);</script>", true),

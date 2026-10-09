@@ -29,7 +29,7 @@ jobs:
         with:
           cache-suffix: differential
 
-      - name: Set up pinned Go release
+      - name: Set up Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.27.1
@@ -40,21 +40,15 @@ jobs:
           go version
           go env GOEXPERIMENT GOOS GOARCH
 
-      - name: Check out pinned Go oracle source
-        env:
-          GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
+      - name: Download the Go module pinned by go.mod
         run: |
-          git clone --filter=blob:none --no-checkout https://github.com/corazawaf/libinjection-go.git "$GO_SOURCE"
-          git -C "$GO_SOURCE" fetch --depth=1 origin f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
-          git -C "$GO_SOURCE" checkout --detach f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
-          test "$(git -C "$GO_SOURCE" rev-parse HEAD)" = f6c336efc0ddac2597fd27d3b1b7db9c87613e8d
+          cd xtask/tools
+          go mod download github.com/corazawaf/libinjection-go
 
-      - name: Compare fixtures and source hashes to pinned Go
-        env:
-          GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
-        run: python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
+      - name: Compare fixtures and source hashes to pinned module
+        run: |
+          GO_SOURCE="$(cd xtask/tools && go list -m -f '{{.Dir}}' github.com/corazawaf/libinjection-go)"
+          python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
 
       - name: Run corpus and generated-byte Go parity gates
-        env:
-          LIBINJECTION_GO_SOURCE: ${{ runner.temp }}/libinjection-go-v033
         run: make parity-differential

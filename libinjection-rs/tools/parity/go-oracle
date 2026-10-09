@@ -15,50 +15,21 @@
 
 set -euo pipefail
 
-readonly oracle_commit='f6c336efc0ddac2597fd27d3b1b7db9c87613e8d'
+readonly module='github.com/corazawaf/libinjection-go'
 readonly expected_goos='linux'
 readonly expected_goarch='amd64'
-readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-owned_cache_dir=''
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+readonly script_dir repo_root
+readonly tools_dir="$repo_root/xtask/tools"
 tmp_dir=''
-
 cleanup() {
 	if [[ -n "$tmp_dir" ]]; then
+		chmod -R u+w -- "$tmp_dir"
 		rm -rf -- "$tmp_dir"
-	fi
-	if [[ -n "$owned_cache_dir" ]]; then
-		rm -rf -- "$owned_cache_dir"
 	fi
 }
 trap cleanup EXIT
-
-source_dir="${1:-${LIBINJECTION_GO_SOURCE:-}}"
-if [[ -z "$source_dir" ]]; then
-	if [[ -n "${LIBINJECTION_GO_CACHE:-}" ]]; then
-		cache_dir="$LIBINJECTION_GO_CACHE"
-		if [[ -L "$cache_dir" ]]; then
-			printf 'refusing symlinked Go oracle cache path: %s\n' "$cache_dir" >&2
-			exit 2
-		fi
-	else
-		owned_cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-go-v033.XXXXXX")"
-		cache_dir="$owned_cache_dir"
-	fi
-	if [[ ! -d "$cache_dir/.git" ]]; then
-		git clone --filter=blob:none --no-checkout https://github.com/corazawaf/libinjection-go.git "$cache_dir" >&2
-	fi
-	if ! git -C "$cache_dir" cat-file -e "$oracle_commit^{commit}" 2>/dev/null; then
-		git -C "$cache_dir" fetch --depth=1 origin "$oracle_commit" >&2
-	fi
-	git -C "$cache_dir" checkout --detach "$oracle_commit" >&2
-	source_dir="$cache_dir"
-fi
-
-actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
-if [[ "$actual_commit" != "$oracle_commit" ]]; then
-	printf 'expected libinjection-go commit %s, got %s\n' "$oracle_commit" "$actual_commit" >&2
-	exit 2
-fi
 
 actual_go_version="$(go version | awk '{print $3}')"
 actual_go_experiment="$(go env GOEXPERIMENT)"
@@ -68,7 +39,7 @@ case "$actual_go_version:$actual_go_experiment" in
 	'go1.27.1:') ;;
 	'go1.27.1-X:nodwarf5:nodwarf5') ;;
 	*)
-		printf 'oracle Go version/experiment must be go1.27.1 with no experiment or go1.27.1-X:nodwarf5 with GOEXPERIMENT=nodwarf5; got %s with GOEXPERIMENT=%s\n' \
+		printf 'oracle requires go1.27.1 with no experiment or GOEXPERIMENT=nodwarf5; got %s with GOEXPERIMENT=%s\n' \
 			"$actual_go_version" "${actual_go_experiment:-<empty>}" >&2
 		exit 2
 		;;
@@ -78,12 +49,24 @@ if [[ "$actual_goos" != "$expected_goos" || "$actual_goarch" != "$expected_goarc
 		"$expected_goos" "$expected_goarch" "$actual_goos" "$actual_goarch" >&2
 	exit 2
 fi
-printf 'oracle runtime: go_version=%s GOEXPERIMENT=%s target=%s/%s\n' \
-	"$actual_go_version" "${actual_go_experiment:-<empty>}" "$actual_goos" "$actual_goarch" >&2
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-oracle.XXXXXX")"
+module_info="$(cd -- "$tools_dir" && go mod download -json "$module")"
+mapfile -t module_fields < <(python3 -c 'import json, sys; module = json.load(sys.stdin); print(module["Version"]); print(module["Sum"]); print(module["Dir"])' <<<"$module_info")
+module_version="${module_fields[0]}"
+module_sum="${module_fields[1]}"
+source_dir="${module_fields[2]}"
+printf 'oracle module=%s version=%s sum=%s go_version=%s GOEXPERIMENT=%s target=%s/%s\n' \
+	"$module" "$module_version" "$module_sum" "$actual_go_version" \
+	"${actual_go_experiment:-<empty>}" "$actual_goos" "$actual_goarch" >&2
 
-git -C "$source_dir" archive "$oracle_commit" | tar -x -C "$tmp_dir"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/libinjection-go-oracle.XXXXXX")"
+for source_file in "$source_dir"/*.go; do
+	[[ "$source_file" == *_test.go ]] || cp --no-preserve=mode,ownership -- "$source_file" "$tmp_dir/"
+done
+cp --no-preserve=mode,ownership -- "$source_dir/go.mod" "$tmp_dir/"
+if [[ -f "$source_dir/go.sum" ]]; then
+	cp --no-preserve=mode,ownership -- "$source_dir/go.sum" "$tmp_dir/"
+fi
 cp -- "$script_dir/oracle_driver_test.go" "$tmp_dir/oracle_parity_driver_test.go"
 (cd -- "$tmp_dir" && go test -c -o "$tmp_dir/oracle.test" .)
 

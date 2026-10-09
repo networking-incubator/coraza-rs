@@ -21,6 +21,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="libinjection-manifest-test-") as temporary:
         copy = Path(temporary) / "libinjection-rs"
         shutil.copytree(CRATE, copy)
+        go_tools = copy.parent / "xtask/tools"
+        go_tools.mkdir(parents=True)
+        for name in ("go.mod", "go.sum"):
+            shutil.copy2(CRATE.parent / "xtask/tools" / name, go_tools / name)
         table = copy / PINNED.relative_to(CRATE)
         contents = table.read_text(encoding="utf-8")
         if contents.count(ORDER_FROM) != 1:

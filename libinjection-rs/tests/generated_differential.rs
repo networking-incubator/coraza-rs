@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Deterministic generated-input comparison against the pinned Go detector.
+//! Deterministic generated-input comparison against the Go module pinned in xtask/tools/go.mod.
 #![expect(clippy::tests_outside_test_module, reason = "integration test binary")]
 #![expect(
     clippy::expect_used,
@@ -29,7 +29,6 @@ use libinjection::{detect_sqli, detect_xss};
 use oracle_subprocess::run_with_timeout;
 
 const SEED: u64 = 0x947E_5A13_B06C_D281;
-const SOURCE_REVISION: &str = "f6c336efc0ddac2597fd27d3b1b7db9c87613e8d";
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(300);
 const ALPHABET: &[u8] = b"abcXYZ012 ' \"`<>=/\\#-*;:&%\0\xff\x80\n\r";
 const FRAGMENTS: [&[u8]; 23] = [
@@ -81,7 +80,7 @@ struct PublicResult {
 }
 
 #[test]
-#[ignore = "manual differential gate; requires the pinned Go 1.27.1 toolchain"]
+#[ignore = "manual differential gate; requires the pinned Go module and 1.27.1 toolchain"]
 fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cases = generated_cases();
@@ -116,7 +115,7 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
 
     if failures.is_empty() {
         eprintln!(
-            "generated differential passed: {} deterministic raw/grammar/regression cases, accepted_exceptions={accepted_exceptions}, fingerprint_diagnostics={fingerprint_diagnostics}, seed=0x{SEED:016x}, source={SOURCE_REVISION}",
+            "generated differential passed: {} deterministic raw/grammar/regression cases, accepted_exceptions={accepted_exceptions}, fingerprint_diagnostics={fingerprint_diagnostics}, seed=0x{SEED:016x}",
             cases.len(),
         );
         assert_eq!(accepted_exceptions, 1, "generated exception inventory changed");
@@ -145,7 +144,7 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
         ));
     }
     panic!(
-        "generated Go differential mismatches; seed=0x{SEED:016x}, source={SOURCE_REVISION}; add minimized bytes and the Go tool version/GOEXPERIMENT to tests/parity/mismatch-ledger.md:\n{}",
+        "generated Go differential mismatches; seed=0x{SEED:016x}; add minimized bytes and the Go tool version/GOEXPERIMENT to tests/parity/mismatch-ledger.md:\n{}",
         details.join("\n")
     );
 }
@@ -218,9 +217,6 @@ fn run_oracle(manifest_dir: &Path, cases: &[Case]) -> Vec<String> {
         writeln!(&mut request, "{}\t{}", case.id, hex(&case.input)).expect("write request");
     }
     let mut command = Command::new(oracle);
-    if let Ok(source) = std::env::var("LIBINJECTION_GO_SOURCE") {
-        command.arg(source);
-    }
     let output = run_with_timeout(&mut command, &request, ORACLE_TIMEOUT)
         .unwrap_or_else(|error| panic!("run Go oracle within deadline: {error}"));
     assert!(
@@ -281,7 +277,7 @@ fn parse_result(case: &Case, line: &str) -> PublicResult {
 fn assert_known_oracle_errors(case: &Case, errors: &str) -> Vec<usize> {
     assert!(
         errors.is_empty(),
-        "{}: libinjection-go v0.3.3 returned an error {errors:?}; input_hex={}",
+        "{}: the pinned libinjection-go module returned an error {errors:?}; input_hex={}",
         case.id,
         hex(&case.input)
     );

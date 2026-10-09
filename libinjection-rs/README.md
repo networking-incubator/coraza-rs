@@ -193,10 +193,11 @@ budget. Callers should enforce their own input-size limit.
 
 `detect_xss` checks data and unquoted-value contexts first. It then enters a
 single-quote, double-quote, or backtick context only when that raw delimiter is
-present. In the pinned Go v0.3.3 state machine, a quoted context without its
-delimiter emits one unclassified attribute value and reaches EOF, so it cannot
-produce a hit. The check is byte-oriented and preserves behavior with NUL and
-invalid UTF-8. The HTML tokenizer and `html5_visit` output are unchanged.
+present. In the Go module pinned by `xtask/tools/go.mod`, a quoted context
+without its delimiter emits one unclassified attribute value and reaches EOF,
+so it cannot produce a hit. The check is byte-oriented and preserves behavior
+with NUL and invalid UTF-8. The HTML tokenizer and `html5_visit` output are
+unchanged.
 
 Regression tests cover absent and late delimiters, NUL, invalid UTF-8, and
 malformed values in
@@ -228,7 +229,7 @@ cargo check -p libinjection --target wasm32-wasip1
 make parity-manifest-check
 ```
 
-The full Go differential suites require a local checkout of the pinned oracle;
+The full Go differential suites use the module pinned in `xtask/tools/go.mod`;
 see the [assurance checks](docs/ASSURANCE_REPORT.md).
 
 ---

@@ -7,7 +7,6 @@ import argparse
 import ast
 import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
@@ -16,8 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tests/parity/manifest.json"
-PIN = "f6c336efc0ddac2597fd27d3b1b7db9c87613e8d"
+GO_MODULE = "github.com/corazawaf/libinjection-go"
 GO_REPOSITORY = "https://github.com/corazawaf/libinjection-go"
+GO_TOOLS = ROOT.parent / "xtask/tools"
 FAMILY_COUNTS = {"sqli": 54, "folding": 118, "tokens": 249, "html5": 68, "xss": 7}
 EXPECTED_KEYWORDS = 9_352
 EXPECTED_FINGERPRINTS = 8_367
@@ -109,14 +109,14 @@ def parse_rust_keywords(path: Path) -> dict[str, str]:
     return entries
 
 
-def extract_keywords(source: Path) -> None:
+def extract_keywords(source: Path, version: str) -> None:
     entries = parse_go_keywords(source)
     if len(entries) != EXPECTED_KEYWORDS:
         fail(f"expected {EXPECTED_KEYWORDS} upstream SQL entries, found {len(entries)}")
     if any(not value.isascii() for value in entries.values()):
         fail("the pinned SQL keyword table contains a non-ASCII value")
     output = [
-        "# Auto-extracted from libinjection-go v0.3.3 sqli_data.go",
+        f"# Auto-extracted from libinjection-go {version} sqli_data.go",
         f"# Total entries: {len(entries)}",
         "# Format: KEY<TAB>VALUE_BYTE",
     ]
@@ -367,22 +367,57 @@ def compare_data(source: Path) -> tuple[dict[str, object], dict[str, str]]:
     return summary, hashes
 
 
+def module_pin() -> tuple[str, str]:
+    go_mod = (GO_TOOLS / "go.mod").read_text(encoding="utf-8")
+    version = None
+    in_require_block = False
+    for line in go_mod.splitlines():
+        line = line.split("//", 1)[0].strip()
+        if line == "require (":
+            in_require_block = True
+            continue
+        if line == ")":
+            in_require_block = False
+            continue
+        fields = line.split()
+        if len(fields) == 3 and fields[:2] == ["require", GO_MODULE]:
+            version = fields[2]
+        elif in_require_block and len(fields) >= 2 and fields[0] == GO_MODULE:
+            version = fields[1]
+    if not version:
+        fail(f"{GO_TOOLS / 'go.mod'} does not pin {GO_MODULE}")
+
+    for line in (GO_TOOLS / "go.sum").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == GO_MODULE and fields[1] == version:
+            return version, fields[2]
+    fail(f"{GO_TOOLS / 'go.sum'} has no checksum for {GO_MODULE} {version}")
+
+
 def pinned_source(path_text: str | None) -> Path | None:
-    if path_text:
-        source = Path(path_text).resolve()
-    elif os.environ.get("LIBINJECTION_GO_SOURCE"):
-        source = Path(os.environ["LIBINJECTION_GO_SOURCE"]).resolve()
-    else:
+    if not path_text:
         return None
-    revision = subprocess.run(
-        ["git", "-C", str(source), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+    source = Path(path_text).resolve()
+    result = subprocess.run(
+        ["go", "list", "-m", "-json", GO_MODULE],
+        cwd=GO_TOOLS,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    if revision.returncode != 0 or revision.stdout.strip() != PIN:
-        fail(f"Go source checkout must be at {PIN}: {source}")
+    if result.returncode != 0:
+        fail(f"could not resolve {GO_MODULE} from {GO_TOOLS / 'go.mod'}: {result.stderr.strip()}")
+    metadata = json.loads(result.stdout)
+    version, module_sum = module_pin()
+    if metadata.get("Version") != version or metadata.get("Sum") != module_sum:
+        fail("resolved Go module differs from xtask/tools/go.mod and go.sum")
+    if Path(metadata.get("Dir", "")).resolve() != source:
+        fail(f"Go source must be the module selected by xtask/tools/go.mod: {source}")
     return source
 
 
 def expected_manifest(source: Path | None) -> dict[str, object]:
+    version, module_sum = module_pin()
     counts, files = fixture_inventory()
     if counts != FAMILY_COUNTS:
         fail(f"fixture family counts differ: expected {FAMILY_COUNTS}, found {counts}")
@@ -404,7 +439,8 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
         "schema": 1,
         "oracle": {
             "repository": GO_REPOSITORY,
-            "revision": PIN,
+            "version": version,
+            "module_sum": module_sum,
             "go_toolchain_flavors": [
                 {"version": "go1.27.1", "go_experiment": ""},
                 {"version": "go1.27.1-X:nodwarf5", "go_experiment": "nodwarf5"},
@@ -424,16 +460,19 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--go-source", help="pinned libinjection-go checkout (may also use LIBINJECTION_GO_SOURCE)")
-    parser.add_argument("--update", action="store_true", help="write manifest from current pinned source and corpus")
-    parser.add_argument("--extract-keywords", action="store_true", help="recreate the checked-in SQL keyword table from pinned Go source")
+    parser.add_argument("--go-source", help="module cache path selected by xtask/tools/go.mod")
+    parser.add_argument("--update", action="store_true", help="write manifest from the selected module and corpus")
+    parser.add_argument("--extract-keywords", action="store_true", help="recreate the checked-in SQL keyword table from the selected module")
     args = parser.parse_args()
 
     source = pinned_source(args.go_source)
     if args.extract_keywords:
         if source is None:
-            fail("--extract-keywords requires --go-source or LIBINJECTION_GO_SOURCE")
-        extract_keywords(source)
+            fail("--extract-keywords requires --go-source")
+        extract_keywords(source, module_pin()[0])
+        if not args.update:
+            print("extracted data/sqli_keywords.txt from the selected module")
+            return
     current = expected_manifest(source)
     expected_fixtures = current.pop("fixtures")
     if args.update:

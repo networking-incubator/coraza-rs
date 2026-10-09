@@ -1,17 +1,18 @@
 # Development oracle protocol
 
-`go-oracle` builds a test binary from the pinned Go commit in a temporary
-directory. It does not patch the checkout. It accepts only these exact Go
+`go-oracle` builds a test binary from the Go module selected by
+`xtask/tools/go.mod` in a temporary copy of the module. It does not patch the
+module cache. It accepts only these exact Go
 version/experiment pairs: standard `go1.27.1` with an empty `GOEXPERIMENT`, or
 the local `go1.27.1-X:nodwarf5` build with `GOEXPERIMENT=nodwarf5`. Both use
-`linux/amd64`. The source commit, accepted toolchain flavors, and target are in
-the machine-readable manifest. Each invocation prints its actual
+`linux/amd64`. The module version and checksum, accepted toolchain flavors, and
+target are in the machine-readable manifest. Each invocation prints its actual
 `go_version`, `GOEXPERIMENT`, and target to stderr; the Rust harness relays that
 per-run record. The only Go-specific test source is
 [`oracle_driver_test.go`](oracle_driver_test.go), which observes existing APIs
 and parser state. Go is never a Rust runtime dependency.
 
-The differential oracle pin, data-table hashes, and exceptions live under the
+The Go module pin, data-table hashes, and exceptions live under the
 `differential` key in `tests/parity/manifest.json`. The root manifest fields
 retain the corpus provenance checked by `cargo xtask corpus-check`.
 
@@ -57,8 +58,8 @@ context, and public XSS result has its own panic boundary. An errored field is
 left empty and gets one `field-index=hex(stage:panic-value)` record in field 1;
 later fields are still evaluated independently. The Rust differential test
 compares every result whose oracle call completed, even when a different field
-crashed. It treats every unlisted oracle error as a mismatch. The v0.3.3
-baseline currently has no oracle errors; malformed CDATA cases and NUL
+crashed. It treats every unlisted oracle error as a mismatch. The current module
+baseline has no oracle errors; malformed CDATA cases and NUL
 IMPORT/ENTITY comments are compared exactly like all other inputs. Field 1 and
 the independent panic boundaries remain so a future oracle crash is reported
 without losing results from fields that completed. Any exception requires

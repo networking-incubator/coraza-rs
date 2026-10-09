@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional differential comparison against the pinned development Go oracle.
+//! Optional differential comparison against the Go module pinned in xtask/tools/go.mod.
 #![expect(clippy::tests_outside_test_module, reason = "integration test binary")]
 #![expect(
     dead_code,
@@ -56,12 +56,6 @@ const SQL_FOLD_COLLAPSE_CASES: [(&str, &[u8]); 8] = [
     ("sql-fold-collapse-word-right-paren-union", b"x)=(x) UNION SELECT 1"),
     ("sql-fold-collapse-word-right-paren-tautology", b"x)=(x) OR 1=1"),
 ];
-const SQL_QUOTE_DIVERGENCE_ID: &str = "sql-escape-suffix";
-const SQL_QUOTE_DIVERGENCE_INPUT: &[u8] = b"\x27\x5c\x27\x27";
-const SQL_QUOTE_DIVERGENCE_GO_STREAM: &str = "1,0,0,0;73:1:3:0:27:00:5c2727";
-const SQL_QUOTE_DIVERGENCE_RUST_STREAM: &str = "1,0,0,0;73:1:2:0:27:27:5c27";
-const SQL_QUOTE_DIVERGENCE_FIELDS: [usize; 4] = [4, 5, 10, 11];
-const SQL_STREAM_EXCEPTION_FIELDS: [usize; 4] = [4, 5, 10, 11];
 const SQL_FLAGS: [u32; 6] = [9, 17, 10, 18, 12, 20];
 const HTML_CONTEXTS: [XssHtmlContext; 5] = [
     XssHtmlContext::Data,
@@ -72,12 +66,9 @@ const HTML_CONTEXTS: [XssHtmlContext; 5] = [
 ];
 
 #[test]
-#[ignore = "manual development-only test; requires the pinned Go toolchain"]
+#[ignore = "manual development-only test; requires the pinned Go toolchain and module"]
 fn pinned_go_oracle_matches_corpus_and_binary_cases() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::env::var("LIBINJECTION_GO_SOURCE").unwrap_or_else(|_| {
-        panic!("set LIBINJECTION_GO_SOURCE to a checkout at f6c336efc0ddac2597fd27d3b1b7db9c87613e8d")
-    });
     let oracle = manifest_dir.join("tools/parity/go-oracle");
     let cases = load_cases(manifest_dir);
     let mut request = Vec::new();
@@ -86,9 +77,8 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
     }
 
     let mut command = Command::new(oracle);
-    command.arg(&source);
     let output = run_with_timeout(&mut command, &request, ORACLE_TIMEOUT)
-        .unwrap_or_else(|error| panic!("run pinned Go oracle within deadline: {error}"));
+        .unwrap_or_else(|error| panic!("run Go module oracle within deadline: {error}"));
     let oracle_stderr = String::from_utf8_lossy(&output.stderr);
     if !oracle_stderr.is_empty() {
         eprint!("{oracle_stderr}");
@@ -134,10 +124,10 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
     );
     assert_eq!(
         result.summary.oracle_errors, 0,
-        "v0.3.3 oracle must complete every result field"
+        "pinned Go module must complete every result field"
     );
     assert_eq!(
-        result.summary.accepted_exceptions, 10,
+        result.summary.accepted_exceptions, 2,
         "accepted differential exceptions must match the reviewed inventory"
     );
 }
@@ -271,7 +261,7 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
     cases.push(("xss-svg-prefix-overlong-control".to_owned(), overlong_svg));
     let overlong_xsl = [b"<xsl".as_slice(), &[b'x'; 64], b">"].concat();
     cases.push(("xss-xsl-prefix-overlong-control".to_owned(), overlong_xsl));
-    cases.push(("xss-cdata-v033-recovery".to_owned(), b"<![CDATA[]]]".to_vec()));
+    cases.push(("xss-cdata-oracle-recovery".to_owned(), b"<![CDATA[]]]".to_vec()));
     for (id, input) in SQL_FOLD_COLLAPSE_CASES {
         cases.push((id.to_owned(), input.to_vec()));
     }
@@ -412,7 +402,7 @@ impl CaseComparison<'_> {
                 self.id,
                 self.input,
                 "oracle-error",
-                "a defined libinjection-go v0.3.3 result",
+                "a defined result from the pinned libinjection-go module",
                 &format!("field={field_index}, error={message}"),
             ));
         }
@@ -537,16 +527,6 @@ impl CaseComparison<'_> {
     }
 
     fn reviewed_deviation(&self, field_index: usize) -> Option<(&'static str, &'static str, bool)> {
-        if self.id == SQL_QUOTE_DIVERGENCE_ID
-            && self.input == SQL_QUOTE_DIVERGENCE_INPUT
-            && SQL_QUOTE_DIVERGENCE_FIELDS.contains(&field_index)
-        {
-            return Some((
-                SQL_QUOTE_DIVERGENCE_GO_STREAM,
-                SQL_QUOTE_DIVERGENCE_RUST_STREAM,
-                field_index == SQL_QUOTE_DIVERGENCE_FIELDS[0],
-            ));
-        }
         reviewed_sql_deviation(self.id, self.input, field_index)
             .or_else(|| reviewed_xss_deviation(self.id, self.input, field_index))
     }
@@ -561,43 +541,6 @@ impl CaseComparison<'_> {
 }
 
 fn reviewed_sql_deviation(id: &str, input: &[u8], field_index: usize) -> Option<(&'static str, &'static str, bool)> {
-    if id == "whitelist-leading-space" && input == b" 1/*x*/"
-        || id == "whitelist-leading-space-zero-x" && input == b" 0x1/*"
-        || id == "whitelist-leading-space-exponent" && input == b"\n1e5/*"
-    {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "3163:2", false)),
-            _ => None,
-        };
-    }
-
-    if id == "sql-malformed-quote-verdict" && input == b"-(top<>thendrop1.5\\'--null'--" {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "7363:2", false)),
-            4 | 5 | 6 | 7 | 10 | 11 | 12 | 13 => Some((
-                "1,0,0,0;73:0:29:0:00:00:2d28746f703c3e7468656e64726f70312e355c272d2d6e756c6c272d2d",
-                "2,0,0,0;73:0:26:0:00:27:2d28746f703c3e7468656e64726f70312e355c272d2d6e756c6c;63:27:2:0:00:00:2d2d",
-                false,
-            )),
-            _ => None,
-        };
-    }
-
-    if id == "sql-q-high-byte-following-union" && input == b"q'\xe9' union /*!50000select*/ 1" {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "58:1", false)),
-            4 | 5 | 10 | 11 => Some((
-                "1,0,0,0;73:3:26:0:71:00:2720756e696f6e202f2a21353030303073656c6563742a2f2031",
-                "5,0,0,0;6e:0:1:0:00:00:71;73:2:1:0:27:27:e9;55:5:5:0:00:00:756e696f6e;58:11:16:0:00:00:2f2a21353030303073656c6563742a2f;31:28:1:0:00:00:31",
-                false,
-            )),
-            _ => None,
-        };
-    }
-
     if id == "sql-nul-after-hex-prefix" && input == b"1 or 0x\x001=1-- " {
         return match field_index {
             2 => Some(("0", "1", true)),
@@ -634,43 +577,7 @@ fn reviewed_sql_deviation(id: &str, input: &[u8], field_index: usize) -> Option<
         };
     }
 
-    if id == "sql-q-high-byte-unclosed" && input == b"q'\xe9x\xe9'" {
-        return stream_deviation(
-            field_index,
-            "1,0,0,0;73:3:3:0:71:00:78e927",
-            "2,0,0,0;6e:0:1:0:00:00:71;73:2:3:0:27:27:e978e9",
-        );
-    }
-
-    if id == "sql-q-utf8-close-advance" && input == b"q'\xe9x\xc3\xa9'" {
-        return match field_index {
-            4 | 5 => Some((
-                "2,0,0,0;73:3:1:0:71:71:78;73:7:0:0:27:00:",
-                "2,0,0,0;6e:0:1:0:00:00:71;73:2:4:0:27:27:e978c3a9",
-                field_index == 4,
-            )),
-            10 | 11 => Some((
-                "2,1,0,0;73:3:1:0:71:71:78",
-                "2,0,0,0;6e:0:1:0:00:00:71;73:2:4:0:27:27:e978c3a9",
-                false,
-            )),
-            _ => None,
-        };
-    }
-
     None
-}
-
-fn stream_deviation(
-    field_index: usize,
-    go_expected: &'static str,
-    rust_expected: &'static str,
-) -> Option<(&'static str, &'static str, bool)> {
-    SQL_STREAM_EXCEPTION_FIELDS.contains(&field_index).then_some((
-        go_expected,
-        rust_expected,
-        field_index == SQL_STREAM_EXCEPTION_FIELDS[0],
-    ))
 }
 
 fn reviewed_xss_deviation(id: &str, input: &[u8], field_index: usize) -> Option<(&'static str, &'static str, bool)> {
@@ -682,10 +589,7 @@ fn reviewed_xss_deviation(id: &str, input: &[u8], field_index: usize) -> Option<
         ));
     }
 
-    match (id, input, field_index) {
-        ("xss-percent-comment-later-script", b"<%a%b%><script>alert(1)</script>", 21) => Some(("0", "1", true)),
-        _ => None,
-    }
+    None
 }
 
 fn mismatch(id: &str, input: &[u8], layer: &str, expected: &str, actual: &str) -> String {
