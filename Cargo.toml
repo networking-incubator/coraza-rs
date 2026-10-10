@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "libinjection-rs",
     "xtask",
+    "ya-libinjection-rs",
 ]
 
 [workspace.package]
