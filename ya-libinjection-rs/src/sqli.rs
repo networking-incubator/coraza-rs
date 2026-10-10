@@ -224,10 +224,12 @@ impl<'a> State<'a> {
                     }
 
                     // The byte after the number. Upstream indexes with the
-                    // token's length, not its end, and compares a `char`
-                    // that is signed on its reference platform, so bytes
-                    // above 127 count as whitespace.
-                    let after = tokens[0].len;
+                    // token's length instead of its end, which is wrong when
+                    // whitespace comes first ("\t1--"): this adds the offset.
+                    // It does compare a `char` that is signed on its
+                    // reference platform, so bytes above 127 count as
+                    // whitespace.
+                    let after = tokens[0].pos + tokens[0].len;
                     return match self.input.get(after) {
                         Some(&ch) if ch.cast_signed() <= 32 => true,
                         Some(b'/') => self.input.get(after + 1) == Some(&b'*'),

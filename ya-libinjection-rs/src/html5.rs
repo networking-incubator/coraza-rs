@@ -109,8 +109,9 @@ impl<'a> Tokenizer<'a> {
                 0x00 | b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' => self.pos += 1,
                 // Upstream returns the byte as an `int` through a `char`
                 // that is signed on its reference platform, where 0xFF
-                // comes out as -1: its end-of-input marker.
-                0xFF => return None,
+                // comes out as -1, its end-of-input marker, and ends the
+                // scan: "<img \xff onerror=...>" gets through. 0xFF is an
+                // ordinary byte here.
                 _ => return Some(ch),
             }
         }
