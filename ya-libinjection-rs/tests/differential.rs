@@ -55,10 +55,9 @@ use std::{
     thread,
 };
 
-use libperfusion::internals::{
-    html5::{Context, TokenKind, Tokenizer},
-    sqli::{Dialect, Lexer, Quote, State, Token},
-    xss::is_xss,
+use libperfusion::{
+    Dialect, HtmlContext as Context, HtmlTokenKind as TokenKind, HtmlTokenizer as Tokenizer, Quote, SqlState, SqlToken,
+    SqlTokenizer as Lexer, xss_in_context,
 };
 
 /// How many fuzzed inputs to compare by default, over all the fuzz tests.
@@ -90,16 +89,16 @@ fn oracle() -> &'static Path {
     ORACLE.get_or_init(|| common::build_with_libinjection("tests/oracle/oracle.c", "-O2"))
 }
 
-fn dump_token(out: &mut String, token: &Token) {
+fn dump_token(out: &mut String, token: &SqlToken) {
     write!(
         out,
         "[{:02x} {} {} {} {:02x} {:02x} ",
-        token.ty.as_byte(),
-        token.pos,
-        token.len,
-        token.count,
-        token.str_open.unwrap_or(0),
-        token.str_close.unwrap_or(0)
+        token.kind().as_byte(),
+        token.pos(),
+        token.len(),
+        token.variable_count(),
+        token.string_open().unwrap_or(0),
+        token.string_close().unwrap_or(0)
     )
     .unwrap();
     for byte in token.value() {
@@ -121,14 +120,13 @@ fn dump(input: &[u8]) -> String {
         for token in lexer.by_ref() {
             dump_token(&mut out, &token);
         }
-        let stats = lexer.stats;
+        let stats = lexer.stats();
         write!(out, "/{},{},{}", stats.tokens, stats.comment_ddx, stats.comment_hash).unwrap();
 
         write!(out, " F{k}:").unwrap();
-        let mut state = State::new(input, quote, dialect);
-        let count = state.fold();
-        for token in &state.tokens[..count] {
-            dump_token(&mut out, token);
+        let mut state = SqlState::new(input);
+        for token in state.fold(quote, dialect) {
+            dump_token(&mut out, &token);
         }
 
         let fingerprint = state.fingerprint(quote, dialect);
@@ -138,7 +136,7 @@ fn dump(input: &[u8]) -> String {
 
     write!(out, " X{}", u8::from(libperfusion::xss(input))).unwrap();
     for (k, context) in HTML_CONTEXTS.into_iter().enumerate() {
-        write!(out, " x{k}:{}:", u8::from(is_xss(input, context))).unwrap();
+        write!(out, " x{k}:{}:", u8::from(xss_in_context(input, context))).unwrap();
         for token in Tokenizer::new(input, context) {
             // The values of upstream's `enum html5_type`.
             let kind = match token.kind {

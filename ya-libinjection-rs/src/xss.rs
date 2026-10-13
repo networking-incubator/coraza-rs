@@ -9,9 +9,6 @@
 //! the contexts it could be injected into, and look for tags, attributes
 //! and URLs that can run script.
 
-pub(crate) mod events;
-
-use self::events::BLACK_ATTR_EVENTS;
 use crate::{
     bytes::contains,
     html5::{Context, TokenKind, Tokenizer},
@@ -29,35 +26,11 @@ pub enum Attribute {
     Indirect,
 }
 
-pub const BLACK_ATTRS: [(&str, Attribute); 20] = [
-    ("ACTION", Attribute::Url),             // form
-    ("ATTRIBUTENAME", Attribute::Indirect), // SVG allows indirection of attribute names
-    ("BY", Attribute::Url),                 // SVG
-    ("BACKGROUND", Attribute::Url),         // IE6, O11
-    ("DATAFORMATAS", Attribute::Black),     // IE
-    ("DATASRC", Attribute::Black),          // IE
-    ("DYNSRC", Attribute::Url),             // obsolete img attribute
-    ("FILTER", Attribute::Style),           // Opera, SVG inline style
-    ("FORMACTION", Attribute::Url),         // HTML 5
-    ("FOLDER", Attribute::Url),             // only on A tags, IE-only
-    ("FROM", Attribute::Url),               // SVG
-    ("HANDLER", Attribute::Url),            // SVG Tiny, Opera
-    ("HREF", Attribute::Url),
-    ("LOWSRC", Attribute::Url), // obsolete img attribute
-    ("POSTER", Attribute::Url), // Opera 10, 11
-    ("SRC", Attribute::Url),
-    ("STYLE", Attribute::Style),
-    ("TO", Attribute::Url),     // SVG
-    ("VALUES", Attribute::Url), // SVG
-    ("XLINK:HREF", Attribute::Url),
-];
+pub(crate) mod tables {
+    include!(concat!(env!("OUT_DIR"), "/xss_tables.rs"));
+}
 
-pub const BLACK_TAGS: [&str; 20] = [
-    "APPLET", "BASE", "COMMENT", // IE, http://html5sec.org/#38
-    "EMBED", "FRAME", "FRAMESET", "HANDLER", // Opera SVG, effectively a script tag
-    "IFRAME", "IMPORT", "ISINDEX", "LINK", "LISTENER", "META", "NOSCRIPT", "OBJECT", "SCRIPT", "STYLE", "VMLFRAME",
-    "XML", "XSS",
-];
+use self::tables::{BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS};
 
 /// Where in [`BLACK_ATTR_EVENTS`] the events starting with each letter are:
 /// from the first of them to the last. The table has them together, but a

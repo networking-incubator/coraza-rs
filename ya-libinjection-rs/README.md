@@ -23,8 +23,8 @@ The name is a play on the original's: `libinjection` and `libinjection-rs` are
 taken on crates.io, by bindings to the C library.
 
 The required tests check feature-level parity against the in-repository
-`libinjection` crate and its pinned corpus. They compare SQLi fingerprints and
-XSS verdicts, not implementation details. The exact C comparisons remain
+`libinjection` crate and its pinned corpus. They compare SQLi fingerprints,
+token records, counters, and XSS verdicts. Exact C comparisons remain
 available as optional tests.
 
 ## Testing
@@ -44,9 +44,39 @@ LIBINJECTION_DIR=/path/to/libinjection \
 ```
 
 `CC` and `CFLAGS` configure the C compiler. The longer fuzz run and sanitizer
-example are documented at the top of `tests/differential.rs`.
+example are documented at the top of `tests/differential.rs`. `cargo xtask
+tables-check` verifies the local SQL and XSS table data against recorded
+semantic hashes. To refresh it from a libinjection checkout, run:
+
+```sh
+cargo xtask tables-refresh --upstream /path/to/libinjection
+```
+
 `tools/vendor_upstream.sh /path/to/libinjection` can populate
-`tests/upstream` and regenerate the derived tables.
+`tests/upstream` and refresh the local tables.
+
+## Parser API
+
+The detector helpers cover common use. `SqlTokenizer` iterates raw SQL tokens;
+`SqlState` can fold those tokens, return a fingerprint in any typed quote and
+dialect context (including benign inputs), and classify that fingerprint.
+`SqlToken` exposes bounded values through read-only accessors. Implement
+`SqlLookup` to customize word, operator, phrase, and fingerprint decisions;
+`BuiltinSqlLookup` supplies the shipped tables. The lookup remains active
+across reset and reparse.
+
+`HtmlTokenizer` iterates tokens in any `HtmlContext`, and `xss_in_context`
+checks the verdict for one explicitly chosen context. `xss_with_context`
+continues to report the first matching context selected by the detector.
+
+```rust
+use libperfusion::{Dialect, Quote, SqlState};
+
+let mut state = SqlState::new(b"1' OR '1'='1");
+let fingerprint = state.fingerprint(Quote::None, Dialect::Ansi);
+assert!(state.check_fingerprint());
+assert!(!fingerprint.as_bytes().is_empty());
+```
 
 ## Performance
 
@@ -88,8 +118,8 @@ exposed:
 - **Construct flags.** A bitset saying *which* constructs appeared in the
   match: for SQLi, things like union, tautology, stacked queries, comments,
   and functions; for XSS, script tags, event handlers, inline SVG, and URL
-  schemes. All the data is in `State.tokens` after folding — it is a post-fold
-  pass with no change to the hot path.
+  schemes. The data is available from `SqlState::tokens()` after folding —
+  this is a post-fold pass with no change to the hot path.
 
 - **Verdict confidence.** A coarser classification than `Option<Fingerprint>`:
   something like `Decisive / Suspicious / Inconclusive` to let callers tune
@@ -125,21 +155,17 @@ exposed:
   signed `char`. Where `char` is unsigned, as on ARM Linux, the C library
   itself answers differently on some inputs with bytes above 127.
 - **Manifest.** It declares no repository.
-- **Public API.** Detection also exports `sqli_with_dialect` (returning
-  `Dialect`), `xss_with_context` (returning `HtmlContext`), `sqli_with_limit`,
-  and `xss_with_limit`. The limit variants scan only the input prefix up to
-  `max_bytes`, which may end inside a token. The tokenizers are behind
-  `internals`, a hidden feature with no stability promise that the tests use.
-  Upstream exposes them, along with a hook to replace the keyword lookup,
-  which was not ported.
+- **Detection run metadata.** The detector helpers do not report which SQL
+  quote context won or which contexts were tried. `SqlState` lets callers
+  select a quote and dialect directly and inspect each resulting fingerprint.
 - **Copyright.** `LICENSE` carries libinjection's notice, as its license
   requires. No line was added for this port.
 - **Minimum Rust version.** None is declared or tested.
 - **Mutation testing** was done once, by hand: of 14 deliberately broken
   variants of the port, the tests caught 11, and the other 3 appear to be
   equivalent. None of that is in the repository.
-- **Following upstream.** Only the tables are generated. Changes to the C code
-  have to be ported by hand.
+- **Following upstream.** The tables can be refreshed from C, but this does not
+  port algorithm changes; review and port those separately.
 
 ## License
 

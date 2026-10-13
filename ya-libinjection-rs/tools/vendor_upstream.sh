@@ -25,4 +25,4 @@ cp "$src"/data/*.txt "$dst/data/"
     git -C "$src" rev-parse HEAD
 } >"$dst/REVISION"
 
-python3 "$root/tools/gen_tables.py"
+cargo run --manifest-path "$root/../Cargo.toml" -p xtask -- tables-refresh --upstream "$src"

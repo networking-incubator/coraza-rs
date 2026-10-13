@@ -8,6 +8,7 @@
 
 //! fingerprint against the known-bad list.
 
+mod api;
 mod fold;
 pub(crate) mod keyword_table;
 mod keywords;
@@ -16,11 +17,17 @@ pub(crate) mod token;
 
 use core::{cmp::Ordering, fmt};
 
-pub use self::lexer::Dialect;
+pub use api::{SqlState, SqlStatistics, SqlToken, SqlTokenizer};
+
 use self::{
-    keywords::{cstrcasecmp, lookup_word},
-    lexer::{Lexer, Quote},
+    keywords::{BUILTIN_SQL_LOOKUP, cstrcasecmp},
+    lexer::Lexer,
     token::{Token, TokenType},
+};
+pub use self::{
+    keywords::{BuiltinSqlLookup, SqlLookup},
+    lexer::{Dialect, Quote},
+    token::TokenType as SqlTokenType,
 };
 use crate::bytes::{contains, find_slice};
 
@@ -109,29 +116,46 @@ impl PartialEq<&str> for Fingerprint {
     }
 }
 
-pub struct State<'a> {
+pub struct State<'a, L = BuiltinSqlLookup> {
     input: &'a [u8],
-    lexer: Lexer<'a>,
+    lexer: Lexer<'a, L>,
     /// One more slot than a fingerprint needs, since a sixth token is
     /// sometimes read to decide the type of the fifth.
     pub tokens: [Token; 8],
     fingerprint: Fingerprint,
+    folded_len: usize,
 }
 
-impl<'a> State<'a> {
+impl<'a> State<'a, BuiltinSqlLookup> {
     pub fn new(input: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
+        Self::with_lookup(input, quote, dialect, BUILTIN_SQL_LOOKUP)
+    }
+}
+
+impl<'a, L: SqlLookup> State<'a, L> {
+    pub fn with_lookup(input: &'a [u8], quote: Quote, dialect: Dialect, lookup: L) -> Self {
         Self {
             input,
-            lexer: Lexer::new(input, quote, dialect),
+            lexer: Lexer::with_lookup(input, quote, dialect, lookup),
             tokens: [Token::default(); 8],
             fingerprint: Fingerprint::default(),
+            folded_len: 0,
         }
+    }
+
+    /// Resets this parser while retaining its input, context, and lookup.
+    pub fn reset(&mut self) {
+        let quote = self.lexer.quote;
+        let dialect = self.lexer.dialect;
+        self.lexer.reset(quote, dialect);
+        self.tokens = [Token::default(); 8];
+        self.fingerprint = Fingerprint::default();
+        self.folded_len = 0;
     }
 
     /// Fingerprints the input in the given context.
     pub fn fingerprint(&mut self, quote: Quote, dialect: Dialect) -> Fingerprint {
-        *self = Self::new(self.input, quote, dialect);
-        let tlen = self.fold();
+        let tlen = self.fold_in_context(quote, dialect);
 
         // PHP's backquote "comment": a trailing, empty, unclosed backtick
         // bareword is turned into a comment.
@@ -169,12 +193,7 @@ impl<'a> State<'a> {
             return false;
         }
 
-        // The table stores fingerprints upper-cased behind a '0' prefix.
-        let mut key = [b'0'; MAX_TOKENS + 1];
-        for (dst, src) in key[1..].iter_mut().zip(fingerprint) {
-            *dst = src.to_ascii_uppercase();
-        }
-        lookup_word(&key[..=fingerprint.len()]) == Some(TokenType::Fingerprint)
+        self.lexer.lookup.is_fingerprint(fingerprint)
     }
 
     /// Second-guesses a blacklisted fingerprint to cut false positives.
@@ -293,6 +312,22 @@ impl<'a> State<'a> {
         self.blacklist() && self.not_whitelist()
     }
 
+    pub(crate) fn folded_tokens(&self) -> &[Token] {
+        &self.tokens[..self.folded_len]
+    }
+
+    pub(crate) fn fold_in_context(&mut self, quote: Quote, dialect: Dialect) -> usize {
+        self.lexer.reset(quote, dialect);
+        self.tokens = [Token::default(); 8];
+        self.fingerprint = Fingerprint::default();
+        self.folded_len = self.fold();
+        self.folded_len
+    }
+
+    pub(crate) fn stats(&self) -> lexer::Stats {
+        self.lexer.stats
+    }
+
     /// Whether the last pass met syntax that MySQL reads differently.
     fn reparse_as_mysql(&self) -> bool {
         let stats = &self.lexer.stats;
@@ -321,6 +356,14 @@ pub(crate) fn detect_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)
         return None;
     }
     let mut state = State::new(input, Quote::None, Dialect::Ansi);
+    detect_state(&mut state)
+}
+
+pub(crate) fn detect_state<L: SqlLookup>(state: &mut State<'_, L>) -> Option<(Fingerprint, Dialect)> {
+    let input = state.input;
+    if input.is_empty() {
+        return None;
+    }
 
     // The input as-is.
     if let Some(result) = state.check_ansi_then_mysql_dialect(Quote::None) {

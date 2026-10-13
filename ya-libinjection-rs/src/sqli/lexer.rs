@@ -9,7 +9,7 @@
 //! token shape, kept function-for-function with upstream's `parse_*`.
 
 use super::{
-    keywords::lookup_word,
+    keywords::{BUILTIN_SQL_LOOKUP, BuiltinSqlLookup, SqlLookup},
     token::{TOKEN_SIZE, Token, TokenType},
 };
 use crate::bytes::{byte_set, cspan, find_byte, find_pair, find_slice, span};
@@ -49,6 +49,8 @@ pub struct Stats {
     pub comment_hash: usize,
     /// Tokens produced, before any folding.
     pub tokens: usize,
+    /// Tokens removed by folding rules.
+    pub folds: usize,
 }
 
 /// The scanner a token's first byte selects (upstream's `char_parse_map`).
@@ -175,23 +177,38 @@ fn parse_string_core(s: &[u8], pos: usize, st: &mut Token, delim: u8, offset: us
     }
 }
 
-pub struct Lexer<'a> {
+pub struct Lexer<'a, L = BuiltinSqlLookup> {
     s: &'a [u8],
     pos: usize,
-    quote: Quote,
-    dialect: Dialect,
+    pub(crate) quote: Quote,
+    pub(crate) dialect: Dialect,
+    pub(crate) lookup: L,
     pub stats: Stats,
 }
 
-impl<'a> Lexer<'a> {
+impl<'a> Lexer<'a, BuiltinSqlLookup> {
     pub fn new(s: &'a [u8], quote: Quote, dialect: Dialect) -> Self {
+        Self::with_lookup(s, quote, dialect, BUILTIN_SQL_LOOKUP)
+    }
+}
+
+impl<'a, L: SqlLookup> Lexer<'a, L> {
+    pub fn with_lookup(s: &'a [u8], quote: Quote, dialect: Dialect, lookup: L) -> Self {
         Self {
             s,
             pos: 0,
             quote,
             dialect,
+            lookup,
             stats: Stats::default(),
         }
+    }
+
+    pub(crate) fn reset(&mut self, quote: Quote, dialect: Dialect) {
+        self.pos = 0;
+        self.quote = quote;
+        self.dialect = dialect;
+        self.stats = Stats::default();
     }
 
     fn parse_operator1(&self, pos: usize, cur: &mut Token) -> usize {
@@ -313,7 +330,7 @@ impl<'a> Lexer<'a> {
         }
 
         let pair = &s[pos..pos + 2];
-        if let Some(ty) = lookup_word(pair) {
+        if let Some(ty) = self.lookup.lookup_operator(pair) {
             cur.assign(ty, pos, pair);
             return pos + 2;
         }
@@ -452,7 +469,7 @@ impl<'a> Lexer<'a> {
         for i in 0..cur.len {
             let delim = cur.byte(i);
             if delim == b'.' || delim == b'`' {
-                match lookup_word(&cur.value()[..i]) {
+                match self.lookup.lookup_word(&cur.value()[..i]) {
                     Some(ty) if ty != TokenType::Bareword => {
                         *cur = Token::default();
                         cur.assign(ty, pos, &s[pos..pos + i]);
@@ -472,7 +489,7 @@ impl<'a> Lexer<'a> {
                 0
             };
         if wlen < TOKEN_SIZE {
-            cur.ty = lookup_word(cur.value()).unwrap_or(TokenType::Bareword);
+            cur.ty = self.lookup.lookup_word(cur.value()).unwrap_or(TokenType::Bareword);
         }
         pos + wlen
     }
@@ -480,7 +497,7 @@ impl<'a> Lexer<'a> {
     /// MySQL backticks: a cross between a string and a bareword.
     fn parse_tick(&self, pos: usize, cur: &mut Token) -> usize {
         let end = parse_string_core(self.s, pos, cur, b'`', 1);
-        cur.ty = if lookup_word(cur.value()) == Some(TokenType::Function) {
+        cur.ty = if self.lookup.lookup_word(cur.value()) == Some(TokenType::Function) {
             TokenType::Function
         } else {
             TokenType::Bareword
@@ -714,7 +731,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-impl Iterator for Lexer<'_> {
+impl<L: SqlLookup> Iterator for Lexer<'_, L> {
     type Item = Token;
 
     fn next(&mut self) -> Option<Token> {
