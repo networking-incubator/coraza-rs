@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+previous_hooks_path="$(git config --local --get coraza.previousHooksPath 2>/dev/null || true)"
+previous_pre_commit="$previous_hooks_path/pre-commit"
+if [[ -n "$previous_hooks_path" && -x "$previous_pre_commit" ]]; then
+    if [[ "$previous_pre_commit" -ef "${BASH_SOURCE[0]}" ]]; then
+        echo "pre-commit: refusing to call itself through the previous hook path"
+        exit 1
+    fi
+    "$previous_pre_commit" "$@"
+fi
+
 if [ "$(git config --get commit.gpgsign 2>/dev/null)" != "true" ]; then
     echo "pre-commit: commit signing is not enabled"
     echo "pre-commit: run: git config --global commit.gpgsign true"

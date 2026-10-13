@@ -20,9 +20,9 @@
 mod common;
 
 use common::Case;
-use libperfusion::internals::{
-    html5::{Context, TokenKind, Tokenizer},
-    sqli::{Dialect, Lexer, Quote, State, Token, TokenType},
+use libperfusion::{
+    Dialect, HtmlContext as Context, HtmlTokenKind as TokenKind, HtmlTokenizer as Tokenizer, Quote, SqlState, SqlToken,
+    SqlTokenType as TokenType, SqlTokenizer as Lexer,
 };
 
 /// Runs every `tests/<prefix>*.txt` through `actual` and compares the
@@ -55,18 +55,22 @@ fn run_cases(prefix: &str, actual: impl Fn(&[u8]) -> Vec<u8>) {
 
 /// `print_token` in `testdriver.c`. Values go through `%s` there, so they
 /// stop at the first NUL.
-fn print_token(out: &mut Vec<u8>, token: &Token) {
-    out.extend([token.ty.as_byte(), b' ']);
-    match token.ty {
+fn print_token(out: &mut Vec<u8>, token: &SqlToken) {
+    out.extend([token.kind().as_byte(), b' ']);
+    match token.kind() {
         TokenType::String | TokenType::Variable => {
-            if token.ty == TokenType::Variable {
-                out.extend(std::iter::repeat_n(b'@', usize::from(token.count.min(2))));
+            if token.kind() == TokenType::Variable {
+                out.extend(std::iter::repeat_n(b'@', usize::from(token.variable_count().min(2))));
             }
-            out.extend(token.str_open);
-            out.extend_from_slice(token.c_str());
-            out.extend(token.str_close);
+            if let Some(open) = token.string_open() {
+                out.push(open);
+            }
+            out.extend_from_slice(token.c_value());
+            if let Some(close) = token.string_close() {
+                out.push(close);
+            }
         },
-        _ => out.extend_from_slice(token.c_str()),
+        _ => out.extend_from_slice(token.c_value()),
     }
     out.push(b'\n');
 }
@@ -87,11 +91,11 @@ fn sqli_tokens() {
 #[ignore = "upstream corpus comparison; requires upstream test files via LIBINJECTION_DIR"]
 fn sqli_folding() {
     run_cases("test-folding-", |input| {
-        let mut state = State::new(input, Quote::None, Dialect::Ansi);
-        let count = state.fold();
+        let mut state = SqlState::new(input);
+        let tokens = state.fold(Quote::None, Dialect::Ansi);
         let mut out = Vec::new();
-        for token in &state.tokens[..count] {
-            print_token(&mut out, token);
+        for token in tokens {
+            print_token(&mut out, &token);
         }
         out
     });

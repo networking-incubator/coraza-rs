@@ -26,6 +26,7 @@
 
 mod corpus;
 mod lint_license;
+mod tables;
 
 use clap::{Parser, Subcommand};
 
@@ -52,6 +53,10 @@ enum Command {
     CorpusCheck,
     /// Refresh fixtures and the SQL oracle from the pinned Go module version.
     CorpusRefresh,
+    /// Check local libperfusion table data against its semantic hashes.
+    TablesCheck,
+    /// Refresh libperfusion's local tables from a libinjection C checkout.
+    TablesRefresh(tables::RefreshArgs),
 }
 
 // -----------------------------------------------------------------------------
@@ -65,5 +70,7 @@ fn main() {
         Command::LintLicense(args) => lint_license::run(args),
         Command::CorpusCheck => corpus::check_or_exit(),
         Command::CorpusRefresh => corpus::refresh_or_exit(),
+        Command::TablesCheck => tables::check_or_exit(),
+        Command::TablesRefresh(args) => tables::refresh_or_exit(&args),
     }
 }

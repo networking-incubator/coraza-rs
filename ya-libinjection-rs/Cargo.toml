@@ -17,8 +17,7 @@ bench = false
 memchr = { version = "2.7", default-features = false }
 
 [features]
-# Exposes implementation details to this crate's own tests. Not part of the
-# API: anything behind it can change in any release.
+# Exposes table constants for exact source-integrity tests only.
 internals = []
 
 [dev-dependencies]

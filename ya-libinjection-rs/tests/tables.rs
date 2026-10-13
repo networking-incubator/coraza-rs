@@ -13,15 +13,12 @@
 // limitations under the License.
 //! The tables ported from libinjection, compared with the upstream sources
 
-//! vendored in `tests/upstream/src`: the generated ones (see
-//! `tools/gen_tables.py`) and the ones copied by hand.
+//! selected by `LIBINJECTION_DIR`: the build-generated ones and the tables
+//! kept in the local canonical data files.
 
 mod common;
 
-use libperfusion::internals::{
-    sqli::{Parser, SQL_KEYWORDS},
-    xss::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS},
-};
+use libperfusion::internals::tables::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS, Parser, SQL_KEYWORDS};
 
 /// The body of the C array introduced by `declaration`, comments removed.
 fn c_array_body(source: &str, declaration: &str) -> String {

@@ -40,29 +40,25 @@ mod html5;
 mod sqli;
 mod xss;
 
-pub use html5::Context as HtmlContext;
-pub use sqli::{Dialect, Fingerprint};
+pub use html5::{Context as HtmlContext, Token as HtmlToken, TokenKind as HtmlTokenKind, Tokenizer as HtmlTokenizer};
+pub use sqli::{
+    BuiltinSqlLookup, Dialect, Fingerprint, Quote, SqlLookup, SqlState, SqlStatistics, SqlToken, SqlTokenType,
+    SqlTokenizer,
+};
 
-/// Implementation details, for this crate's own tests and their differential
-/// oracle. Not part of the API: anything in here can change in any release.
+/// Ported table constants for exact source-integrity tests. Not stable API.
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod internals {
-    pub mod html5 {
-        pub use crate::html5::{Context, Token, TokenKind, Tokenizer};
-    }
-
-    pub mod sqli {
-        pub use crate::sqli::{
-            State,
-            keyword_table::SQL_KEYWORDS,
-            lexer::{Dialect, Lexer, Parser, Quote, Stats},
-            token::{Token, TokenType},
+    /// Ported tables, exposed only for source-integrity tests.
+    pub mod tables {
+        pub use crate::{
+            sqli::{keyword_table::SQL_KEYWORDS, lexer::Parser},
+            xss::{
+                Attribute,
+                tables::{BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS},
+            },
         };
-    }
-
-    pub mod xss {
-        pub use crate::xss::{Attribute, BLACK_ATTRS, BLACK_TAGS, events::BLACK_ATTR_EVENTS, is_xss};
     }
 }
 
@@ -107,6 +103,12 @@ pub fn xss(input: &[u8]) -> bool {
 #[must_use]
 pub fn xss_with_context(input: &[u8]) -> Option<HtmlContext> {
     xss::detect_with_context(input)
+}
+
+/// Checks `input` for cross-site scripting in one caller-selected HTML context.
+#[must_use]
+pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
+    xss::is_xss(input, context)
 }
 
 /// Checks `input` for cross-site scripting, scanning at most `max_bytes`.

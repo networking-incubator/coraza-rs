@@ -11,6 +11,62 @@ use super::{
     token::{TOKEN_SIZE, TokenType},
 };
 
+/// SQL lookup used by the tokenizer, phrase folder, and fingerprint checker.
+///
+/// Implementations can borrow caller-owned data; passing `&lookup` to the
+/// parser keeps that configuration in place across reparses.
+pub trait SqlLookup {
+    /// Classify a keyword, word, or phrase.
+    fn lookup_word(&self, word: &[u8]) -> Option<TokenType>;
+
+    /// Classify a multi-byte SQL operator. By default, operators use the same
+    /// table as words.
+    fn lookup_operator(&self, operator: &[u8]) -> Option<TokenType> {
+        self.lookup_word(operator)
+    }
+
+    /// Whether `fingerprint` is in the detector's deny list.
+    fn is_fingerprint(&self, fingerprint: &[u8]) -> bool;
+}
+
+impl<T: SqlLookup + ?Sized> SqlLookup for &T {
+    fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
+        (**self).lookup_word(word)
+    }
+
+    fn lookup_operator(&self, operator: &[u8]) -> Option<TokenType> {
+        (**self).lookup_operator(operator)
+    }
+
+    fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
+        (**self).is_fingerprint(fingerprint)
+    }
+}
+
+/// The keyword, operator, and fingerprint tables shipped with libperfusion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuiltinSqlLookup;
+
+impl SqlLookup for BuiltinSqlLookup {
+    fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
+        lookup_word(word)
+    }
+
+    fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
+        if fingerprint.is_empty() || fingerprint.len() > super::MAX_TOKENS {
+            return false;
+        }
+
+        let mut key = [b'0'; super::MAX_TOKENS + 1];
+        for (dst, src) in key[1..].iter_mut().zip(fingerprint) {
+            *dst = src.to_ascii_uppercase();
+        }
+        lookup_word(&key[..=fingerprint.len()]) == Some(TokenType::Fingerprint)
+    }
+}
+
+pub(crate) const BUILTIN_SQL_LOOKUP: BuiltinSqlLookup = BuiltinSqlLookup;
+
 /// Upstream's `cstrcasecmp`: compares the upper-case C string `a` with the
 /// arbitrary bytes `b`, upper-casing `b` on the fly.
 ///

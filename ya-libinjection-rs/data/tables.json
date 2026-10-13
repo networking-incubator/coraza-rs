@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "source": {
+    "commit": "d88a8f86d617ac8dcb9169c9f34637aaac71ac76",
+    "repository": "https://github.com/libinjection/libinjection",
+    "version": "v4.0.0-8-gd88a8f8"
+  },
+  "sql": {
+    "entries": 9352,
+    "sha256": "d9f0395d3e9b90c70c59f45d6be0408ef493bd854933b276e44614cb9d6b56bd"
+  },
+  "xss": {
+    "attributes": 20,
+    "entries": 472,
+    "events": 432,
+    "sha256": "810bc9a015c0c3d699e498e6f486a718dd216f966844b8b5732129028290aff6",
+    "tags": 20
+  }
+}

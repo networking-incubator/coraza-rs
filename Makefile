@@ -32,6 +32,7 @@ clean:
 
 test:
 	cargo xtask corpus-check
+	cargo xtask tables-check
 	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
 
@@ -81,8 +82,20 @@ doc:
 # -------------------------------------------------------------------
 
 setup-hooks:
-	ln -sf ../../.hooks/pre-commit .git/hooks/pre-commit
-	@echo "Git hooks installed."
+	@set -eu; \
+	project_root="$$(git rev-parse --show-toplevel)"; \
+	project_hooks="$$(cd "$$project_root/.hooks" && pwd -P)"; \
+	current_hooks="$$(git config --get core.hooksPath 2>/dev/null || git rev-parse --git-path hooks)"; \
+	case "$$current_hooks" in /*) ;; *) current_hooks="$$project_root/$$current_hooks" ;; esac; \
+	if [ -d "$$current_hooks" ]; then current_hooks="$$(cd "$$current_hooks" && pwd -P)"; fi; \
+	if [ "$$current_hooks" = "$$project_hooks" ]; then \
+		echo "Git hooks already point to .hooks."; \
+	else \
+		git config --local coraza.previousHooksPath "$$current_hooks"; \
+		git config --local core.hooksPath .hooks; \
+		echo "Git hooks installed; an existing pre-commit hook will be chained when present."; \
+	fi; \
+	chmod +x "$$project_hooks/pre-commit"
 
 # -------------------------------------------------------------------
 # Help
@@ -115,4 +128,4 @@ help:
 	@echo "  doc        build docs with warnings denied"
 	@echo ""
 	@echo "Dev Setup:"
-	@echo "  setup-hooks  install git pre-commit hook (commit signing + lint)"
+	@echo "  setup-hooks  enable project pre-commit checks and chain existing hooks"

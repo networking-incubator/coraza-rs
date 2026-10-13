@@ -14,7 +14,7 @@
 
 use super::{
     MAX_TOKENS, State,
-    keywords::lookup_word,
+    keywords::SqlLookup,
     token::{TOKEN_SIZE, Token, TokenType as T},
 };
 
@@ -45,7 +45,11 @@ const FUNCTION_LIKE_WORDS: [&[u8]; 11] = [
     b"LOCALTIMESTAMP",
 ];
 
-impl State<'_> {
+impl<L: SqlLookup> State<'_, L> {
+    fn record_folds(&mut self, count: usize) {
+        self.lexer.stats.folds += count;
+    }
+
     /// Reads the next token into slot `index`, clearing the slot at the end
     /// of input. Returns whether there was a token.
     fn tokenize_into(&mut self, index: usize) -> bool {
@@ -105,7 +109,7 @@ impl State<'_> {
         let phrase = &phrase[..len];
         let pos = a.pos;
 
-        match lookup_word(phrase) {
+        match self.lexer.lookup.lookup_word(phrase) {
             Some(ty) => {
                 self.tokens[left].assign(ty, pos, phrase);
                 true
@@ -197,23 +201,28 @@ impl State<'_> {
             if a.ty == T::String && b.ty == T::String {
                 // "foo" "bar" is valid SQL: ignore the second string.
                 pos -= 1;
+                self.record_folds(1);
                 continue;
             } else if a.ty == T::Semicolon && b.ty == T::Semicolon {
                 // Fold away repeated semicolons.
                 pos -= 1;
+                self.record_folds(1);
                 continue;
             } else if matches!(a.ty, T::Operator | T::LogicOperator) && (b.is_unary_op() || b.ty == T::SqlType) {
                 pos -= 1;
+                self.record_folds(1);
                 left = 0;
                 continue;
             } else if a.ty == T::LeftParens && b.is_unary_op() {
                 pos -= 1;
+                self.record_folds(1);
                 left = left.saturating_sub(1);
                 continue;
             }
 
             if self.merge_words(left) {
                 pos -= 1;
+                self.record_folds(1);
                 left = left.saturating_sub(1);
                 continue;
             }
@@ -265,6 +274,7 @@ impl State<'_> {
             {
                 self.tokens[left] = *b;
                 pos -= 1;
+                self.record_folds(1);
                 left = 0;
                 continue;
             } else if a.ty == T::Collate && b.ty == T::Bareword {
@@ -282,6 +292,7 @@ impl State<'_> {
                     // ... and "\1" as "1": drop the backslash.
                     self.tokens[left] = *b;
                     pos -= 1;
+                    self.record_folds(1);
                 }
                 left = 0;
                 continue;
@@ -290,6 +301,7 @@ impl State<'_> {
             {
                 pos -= 1;
                 left = 0;
+                self.record_folds(1);
                 continue;
             } else if a.ty == T::LeftBrace && b.ty == T::Bareword {
                 // MySQL accepts "select { ``.``.id }". Folding cannot look
@@ -302,10 +314,12 @@ impl State<'_> {
                 // ODBC's "{foo expr}" is "expr": strip the "{ foo".
                 left = 0;
                 pos -= 2;
+                self.record_folds(2);
                 continue;
             } else if b.ty == T::RightBrace {
                 pos -= 1;
                 left = 0;
+                self.record_folds(1);
                 continue;
             }
 
@@ -358,6 +372,7 @@ impl State<'_> {
                 // A PostgreSQL cast.
                 pos -= 2;
                 left = 0;
+                self.record_folds(2);
                 continue;
             } else if matches!(a.ty, T::Bareword | T::Number | T::String | T::Variable)
                 && b.ty == T::Comma
