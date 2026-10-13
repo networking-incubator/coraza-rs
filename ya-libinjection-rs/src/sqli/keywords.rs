@@ -1,7 +1,15 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 use core::cmp::Ordering;
 
-use super::keyword_table::SQL_KEYWORDS;
-use super::token::TokenType;
+use super::{
+    keyword_table::SQL_KEYWORDS,
+    token::{TOKEN_SIZE, TokenType},
+};
 
 /// Upstream's `cstrcasecmp`: compares the upper-case C string `a` with the
 /// arbitrary bytes `b`, upper-casing `b` on the fly.
@@ -42,7 +50,7 @@ const EMPTY: u16 = u16::MAX;
 
 /// FNV-1a over the key as the comparison sees it: upper-cased.
 const fn hash(key: &[u8]) -> usize {
-    let mut hash: u32 = 0x811c_9dc5;
+    let mut hash: u32 = 0x811C_9DC5;
     let mut i = 0;
     while i < key.len() {
         hash = (hash ^ key[i].to_ascii_uppercase() as u32).wrapping_mul(0x0100_0193);
@@ -90,6 +98,34 @@ static SLOTS: [u16; SLOT_COUNT] = {
 /// finds the same words: those `key` equals by [`cstrcasecmp`]. Done that
 /// way, the lookups were half of what detecting SQLi cost.
 pub(crate) fn lookup_word(key: &[u8]) -> Option<TokenType> {
+    if !key.is_ascii() {
+        return lookup_unicode_word(key);
+    }
+    lookup_ascii_word(key)
+}
+
+/// Looks up a valid UTF-8 word using Go's Unicode uppercase behavior for
+/// characters whose uppercase form is a single ASCII byte. SQL table keys
+/// are ASCII; other Unicode uppercase results cannot match them.
+/// Keep conversion outlined: inlining it slows large ASCII miss scans.
+#[inline(never)]
+fn lookup_unicode_word(key: &[u8]) -> Option<TokenType> {
+    let word = core::str::from_utf8(key).ok()?;
+    let mut upper = [0; TOKEN_SIZE];
+    let mut len = 0;
+    for ch in word.chars() {
+        let mut uppercase = ch.to_uppercase();
+        let mapped = uppercase.next()?;
+        if uppercase.next().is_some() || !mapped.is_ascii() || len == upper.len() {
+            return None;
+        }
+        upper[len] = mapped as u8;
+        len += 1;
+    }
+    lookup_ascii_word(&upper[..len])
+}
+
+fn lookup_ascii_word(key: &[u8]) -> Option<TokenType> {
     let mut slot = hash(key);
     loop {
         let index = SLOTS[slot];
@@ -112,11 +148,7 @@ mod tests {
     fn every_table_entry_is_found() {
         for &(word, ty) in &SQL_KEYWORDS {
             assert_eq!(lookup_word(word.as_bytes()), Some(ty), "{word}");
-            assert_eq!(
-                lookup_word(word.to_ascii_lowercase().as_bytes()),
-                Some(ty),
-                "{word}"
-            );
+            assert_eq!(lookup_word(word.to_ascii_lowercase().as_bytes()), Some(ty), "{word}");
         }
     }
 
@@ -184,12 +216,7 @@ mod tests {
     #[test]
     fn finds_what_upstream_finds() {
         let check = |key: &[u8]| {
-            assert_eq!(
-                lookup_word(key),
-                upstream_lookup(key),
-                "{}",
-                key.escape_ascii()
-            );
+            assert_eq!(lookup_word(key), upstream_lookup(key), "{}", key.escape_ascii());
         };
 
         // Nothing, and every one and two bytes there are: the operators.
@@ -221,6 +248,14 @@ mod tests {
         assert_eq!(lookup_word(b"SELECTS"), None);
         assert_eq!(lookup_word(b"SELECT\0"), None);
         assert_eq!(lookup_word(b"\xff\xfe"), None);
+    }
+
+    #[test]
+    fn unicode_uppercase_matches_ascii_keywords_and_phrases() {
+        assert_eq!(lookup_word("unıon".as_bytes()), Some(TokenType::Union));
+        assert_eq!(lookup_word("ſelect".as_bytes()), Some(TokenType::Expression));
+        assert_eq!(lookup_word("unıon all".as_bytes()), Some(TokenType::Union));
+        assert_eq!(lookup_word("select ſleep".as_bytes()), None);
     }
 
     #[test]

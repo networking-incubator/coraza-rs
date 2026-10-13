@@ -1,8 +1,17 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 //! The SQL tokenizer: a first-byte dispatch into one small scanner per
+
 //! token shape, kept function-for-function with upstream's `parse_*`.
 
-use super::keywords::lookup_word;
-use super::token::{TOKEN_SIZE, Token, TokenType};
+use super::{
+    keywords::lookup_word,
+    token::{TOKEN_SIZE, Token, TokenType},
+};
 use crate::bytes::{byte_set, cspan, find_byte, find_pair, find_slice, span};
 
 /// How the input is assumed to sit inside the surrounding SQL statement.
@@ -127,6 +136,14 @@ fn is_double_delim_escaped(s: &[u8], at: usize) -> bool {
     s.get(at + 1) == Some(&s[at])
 }
 
+fn find_string_delimiter(s: &[u8], from: usize, delim: u8) -> Option<usize> {
+    if s.get(from) == Some(&delim) {
+        Some(from)
+    } else {
+        find_byte(s, from, delim)
+    }
+}
+
 /// Scans a `delim`-quoted string whose body starts `offset` bytes after
 /// `pos`. With `offset == 0` the opening quote is the simulated one of
 /// [`Quote`].
@@ -134,7 +151,7 @@ fn parse_string_core(s: &[u8], pos: usize, st: &mut Token, delim: u8, offset: us
     let start = pos + offset;
     st.str_open = (offset > 0).then_some(delim);
 
-    let mut qpos = find_byte(s, start, delim);
+    let mut qpos = find_string_delimiter(s, start, delim);
     loop {
         match qpos {
             None => {
@@ -142,14 +159,18 @@ fn parse_string_core(s: &[u8], pos: usize, st: &mut Token, delim: u8, offset: us
                 st.assign(TokenType::String, start, &s[start..]);
                 st.str_close = None;
                 return s.len();
-            }
-            Some(q) if is_backslash_escaped(&s[start..q]) => qpos = find_byte(s, q + 1, delim),
-            Some(q) if is_double_delim_escaped(s, q) => qpos = find_byte(s, q + 2, delim),
+            },
+            Some(q) if is_backslash_escaped(&s[start..q]) => {
+                qpos = find_string_delimiter(s, q + 1, delim);
+            },
+            Some(q) if is_double_delim_escaped(s, q) => {
+                qpos = find_string_delimiter(s, q + 2, delim);
+            },
             Some(q) => {
                 st.assign(TokenType::String, start, &s[start..q]);
                 st.str_close = Some(delim);
                 return q + 1;
-            }
+            },
         }
     }
 }
@@ -194,11 +215,11 @@ impl<'a> Lexer<'a> {
             None => {
                 cur.assign(TokenType::Comment, pos, &s[pos..]);
                 s.len()
-            }
+            },
             Some(end) => {
                 cur.assign(TokenType::Comment, pos, &s[pos..end]);
                 end + 1
-            }
+            },
         }
     }
 
@@ -341,11 +362,7 @@ impl<'a> Lexer<'a> {
         let slen = s.len();
         let pos = start + offset;
 
-        if pos >= slen
-            || (s[pos] != b'q' && s[pos] != b'Q')
-            || pos + 2 >= slen
-            || s[pos + 1] != b'\''
-        {
+        if pos >= slen || (s[pos] != b'q' && s[pos] != b'Q') || pos + 2 >= slen || s[pos + 1] != b'\'' {
             return self.parse_word(start, cur);
         }
 
@@ -370,12 +387,12 @@ impl<'a> Lexer<'a> {
                 cur.assign(TokenType::String, body, &s[body..]);
                 cur.str_close = None;
                 slen
-            }
+            },
             Some(end) => {
                 cur.assign(TokenType::String, body, &s[body..body + end]);
                 cur.str_close = Some(b'q');
                 body + end + 2
-            }
+            },
         }
     }
 
@@ -416,18 +433,19 @@ impl<'a> Lexer<'a> {
             None => {
                 cur.assign(TokenType::Bareword, pos, &s[pos..]);
                 s.len()
-            }
+            },
             Some(end) => {
                 cur.assign(TokenType::Bareword, pos, &s[pos..=end]);
                 end + 1
-            }
+            },
         }
     }
 
     fn parse_word(&self, pos: usize, cur: &mut Token) -> usize {
         let s = self.s;
-        let wlen = cspan(&s[pos..], &WORD_END);
-        cur.assign(TokenType::Bareword, pos, &s[pos..pos + wlen]);
+        let prefix_end = (pos + TOKEN_SIZE).min(s.len());
+        let prefix_len = cspan(&s[pos..prefix_end], &WORD_END);
+        cur.assign(TokenType::Bareword, pos, &s[pos..pos + prefix_len]);
 
         // Look inside the word for '.' and '`': if what precedes one is a
         // keyword ("SELECT.1", "SELECT`column`"), the token ends there.
@@ -439,14 +457,20 @@ impl<'a> Lexer<'a> {
                         *cur = Token::default();
                         cur.assign(ty, pos, &s[pos..pos + i]);
                         return pos + i;
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
             }
         }
 
         // Otherwise look up the whole word, '.' included. A word too long
         // for the token buffer was truncated and is left a bareword.
+        let wlen = prefix_len
+            + if prefix_len == TOKEN_SIZE {
+                cspan(&s[pos + prefix_len..], &WORD_END)
+            } else {
+                0
+            };
         if wlen < TOKEN_SIZE {
             cur.ty = lookup_word(cur.value()).unwrap_or(TokenType::Bareword);
         }
@@ -482,13 +506,13 @@ impl<'a> Lexer<'a> {
                 let end = self.parse_tick(pos, cur);
                 cur.ty = TokenType::Variable;
                 return end;
-            }
+            },
             Some(b'\'' | b'"') => {
                 let end = self.parse_string(pos, cur);
                 cur.ty = TokenType::Variable;
                 return end;
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         let xlen = cspan(&s[pos..], &VARIABLE_END);
@@ -525,12 +549,12 @@ impl<'a> Lexer<'a> {
                     cur.assign(TokenType::String, body, &s[body..]);
                     cur.str_close = None;
                     slen
-                }
+                },
                 Some(end) => {
                     cur.assign(TokenType::String, body, &s[body..body + end]);
                     cur.str_close = Some(b'$');
                     body + end + 2
-                }
+                },
             };
         }
 
@@ -550,12 +574,12 @@ impl<'a> Lexer<'a> {
                 cur.assign(TokenType::String, body, &s[body..]);
                 cur.str_close = None;
                 slen
-            }
+            },
             Some(end) => {
                 cur.assign(TokenType::String, body, &s[body..body + end]);
                 cur.str_close = Some(b'$');
                 body + end + tag.len()
-            }
+            },
         }
     }
 
@@ -696,5 +720,41 @@ impl Iterator for Lexer<'_> {
     fn next(&mut self) -> Option<Token> {
         let mut token = Token::default();
         self.next_into(&mut token).then_some(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_string_skips_escaped_and_doubled_delimiters() {
+        let input = b"'\\''''x";
+        let mut token = Token::default();
+
+        assert_eq!(parse_string_core(input, 0, &mut token, b'\'', 1), 6);
+        assert_eq!(token.value(), [b'\\', b'\'', b'\'', b'\'']);
+        assert_eq!(token.str_open, Some(b'\''));
+        assert_eq!(token.str_close, Some(b'\''));
+    }
+
+    #[test]
+    fn repeated_and_dot_words_keep_token_contents_and_positions() {
+        const REPEATS: usize = 8_192;
+        let input = b"AND.".repeat(REPEATS);
+        let tokens: Vec<_> = Lexer::new(&input, Quote::None, Dialect::Ansi).collect();
+
+        assert_eq!(tokens.len(), REPEATS * 2);
+        for (index, pair) in tokens.chunks_exact(2).enumerate() {
+            let keyword = &pair[0];
+            assert_eq!(keyword.ty, TokenType::LogicOperator);
+            assert_eq!(keyword.pos, index * 4);
+            assert_eq!(keyword.value(), b"AND");
+
+            let dot = &pair[1];
+            assert_eq!(dot.ty, TokenType::Dot);
+            assert_eq!(dot.pos, index * 4 + 3);
+            assert_eq!(dot.value(), b".");
+        }
     }
 }

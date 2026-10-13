@@ -60,3 +60,4 @@ path = "tests/fuzz_regressions.rs"
 required-features = ["legacy"]
 
 [dev-dependencies]
+libperfusion = { path = "../ya-libinjection-rs" }

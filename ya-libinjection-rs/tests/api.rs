@@ -1,4 +1,18 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //! Tests for the extended public API: dialect, html context, and input limits.
+
 
 use libperfusion::{Dialect, HtmlContext};
 
@@ -52,18 +66,12 @@ fn xss_with_limit_overlarge_limit_is_same_as_no_limit() {
 #[test]
 fn xss_with_limit_truncation_prevents_detection() {
     // "<sc" is not an XSS payload.
-    assert!(!libperfusion::xss_with_limit(
-        b"<script>alert(1)</script>",
-        3
-    ));
+    assert!(!libperfusion::xss_with_limit(b"<script>alert(1)</script>", 3));
 }
 
 #[test]
 fn xss_with_limit_zero_is_false() {
-    assert!(!libperfusion::xss_with_limit(
-        b"<script>alert(1)</script>",
-        0
-    ));
+    assert!(!libperfusion::xss_with_limit(b"<script>alert(1)</script>", 0));
 }
 
 #[test]

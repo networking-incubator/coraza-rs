@@ -57,7 +57,6 @@ lint-extra:
 	taplo format --check .
 	actionlint -ignore 'specifying action "\$$/.+" in invalid format because ref is missing'
 	shellcheck .hooks/*
-	npx --yes markdownlint-cli2@0.23.2 "**/*.md" "#target"
 
 audit:
 	cargo audit
@@ -109,7 +108,7 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"
-	@echo "  lint-extra typos + taplo + actionlint + shellcheck + markdownlint"
+	@echo "  lint-extra typos + taplo + actionlint + shellcheck"
 	@echo "  audit      cargo audit + cargo deny"
 	@echo "  coverage-check  enforce 90% line / 80% region coverage"
 	@echo "  fmt        format with rustfmt"

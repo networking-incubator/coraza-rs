@@ -16,6 +16,9 @@ SEEKED = "SEEKED"
 Unparseable = "Unparseable"
 unparseable = "unparseable"
 
+# Short name for comment length in the SQL lexer.
+clen = "clen"
+
 # Intentional upstream test names and fixture literals.
 Attribures = "Attribures"
 som = "som"

@@ -1,4 +1,11 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 //! A pure Rust port of [libinjection], which detects SQL injection and
+
 //! cross-site scripting in user input by tokenizing it rather than matching
 //! regular expressions.
 //!
@@ -46,15 +53,16 @@ pub mod internals {
     }
 
     pub mod sqli {
-        pub use crate::sqli::State;
-        pub use crate::sqli::keyword_table::SQL_KEYWORDS;
-        pub use crate::sqli::lexer::{Dialect, Lexer, Parser, Quote, Stats};
-        pub use crate::sqli::token::{Token, TokenType};
+        pub use crate::sqli::{
+            State,
+            keyword_table::SQL_KEYWORDS,
+            lexer::{Dialect, Lexer, Parser, Quote, Stats},
+            token::{Token, TokenType},
+        };
     }
 
     pub mod xss {
-        pub use crate::xss::events::BLACK_ATTR_EVENTS;
-        pub use crate::xss::{Attribute, BLACK_ATTRS, BLACK_TAGS, is_xss};
+        pub use crate::xss::{Attribute, BLACK_ATTRS, BLACK_TAGS, events::BLACK_ATTR_EVENTS, is_xss};
     }
 }
 

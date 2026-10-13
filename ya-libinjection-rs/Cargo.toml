@@ -10,10 +10,11 @@ keywords = ["libinjection", "sqli", "xss", "sql-injection", "waf"]
 exclude = ["/benches", "/tests"]
 
 [lib]
-# `cargo bench` is for benches/speed.rs, not for running the unit tests.
+# Keep the library's unit-test harness out of `cargo bench`.
 bench = false
 
 [dependencies]
+memchr = { version = "2.7", default-features = false }
 
 [features]
 # Exposes implementation details to this crate's own tests. Not part of the
@@ -23,7 +24,16 @@ internals = []
 [dev-dependencies]
 # Turns `internals` on for the tests, and only for them.
 libperfusion = { path = ".", features = ["internals"] }
+libinjection = { path = "../libinjection-rs" }
 
 [[bench]]
 name = "speed"
+harness = false
+
+[[bench]]
+name = "compare"
+harness = false
+
+[[bench]]
+name = "scaling"
 harness = false

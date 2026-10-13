@@ -1,4 +1,11 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 //! A small HTML5 tokenizer, after the tokenization chapter of the HTML5 spec
+
 //! with the browser quirks upstream cares about (NULs in tag names,
 //! backtick-quoted attribute values, `<% %>` comments).
 //!
@@ -58,9 +65,15 @@ enum State {
 }
 
 /// What ends an attribute name: whitespace (see [`is_white`]), '/', '=' or '>'.
-static ATTRIBUTE_NAME_END: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r/=>");
+const fn html_byte_set(bytes: &[u8]) -> [bool; 256] {
+    let mut set = byte_set(bytes);
+    set[0] = false;
+    set
+}
+
+static ATTRIBUTE_NAME_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r/=>");
 /// What ends an unquoted attribute value: whitespace or '>'.
-static UNQUOTED_VALUE_END: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r>");
+static UNQUOTED_VALUE_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r>");
 
 /// Upstream's `h5_is_white`, a `strchr` that also matches NUL.
 fn is_white(ch: u8) -> bool {
@@ -109,8 +122,9 @@ impl<'a> Tokenizer<'a> {
                 0x00 | b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' => self.pos += 1,
                 // Upstream returns the byte as an `int` through a `char`
                 // that is signed on its reference platform, where 0xFF
-                // comes out as -1: its end-of-input marker.
-                0xFF => return None,
+                // comes out as -1, its end-of-input marker, and ends the
+                // scan: "<img \xff onerror=...>" gets through. 0xFF is an
+                // ordinary byte here.
                 _ => return Some(ch),
             }
         }
@@ -119,7 +133,14 @@ impl<'a> Tokenizer<'a> {
 
     fn state_data(&mut self) -> Option<Token<'a>> {
         let start = self.pos;
-        match find_byte(self.s, start, b'<') {
+        // A run of invalid '<' bytes reaches this state one byte at a time.
+        // Avoid calling memchr for each immediate match in that case.
+        let next_tag = if self.s.get(start) == Some(&b'<') {
+            Some(start)
+        } else {
+            find_byte(self.s, start, b'<')
+        };
+        match next_tag {
             None => {
                 self.state = State::Eof;
                 let len = self.s.len() - start;
@@ -128,7 +149,7 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     Some(self.token(TokenKind::DataText, start, len))
                 }
-            }
+            },
             Some(idx) => {
                 self.pos = idx + 1;
                 self.state = State::TagOpen;
@@ -137,7 +158,7 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     Some(self.token(TokenKind::DataText, start, idx - start))
                 }
-            }
+            },
         }
     }
 
@@ -148,22 +169,22 @@ impl<'a> Tokenizer<'a> {
             b'!' => {
                 self.pos += 1;
                 self.state_markup_declaration_open()
-            }
+            },
             b'/' => {
                 self.pos += 1;
                 self.is_close = true;
                 self.state_end_tag_open()
-            }
+            },
             b'?' => {
                 self.pos += 1;
                 self.state_bogus_comment()
-            }
+            },
             // Not in the spec: the alternative comment format of IE <= 9
             // and Safari < 4.0.3.
             b'%' => {
                 self.pos += 1;
                 self.state_bogus_comment2()
-            }
+            },
             // An IE-ism: NUL characters are ignored.
             b'a'..=b'z' | b'A'..=b'Z' | 0 => self.state_tag_name(),
             _ => {
@@ -173,7 +194,7 @@ impl<'a> Tokenizer<'a> {
                 // Not a tag after all: the '<' is text.
                 self.state = State::Data;
                 Some(self.token(TokenKind::DataText, self.pos - 1, 1))
-            }
+            },
         }
     }
 
@@ -253,13 +274,13 @@ impl<'a> Tokenizer<'a> {
                         continue;
                     }
                     return self.state_self_closing_start_tag();
-                }
+                },
                 b'>' => {
                     let start = self.pos;
                     self.pos += 1;
                     self.state = State::Data;
                     return Some(self.token(TokenKind::TagNameClose, start, 1));
-                }
+                },
                 _ => return self.state_attribute_name(),
             }
         }
@@ -286,11 +307,11 @@ impl<'a> Tokenizer<'a> {
             b'/' => {
                 self.pos += 1;
                 self.state_self_closing_start_tag()
-            }
+            },
             b'=' => {
                 self.pos += 1;
                 self.state_before_attribute_value()
-            }
+            },
             b'>' => self.state_tag_name_close(),
             _ => self.state_attribute_name(),
         }
@@ -322,12 +343,12 @@ impl<'a> Tokenizer<'a> {
             None => {
                 self.state = State::Eof;
                 Some(self.token(TokenKind::AttrValue, start, self.s.len() - start))
-            }
+            },
             Some(idx) => {
                 self.state = State::AfterAttributeValueQuoted;
                 self.pos = idx + 1;
                 Some(self.token(TokenKind::AttrValue, start, idx - start))
-            }
+            },
         }
     }
 
@@ -385,12 +406,12 @@ impl<'a> Tokenizer<'a> {
                 self.pos = s.len();
                 self.state = State::Eof;
                 Some(self.token(TokenKind::TagComment, start, s.len() - start))
-            }
+            },
             Some(idx) => {
                 self.pos = idx + 1;
                 self.state = State::Data;
                 Some(self.token(TokenKind::TagComment, start, idx - start))
-            }
+            },
         }
     }
 
@@ -409,12 +430,12 @@ impl<'a> Tokenizer<'a> {
                     self.pos = idx + 2;
                     self.state = State::Data;
                     return Some(self.token(TokenKind::TagComment, start, idx - start));
-                }
+                },
                 _ => {
                     self.pos = s.len();
                     self.state = State::Eof;
                     return Some(self.token(TokenKind::TagComment, start, s.len() - start));
-                }
+                },
             }
         }
     }
@@ -495,12 +516,12 @@ impl<'a> Tokenizer<'a> {
                 None => {
                     self.state = State::Eof;
                     return Some(self.token(TokenKind::DataText, start, len - start));
-                }
+                },
                 Some(idx) if s[idx + 1] == b']' && s[idx + 2] == b'>' => {
                     self.state = State::Data;
                     self.pos = idx + 3;
                     return Some(self.token(TokenKind::DataText, start, idx - start));
-                }
+                },
                 Some(idx) => pos = idx + 1,
             }
         }
@@ -514,12 +535,12 @@ impl<'a> Tokenizer<'a> {
             None => {
                 self.state = State::Eof;
                 Some(self.token(TokenKind::Doctype, start, s.len() - start))
-            }
+            },
             Some(idx) => {
                 self.state = State::Data;
                 self.pos = idx + 1;
                 Some(self.token(TokenKind::Doctype, start, idx - start))
-            }
+            },
         }
     }
 }
@@ -540,5 +561,26 @@ impl<'a> Iterator for Tokenizer<'a> {
             State::AttributeValueQuoted(quote) => self.state_attribute_value_quote(quote),
             State::AfterAttributeValueQuoted => self.state_after_attribute_value_quoted(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attribute_tokens_preserve_embedded_nul_bytes_and_spans() {
+        let input = b"<a on\0error=ja\0va:>";
+        let tokens: Vec<_> = Tokenizer::new(input, Context::Data).collect();
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::AttrName && token.text == b"on\0error")
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::AttrValue && token.text == b"ja\0va:")
+        );
     }
 }

@@ -1,5 +1,19 @@
-//! The port against libinjection itself: `tests/oracle/oracle.c` runs the C
-//! library, built from the sources vendored in `tests/upstream/src`, and
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//! Optional exact-C comparison: `tests/oracle/oracle.c` runs the C library,
+
+//! built from the sources in the checkout selected by `LIBINJECTION_DIR`, and
 //! every input has to come out of both identically. Compared are the SQL
 //! tokens, folded tokens, fingerprints and verdicts in each of the six
 //! quote/dialect contexts, and the HTML5 tokens and XSS verdicts in each of
@@ -9,35 +23,43 @@
 //! ones. The fuzzing is deterministic: a run compares the same inputs
 //! every time.
 //!
-//! These tests need a C compiler: `CC` (default `cc`) with `CFLAGS`
-//! (default `-O2`). To have the C side checked for memory errors as well:
+//! These tests are ignored by default. Run them with `LIBINJECTION_DIR` set
+//! and a C compiler: `CC` (default `cc`) with `CFLAGS` (default `-O2`). To
+//! have the C side checked for memory errors as well:
 //!
 //! ```text
 //! CC=clang CFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined" \
-//!     cargo test --test differential
+//!     LIBINJECTION_DIR=/path/to/libinjection cargo test --test differential -- --ignored
 //! ```
 //!
 //! `DIFFERENTIAL_FUZZ_INPUTS` sets how many fuzzed inputs to compare, in
 //! all. For a long run, with the number of inputs each test compared:
 //!
 //! ```text
-//! DIFFERENTIAL_FUZZ_INPUTS=20000000 cargo test --release --test differential -- --nocapture
+//! LIBINJECTION_DIR=/path/to/libinjection DIFFERENTIAL_FUZZ_INPUTS=20000000 \
+//!     cargo test --release --test differential -- --ignored --nocapture
 //! ```
 
 mod common;
 
-use std::env;
-use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, BufWriter, Write as _};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use std::{
+    env,
+    fmt::Write as _,
+    io::{BufRead, BufReader, BufWriter, Write as _},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+};
 
-use libperfusion::internals::html5::{Context, TokenKind, Tokenizer};
-use libperfusion::internals::sqli::{Dialect, Lexer, Quote, State, Token};
-use libperfusion::internals::xss::is_xss;
+use libperfusion::internals::{
+    html5::{Context, TokenKind, Tokenizer},
+    sqli::{Dialect, Lexer, Quote, State, Token},
+    xss::is_xss,
+};
 
 /// How many fuzzed inputs to compare by default, over all the fuzz tests.
 const DEFAULT_FUZZ_INPUTS: usize = 500_000;
@@ -100,12 +122,7 @@ fn dump(input: &[u8]) -> String {
             dump_token(&mut out, &token);
         }
         let stats = lexer.stats;
-        write!(
-            out,
-            "/{},{},{}",
-            stats.tokens, stats.comment_ddx, stats.comment_hash
-        )
-        .unwrap();
+        write!(out, "/{},{},{}", stats.tokens, stats.comment_ddx, stats.comment_hash).unwrap();
 
         write!(out, " F{k}:").unwrap();
         let mut state = State::new(input, quote, dialect);
@@ -199,9 +216,7 @@ fn compare(inputs: &[Vec<u8>]) -> Result<(), String> {
         }
     });
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("cannot wait for the oracle: {e}"))?;
+    let status = child.wait().map_err(|e| format!("cannot wait for the oracle: {e}"))?;
     if let Some(mismatch) = mismatch {
         return Err(mismatch);
     }
@@ -209,10 +224,7 @@ fn compare(inputs: &[Vec<u8>]) -> Result<(), String> {
         return Err(format!(
             "the oracle stopped at input {answered} of {} ({status}): \"{}\"",
             inputs.len(),
-            inputs
-                .get(answered)
-                .map_or(&[][..], Vec::as_slice)
-                .escape_ascii()
+            inputs.get(answered).map_or(&[][..], Vec::as_slice).escape_ascii()
         ));
     }
     Ok(())
@@ -270,9 +282,7 @@ fn corpus() -> &'static [Vec<u8>] {
 /// The number of chunks that `share` percent of the fuzz budget comes to.
 fn fuzz_chunks(share: usize) -> usize {
     let total = env::var("DIFFERENTIAL_FUZZ_INPUTS").map_or(DEFAULT_FUZZ_INPUTS, |inputs| {
-        inputs
-            .parse()
-            .expect("DIFFERENTIAL_FUZZ_INPUTS is not a number")
+        inputs.parse().expect("DIFFERENTIAL_FUZZ_INPUTS is not a number")
     });
     (total * share / 100).div_ceil(CHUNK)
 }
@@ -670,11 +680,7 @@ fn any_piece(rng: &mut Rng) -> &'static [u8] {
     SQL.get(index).unwrap_or_else(|| &HTML[index - SQL.len()])
 }
 
-fn concat(
-    rng: &mut Rng,
-    count: usize,
-    mut piece: impl FnMut(&mut Rng) -> &'static [u8],
-) -> Vec<u8> {
+fn concat(rng: &mut Rng, count: usize, mut piece: impl FnMut(&mut Rng) -> &'static [u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..count {
         out.extend_from_slice(piece(rng));
@@ -692,28 +698,28 @@ fn mutate(rng: &mut Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
             1 if !s.is_empty() => {
                 let end = s.len().min(at + rng.between(1, 6));
                 s.drain(at..end);
-            }
+            },
             2 if !s.is_empty() => {
                 let at = rng.below(s.len());
                 s[at] = rng.byte();
-            }
+            },
             3 if !s.is_empty() => {
                 let end = s.len().min(at + rng.between(1, 12));
                 let repeated = s[at..end].to_vec();
                 s.splice(at..at, repeated);
-            }
+            },
             4 => s.truncate(at),
             5 => drop(s.drain(..at)),
             6 if !s.is_empty() => {
                 let at = rng.below(s.len());
                 s[at] ^= 0x20;
-            }
+            },
             // Continue with the tail of another seed.
             _ => {
                 let other = &seeds[rng.below(seeds.len())];
                 s.truncate(at);
                 s.extend_from_slice(&other[rng.between(0, other.len())..]);
-            }
+            },
         }
     }
     s.truncate(400);
@@ -721,6 +727,7 @@ fn mutate(rng: &mut Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "exact C differential; requires an upstream checkout via LIBINJECTION_DIR"]
 fn corpus_matches() {
     let corpus = corpus();
     compare_chunks("upstream corpus", corpus.len().div_ceil(CHUNK), |index| {
@@ -730,6 +737,7 @@ fn corpus_matches() {
 
 /// Mutated seeds, strings of special pieces, and plain random bytes.
 #[test]
+#[ignore = "exact C differential; requires an upstream checkout via LIBINJECTION_DIR"]
 fn fuzz_mutations() {
     let seeds = corpus();
     compare_chunks("mutations", fuzz_chunks(60), |index| {
@@ -740,15 +748,15 @@ fn fuzz_mutations() {
                 4..6 => {
                     let count = rng.between(0, 12);
                     concat(&mut rng, count, |rng| rng.pick(SQL))
-                }
+                },
                 6..8 => {
                     let count = rng.between(0, 14);
                     concat(&mut rng, count, |rng| rng.pick(HTML))
-                }
+                },
                 8 => {
                     let count = rng.between(0, 10);
                     concat(&mut rng, count, any_piece)
-                }
+                },
                 _ => (0..rng.between(0, 24)).map(|_| rng.byte()).collect(),
             })
             .collect()
@@ -757,6 +765,7 @@ fn fuzz_mutations() {
 
 /// Sequences of whole SQL tokens, for the folding rules.
 #[test]
+#[ignore = "exact C differential; requires an upstream checkout via LIBINJECTION_DIR"]
 fn fuzz_sql_token_soup() {
     compare_chunks("SQL token soup", fuzz_chunks(30), |index| {
         let mut rng = Rng::new(2, index);
@@ -783,6 +792,7 @@ fn fuzz_sql_token_soup() {
 /// URL attributes whose scheme is spelled with numeric character
 /// references, in and out of a tag.
 #[test]
+#[ignore = "exact C differential; requires an upstream checkout via LIBINJECTION_DIR"]
 fn fuzz_entity_urls() {
     compare_chunks("entity-encoded URLs", fuzz_chunks(10), |index| {
         let mut rng = Rng::new(3, index);
@@ -805,8 +815,7 @@ fn fuzz_entity_urls() {
                     let ch = if rng.chance(30) { ch ^ 0x20 } else { ch };
                     // Sometimes out of a byte's range: upstream narrows the
                     // decoded value.
-                    let value = u32::from(ch)
-                        + [0, 0, 0, 0x100, 0x200, 0x1_0000, 0x10_0000, 0x100_0000][rng.below(8)];
+                    let value = u32::from(ch) + [0, 0, 0, 0x100, 0x200, 0x1_0000, 0x10_0000, 0x100_0000][rng.below(8)];
                     let end = if rng.chance(66) { ";" } else { "" };
                     match rng.below(7) {
                         0 => url.extend_from_slice(format!("&#{value}{end}").as_bytes()),
@@ -816,8 +825,7 @@ fn fuzz_entity_urls() {
                     }
                     // Things the scheme match skips, or trips on.
                     url.extend_from_slice(rng.pick(&[
-                        b"", b"", b"", b"\x00", b"\n", b"&#0;", b"&#10;", b"&#x0a;", b"\t", b" ",
-                        b"&", b"&#", b"&#x",
+                        b"", b"", b"", b"\x00", b"\n", b"&#0;", b"&#10;", b"&#x0a;", b"\t", b" ", b"&", b"&#", b"&#x",
                     ]));
                 }
                 url.extend_from_slice(rng.pick(&[b":alert(1)", b":", b"", b"&colon;x"]));
@@ -849,6 +857,7 @@ fn fuzz_entity_urls() {
 /// them: the false-positive check for the `1c` fingerprint looks at the
 /// byte that follows the number.
 #[test]
+#[ignore = "exact C differential; requires an upstream checkout via LIBINJECTION_DIR"]
 fn number_then_comment() {
     let prefixes: [&[u8]; 4] = [b"", b" ", b"\xa0", b"  "];
     let numbers: [&[u8]; 7] = [b"1", b"12", b"1.5", b"0x1f", b"\\N", b"$1", &[b'1'; 40]];
@@ -865,9 +874,7 @@ fn number_then_comment() {
             }
         }
     }
-    compare_chunks(
-        "number then comment",
-        inputs.len().div_ceil(CHUNK),
-        |index| inputs.chunks(CHUNK).nth(index).unwrap().to_vec(),
-    );
+    compare_chunks("number then comment", inputs.len().div_ceil(CHUNK), |index| {
+        inputs.chunks(CHUNK).nth(index).unwrap().to_vec()
+    });
 }
