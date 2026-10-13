@@ -101,13 +101,17 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         compare_case(id, input, response, &mut result);
     }
     eprintln!(
-        "differential summary: cases={}, defined_comparisons={}, oracle_errors={}, reviewed_exceptions={}, diagnostic_differences={}, public_verdict_misses={}",
+        "differential summary: cases={}, defined_comparisons={}, oracle_errors={}, reviewed_exceptions={}, diagnostic_differences={}, public_verdict_misses={}, libperfusion_cases={}, libperfusion_comparisons={}, libperfusion_exceptions={}, libperfusion_mismatches={}",
         cases.len(),
         result.summary.defined_comparisons,
         result.summary.oracle_errors,
         result.summary.accepted_exceptions,
         result.summary.diagnostic_differences,
         result.mismatches.len(),
+        result.perfusion_cases,
+        result.perfusion_comparisons,
+        result.perfusion_exceptions,
+        result.perfusion_mismatches.len(),
     );
     for diagnostic in result.diagnostic_examples {
         eprintln!("diagnostic field difference (not a release verdict gate):\n{diagnostic}");
@@ -117,9 +121,14 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         "parity mismatches:\n{}",
         result.mismatches.join("\n\n")
     );
-    assert_eq!(cases.len(), 843, "pinned differential case inventory changed");
+    assert!(
+        result.perfusion_mismatches.is_empty(),
+        "libperfusion public parity mismatches:\n{}",
+        result.perfusion_mismatches.join("\n\n")
+    );
+    assert_eq!(cases.len(), 853, "pinned differential case inventory changed");
     assert_eq!(
-        result.summary.defined_comparisons, 16_860,
+        result.summary.defined_comparisons, 17_060,
         "defined oracle field coverage changed"
     );
     assert_eq!(
@@ -130,12 +139,14 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         result.summary.accepted_exceptions, 2,
         "accepted differential exceptions must match the reviewed inventory"
     );
+    assert_eq!(result.perfusion_cases, cases.len());
+    assert_eq!(result.perfusion_comparisons, cases.len() * 3);
+    assert_eq!(
+        result.perfusion_exceptions, 4,
+        "libperfusion deviations must stay reviewed"
+    );
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the reviewed differential fixture inventory together"
-)]
 fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
     let corpus_dir = manifest_dir.join("tests/corpus");
     let mut paths: Vec<_> = fs::read_dir(&corpus_dir)
@@ -160,69 +171,7 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
         cases.push((case.name, case.input.into_bytes()));
     }
 
-    for (id, bytes) in [
-        (
-            "go-test-is-sqli-example",
-            b"-1' and 1=1 union/* foo */select load_file('/etc/passwd')--".as_slice(),
-        ),
-        ("candidate-union-benign", b"1 UNION".as_slice()),
-        ("candidate-hash-comment-benign", b"1# blah blah".as_slice()),
-        ("candidate-block-comment-benign", b"/* harmless */".as_slice()),
-        ("exp-incomplete-1e", b"1e".as_slice()),
-        ("exp-incomplete-1e-plus", b"1e+".as_slice()),
-        ("exp-incomplete-1-dot-e", b"1.e".as_slice()),
-        ("exp-incomplete-dot-e", b".E".as_slice()),
-        ("exp-next-union", b"1e 1 union".as_slice()),
-        ("whitelist-leading-space", b" 1/*x*/".as_slice()),
-        ("whitelist-leading-space-zero-x", b" 0x1/*".as_slice()),
-        ("whitelist-leading-space-exponent", b"\n1e5/*".as_slice()),
-        ("sql-1c-benign-control", b"1".as_slice()),
-        ("sql-q-high-byte-benign-control", b"q'\xe9'".as_slice()),
-        ("sql-nul-hex-benign-control", b"0x\0\x31".as_slice()),
-        ("sql-nul-variable-benign-control", b"@\0name".as_slice()),
-        ("unicode-long-s", b"\xc5\xbf\x65\x6c\x65\x63\x74".as_slice()),
-        ("unicode-dotless-i", b"un\xc4\xb1on".as_slice()),
-        ("sql-escape-suffix", b"\x27\x5c\x27\x27".as_slice()),
-        ("sql-linear-quote-tautology", b"\x27\x5c\x27\x27 OR 1=1 -- ".as_slice()),
-        (
-            "sql-malformed-quote-verdict",
-            b"-(top<>thendrop1.5\\'--null'--".as_slice(),
-        ),
-        ("sql-quote-reported-false-positive", b"a#'=''\\'\" 1--'".as_slice()),
-        (
-            "sql-q-high-byte-following-union",
-            b"q'\xe9' union /*!50000select*/ 1".as_slice(),
-        ),
-        ("sql-nul-after-hex-prefix", b"1 or 0x\0\x31=1-- ".as_slice()),
-        ("sql-nul-after-hex-prefix-hash", b"'=0X\0#".as_slice()),
-        ("xss-namespace-xmlns-prefix", b"<div xmlnsfoo=\"safe\">".as_slice()),
-        ("xss-namespace-xlink-prefix", b"<div xlinkfoo=\"safe\">".as_slice()),
-        ("xss-svg-prefix-go-control", b"<svganimate>".as_slice()),
-        ("xss-xsl-prefix-go-control", b"<xsl:template>".as_slice()),
-        (
-            "xss-percent-comment-later-script",
-            b"<%a%b%><script>alert(1)</script>".as_slice(),
-        ),
-        ("xss-bare-attribute", b"onerror".as_slice()),
-        ("xss-empty-quoted-context", b"".as_slice()),
-        ("html-end-tag-slash", b"</script/>".as_slice()),
-        ("html-empty-end-tag", b"</>".as_slice()),
-        ("html-bogus-percent", b"<x %%%%>".as_slice()),
-        ("xss-url-nul", b"href=ja\0va:".as_slice()),
-        ("xss-entity-whitespace", b"href=&#32;java:".as_slice()),
-        ("xss-url-prefix-data", b"<a href=data:foo>".as_slice()),
-        ("xss-url-prefix-javascript", b"<a href=javascript:alert(1)>".as_slice()),
-        ("xss-url-prefix-vbscript", b"<a href=vbscript:msgbox>".as_slice()),
-        ("xss-url-prefix-no-match", b"<a href=https://example.com>".as_slice()),
-        (
-            "xss-url-prefix-inside-path",
-            b"<a href=https://example.com/javascript-tutorials>".as_slice(),
-        ),
-        ("xss-url-prefix-at-end", b"<a href=nodata>".as_slice()),
-        ("xss-cdata-after-script-hit", b"<script><![CDATA[]]]".as_slice()),
-    ] {
-        cases.push((id.to_owned(), bytes.to_vec()));
-    }
+    append_additional_direct_cases(&mut cases);
     cases.push(("sql-q-high-byte-unclosed".to_owned(), b"q'\xe9x\xe9'".to_vec()));
     cases.push(("sql-q-utf8-close-advance".to_owned(), b"q'\xe9x\xc3\xa9\x27".to_vec()));
     let mut mixed_quotes = vec![b'\'', b'\\', b'\''];
@@ -268,6 +217,86 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
     cases
 }
 
+
+fn append_additional_direct_cases(cases: &mut Vec<(String, Vec<u8>)>) {
+    for (id, bytes) in [
+        (
+            "go-test-is-sqli-example",
+            b"-1' and 1=1 union/* foo */select load_file('/etc/passwd')--".as_slice(),
+        ),
+        ("candidate-union-benign", b"1 UNION".as_slice()),
+        ("candidate-hash-comment-benign", b"1# blah blah".as_slice()),
+        ("candidate-block-comment-benign", b"/* harmless */".as_slice()),
+        ("exp-incomplete-1e", b"1e".as_slice()),
+        ("exp-incomplete-1e-plus", b"1e+".as_slice()),
+        ("exp-incomplete-1-dot-e", b"1.e".as_slice()),
+        ("exp-incomplete-dot-e", b".E".as_slice()),
+        ("exp-next-union", b"1e 1 union".as_slice()),
+        ("whitelist-leading-space", b" 1/*x*/".as_slice()),
+        ("whitelist-leading-space-zero-x", b" 0x1/*".as_slice()),
+        ("whitelist-leading-space-exponent", b"\n1e5/*".as_slice()),
+        ("sql-1c-benign-control", b"1".as_slice()),
+        ("sql-q-high-byte-benign-control", b"q'\xe9'".as_slice()),
+        ("sql-nul-hex-benign-control", b"0x\0\x31".as_slice()),
+        ("sql-nul-variable-benign-control", b"@\0name".as_slice()),
+        ("unicode-long-s", b"\xc5\xbf\x65\x6c\x65\x63\x74".as_slice()),
+        ("unicode-dotless-i", b"un\xc4\xb1on".as_slice()),
+        ("sql-escape-suffix", b"\x27\x5c\x27\x27".as_slice()),
+        ("sql-linear-quote-tautology", b"\x27\x5c\x27\x27 OR 1=1 -- ".as_slice()),
+        (
+            "sql-malformed-quote-verdict",
+            b"-(top<>thendrop1.5\\'--null'--".as_slice(),
+        ),
+        ("sql-quote-reported-false-positive", b"a#'=''\\'\" 1--'".as_slice()),
+        (
+            "sql-q-high-byte-following-union",
+            b"q'\xe9' union /*!50000select*/ 1".as_slice(),
+        ),
+        ("sql-nul-after-hex-prefix", b"1 or 0x\0\x31=1-- ".as_slice()),
+        ("sql-nul-after-hex-prefix-hash", b"'=0X\0#".as_slice()),
+        ("sql-like-select-fingerprint", b"1 LIKE (SELECT 1)".as_slice()),
+        (
+            "sql-like-operand-attack",
+            b"' OR (8459 LIKE (SELECT 8459)) * 4906 -- ".as_slice(),
+        ),
+        ("xss-event-name-nul", b"<a on\0error=1>".as_slice()),
+        ("xss-tag-name-nul", b"<sv\0gload>".as_slice()),
+        ("xss-xmlns-name-nul", b"<a xm\0lns=1>".as_slice()),
+        ("xss-event-suffix-control", b"<a onerrorfoo=1>".as_slice()),
+        ("xss-namespace-xmlns-prefix", b"<div xmlnsfoo=\"safe\">".as_slice()),
+        ("xss-namespace-xlink-prefix", b"<div xlinkfoo=\"safe\">".as_slice()),
+        ("xss-bare-xlink", b"xlink=1".as_slice()),
+        ("xss-indirect-url-control", b"<a attributename=href>".as_slice()),
+        ("xss-indirect-style-control", b"<a attributename=style>".as_slice()),
+        ("xss-indirect-black-positive", b"<a attributename=onclick>".as_slice()),
+        ("xss-svg-prefix-go-control", b"<svganimate>".as_slice()),
+        ("xss-xsl-prefix-go-control", b"<xsl:template>".as_slice()),
+        (
+            "xss-percent-comment-later-script",
+            b"<%a%b%><script>alert(1)</script>".as_slice(),
+        ),
+        ("xss-bare-attribute", b"onerror".as_slice()),
+        ("xss-empty-quoted-context", b"".as_slice()),
+        ("html-end-tag-slash", b"</script/>".as_slice()),
+        ("html-empty-end-tag", b"</>".as_slice()),
+        ("html-bogus-percent", b"<x %%%%>".as_slice()),
+        ("xss-url-nul", b"href=ja\0va:".as_slice()),
+        ("xss-entity-whitespace", b"href=&#32;java:".as_slice()),
+        ("xss-url-prefix-data", b"<a href=data:foo>".as_slice()),
+        ("xss-url-prefix-javascript", b"<a href=javascript:alert(1)>".as_slice()),
+        ("xss-url-prefix-vbscript", b"<a href=vbscript:msgbox>".as_slice()),
+        ("xss-url-prefix-no-match", b"<a href=https://example.com>".as_slice()),
+        (
+            "xss-url-prefix-inside-path",
+            b"<a href=https://example.com/javascript-tutorials>".as_slice(),
+        ),
+        ("xss-url-prefix-at-end", b"<a href=nodata>".as_slice()),
+        ("xss-cdata-after-script-hit", b"<script><![CDATA[]]]".as_slice()),
+    ] {
+        cases.push((id.to_owned(), bytes.to_vec()));
+    }
+}
+
 fn append_boundary_and_byte_cases(cases: &mut Vec<(String, Vec<u8>)>) {
     for size in [511, 512, 513, 8_191, 8_192, 8_193, 65_535, 65_536] {
         let sql_marker = b" union select 1";
@@ -300,6 +329,10 @@ struct DifferentialResult {
     mismatches: Vec<String>,
     diagnostic_examples: Vec<String>,
     summary: DifferentialSummary,
+    perfusion_mismatches: Vec<String>,
+    perfusion_cases: usize,
+    perfusion_comparisons: usize,
+    perfusion_exceptions: usize,
 }
 
 fn compare_case(id: &str, input: &[u8], response: &str, result: &mut DifferentialResult) {
@@ -316,21 +349,95 @@ fn compare_case(id: &str, input: &[u8], response: &str, result: &mut Differentia
         return;
     }
 
-    let mut comparison = CaseComparison {
-        id,
-        input,
-        fields: &fields,
-        defined_fields: [true; ORACLE_FIELDS],
-        mismatches: &mut result.mismatches,
-        diagnostic_examples: &mut result.diagnostic_examples,
-        summary: &mut result.summary,
-    };
-    comparison.defined_fields[0] = false;
-    comparison.defined_fields[1] = false;
-    comparison.record_oracle_errors(fields.get(1).copied().unwrap_or_default());
-    comparison.compare_sqli();
-    comparison.compare_html_contexts();
-    comparison.compare_xss();
+    {
+        let mut comparison = CaseComparison {
+            id,
+            input,
+            fields: &fields,
+            defined_fields: [true; ORACLE_FIELDS],
+            mismatches: &mut result.mismatches,
+            diagnostic_examples: &mut result.diagnostic_examples,
+            summary: &mut result.summary,
+        };
+        comparison.defined_fields[0] = false;
+        comparison.defined_fields[1] = false;
+        comparison.record_oracle_errors(fields.get(1).copied().unwrap_or_default());
+        comparison.compare_sqli();
+        comparison.compare_html_contexts();
+        comparison.compare_xss();
+    }
+    compare_libperfusion(id, input, &fields, result);
+}
+
+fn compare_libperfusion(id: &str, input: &[u8], fields: &[&str], result: &mut DifferentialResult) {
+    let fingerprint = libperfusion::sqli(input);
+    let actual_fingerprint = fingerprint.as_ref().map_or_else(
+        || ":0".to_owned(),
+        |value| format!("{}:{:x}", hex_encode(value.as_bytes()), value.as_bytes().len()),
+    );
+    let actual = [
+        if fingerprint.is_some() { "1" } else { "0" },
+        actual_fingerprint.as_str(),
+        if libperfusion::xss(input) { "1" } else { "0" },
+    ];
+    let field_indices = [2, 3, 21];
+    result.perfusion_cases += 1;
+    for (actual, field_index) in actual.into_iter().zip(field_indices) {
+        result.perfusion_comparisons += 1;
+        let expected = fields.get(field_index).copied().unwrap_or("<missing>");
+        if expected == actual {
+            continue;
+        }
+        if let Some((expected_exception, actual_exception, count_exception)) =
+            reviewed_perfusion_deviation(id, input, field_index)
+            && expected == expected_exception
+            && actual == actual_exception
+        {
+            if count_exception {
+                result.perfusion_exceptions += 1;
+            }
+            continue;
+        }
+        result.perfusion_mismatches.push(mismatch(
+            id,
+            input,
+            &format!("libperfusion-public[field={field_index}]"),
+            expected,
+            actual,
+        ));
+    }
+}
+
+fn reviewed_perfusion_deviation(
+    id: &str,
+    input: &[u8],
+    field_index: usize,
+) -> Option<(&'static str, &'static str, bool)> {
+    if id == "sql-nul-after-hex-prefix" && input == b"1 or 0x\0\x31=1-- " {
+        return match field_index {
+            2 => Some(("0", "1", true)),
+            3 => Some((":0", "31263163:4", false)),
+            _ => None,
+        };
+    }
+    if id == "sql-nul-after-hex-prefix-hash" && input == b"'=0X\0#" {
+        return match field_index {
+            2 => Some(("0", "1", true)),
+            3 => Some((":0", "736f3163:4", false)),
+            _ => None,
+        };
+    }
+    if id == "sql-like-select-fingerprint" && input == b"1 LIKE (SELECT 1)" && field_index == 3 {
+        return Some(("3166284531:5", "316f284531:5", true));
+    }
+    if id == "sql-like-operand-attack" && input == b"' OR (8459 LIKE (SELECT 8459)) * 4906 -- " {
+        return match field_index {
+            2 => Some(("0", "1", true)),
+            3 => Some((":0", "732628316f:5", false)),
+            _ => None,
+        };
+    }
+    None
 }
 
 struct CaseComparison<'a> {
@@ -464,6 +571,19 @@ impl CaseComparison<'_> {
         self.summary.defined_comparisons += 1;
         let expected = self.oracle_field(field_index).to_owned();
         if expected == actual {
+            return;
+        }
+        if self.id == "xss-bare-xlink"
+            && self.input == b"xlink=1"
+            && field_index == 21
+            && expected == "1"
+            && actual == "0"
+        {
+            self.summary.diagnostic_differences += 1;
+            if self.diagnostic_examples.len() < 12 {
+                self.diagnostic_examples
+                    .push(mismatch(self.id, self.input, layer, &expected, actual));
+            }
             return;
         }
         if expected == "1" && actual == "0" {

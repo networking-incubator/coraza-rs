@@ -90,12 +90,18 @@ int main(int argc, char **argv) {
             len++;
         }
         if (count == cap) {
-            cap = cap ? cap * 2 : 1024;
-            inputs = realloc(inputs, cap * sizeof(*inputs));
+            size_t new_cap = cap ? cap * 2 : 1024;
+            struct input *new_inputs = realloc(inputs, new_cap * sizeof(*inputs));
+            if (new_inputs == NULL) {
+                perror("realloc");
+                return 1;
+            }
+            inputs = new_inputs;
+            cap = new_cap;
         }
         inputs[count].len = len;
         inputs[count].data = malloc(len ? len : 1);
-        if (inputs == NULL || inputs[count].data == NULL) {
+        if (inputs[count].data == NULL) {
             return 1;
         }
         for (i = 0; i < len; i++) {

@@ -1,14 +1,29 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //! Helpers shared by the integration tests and the benchmark: access to
+
 //! the files vendored from libinjection, read the way its own test programs
 //! read them, and a way to build the C library to run alongside the port.
 
 // Each test binary uses its own subset of these.
 #![allow(dead_code)]
 
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// The libinjection files the tests run against: the copy vendored in
 /// `tests/upstream`, or the checkout `LIBINJECTION_DIR` points at.
@@ -17,11 +32,7 @@ pub fn upstream() -> PathBuf {
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/upstream"),
         PathBuf::from,
     );
-    assert!(
-        dir.join("tests").is_dir(),
-        "no libinjection files at {}",
-        dir.display()
-    );
+    assert!(dir.join("tests").is_dir(), "no libinjection files at {}", dir.display());
     dir
 }
 
@@ -83,14 +94,7 @@ pub fn build_with_libinjection(program: &str, default_flags: &str) -> PathBuf {
         .arg("-I")
         .arg(&sources)
         .arg(&program)
-        .args(
-            [
-                "libinjection_sqli.c",
-                "libinjection_html5.c",
-                "libinjection_xss.c",
-            ]
-            .map(|source| sources.join(source)),
-        )
+        .args(["libinjection_sqli.c", "libinjection_html5.c", "libinjection_xss.c"].map(|source| sources.join(source)))
         .arg("-o")
         .arg(&building)
         .status()
@@ -159,7 +163,7 @@ pub fn url_decode(s: &[u8]) -> Vec<u8> {
                 } else {
                     out.push(b'%');
                 }
-            }
+            },
             other => out.push(other),
         }
         i += 1;

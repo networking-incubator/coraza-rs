@@ -1,4 +1,11 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 //! SQL injection detection: tokenize, fold, and match the resulting
+
 //! fingerprint against the known-bad list.
 
 mod fold;
@@ -7,14 +14,15 @@ mod keywords;
 pub(crate) mod lexer;
 pub(crate) mod token;
 
-use core::cmp::Ordering;
-use core::fmt;
+use core::{cmp::Ordering, fmt};
 
-use self::keywords::{cstrcasecmp, lookup_word};
 pub use self::lexer::Dialect;
-use self::lexer::{Lexer, Quote};
-use self::token::{Token, TokenType};
-use crate::bytes::find_slice;
+use self::{
+    keywords::{cstrcasecmp, lookup_word},
+    lexer::{Lexer, Quote},
+    token::{Token, TokenType},
+};
+use crate::bytes::{contains, find_slice};
 
 /// The most tokens a folded input, and so a fingerprint, can have.
 pub(crate) const MAX_TOKENS: usize = 5;
@@ -224,10 +232,12 @@ impl<'a> State<'a> {
                     }
 
                     // The byte after the number. Upstream indexes with the
-                    // token's length, not its end, and compares a `char`
-                    // that is signed on its reference platform, so bytes
-                    // above 127 count as whitespace.
-                    let after = tokens[0].len;
+                    // token's length instead of its end, which is wrong when
+                    // whitespace comes first ("\t1--"): this adds the offset.
+                    // It does compare a `char` that is signed on its
+                    // reference platform, so bytes above 127 count as
+                    // whitespace.
+                    let after = tokens[0].pos + tokens[0].len;
                     return match self.input.get(after) {
                         Some(&ch) if ch.cast_signed() <= 32 => true,
                         Some(b'/') => self.input.get(after + 1) == Some(&b'*'),
@@ -241,7 +251,7 @@ impl<'a> State<'a> {
                 if tokens[1].len > 2 && tokens[1].byte(0) == b'-' {
                     return false;
                 }
-            }
+            },
             3 => {
                 if matches!(fingerprint, b"sos" | b"s&s") {
                     // "...foo' + 'bar...": no opening quote, no closing
@@ -263,8 +273,8 @@ impl<'a> State<'a> {
                         return false;
                     }
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         true
@@ -296,9 +306,7 @@ impl<'a> State<'a> {
             return Some((fingerprint, Dialect::Ansi));
         }
         if self.reparse_as_mysql() {
-            return self
-                .check(quote, Dialect::Mysql)
-                .map(|fp| (fp, Dialect::Mysql));
+            return self.check(quote, Dialect::Mysql).map(|fp| (fp, Dialect::Mysql));
         }
         None
     }
@@ -321,14 +329,14 @@ pub(crate) fn detect_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)
 
     // If the input has a single quote, test it as if it sat inside a
     // single-quoted string: "1' = 1" is read as "'1' = 1".
-    if input.contains(&b'\'')
+    if contains(input, b'\'')
         && let Some(result) = state.check_ansi_then_mysql_dialect(Quote::Single)
     {
         return Some(result);
     }
 
     // The same with a double quote, which only MySQL uses for strings.
-    if input.contains(&b'"') {
+    if contains(input, b'"') {
         return state
             .check(Quote::Double, Dialect::Mysql)
             .map(|fp| (fp, Dialect::Mysql));

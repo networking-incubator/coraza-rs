@@ -15,37 +15,44 @@ assert!(libperfusion::xss(b"<script>alert('xss')</script>"));
 
 The port is complete, and not published yet. It follows libinjection 4.0.0
 (`d88a8f8`): the SQL tokenizer, folding, fingerprints and false-positive
-checks, the HTML5 tokenizer, and the XSS checks. It has no dependencies and no
-`unsafe` code, and needs neither `std` nor an allocator.
+checks, the HTML5 tokenizer, and the XSS checks. Its one dependency is
+[memchr](https://crates.io/crates/memchr), for byte searches. It has no
+`unsafe` code of its own, and needs neither `std` nor an allocator.
 
 The name is a play on the original's: `libinjection` and `libinjection-rs` are
 taken on crates.io, by bindings to the C library.
 
-It is meant to give the same answer as the C library, as built on x86-64, on
-every input. Two things check that:
-
-- libinjection's own tests: its 584 expected-output files and its sample
-  corpora.
-- A differential test, which builds the C library and compares it with the
-  port on upstream's corpus and on fuzzed inputs: tokens, folded tokens,
-  fingerprints and verdicts, in every context. A default run compares some
-  940,000 inputs. The longest so far compared 20 million and found no
-  difference.
+The required tests check feature-level parity against the in-repository
+`libinjection` crate and its pinned corpus. They compare SQLi fingerprints and
+XSS verdicts, not implementation details. The exact C comparisons remain
+available as optional tests.
 
 ## Testing
 
-`cargo test` runs everything. The differential tests need a C compiler (`CC`,
-`CFLAGS`); the top of `tests/differential.rs` describes the longer run, and
-the one with the C side under sanitizers.
+`cargo test -p libperfusion` runs the local corpus, API, and regression tests;
+`cargo test --workspace` also runs the sibling crate's tests. The exact-C
+differential, upstream corpus, sample, and table comparisons are ignored by
+default. Run them with an upstream checkout and a C compiler:
 
-`tests/upstream` holds libinjection's sources, tests and samples.
-`tools/vendor_upstream.sh` refreshes it from a checkout and regenerates the
-tables in `src` that are derived from it.
+```sh
+LIBINJECTION_DIR=/path/to/libinjection \
+  cargo test -p libperfusion --test differential -- --ignored
+LIBINJECTION_DIR=/path/to/libinjection \
+  cargo test -p libperfusion --test upstream -- --ignored
+LIBINJECTION_DIR=/path/to/libinjection \
+  cargo test -p libperfusion --test tables -- --ignored
+```
+
+`CC` and `CFLAGS` configure the C compiler. The longer fuzz run and sanitizer
+example are documented at the top of `tests/differential.rs`.
+`tools/vendor_upstream.sh /path/to/libinjection` can populate
+`tests/upstream` and regenerate the derived tables.
 
 ## Performance
 
-`cargo bench` times the port next to the C library on the same inputs: those
-of upstream's two speed tests, and its sample corpora. The SQL corpora go
+`cargo bench` also needs the upstream checkout and a C compiler. It times the
+port next to the C library on the same inputs: those of upstream's two speed
+tests and sample corpora. The SQL corpora go
 through the XSS detection as well, as inputs that are not XSS: those cost the
 most, since nothing ends the search early. Below is the time per input, in
 nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC 16.2 at
@@ -61,8 +68,16 @@ nanoseconds, on an AMD Ryzen 9 7900, with libinjection built by GCC 16.2 at
 | xss: sqli attack samples    | 85,802 |           141 |       1495.6 |  734.2 |    0.49x |
 | xss: benign samples         |    423 |            34 |        371.3 |  208.4 |    0.56x |
 
-The two sides run one after the other and nothing is pinned to a core, so
-small differences are noise: rebuilding alone can move a time by a tenth.
+The table below preserves the earlier single C-first measurements. Current
+`cargo bench` runs two measurements per workload, alternating which side runs
+first and printing the order for each ratio. Nothing is pinned to a core, so
+small differences remain noise: rebuilding alone can move a time by a tenth.
+
+To compare this crate with the in-repository `libinjection-rs` implementation,
+run `cargo bench -p libperfusion --bench compare` for the shared corpus and
+`cargo bench -p libperfusion --bench scaling` for generated size and shape
+workloads. These targets do not need the upstream C checkout. See the
+[benchmark report](BENCHMARK_REPORT.md) for the measured results and limits.
 
 ## Missing quality of life APIs
 
@@ -110,7 +125,10 @@ exposed:
   signed `char`. Where `char` is unsigned, as on ARM Linux, the C library
   itself answers differently on some inputs with bytes above 127.
 - **Manifest.** It declares no repository.
-- **Public API.** Only `sqli` and `xss` are public. The tokenizers are behind
+- **Public API.** Detection also exports `sqli_with_dialect` (returning
+  `Dialect`), `xss_with_context` (returning `HtmlContext`), `sqli_with_limit`,
+  and `xss_with_limit`. The limit variants scan only the input prefix up to
+  `max_bytes`, which may end inside a token. The tokenizers are behind
   `internals`, a hidden feature with no stability promise that the tests use.
   Upstream exposes them, along with a hook to replace the keyword lookup,
   which was not ported.

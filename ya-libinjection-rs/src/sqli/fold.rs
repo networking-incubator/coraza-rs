@@ -1,13 +1,30 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 //! Token folding: reduces the token stream to at most [`MAX_TOKENS`] tokens
+
 //! by merging and dropping the ones that do not change what a statement is.
 //!
 //! This follows upstream's `libinjection_sqli_fold` step for step. The rules
 //! work on a window of slots that is truncated and re-scanned in place, and
 //! which token a rule drops depends on exactly that bookkeeping.
 
-use super::keywords::lookup_word;
-use super::token::{TOKEN_SIZE, Token, TokenType as T};
-use super::{MAX_TOKENS, State};
+use super::{
+    MAX_TOKENS, State,
+    keywords::lookup_word,
+    token::{TOKEN_SIZE, Token, TokenType as T},
+};
+
+struct FillState<'a> {
+    want: usize,
+    pos: &'a mut usize,
+    left: usize,
+    more: &'a mut bool,
+    last_comment: &'a mut Token,
+}
 
 /// Words that are functions when called, but common enough as column names
 /// to be barewords otherwise.
@@ -37,22 +54,15 @@ impl State<'_> {
 
     /// Reads tokens into slot `pos` until `pos - left` reaches `want`,
     /// setting comments aside rather than counting them.
-    fn fill(
-        &mut self,
-        want: usize,
-        pos: &mut usize,
-        left: usize,
-        more: &mut bool,
-        last_comment: &mut Token,
-    ) {
-        while *more && *pos <= MAX_TOKENS && *pos - left < want {
-            *more = self.tokenize_into(*pos);
-            if *more {
-                if self.tokens[*pos].ty == T::Comment {
-                    *last_comment = self.tokens[*pos];
+    fn fill(&mut self, fill: FillState<'_>) {
+        while *fill.more && *fill.pos <= MAX_TOKENS && *fill.pos - fill.left < fill.want {
+            *fill.more = self.tokenize_into(*fill.pos);
+            if *fill.more {
+                if self.tokens[*fill.pos].ty == T::Comment {
+                    *fill.last_comment = self.tokens[*fill.pos];
                 } else {
-                    last_comment.ty = T::Null;
-                    *pos += 1;
+                    fill.last_comment.ty = T::Null;
+                    *fill.pos += 1;
                 }
             }
         }
@@ -64,14 +74,7 @@ impl State<'_> {
         let (a, b) = (&self.tokens[left], &self.tokens[left + 1]);
         if !matches!(
             a.ty,
-            T::Keyword
-                | T::Bareword
-                | T::Operator
-                | T::Union
-                | T::Function
-                | T::Expression
-                | T::Tsql
-                | T::SqlType
+            T::Keyword | T::Bareword | T::Operator | T::Union | T::Function | T::Expression | T::Tsql | T::SqlType
         ) {
             return false;
         }
@@ -106,7 +109,7 @@ impl State<'_> {
             Some(ty) => {
                 self.tokens[left].assign(ty, pos, phrase);
                 true
-            }
+            },
             None => false,
         }
     }
@@ -129,9 +132,7 @@ impl State<'_> {
         while more {
             more = self.tokenize_into(0);
             let current = &self.tokens[0];
-            if !(matches!(current.ty, T::Comment | T::LeftParens | T::SqlType)
-                || current.is_unary_op())
-            {
+            if !(matches!(current.ty, T::Comment | T::LeftParens | T::SqlType) || current.is_unary_op()) {
                 break;
             }
         }
@@ -160,19 +161,8 @@ impl State<'_> {
                         T::LeftParens,
                         T::Bareword | T::Number,
                         T::RightParens
-                    ) | (
-                        T::Number,
-                        T::RightParens,
-                        T::Comma,
-                        T::LeftParens,
-                        T::Number
-                    ) | (
-                        T::Bareword,
-                        T::RightParens,
-                        T::Operator,
-                        T::LeftParens,
-                        T::Bareword
-                    )
+                    ) | (T::Number, T::RightParens, T::Comma, T::LeftParens, T::Number)
+                        | (T::Bareword, T::RightParens, T::Operator, T::LeftParens, T::Bareword)
                 ) {
                     if pos > MAX_TOKENS {
                         self.tokens[1] = self.tokens[MAX_TOKENS];
@@ -190,7 +180,13 @@ impl State<'_> {
             }
 
             // Get up to two tokens.
-            self.fill(2, &mut pos, left, &mut more, &mut last_comment);
+            self.fill(FillState {
+                want: 2,
+                pos: &mut pos,
+                left,
+                more: &mut more,
+                last_comment: &mut last_comment,
+            });
             if pos - left < 2 {
                 left = pos;
                 continue;
@@ -206,9 +202,7 @@ impl State<'_> {
                 // Fold away repeated semicolons.
                 pos -= 1;
                 continue;
-            } else if matches!(a.ty, T::Operator | T::LogicOperator)
-                && (b.is_unary_op() || b.ty == T::SqlType)
-            {
+            } else if matches!(a.ty, T::Operator | T::LogicOperator) && (b.is_unary_op() || b.ty == T::SqlType) {
                 pos -= 1;
                 left = 0;
                 continue;
@@ -252,20 +246,21 @@ impl State<'_> {
                 };
                 continue;
             } else if a.ty == T::Operator && (a.is_word(b"LIKE") || a.is_word(b"NOT LIKE")) {
-                // "LIKE(" is a function call.
-                if b.ty == T::LeftParens {
+                // LIKE followed by '(' is a function only when it has no
+                // operand before it. Keep `value LIKE (pattern)` as an
+                // operator expression, as current libinjection does.
+                let has_operand = left > 0
+                    && matches!(
+                        self.tokens[left - 1].ty,
+                        T::Number | T::String | T::Bareword | T::Variable | T::RightParens
+                    );
+                if b.ty == T::LeftParens && !has_operand {
                     self.tokens[left].ty = T::Function;
                 }
             } else if a.ty == T::SqlType
                 && matches!(
                     b.ty,
-                    T::Bareword
-                        | T::Number
-                        | T::SqlType
-                        | T::LeftParens
-                        | T::Function
-                        | T::Variable
-                        | T::String
+                    T::Bareword | T::Number | T::SqlType | T::LeftParens | T::Function | T::Variable | T::String
                 )
             {
                 self.tokens[left] = *b;
@@ -315,17 +310,19 @@ impl State<'_> {
             }
 
             // No two-token rule matched: get one more token.
-            self.fill(3, &mut pos, left, &mut more, &mut last_comment);
+            self.fill(FillState {
+                want: 3,
+                pos: &mut pos,
+                left,
+                more: &mut more,
+                last_comment: &mut last_comment,
+            });
             if pos - left < 3 {
                 left = pos;
                 continue;
             }
 
-            let (a, b, c) = (
-                &self.tokens[left],
-                &self.tokens[left + 1],
-                &self.tokens[left + 2],
-            );
+            let (a, b, c) = (&self.tokens[left], &self.tokens[left + 1], &self.tokens[left + 2]);
 
             if a.ty == T::Number && b.ty == T::Operator && c.ty == T::Number {
                 pos -= 2;
@@ -369,10 +366,7 @@ impl State<'_> {
                 pos -= 2;
                 left = 0;
                 continue;
-            } else if matches!(a.ty, T::Expression | T::Group | T::Comma)
-                && b.is_unary_op()
-                && c.ty == T::LeftParens
-            {
+            } else if matches!(a.ty, T::Expression | T::Group | T::Comma) && b.is_unary_op() && c.ty == T::LeftParens {
                 // "SELECT + (", "LIMIT + (": remove the unary operator.
                 self.tokens[left + 1] = *c;
                 pos -= 1;
@@ -380,10 +374,7 @@ impl State<'_> {
                 continue;
             } else if matches!(a.ty, T::Keyword | T::Expression | T::Group)
                 && b.is_unary_op()
-                && matches!(
-                    c.ty,
-                    T::Number | T::Bareword | T::Variable | T::String | T::Function
-                )
+                && matches!(c.ty, T::Number | T::Bareword | T::Variable | T::String | T::Function)
             {
                 // "select - 1": remove the unary operator.
                 self.tokens[left + 1] = *c;
@@ -418,11 +409,7 @@ impl State<'_> {
                 pos -= 1;
                 left = 0;
                 continue;
-            } else if a.ty == T::Function
-                && b.ty == T::LeftParens
-                && c.ty != T::RightParens
-                && a.is_word(b"USER")
-            {
+            } else if a.ty == T::Function && b.ty == T::LeftParens && c.ty != T::RightParens && a.is_word(b"USER") {
                 // USER() takes no arguments, so "User(foo)" is not it.
                 self.tokens[left].ty = T::Bareword;
             }
@@ -440,5 +427,43 @@ impl State<'_> {
 
         // A sixth token is sometimes read to decide the type of the fifth.
         left.min(MAX_TOKENS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqli::lexer::{Dialect, Quote};
+
+    #[test]
+    fn like_with_a_preceding_operand_stays_an_operator() {
+        for input in [
+            b"1 LIKE (SELECT 1)".as_slice(),
+            b"'value' LIKE (SELECT 1)",
+            b"users LIKE (SELECT 1)",
+            b"@value LIKE (SELECT 1)",
+            b"(users) LIKE (SELECT 1)",
+            b"1 NOT LIKE (SELECT 1)",
+        ] {
+            let mut state = State::new(input, Quote::None, Dialect::Ansi);
+            let count = state.fold();
+            let like = state.tokens[..count]
+                .iter()
+                .find(|token| token.is_word(b"LIKE") || token.is_word(b"NOT LIKE"));
+            assert_eq!(
+                like.map(|token| token.ty),
+                Some(T::Operator),
+                "{input:?}: {:?}",
+                &state.tokens[..count]
+            );
+        }
+    }
+
+    #[test]
+    fn like_at_the_start_can_be_a_function() {
+        let mut state = State::new(b"LIKE(1, 2)", Quote::None, Dialect::Ansi);
+        let count = state.fold();
+        assert!(count > 0);
+        assert_eq!(state.tokens[0].ty, T::Function);
     }
 }

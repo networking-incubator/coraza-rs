@@ -99,23 +99,44 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
     let mut failures = Vec::new();
     let mut accepted_exceptions = 0_usize;
     let mut fingerprint_diagnostics = 0_usize;
+    let mut perfusion_failures = Vec::new();
+    let mut perfusion_exceptions = 0_usize;
+    let mut perfusion_fingerprint_diagnostics = 0_usize;
 
     for (case, response) in cases.iter().zip(responses.iter()) {
         let expected = parse_result(case, response);
         let actual = rust_result(&case.input);
+        let perfusion = perfusion_result(&case.input);
         fingerprint_diagnostics += usize::from(expected.fingerprint != actual.fingerprint);
+        perfusion_fingerprint_diagnostics += usize::from(expected.fingerprint != perfusion.fingerprint);
         if !results_match(&expected, &actual) {
             if is_reviewed_c_aligned_sql_improvement(case, &expected, &actual) {
                 accepted_exceptions += 1;
             } else {
-                failures.push((case.clone(), expected, actual));
+                failures.push((case.clone(), expected.clone(), actual));
             }
+        }
+        if is_reviewed_c_aligned_sql_improvement(case, &expected, &perfusion) {
+            perfusion_exceptions += 1;
+        } else if !results_match(&expected, &perfusion) {
+            perfusion_failures.push(format!(
+                "case={} input_hex={} expected={expected:?} actual={perfusion:?}",
+                case.id,
+                hex(&case.input),
+            ));
         }
     }
 
+    assert!(
+        perfusion_failures.is_empty(),
+        "libperfusion generated Go mismatches:\n{}",
+        perfusion_failures.join("\n")
+    );
+    assert_eq!(perfusion_exceptions, 1, "libperfusion Go exception inventory changed");
+
     if failures.is_empty() {
         eprintln!(
-            "generated differential passed: {} deterministic raw/grammar/regression cases, accepted_exceptions={accepted_exceptions}, fingerprint_diagnostics={fingerprint_diagnostics}, seed=0x{SEED:016x}",
+            "generated differential passed: {} deterministic raw/grammar/regression cases, accepted_exceptions={accepted_exceptions}, fingerprint_diagnostics={fingerprint_diagnostics}, libperfusion_exceptions={perfusion_exceptions}, libperfusion_fingerprint_diagnostics={perfusion_fingerprint_diagnostics}, seed=0x{SEED:016x}",
             cases.len(),
         );
         assert_eq!(accepted_exceptions, 1, "generated exception inventory changed");
@@ -298,6 +319,18 @@ fn rust_result(input: &[u8]) -> PublicResult {
             sqli.fingerprint.len
         ),
         xss: Some(detect_xss(input)),
+    }
+}
+
+fn perfusion_result(input: &[u8]) -> PublicResult {
+    let fingerprint = libperfusion::sqli(input);
+    PublicResult {
+        sqli: fingerprint.is_some(),
+        fingerprint: fingerprint.as_ref().map_or_else(
+            || ":0".to_owned(),
+            |value| format!("{}:{:x}", hex(value.as_bytes()), value.as_bytes().len()),
+        ),
+        xss: Some(libperfusion::xss(input)),
     }
 }
 

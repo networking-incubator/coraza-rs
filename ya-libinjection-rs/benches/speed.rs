@@ -1,5 +1,18 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //! `cargo bench`: how fast the port is, next to libinjection itself.
-//!
+
 //! Both are run over the same inputs and timed the same way: the port
 //! here, and the C library by `benches/speed.c`, which is built from the
 //! sources vendored in `tests/upstream/src`. That needs a C compiler:
@@ -9,26 +22,29 @@
 //! The workloads are the inputs of upstream's two speed tests,
 //! `src/test_speed_sqli.c` and `src/test_speed_xss.c`, and its sample
 //! corpora, the SQL ones through the XSS detection as well: it has no
-//! samples of its own that are not attacks. A time is that of the best of a
+//! samples of its own that are not attacks. Each measurement is the best of a
 //! second's worth of rounds over a workload, each calling the detection once
-//! per input.
+//! per input. Two measurements alternate which implementation runs first.
 //!
 //! This is for a feel of where the port stands, not for small differences:
-//! nothing is pinned to a core, and the two sides run one after the other.
+//! nothing is pinned to a core, so order-labelled ratios still contain noise.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use std::env;
-use std::fmt::Write as _;
-use std::hint::black_box;
-use std::io::Write as _;
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::{
+    env,
+    fmt::Write as _,
+    hint::black_box,
+    io::Write as _,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 /// Rounds are made long enough for the clock not to matter.
 const MIN_ROUND: Duration = Duration::from_millis(10);
+const MEASUREMENTS: usize = 2;
 
 #[derive(Clone, Copy)]
 enum Detection {
@@ -88,9 +104,9 @@ fn speed_test_inputs(path: &str) -> Vec<Vec<u8>> {
                         other => string.push(other),
                     }
                 }
-            }
+            },
             b',' => inputs.extend(string.take()),
-            _ => {}
+            _ => {},
         }
     }
     inputs.extend(string);
@@ -244,28 +260,39 @@ fn main() {
         common::c_flags("-O3")
     );
     println!(
-        "{:<28} {:>7} {:>9} {:>13} {:>9} {:>9}",
-        "workload", "inputs", "avg bytes", "libinjection", "port", "port / C"
+        "{:<28} {:>7} {:>9} {:>6} {:>12} {:>13} {:>9} {:>8}",
+        "workload", "inputs", "avg bytes", "sample", "order", "libinjection", "port", "port / C"
     );
 
     for workload in &workloads {
-        let theirs = time_libinjection(&driver, workload, budget);
-        let ours = time_port(workload, budget);
-        assert_eq!(
-            theirs.hits, ours.hits,
-            "{}: the two sides disagree on what is an attack",
-            workload.name
-        );
-
         let bytes: usize = workload.inputs.iter().map(Vec::len).sum();
-        println!(
-            "{:<28} {:>7} {:>9.0} {:>13.1} {:>9.1} {:>8.2}x",
-            workload.name,
-            workload.inputs.len(),
-            bytes as f64 / workload.inputs.len() as f64,
-            theirs.nanos_per_input,
-            ours.nanos_per_input,
-            ours.nanos_per_input / theirs.nanos_per_input
-        );
+        for sample in 0..MEASUREMENTS {
+            let (theirs, ours, order) = if sample % 2 == 0 {
+                let theirs = time_libinjection(&driver, workload, budget);
+                let ours = time_port(workload, budget);
+                (theirs, ours, "C first")
+            } else {
+                let ours = time_port(workload, budget);
+                let theirs = time_libinjection(&driver, workload, budget);
+                (theirs, ours, "port first")
+            };
+            assert_eq!(
+                theirs.hits, ours.hits,
+                "{}: the two sides disagree on what is an attack",
+                workload.name
+            );
+
+            println!(
+                "{:<28} {:>7} {:>9.0} {:>6} {:>12} {:>13.1} {:>9.1} {:>7.2}x",
+                workload.name,
+                workload.inputs.len(),
+                bytes as f64 / workload.inputs.len() as f64,
+                sample + 1,
+                order,
+                theirs.nanos_per_input,
+                ours.nanos_per_input,
+                ours.nanos_per_input / theirs.nanos_per_input
+            );
+        }
     }
 }

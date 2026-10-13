@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `cargo xtask lint-license` - enforce the Apache-2.0 copyright header on
-//! every tracked `.rs` file.
+//! `cargo xtask lint-license` - enforce the appropriate license header on
+//! every Rust file in a workspace member.
 
 use std::{
     collections::HashSet,
@@ -43,6 +43,15 @@ const LICENSE_HEADER: &str = r#"// Copyright Coraza Kubernetes Operator contribu
 // See the License for the specific language governing permissions and
 // limitations under the License.
 "#;
+
+/// The header for source files derived from BSD-3-Clause libinjection.
+const LIBINJECTION_SOURCE_HEADER: &str = "// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
+";
 
 /// Directory names skipped while walking the workspace for `.rs` files.
 const SKIPPED_DIRS: [&str; 3] = ["target", ".git", "coraza-rs"];
@@ -142,12 +151,31 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
             path: path.clone(),
             message: err.to_string(),
         })?;
-        if !content.starts_with(LICENSE_HEADER) {
+        let expected_header = if is_libinjection_source(&path) {
+            LIBINJECTION_SOURCE_HEADER
+        } else {
+            LICENSE_HEADER
+        };
+        if !content.starts_with(expected_header) {
             violations.push(path);
         }
     }
 
     Ok(violations)
+}
+
+/// Files containing the BSD-derived engine must preserve libinjection's
+/// copyright and license; repository tests and tools use the project header.
+fn is_libinjection_source(path: &Path) -> bool {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == "ya-libinjection-rs" {
+            return components
+                .next()
+                .is_some_and(|next| next.as_os_str() == "src" || next.as_os_str() == "build.rs");
+        }
+    }
+    false
 }
 
 // -----------------------------------------------------------------------------
@@ -480,6 +508,14 @@ mod tests {
         assert!(!is_safe_workspace_member("/tmp/crate-a"));
         assert!(!is_safe_workspace_member("../outside"));
         assert!(!is_safe_workspace_member("crate-a/../../outside"));
+    }
+
+    #[test]
+    fn is_libinjection_source_only_accepts_engine_sources_and_build_script() {
+        assert!(is_libinjection_source(Path::new("ya-libinjection-rs/src/lib.rs")));
+        assert!(is_libinjection_source(Path::new("ya-libinjection-rs/build.rs")));
+        assert!(!is_libinjection_source(Path::new("ya-libinjection-rs/tests/api.rs")));
+        assert!(!is_libinjection_source(Path::new("libinjection-rs/src/lib.rs")));
     }
 
     #[test]

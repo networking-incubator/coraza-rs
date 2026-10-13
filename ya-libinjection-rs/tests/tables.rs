@@ -1,11 +1,27 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //! The tables ported from libinjection, compared with the upstream sources
+
 //! vendored in `tests/upstream/src`: the generated ones (see
 //! `tools/gen_tables.py`) and the ones copied by hand.
 
 mod common;
 
-use libperfusion::internals::sqli::{Parser, SQL_KEYWORDS};
-use libperfusion::internals::xss::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS};
+use libperfusion::internals::{
+    sqli::{Parser, SQL_KEYWORDS},
+    xss::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS},
+};
 
 /// The body of the C array introduced by `declaration`, comments removed.
 fn c_array_body(source: &str, declaration: &str) -> String {
@@ -33,6 +49,7 @@ fn c_strings(body: &str) -> Vec<(&str, &str)> {
 }
 
 #[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn sql_keywords() {
     let source = common::upstream_source("src/libinjection_sqli_data.h");
     let body = c_array_body(&source, "sql_keywords[] = {");
@@ -46,17 +63,12 @@ fn sql_keywords() {
         })
         .collect();
 
-    let table: Vec<(&str, u8)> = SQL_KEYWORDS
-        .iter()
-        .map(|&(word, ty)| (word, ty.as_byte()))
-        .collect();
-    assert!(
-        table == upstream,
-        "src/sqli/keyword_table.rs is out of date"
-    );
+    let table: Vec<(&str, u8)> = SQL_KEYWORDS.iter().map(|&(word, ty)| (word, ty.as_byte())).collect();
+    assert!(table == upstream, "src/sqli/keyword_table.rs is out of date");
 }
 
 #[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn sql_char_dispatch() {
     let source = common::upstream_source("src/libinjection_sqli_data.h");
     let body = c_array_body(&source, "char_parse_map[] = {");
@@ -78,17 +90,16 @@ fn sql_char_dispatch() {
 }
 
 #[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn xss_event_handlers() {
     let source = common::upstream_source("src/libinjection_xss.c");
     let body = c_array_body(&source, "BLACKATTREVENT[] = {");
     let events: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
-    assert!(
-        BLACK_ATTR_EVENTS[..] == events[..],
-        "src/xss/events.rs is out of date"
-    );
+    assert!(BLACK_ATTR_EVENTS[..] == events[..], "src/xss/events.rs is out of date");
 }
 
 #[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn xss_attributes() {
     let source = common::upstream_source("src/libinjection_xss.c");
     let body = c_array_body(&source, " BLACKATTR[] = {");
@@ -115,6 +126,7 @@ fn xss_attributes() {
 }
 
 #[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn xss_tags() {
     let source = common::upstream_source("src/libinjection_xss.c");
     let body = c_array_body(&source, "BLACKTAG[] = {");

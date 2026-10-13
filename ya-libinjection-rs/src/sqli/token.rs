@@ -1,3 +1,9 @@
+// Copyright (c) 2012-2016, Nick Galbreath
+// Copyright (c) 2017-2024, libinjection Contributors
+// Copyright 2026 Coraza Kubernetes Operator contributors.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+// See the crate's LICENSE for the complete terms.
 use core::cmp::Ordering;
 
 use super::keywords::cstrcasecmp;
@@ -107,9 +113,7 @@ impl Token {
     }
 
     pub(crate) fn is_arithmetic_op(&self) -> bool {
-        self.ty == TokenType::Operator
-            && self.len == 1
-            && matches!(self.val[0], b'*' | b'/' | b'-' | b'+' | b'%')
+        self.ty == TokenType::Operator && self.len == 1 && matches!(self.val[0], b'*' | b'/' | b'-' | b'+' | b'%')
     }
 
     pub(crate) fn is_unary_op(&self) -> bool {
