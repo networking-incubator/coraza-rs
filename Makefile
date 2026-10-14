@@ -37,8 +37,8 @@ test:
 	cargo test --workspace $(_NOCAPTURE)
 
 parity-manifest-check:
-	python3 libinjection-rs/tools/parity/check_manifest.py
-	python3 libinjection-rs/tools/parity/test_manifest_semantics.py
+	python3 libperfusion/tools/parity/check_manifest.py
+	python3 libperfusion/tools/parity/test_manifest_semantics.py
 
 parity-differential:
 	cargo test -p libperfusion --test upstream xss_samples -- --ignored

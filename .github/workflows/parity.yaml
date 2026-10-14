@@ -48,12 +48,12 @@ jobs:
       - name: Compare fixtures and source hashes to pinned module
         run: |
           GO_SOURCE="$(cd xtask/tools && go list -m -f '{{.Dir}}' github.com/corazawaf/libinjection-go)"
-          python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
+          python3 libperfusion/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
 
       - name: Fetch the pinned C reference
         run: |
           set -euo pipefail
-          C_COMMIT="$(python3 -c 'import json; print(json.load(open("libinjection-rs/tests/parity/manifest.json"))["differential"]["c_reference"]["commit"])')"
+          C_COMMIT="$(python3 -c 'import json; print(json.load(open("libperfusion/tests/parity/manifest.json"))["differential"]["c_reference"]["commit"])')"
           C_DIR="$RUNNER_TEMP/libinjection-c"
           git init --quiet "$C_DIR"
           git -C "$C_DIR" remote add origin https://github.com/libinjection/libinjection.git

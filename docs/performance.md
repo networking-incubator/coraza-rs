@@ -4,7 +4,7 @@ This report preserves the comparison made before consolidation. In its tables,
 “YA original” means the initial libperfusion implementation,
 “libinjection-rs original” means the Rust implementation removed during P3,
 and “YA after all optimizations” means the selected implementation before it
-moved into `libinjection-rs/`. The repository now contains only libperfusion;
+moved into `libperfusion/`. The repository now contains only libperfusion;
 current benchmark targets do not reproduce these pairwise measurements.
 
 **Measured:** 2026-10-13
@@ -105,7 +105,7 @@ rustc 1.97.1, release bench profile.
 
 ## Inputs
 
-The corpus run parses all 496 files in libinjection-rs/tests/corpus. The XSS
+The corpus run parses all 496 files in libperfusion/tests/corpus. The XSS
 workload contains 17 hits and 479 misses; the SQLi workload contains 96 hits
 and 400 misses. The shared fixture results are checked before timing.
 
@@ -379,7 +379,7 @@ without adding columns or changing the existing tables.
 The initial measurements used the five-context YA XSS path. The original
 source-level explanation was that repeated context scans contributed to
 large misses; no profiler was run to apportion that cost. The changed YA
-[entry point](../libinjection-rs/src/xss.rs) preserves context priority, skips Data when no
+[entry point](../libperfusion/src/xss.rs) preserves context priority, skips Data when no
 less than sign occurs, always checks unquoted values, and skips quoted
 contexts without their delimiter. The comparison implementation applied
 similar context gates in its own detector.
@@ -406,8 +406,8 @@ work could target binary tokenization while preserving NUL and high-byte
 behavior.
 
 The retained benchmark targets are
-[compare.rs](../libinjection-rs/benches/compare.rs) and
-[scaling.rs](../libinjection-rs/benches/scaling.rs). They measure only the
+[compare.rs](../libperfusion/benches/compare.rs) and
+[scaling.rs](../libperfusion/benches/scaling.rs). They measure only the
 selected implementation now.
 
 ## Current implementation after P3 optimizations

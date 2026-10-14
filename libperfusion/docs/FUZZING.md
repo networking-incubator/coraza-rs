@@ -15,7 +15,7 @@ stay separate from the published library dependencies.
 ## Run a campaign
 
 Install nightly Rust, `cargo-fuzz`, and the libFuzzer build prerequisites.
-From `libinjection-rs/`, run:
+From `libperfusion/`, run:
 
 ```sh
 cargo +nightly fuzz run raw_bytes -- \

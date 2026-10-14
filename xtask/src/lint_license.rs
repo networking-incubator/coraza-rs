@@ -169,7 +169,7 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
 fn is_libinjection_source(path: &Path) -> bool {
     let mut components = path.components();
     while let Some(component) = components.next() {
-        if component.as_os_str() == "libinjection-rs" {
+        if component.as_os_str() == "libperfusion" {
             return components
                 .next()
                 .is_some_and(|next| next.as_os_str() == "src" || next.as_os_str() == "build.rs");
@@ -370,7 +370,7 @@ mod tests {
     fn workspace_member_dirs_reads_current_workspace() {
         let members = workspace_member_dirs(&workspace_root()).unwrap();
         assert!(members.iter().any(|path| path.ends_with("xtask")));
-        assert!(members.iter().any(|path| path.ends_with("libinjection-rs")));
+        assert!(members.iter().any(|path| path.ends_with("libperfusion")));
     }
 
     #[test]
@@ -512,9 +512,9 @@ mod tests {
 
     #[test]
     fn is_libinjection_source_only_accepts_engine_sources_and_build_script() {
-        assert!(is_libinjection_source(Path::new("libinjection-rs/src/lib.rs")));
-        assert!(is_libinjection_source(Path::new("libinjection-rs/build.rs")));
-        assert!(!is_libinjection_source(Path::new("libinjection-rs/tests/api.rs")));
+        assert!(is_libinjection_source(Path::new("libperfusion/src/lib.rs")));
+        assert!(is_libinjection_source(Path::new("libperfusion/build.rs")));
+        assert!(!is_libinjection_source(Path::new("libperfusion/tests/api.rs")));
     }
 
     #[test]
@@ -618,13 +618,13 @@ mod tests {
         let cargo_toml = r#"
 [workspace]
 members = [
-    "libinjection-rs",
+    "libperfusion",
     "xtask",
 ]
 "#;
         assert_eq!(
             extract_workspace_members(cargo_toml),
-            Some(vec!["libinjection-rs".to_owned(), "xtask".to_owned(),])
+            Some(vec!["libperfusion".to_owned(), "xtask".to_owned(),])
         );
     }
 
