@@ -23,7 +23,7 @@
 )]
 
 
-use libperfusion::{Dialect, HtmlContext};
+use libperfusion::{Dialect, HtmlContext, MAX_INPUT_LEN};
 
 #[test]
 fn sqli_with_limit_detects_full_input() {
@@ -129,6 +129,34 @@ fn xss_context_attribute_value() {
 fn xss_context_benign_is_none() {
     assert!(libperfusion::xss_with_context(b"hello world").is_none());
     assert!(libperfusion::xss_with_context(b"<p>Hello World</p>").is_none());
+}
+
+#[test]
+fn sqli_rejects_oversized_input() {
+    let mut attack = b"1' OR '1'='1".to_vec();
+    attack.resize(MAX_INPUT_LEN + 1, b' ');
+    assert!(libperfusion::sqli(&attack).is_none());
+}
+
+#[test]
+fn sqli_accepts_max_size_input() {
+    let mut input = b"1' OR '1'='1".to_vec();
+    input.resize(MAX_INPUT_LEN, b' ');
+    assert!(libperfusion::sqli(&input).is_some());
+}
+
+#[test]
+fn xss_rejects_oversized_input() {
+    let mut attack = b"<script>alert(1)</script>".to_vec();
+    attack.resize(MAX_INPUT_LEN + 1, b' ');
+    assert!(!libperfusion::xss(&attack));
+}
+
+#[test]
+fn xss_accepts_max_size_input() {
+    let mut input = b"<script>alert(1)</script>".to_vec();
+    input.resize(MAX_INPUT_LEN, b' ');
+    assert!(libperfusion::xss(&input));
 }
 
 #[test]

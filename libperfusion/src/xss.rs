@@ -57,6 +57,12 @@ use self::tables::{BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS};
 /// Where in [`BLACK_ATTR_EVENTS`] the events starting with each letter are:
 /// from the first of them to the last. The table has them together, but a
 /// stray event would only widen a span, to be ruled out by the comparison.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Const initializer: loop bound guards BLACK_ATTR_EVENTS[i]; events are non-empty \
+              &str so .as_bytes()[0] is valid; letter is uppercase ASCII minus b'A' (0..=25) \
+              indexing [(_, _); 26]."
+)]
 static EVENT_SPANS: [(usize, usize); 26] = {
     let mut spans = [(0, 0); 26];
     let mut i = 0;
@@ -122,7 +128,7 @@ fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
     if first != b'&' || src.len() < 3 || (is_hex && src.len() < 4) {
         return Some((u32::from(first), 1));
     }
-    if src[1] != b'#' {
+    if src.get(1) != Some(&b'#') {
         return Some(AMPERSAND);
     }
 
@@ -130,7 +136,7 @@ fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
     let digit = |ch: u8| char::from(ch).to_digit(radix);
 
     // The degenerate "&#?" has no digit at all.
-    let Some(mut val) = digit(src[digits_at]) else {
+    let Some(mut val) = src.get(digits_at).and_then(|&ch| digit(ch)) else {
         return Some(AMPERSAND);
     };
     for (i, &ch) in src.iter().enumerate().skip(digits_at + 1) {
@@ -157,7 +163,7 @@ fn htmlencode_startswith(mut prefix: &[u8], mut src: &[u8]) -> bool {
         let Some((&expected, rest)) = prefix.split_first() else {
             return true;
         };
-        src = &src[consumed..];
+        src = src.get(consumed..).unwrap_or_default();
 
         if first && cb <= 32 {
             continue;
@@ -190,7 +196,7 @@ fn is_black_tag(name: &[u8]) -> bool {
     let Some(len) = normalize_name(name, &mut normalized) else {
         return false;
     };
-    let name = &normalized[..len];
+    let name = normalized.get(..len).unwrap_or_default();
     BLACK_TAGS.iter().any(|tag| name == tag.as_bytes())
         // Anything SVG or XSL(T) related.
         || name.starts_with(b"SVG")
@@ -200,7 +206,7 @@ fn is_black_tag(name: &[u8]) -> bool {
 fn black_attr(name: &[u8]) -> Option<Attribute> {
     let mut normalized = [0; MAX_NORMALIZED_TOKEN_LEN];
     let len = normalize_name(name, &mut normalized)?;
-    let name = &normalized[..len];
+    let name = normalized.get(..len).unwrap_or_default();
     if name.len() < 2 {
         return None;
     }
@@ -210,16 +216,15 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
     }
 
     if name.len() >= 5 && name.starts_with(b"ON") {
-        let event = &name[2..];
-        let first = event[0];
-        if first.is_ascii_uppercase() {
-            let (start, end) = EVENT_SPANS[usize::from(first - b'A')];
-            if BLACK_ATTR_EVENTS[start..end]
-                .iter()
-                .any(|known| event == known.as_bytes())
-            {
-                return Some(Attribute::Black);
-            }
+        let event = name.get(2..).unwrap_or_default();
+        if let Some(&first) = event.first()
+            && first.is_ascii_uppercase()
+            && let Some(&(start, end)) = EVENT_SPANS.get(usize::from(first - b'A'))
+            && BLACK_ATTR_EVENTS
+                .get(start..end)
+                .is_some_and(|events| events.iter().any(|known| event == known.as_bytes()))
+        {
+            return Some(Attribute::Black);
         }
     }
 
@@ -233,7 +238,7 @@ fn is_black_url(url: &[u8]) -> bool {
     // Skip whitespace, and high-bit bytes with it: they are not ASCII, Opera
     // sometimes takes UTF-8 whitespace, and EUC-JP ignores some of them.
     let start = url.iter().position(|&ch| ch > 32 && ch < 127).unwrap_or(url.len());
-    let url = &url[start..];
+    let url = url.get(start..).unwrap_or_default();
 
     BLACK_URL_SCHEMES
         .iter()
@@ -291,7 +296,10 @@ pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) 
                 }
 
                 // IE conditional comments, and XML processing instructions.
-                if text.len() > 3 && (text[..3].eq_ignore_ascii_case(b"[if") || text[..3].eq_ignore_ascii_case(b"xml"))
+                if text.len() > 3
+                    && text
+                        .get(..3)
+                        .is_some_and(|p| p.eq_ignore_ascii_case(b"[if") || p.eq_ignore_ascii_case(b"xml"))
                 {
                     return true;
                 }
@@ -341,6 +349,10 @@ pub(crate) fn detect_with_context(input: &[u8]) -> Option<Context> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions index known-valid table entries and fixed-size buffers."
+)]
 mod tests {
     use super::*;
 
@@ -379,7 +391,7 @@ mod tests {
     #[test]
     fn black_attribute_candidates_start_with_ascii_letters() {
         for (name, attribute) in BLACK_ATTRS {
-            assert!(name.as_bytes()[0].is_ascii_alphabetic(), "{name}");
+            assert!(name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic), "{name}");
             assert_eq!(black_attr(name.as_bytes()), Some(attribute), "{name}");
         }
         assert_eq!(black_attr(b"onloadx"), None);
