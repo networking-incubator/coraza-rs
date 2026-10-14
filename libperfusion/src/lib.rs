@@ -81,8 +81,9 @@ pub mod internals {
 /// Maximum input length accepted by the top-level detection functions.
 ///
 /// Inputs longer than 65 536 bytes are rejected (returning `None` / `false`)
-/// without scanning. This matches the fuzzer's `max_len` and provides a
-/// defense-in-depth bound on per-request work.
+/// without scanning, providing a defense-in-depth bound on per-request work.
+/// The fuzzer uses a 4× larger window (`-max_len=262144`) to stress-test
+/// the rejection path.
 pub const MAX_INPUT_LEN: usize = 65_536;
 
 /// Checks `input` for SQL injection.
