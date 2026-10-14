@@ -67,7 +67,7 @@ fn workspace_root() -> PathBuf {
 
 fn check(root: &Path) -> Result<(), String> {
     let (version, module_sum) = pinned_module(root)?;
-    let crate_root = root.join("libinjection-rs");
+    let crate_root = root.join("libperfusion");
     check_snapshot(
         &crate_root.join("tests/corpus"),
         &crate_root.join("tests/parity/manifest.json"),
@@ -256,7 +256,7 @@ fn pinned_module(root: &Path) -> Result<(String, String), String> {
 
 fn refresh() -> Result<(), String> {
     let root = workspace_root();
-    let crate_root = root.join("libinjection-rs");
+    let crate_root = root.join("libperfusion");
     let previous_manifest: Value = serde_json::from_slice(
         &fs::read(crate_root.join("tests/parity/manifest.json")).map_err(|error| error.to_string())?,
     )

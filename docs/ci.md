@@ -22,7 +22,7 @@ This repository uses GitHub Actions to block risky changes early.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
 
 The oracle module version, checksum, and comparison format are documented in
-the [parity protocol](../libinjection-rs/tools/parity/PROTOCOL.md).
+the [parity protocol](../libperfusion/tools/parity/PROTOCOL.md).
 
 ### `focused-fuzz`
 
@@ -30,7 +30,7 @@ the [parity protocol](../libinjection-rs/tools/parity/PROTOCOL.md).
 - Uploads campaign logs and crash artifacts, including on failure.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
 
-See the [fuzzing guide](../libinjection-rs/docs/FUZZING.md) for local runs and
+See the [fuzzing guide](../libperfusion/docs/FUZZING.md) for local runs and
 regression promotion.
 
 ### `supply-chain`
@@ -69,7 +69,7 @@ make all
 ```
 
 The differential gates use the Go module pinned in `xtask/tools/go.mod` and a
-C checkout at the revision pinned in `libinjection-rs/tests/parity/manifest.json`.
+C checkout at the revision pinned in `libperfusion/tests/parity/manifest.json`.
 Set `LIBINJECTION_DIR` to that checkout before running:
 
 ```console

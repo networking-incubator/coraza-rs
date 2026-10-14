@@ -19,7 +19,7 @@ ORDER_TO = "event\tACCESSKEYNOTFOUND\nevent\tABORT"
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="libinjection-manifest-test-") as temporary:
-        copy = Path(temporary) / "libinjection-rs"
+        copy = Path(temporary) / "libperfusion"
         shutil.copytree(CRATE, copy)
         go_tools = copy.parent / "xtask/tools"
         go_tools.mkdir(parents=True)

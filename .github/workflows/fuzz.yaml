@@ -42,7 +42,7 @@ jobs:
       - name: Run raw-byte and SQL/HTML grammar campaigns
         env:
           ASAN_OPTIONS: detect_leaks=0
-        working-directory: libinjection-rs
+        working-directory: libperfusion
         run: |
           mkdir -p "$RUNNER_TEMP/fuzz/corpus/raw_bytes" "$RUNNER_TEMP/fuzz/corpus/sql_grammar" "$RUNNER_TEMP/fuzz/corpus/html_grammar"
           mkdir -p "$RUNNER_TEMP/fuzz/artifacts/raw_bytes" "$RUNNER_TEMP/fuzz/artifacts/sql_grammar" "$RUNNER_TEMP/fuzz/artifacts/html_grammar"

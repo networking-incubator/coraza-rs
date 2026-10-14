@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
   path_filters:
-    - "!libinjection-rs/data/sqli_keywords.txt"
+    - "!libperfusion/data/sqli_keywords.txt"
     - "!**/Cargo.lock"
     - "!**/target/**"
     - "!**/generated/**"
