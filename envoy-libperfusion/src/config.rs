@@ -16,6 +16,15 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::Deserialize;
 
+/// Maximum request or response body buffered by the plugin.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum size of one extracted field.
+const MAX_FIELD_BYTES: usize = 1024 * 1024;
+/// Maximum number of extracted fields in one message.
+const MAX_FIELDS: usize = 65_536;
+/// Maximum JSON nesting depth accepted by the plugin.
+const MAX_JSON_DEPTH: usize = 128;
+
 /// Chooses what to do with a direction's detections.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +76,8 @@ pub(crate) enum ConfigError {
     Json(serde_json::Error),
     /// One or more resource limits were zero.
     InvalidLimit,
+    /// One or more resource limits exceeded the supported maximum.
+    LimitTooLarge,
 }
 
 impl Display for ConfigError {
@@ -75,6 +86,7 @@ impl Display for ConfigError {
         match self {
             Self::Json(error) => write!(f, "invalid JSON: {error}"),
             Self::InvalidLimit => f.write_str("inspection limits must be non-zero"),
+            Self::LimitTooLarge => f.write_str("inspection limits exceed the supported maximum"),
         }
     }
 }
@@ -93,7 +105,21 @@ impl Config {
         {
             return Err(ConfigError::InvalidLimit);
         }
+        if config.max_request_body_bytes > MAX_BODY_BYTES
+            || config.max_response_body_bytes > MAX_BODY_BYTES
+            || config.max_field_bytes > MAX_FIELD_BYTES
+            || config.max_field_bytes > config.max_request_body_bytes
+            || config.max_fields > MAX_FIELDS
+            || config.max_json_depth > MAX_JSON_DEPTH
+        {
+            return Err(ConfigError::LimitTooLarge);
+        }
         Ok(config)
+    }
+
+    /// Rejects incomplete inspection only when that direction is blocking.
+    pub(crate) fn rejects_incomplete(&self, mode: Mode) -> bool {
+        mode == Mode::Block && self.incomplete_inspection_policy == IncompletePolicy::Reject
     }
 }
 
@@ -116,7 +142,7 @@ impl Default for Config {
 #[cfg(test)]
 /// Configuration tests.
 mod tests {
-    use super::{Config, IncompletePolicy, Mode};
+    use super::{Config, ConfigError, IncompletePolicy, Mode};
 
     /// Checks defaults and configuration validation.
     #[test]
@@ -147,5 +173,37 @@ mod tests {
             Config::parse(br#"{"max_request_body_bytes":0}"#).is_err(),
             "zero body limits must be rejected"
         );
+    }
+
+    /// Rejects configured limits above the supported memory and parser bounds.
+    #[test]
+    fn rejects_limits_above_supported_maxima() {
+        for configuration in [
+            br#"{"max_request_body_bytes":67108865}"#.as_slice(),
+            br#"{"max_response_body_bytes":67108865}"#,
+            br#"{"max_field_bytes":1048577}"#,
+            br#"{"max_request_body_bytes":64,"max_field_bytes":65}"#,
+            br#"{"max_fields":65537}"#,
+            br#"{"max_json_depth":129}"#,
+        ] {
+            assert!(
+                matches!(Config::parse(configuration), Err(ConfigError::LimitTooLarge)),
+                "configuration must exceed a supported maximum"
+            );
+        }
+    }
+
+    /// Keeps incomplete messages passable in detect mode despite a reject policy.
+    #[test]
+    fn rejects_incomplete_only_in_block_mode() {
+        let config = Config::default();
+        assert!(!config.rejects_incomplete(Mode::Detect));
+        assert!(config.rejects_incomplete(Mode::Block));
+
+        let report = Config {
+            incomplete_inspection_policy: IncompletePolicy::Report,
+            ..config
+        };
+        assert!(!report.rejects_incomplete(Mode::Block));
     }
 }
