@@ -5,6 +5,8 @@ The workspace contains one detector implementation, the `libperfusion` crate,
 plus `xtask` for corpus, provenance, and table maintenance.
 
 - [Library API and development guide](libperfusion/README.md)
+- [Envoy Wasm filter example](examples/envoy-libperfusion/README.md)
+- [Envoy Wasm research and coverage contract](docs/envoy-wasm-plan.md)
 - [CI checks](docs/ci.md)
 - [Fuzzing guide](libperfusion/docs/FUZZING.md)
 - [Historical performance comparison](docs/performance.md)
