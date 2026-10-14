@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust (MSRV)
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           cache-suffix: msrv
 

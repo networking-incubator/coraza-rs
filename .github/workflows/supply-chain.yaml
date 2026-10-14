@@ -26,4 +26,4 @@ jobs:
           persist-credentials: false
 
       - name: Supply chain audit
-        uses: ./.github/actions/supply-chain-audit
+        uses: $/.github/actions/supply-chain-audit

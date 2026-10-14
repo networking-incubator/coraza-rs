@@ -148,9 +148,9 @@ status=$(request "$temp_dir/response" --dump-header "$temp_dir/headers" --http2-
     --header 'content-type: application/grpc' --header 'te: trailers' \
     --data-binary "@$temp_dir/grpc-request" \
     http://127.0.0.1:10000/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo)
-check_status 502 "$status" 'blocked gRPC response with trailers'
-if grep --ignore-case --quiet '^grpc-status:' "$temp_dir/headers"; then
-    fail 'blocked gRPC response retained upstream trailers'
+check_status 200 "$status" 'blocked gRPC response'
+if ! grep --ignore-case --quiet '^grpc-status: 14' "$temp_dir/headers"; then
+    fail 'blocked gRPC response did not return the local UNAVAILABLE status'
 fi
 
 status=$(request "$temp_dir/response" http://127.0.0.1:10000/health)

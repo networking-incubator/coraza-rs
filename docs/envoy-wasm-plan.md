@@ -3,10 +3,6 @@
 Research date: 2026-10-14. Status: initial implementation complete. The Wasm
 artifact builds and the Envoy 1.40 blocking-profile integration checks pass.
 
-Workspace: `/home/rpchevuz/codes/work/waf/coraza-rs-worktree1`. Branch:
-`feature/envoy-libperfusion-wasm`, based on `17f8517`. This is an isolated Git
-worktree; the original checkout remains untouched.
-
 The selected outcome is an Envoy HTTP Wasm filter that checks request and
 response headers and bodies using libperfusion. Request and response modes are
 independently configurable as `off`, `detect` or `block`; incomplete coverage

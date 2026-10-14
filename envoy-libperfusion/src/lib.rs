@@ -266,6 +266,7 @@ impl LibperfusionHttp {
             return Action::Continue;
         };
         if self.response_state == ResponseState::BlockedHeld {
+            self.replace_blocked_response_body(body_size);
             self.response_state = ResponseState::Done;
             log::warn!("libperfusion: response outcome=blocked status=502");
             return Action::Continue;
@@ -459,6 +460,19 @@ impl HttpContext for LibperfusionHttp {
 
         let reject_headers = has_detection && self.response_mode() == Mode::Block
             || incomplete.is_some() && self.reject_incomplete(self.response_mode());
+        if reject_headers && streaming && !end_of_stream {
+            self.response_state = ResponseState::Done;
+            self.send_http_response(
+                502,
+                vec![
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("cache-control", "no-store"),
+                ],
+                Some(b"Upstream response blocked\n"),
+            );
+            log::warn!("libperfusion: response outcome=blocked status=502");
+            return Action::Pause;
+        }
         if reject_headers {
             self.response_state = ResponseState::BlockedHeld;
             self.block_response_headers();
