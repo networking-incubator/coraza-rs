@@ -53,6 +53,8 @@ pub(crate) enum IncompletePolicy {
 pub(crate) struct Config {
     /// Request inspection mode.
     pub(crate) request_mode: Mode,
+    /// Allow clean request headers upstream before the body verdict; for hosts without header-stop support.
+    pub(crate) allow_request_headers_before_body_verdict: bool,
     /// Response inspection mode.
     pub(crate) response_mode: Mode,
     /// Policy for messages the plugin cannot fully inspect.
@@ -128,6 +130,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             request_mode: Mode::Detect,
+            allow_request_headers_before_body_verdict: false,
             response_mode: Mode::Detect,
             incomplete_inspection_policy: IncompletePolicy::Reject,
             max_request_body_bytes: 1024 * 1024,
@@ -152,6 +155,10 @@ mod tests {
         let config = parsed.unwrap_or_default();
 
         assert_eq!(config.request_mode, Mode::Detect, "request mode default");
+        assert!(
+            !config.allow_request_headers_before_body_verdict,
+            "request headers are held for the body verdict by default"
+        );
         assert_eq!(config.response_mode, Mode::Detect, "response mode default");
         assert_eq!(
             config.incomplete_inspection_policy,
@@ -160,6 +167,17 @@ mod tests {
         );
         assert_eq!(config.max_request_body_bytes, 1024 * 1024, "request body bound");
         assert_eq!(config.max_response_body_bytes, 1024 * 1024, "response body bound");
+    }
+
+    /// Parses the opt-in for forwarding request headers before the body verdict.
+    #[test]
+    fn allows_early_request_headers_only_when_opted_in() {
+        let parsed = Config::parse(br#"{"allow_request_headers_before_body_verdict":true}"#);
+        assert!(parsed.is_ok(), "request header flow setting should parse");
+        assert!(
+            parsed.unwrap_or_default().allow_request_headers_before_body_verdict,
+            "true should release clean headers before the body verdict"
+        );
     }
 
     /// Ensures unknown fields and invalid resource bounds fail parsing.

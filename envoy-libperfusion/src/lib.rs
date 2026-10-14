@@ -336,7 +336,7 @@ impl LibperfusionHttp {
 impl Context for LibperfusionHttp {}
 
 impl HttpContext for LibperfusionHttp {
-    /// Inspects request headers and pauses buffered requests for body inspection.
+    /// Inspects request headers and applies the configured body-hold strategy.
     fn on_http_request_headers(&mut self, _num_headers: usize, end_of_stream: bool) -> Action {
         if self.request_mode() == Mode::Off {
             return Action::Continue;
@@ -371,7 +371,10 @@ impl HttpContext for LibperfusionHttp {
         if end_of_stream {
             return self.finish_request();
         }
-        Action::Pause
+        if !self.config.allow_request_headers_before_body_verdict {
+            return Action::Pause;
+        }
+        Action::Continue
     }
 
     /// Tracks buffered request bodies and inspects them when complete.
