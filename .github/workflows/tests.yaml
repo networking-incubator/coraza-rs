@@ -92,11 +92,8 @@ jobs:
         with:
           cache-suffix: envoy-wasm
 
-      - name: Install Wasm target
-        run: rustup target add wasm32-wasip1
-
       - name: Build Envoy filter
-        run: cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion
+        run: make build-envoy-wasm
 
       - name: Run Envoy integration checks
         run: ./examples/envoy-libperfusion/test-envoy.sh

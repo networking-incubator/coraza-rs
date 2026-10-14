@@ -15,8 +15,10 @@
 
 set -euo pipefail
 
-compose=(docker compose -f "$(dirname -- "${BASH_SOURCE[0]}")/compose.yaml" -p libperfusion-envoy-test)
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+compose=(docker compose -f "$script_dir/compose.yaml" -p libperfusion-envoy-test)
 temp_dir=$(mktemp -d)
+compat_config="$script_dir/.envoy-istio-compatible.$$.yaml"
 
 cleanup() {
     local exit_code=$?
@@ -27,6 +29,7 @@ cleanup() {
             | tail --lines=40 >&2 || true
     fi
     "${compose[@]}" down --volumes >/dev/null 2>&1 || true
+    rm -f "$compat_config"
     rm -rf "$temp_dir"
     exit "$exit_code"
 }
@@ -66,6 +69,28 @@ for config in envoy.yaml envoy-blocking.yaml envoy-response-blocking.yaml; do
     "${compose[@]}" run --rm --no-deps envoy --mode validate \
         -c "/etc/envoy/config/$config"
 done
+
+sed \
+    -e 's/allow_on_headers_stop_iteration: true/allow_on_headers_stop_iteration: false/' \
+    -e 's/"request_mode":"detect"/"request_mode":"block","allow_request_headers_before_body_verdict":true/' \
+    -e 's/"response_mode":"detect"/"response_mode":"off"/' \
+    -e 's/"incomplete_inspection_policy":"report"/"incomplete_inspection_policy":"reject"/' \
+    "$script_dir/envoy.yaml" >"$compat_config"
+compat_config_name=$(basename -- "$compat_config")
+"${compose[@]}" run --rm --no-deps envoy --mode validate \
+    -c "/etc/envoy/config/$compat_config_name"
+
+ENVOY_CONFIG="$compat_config_name" "${compose[@]}" up --detach
+wait_for_envoy
+status=$(request "$temp_dir/response" --request POST --data-urlencode 'query=hello' http://127.0.0.1:10000/echo)
+check_status 200 "$status" 'Istio-compatible clean request body'
+status=$(request "$temp_dir/response" --header 'x-untrusted: <script>alert(1)</script>' http://127.0.0.1:10000/)
+check_status 403 "$status" 'Istio-compatible blocked request header'
+status=$(request "$temp_dir/response" --data-urlencode 'query=1 UNION SELECT password FROM users' http://127.0.0.1:10000/echo)
+check_status 403 "$status" 'Istio-compatible blocked request body'
+status=$(request "$temp_dir/response" http://127.0.0.1:10000/health)
+check_status 200 "$status" 'request after Istio-compatible body rejection'
+"${compose[@]}" down >/dev/null
 
 ENVOY_CONFIG=envoy-blocking.yaml "${compose[@]}" up --detach
 wait_for_envoy
