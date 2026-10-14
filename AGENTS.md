@@ -12,3 +12,8 @@ development so failures are caught before the final review.
 
 Reference actions from this repository with `uses: $/.github/...` rather than
 `uses: ./.github/...`.
+
+## Commits
+
+Every commit must have a `Signed-off-by` trailer generated from the correct Git
+identity (use `git commit -s`). Do not include a `Co-authored-by` trailer.

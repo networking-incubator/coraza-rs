@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!Cargo.lock
+!envoy-libperfusion/
+!envoy-libperfusion/**
+!libperfusion/
+!libperfusion/**
+!xtask/
+!xtask/Cargo.toml

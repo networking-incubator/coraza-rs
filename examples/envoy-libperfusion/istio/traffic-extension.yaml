@@ -1,0 +1,28 @@
+apiVersion: extensions.istio.io/v1alpha1
+kind: TrafficExtension
+metadata:
+  name: libperfusion-waf-test
+  namespace: istio-ingress
+spec:
+  match:
+    - mode: CLIENT
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: gateway
+  phase: AUTHZ
+  wasm:
+    url: oci://docker.io/rpkatz/libperfusion-wasm:0.2.0@sha256:4d905c336e55f59241daaaa8a8812f00a41d2c160b318d8b38a22e4b5d81defd
+    pluginName: libperfusion
+    type: HTTP
+    failStrategy: FAIL_CLOSE
+    pluginConfig:
+      request_mode: block
+      allow_request_headers_before_body_verdict: true
+      response_mode: "off"
+      incomplete_inspection_policy: reject
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+      max_fields: 1024
+      max_field_bytes: 65536
+      max_json_depth: 32

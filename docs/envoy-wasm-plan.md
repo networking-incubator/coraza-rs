@@ -119,6 +119,13 @@ This applies to both directions.
 [Host status conversion](https://raw.githubusercontent.com/proxy-wasm/proxy-wasm-cpp-host/master/src/context.cc),
 [Envoy host implementation](https://raw.githubusercontent.com/envoyproxy/envoy/main/source/extensions/common/wasm/context.cc).
 
+Istio's interim request-only mode opts in with
+`allow_request_headers_before_body_verdict: true`. Header inspection still runs
+before clean headers continue, and body delivery pauses until complete
+inspection. The upstream may receive clean headers before the body verdict.
+Keep `response_mode: off` in this mode; response blocking requires held
+response headers to replace the status and body safely.
+
 The ABI permits a local response before downstream response headers are
 sent. Thus **response headers must remain held until body and trailers pass**
 if a body verdict is to replace the response without leaking content.
@@ -216,6 +223,7 @@ Implemented configuration:
 | Setting | Proposed contract |
 | --- | --- |
 | `request_mode`, `response_mode` | Independently `off`, `detect`, or `block`; built-in default is `detect`. |
+| `allow_request_headers_before_body_verdict` | Defaults to `false`; set `true` only on hosts without header-stop support, accepting that clean headers reach the upstream before body inspection completes. |
 | Detectors | SQLi and XSS both run in each enabled direction. |
 | `max_request_body_bytes`, `max_response_body_bytes` | Hard body bounds; built-in default is 1 MiB each, maximum 64 MiB each. |
 | Extraction budgets | Default 1,024 fields, 64 KiB per field and JSON depth 32; maximum 65,536 fields, 1 MiB per field and depth 128. Field bytes cannot exceed the request body limit. |

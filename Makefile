@@ -4,12 +4,14 @@
 
 V ?=
 NIGHTLY ?= nightly
+CARGO_TARGET_DIR ?= target
+ENVOY_WASM_IMAGE ?= coraza-rs/envoy-libperfusion:dev
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build check clean test parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -22,6 +24,13 @@ build:
 
 check:
 	cargo check --workspace
+
+build-envoy-wasm:
+	rustup target add wasm32-wasip1
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion
+
+build-envoy-wasm-image:
+	docker build --file envoy-libperfusion/Dockerfile --tag "$(ENVOY_WASM_IMAGE)" .
 
 clean:
 	cargo clean
@@ -114,6 +123,9 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  build      cargo build --workspace"
+	@echo "  build-envoy-wasm       build the release Envoy filter for wasm32-wasip1"
+	@echo "  build-envoy-wasm-image build/tag a scratch OCI image using Docker's Rust build stage"
+	@echo "    ENVOY_WASM_IMAGE=...  image tag (default: $(ENVOY_WASM_IMAGE))"
 	@echo "  check      cargo check --workspace"
 	@echo "  clean      cargo clean"
 	@echo ""
