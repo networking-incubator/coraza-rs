@@ -36,7 +36,8 @@
 
 #[expect(
     clippy::indexing_slicing,
-    reason = "The byte helpers check their slice bounds before accessing them."
+    reason = "The const byte-set builder and span/cspan helpers index [bool; 256] by u8 values \
+              (always 0..=255) and guard loop indices against slice length."
 )]
 mod bytes;
 #[expect(
@@ -53,10 +54,6 @@ mod html5;
     reason = "The SQL scanner and fixed token window maintain bounded byte and slot positions."
 )]
 mod sqli;
-#[expect(
-    clippy::indexing_slicing,
-    reason = "The XSS scanner bounds normalized names and table spans before access."
-)]
 mod xss;
 
 pub use html5::{Context as HtmlContext, Token as HtmlToken, TokenKind as HtmlTokenKind, Tokenizer as HtmlTokenizer};
@@ -81,20 +78,39 @@ pub mod internals {
     }
 }
 
+/// Maximum input length accepted by the top-level detection functions.
+///
+/// Inputs longer than 65 536 bytes are rejected (returning `None` / `false`)
+/// without scanning. This matches the fuzzer's `max_len` and provides a
+/// defense-in-depth bound on per-request work.
+pub const MAX_INPUT_LEN: usize = 65_536;
+
 /// Checks `input` for SQL injection.
 ///
 /// The input is tested as-is, and as if it continued a single- or
 /// double-quoted string. Returns the fingerprint of the first of these
 /// readings that matches a known SQL injection pattern, or `None` if the
 /// input looks benign.
+///
+/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
+/// scanning.
 #[must_use]
 pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
+    if input.len() > MAX_INPUT_LEN {
+        return None;
+    }
     sqli::detect(input)
 }
 
 /// Like [`sqli()`], but also returns which [`Dialect`] the match was found in.
+///
+/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
+/// scanning.
 #[must_use]
 pub fn sqli_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)> {
+    if input.len() > MAX_INPUT_LEN {
+        return None;
+    }
     sqli::detect_with_dialect(input)
 }
 
@@ -111,22 +127,37 @@ pub fn sqli_with_limit(input: &[u8], max_bytes: usize) -> Option<Fingerprint> {
 /// The input is tested as HTML, and as if it continued an attribute value,
 /// unquoted or quoted with `'`, `"` or a backtick. Returns `true` if any of
 /// these readings holds a tag, attribute or URL that can run script.
+///
+/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
+/// scanning.
 #[must_use]
 pub fn xss(input: &[u8]) -> bool {
+    if input.len() > MAX_INPUT_LEN {
+        return false;
+    }
     xss::detect(input)
 }
 
 /// Like [`xss()`], but also returns which [`HtmlContext`] the match was found in.
 ///
-/// Returns `None` if the input looks benign.
+/// Returns `None` if the input looks benign or exceeds [`MAX_INPUT_LEN`].
 #[must_use]
 pub fn xss_with_context(input: &[u8]) -> Option<HtmlContext> {
+    if input.len() > MAX_INPUT_LEN {
+        return None;
+    }
     xss::detect_with_context(input)
 }
 
 /// Checks `input` for cross-site scripting in one caller-selected HTML context.
+///
+/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
+/// scanning.
 #[must_use]
 pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
+    if input.len() > MAX_INPUT_LEN {
+        return false;
+    }
     xss::is_xss(input, context, None)
 }
 

@@ -7,8 +7,10 @@
 //! Byte-string helpers standing in for the C library calls upstream leans on.
 
 /// `memchr` over `s[from..]`, returning an index into `s`.
+///
+/// Returns `None` if `from` is past the end of `s` or `byte` is not found.
 pub(crate) fn find_byte(s: &[u8], from: usize, byte: u8) -> Option<usize> {
-    memchr::memchr(byte, &s[from..]).map(|i| from + i)
+    memchr::memchr(byte, s.get(from..)?).map(|i| from + i)
 }
 
 /// Whether `byte` occurs in `s`.
@@ -71,9 +73,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn find_byte_rejects_offsets_past_the_end() {
-        let _ = find_byte(b"abc", 4, b'a');
+    fn find_byte_returns_none_for_offsets_past_the_end() {
+        assert_eq!(find_byte(b"abc", 4, b'a'), None);
+        assert_eq!(find_byte(b"abc", 3, b'a'), None);
     }
 
     #[test]

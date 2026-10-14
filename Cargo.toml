@@ -187,8 +187,8 @@ significant_drop_tightening = "warn"
 # Diagnostic hygiene (deny: a WAF engine must not panic on attacker-controlled input)
 expect_used = "deny"
 panic = "deny"
-# Below should be moved to deny in long-term, but let's keep as warn while porting the library
-indexing_slicing = "warn"
+# Promoted to deny: remaining uses carry local #[expect] with safety justifications.
+indexing_slicing = "deny"
 # Redundancy
 redundant_type_annotations = "deny"
 needless_raw_strings = "deny"
