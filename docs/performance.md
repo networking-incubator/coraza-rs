@@ -461,7 +461,7 @@ still checked all 862 cases and retained the same 24 reviewed differences.
 
 The final source also passed exact before/after comparisons on 100,000
 deterministic SQLi, XSS, and context inputs; 486 repeated-slash boundary inputs
-kept identical HTML token streams in all five contexts. Pinned C and Go v0.3.5
-differentials passed with their existing reviewed exceptions. These checks do
-not replace broader fuzzing or make the unlocked-frequency timings portable to
-other CPUs.
+kept identical HTML token streams in all five contexts. At measurement time,
+pinned C and Go v0.3.5 differentials passed with their reviewed exceptions.
+These checks do not replace broader fuzzing or make the unlocked-frequency
+timings portable to other CPUs.

@@ -150,8 +150,8 @@ fn count_samples(prefix: &str, detect: impl Fn(&[u8]) -> bool) -> (usize, usize)
     (flagged, samples.len() - flagged)
 }
 
-// The SQL counts match upstream at d88a8f8. Go v0.3.5 allows nine XSS samples
-// that C flags; those exact cases are listed in the parity mismatch ledger.
+// The SQL counts match upstream at d88a8f8. The pinned Go main commit allows
+// nine XSS samples that C flags; those exact cases are in the parity ledger.
 
 #[test]
 #[ignore = "upstream sample comparison; requires upstream data files via LIBINJECTION_DIR"]

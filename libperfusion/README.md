@@ -30,8 +30,8 @@ tests, and benchmarks also use `std`.
 
 ## Compatibility and development
 
-The default CI gate checks the pinned `libinjection-go` v0.3.5 corpus and
-generated inputs. The exact reviewed differences are recorded in the
+The default CI gate checks the corpus and generated inputs against the pinned
+`libinjection-go` main commit. The exact reviewed differences are recorded in the
 [mismatch ledger](tests/parity/mismatch-ledger.md). The vendored C-derived
 tables retain their source revision in their headers and are checked with
 `cargo xtask tables-check`.

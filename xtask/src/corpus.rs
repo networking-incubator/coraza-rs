@@ -594,7 +594,7 @@ fn trim_section(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex(&Sha256::digest(bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {
