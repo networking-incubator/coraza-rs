@@ -216,7 +216,7 @@ impl<'a, L: SqlLookup> State<'a, L> {
 
         // SQL Server's audit log skips anything mentioning 'sp_password',
         // which makes it a known companion of SQLi in a trailing comment.
-        if fingerprint.len() > 1
+        if matches!(fingerprint.len(), 2 | 3)
             && fingerprint.last() == Some(&TokenType::Comment.as_byte())
             && find_slice(self.input, b"sp_password").is_some()
         {

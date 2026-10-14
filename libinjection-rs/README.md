@@ -1,7 +1,8 @@
 # libperfusion
 
-A `no_std`, allocation-free Rust port of [libinjection] for SQL injection and
-cross-site scripting detection. The crate uses `memchr` for byte searches.
+A Rust port of [libinjection] for SQL injection and cross-site scripting
+detection. It uses `std` for accelerated byte searches and does not allocate
+while detecting.
 Inputs are bytes: decode them the way the consuming application does before
 checking them.
 
@@ -24,8 +25,8 @@ tokens, return fingerprints for a selected quote and dialect (including for
 benign input), classify fingerprints, and accept a custom `SqlLookup`.
 `HtmlTokenizer` exposes HTML tokens for a caller-selected starting context.
 
-The library code uses neither `std` nor a heap allocator. Development tools,
-tests, and benchmarks may use both.
+The library uses `std`; its detection paths do not allocate. Development tools,
+tests, and benchmarks also use `std`.
 
 ## Compatibility and development
 
@@ -58,9 +59,8 @@ LIBINJECTION_DIR=/path/to/libinjection cargo test -p libperfusion --test tables 
 The `compare` and `scaling` benchmarks run on the retained implementation
 without an upstream checkout. The `speed` benchmark also times the C library
 and needs an upstream checkout and C compiler. The
-[performance report](../docs/performance.md) preserves measurements from
-before the two implementations were consolidated; its pairwise comparison is
-historical.
+[performance report](../docs/performance.md) preserves the historical
+pairwise comparison and adds measurements for the current implementation.
 
 See the [CI guide](../docs/ci.md) and [fuzzing guide](docs/FUZZING.md) for
 workflow and local campaign details.

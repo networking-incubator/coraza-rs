@@ -17,7 +17,7 @@
     )
 )]
 use crate::{
-    bytes::contains,
+    bytes::{contains, find_byte},
     html5::{Context, TokenKind, Tokenizer},
 };
 
@@ -240,9 +240,25 @@ fn is_black_url(url: &[u8]) -> bool {
         .any(|scheme| htmlencode_startswith(scheme, url))
 }
 
-pub(crate) fn is_xss(input: &[u8], context: Context) -> bool {
+pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
     let mut attr = None;
-    for token in Tokenizer::new(input, context) {
+    let mut tokenizer = match context {
+        Context::Data => {
+            // Plain text before the first tag cannot affect Data-context detection.
+            let Some(start) = data_start.or_else(|| {
+                if input.first() == Some(&b'<') {
+                    Some(0)
+                } else {
+                    find_byte(input, 0, b'<')
+                }
+            }) else {
+                return false;
+            };
+            Tokenizer::new_data_at(input, start)
+        },
+        _ => Tokenizer::new(input, context),
+    };
+    for token in &mut tokenizer {
         let text = token.text;
         if token.kind != TokenKind::AttrValue {
             attr = None;
@@ -298,11 +314,17 @@ pub(crate) fn detect(input: &[u8]) -> bool {
 }
 
 pub(crate) fn detect_with_context(input: &[u8]) -> Option<Context> {
-    let has_data_start = input.first() == Some(&b'<') || crate::bytes::find_byte(input, 0, b'<').is_some();
-    if has_data_start && is_xss(input, Context::Data) {
+    let data_start = if input.first() == Some(&b'<') {
+        Some(0)
+    } else {
+        find_byte(input, 0, b'<')
+    };
+    if let Some(start) = data_start
+        && is_xss(input, Context::Data, Some(start))
+    {
         return Some(Context::Data);
     }
-    if is_xss(input, Context::ValueNoQuote) {
+    if is_xss(input, Context::ValueNoQuote, None) {
         return Some(Context::ValueNoQuote);
     }
 
@@ -311,7 +333,7 @@ pub(crate) fn detect_with_context(input: &[u8]) -> Option<Context> {
         (b'"', Context::ValueDoubleQuote),
         (b'`', Context::ValueBackQuote),
     ] {
-        if crate::bytes::find_byte(input, 0, quote).is_some() && is_xss(input, context) {
+        if find_byte(input, 0, quote).is_some() && is_xss(input, context, None) {
             return Some(context);
         }
     }
@@ -370,8 +392,8 @@ mod tests {
     fn high_bit_attribute_names_are_rejected_after_leading_nuls() {
         assert_eq!(black_attr(b"\0\0\0"), None);
         assert_eq!(black_attr(b"\0\xff\x80\0\xff\x80"), None);
-        assert!(!is_xss(b"<p attributeName=\"\0\xff\x80\">", Context::Data));
-        assert!(is_xss(b"<p attributeName=onload>", Context::Data));
+        assert!(!is_xss(b"<p attributeName=\"\0\xff\x80\">", Context::Data, None));
+        assert!(is_xss(b"<p attributeName=onload>", Context::Data, None));
     }
 
     fn unpruned_detect_with_context(input: &[u8]) -> Option<Context> {
@@ -383,7 +405,7 @@ mod tests {
             Context::ValueBackQuote,
         ]
         .into_iter()
-        .find(|&context| is_xss(input, context))
+        .find(|&context| is_xss(input, context, None))
     }
 
     #[test]
@@ -391,10 +413,10 @@ mod tests {
         const ALPHABET: &[u8] = b"<> '\"`= on\0";
 
         let attack = b"\"onclick=x'onerror=y";
-        assert!(!is_xss(attack, Context::Data));
-        assert!(!is_xss(attack, Context::ValueNoQuote));
-        assert!(is_xss(attack, Context::ValueDoubleQuote));
-        assert!(is_xss(attack, Context::ValueSingleQuote));
+        assert!(!is_xss(attack, Context::Data, None));
+        assert!(!is_xss(attack, Context::ValueNoQuote, None));
+        assert!(is_xss(attack, Context::ValueDoubleQuote, None));
+        assert!(is_xss(attack, Context::ValueSingleQuote, None));
         // The double quote is encountered first, but the single-quote context
         // still has priority in the original context sequence.
         assert_eq!(detect_with_context(attack), Some(Context::ValueSingleQuote));
@@ -404,6 +426,9 @@ mod tests {
         assert_eq!(detect_with_context(b"\"onclick=x"), Some(Context::ValueDoubleQuote));
         assert_eq!(detect_with_context(b"`onclick=x"), Some(Context::ValueBackQuote));
         assert_eq!(detect_with_context(b"hello world"), None);
+        assert!(!is_xss(b"plain text", Context::Data, None));
+        assert!(is_xss(b"plain text <script>alert(1)</script>", Context::Data, None));
+        assert_eq!(detect_with_context(b"prefix <script>"), Some(Context::Data));
 
         for len in 0..=4 {
             let cases = ALPHABET.len().pow(u32::try_from(len).unwrap_or_default());
@@ -440,19 +465,23 @@ mod tests {
 
     #[test]
     fn indirect_attributes_only_accept_black_attribute_values() {
-        assert!(is_xss(b"<a attributename=onclick>", Context::Data));
-        assert!(!is_xss(b"<a attributename=href>", Context::Data));
-        assert!(!is_xss(b"<a attributename=style>", Context::Data));
+        assert!(is_xss(b"<a attributename=onclick>", Context::Data, None));
+        assert!(!is_xss(b"<a attributename=href>", Context::Data, None));
+        assert!(!is_xss(b"<a attributename=style>", Context::Data, None));
     }
 
     #[test]
     fn embedded_nuls_are_removed_before_name_classification() {
-        assert!(is_xss(b"<a on\0error=1>", Context::Data));
-        assert!(is_xss(b"<sv\0gload>", Context::Data));
-        assert!(is_xss(b"<a xm\0lns=1>", Context::Data));
-        assert!(is_xss(b"href=ja\0va:", Context::ValueNoQuote));
-        assert!(is_xss(b"<?im\0port namespace=\"t\">", Context::Data));
-        assert!(is_xss(b"<!EN\0TITY x SYSTEM \"file:///etc/passwd\">", Context::Data));
+        assert!(is_xss(b"<a on\0error=1>", Context::Data, None));
+        assert!(is_xss(b"<sv\0gload>", Context::Data, None));
+        assert!(is_xss(b"<a xm\0lns=1>", Context::Data, None));
+        assert!(is_xss(b"href=ja\0va:", Context::ValueNoQuote, None));
+        assert!(is_xss(b"<?im\0port namespace=\"t\">", Context::Data, None));
+        assert!(is_xss(
+            b"<!EN\0TITY x SYSTEM \"file:///etc/passwd\">",
+            Context::Data,
+            None
+        ));
     }
 
     #[test]

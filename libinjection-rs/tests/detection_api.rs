@@ -143,6 +143,11 @@ fn html5_tokenizer_matches_go_boundary_tokens() {
         b"<div / foo>",
         &[(TagNameOpen, b"div"), (AttrName, b"foo"), (TagNameClose, b">")],
     );
+    assert_tokens(b"<div //////>", &[(TagNameOpen, b"div"), (TagNameSelfClose, b"/>")]);
+    assert_tokens(
+        b"<div //// foo>",
+        &[(TagNameOpen, b"div"), (AttrName, b"foo"), (TagNameClose, b">")],
+    );
     assert_tokens(b"<%a%b>", &[(TagComment, b"a%b>")]);
     assert_tokens(b"<!---\0->", &[(TagComment, b"")]);
     assert_tokens(b"<!---\0\0", &[(TagComment, b"-\0\0")]);
