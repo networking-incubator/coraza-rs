@@ -8,6 +8,8 @@ This repository uses GitHub Actions to block risky changes early.
 
 - Lint: `make lint`
 - Tests: `make test`
+- `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
+  integration checks against the pinned Envoy 1.40.0 image.
 - Meta-lint: `make lint-extra`
 - Feature matrix: test and lint each feature combo with `cargo-hack`
 
