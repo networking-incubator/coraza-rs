@@ -1,0 +1,20 @@
+services:
+  echo:
+    image: registry.k8s.io/gateway-api/conformance/echo-basic:v0.2.0
+    expose:
+      - "3000"
+
+  envoy:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    command:
+      - -c
+      - /etc/envoy/config/${ENVOY_CONFIG:-envoy.yaml}
+      - --log-level
+      - info
+    depends_on:
+      - echo
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./:/etc/envoy/config:ro
+      - ../../target/wasm32-wasip1/release/envoy_libperfusion.wasm:/etc/envoy/libperfusion.wasm:ro
