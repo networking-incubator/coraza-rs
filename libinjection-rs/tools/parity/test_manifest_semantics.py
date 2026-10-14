@@ -10,11 +10,11 @@ from pathlib import Path
 
 
 CRATE = Path(__file__).resolve().parents[2]
-PINNED = CRATE / "src/xss/legacy/deny_list.rs"
-MUTATION_FROM = 'b"APPLET"'
-MUTATION_TO = 'b"APPLEZ"'
-ORDER_FROM = '    (b"BACKGROUND", DenyAttrKind::Url),\n    (b"BY", DenyAttrKind::Url),'
-ORDER_TO = '    (b"BY", DenyAttrKind::Url),\n    (b"BACKGROUND", DenyAttrKind::Url),'
+PINNED = CRATE / "data/xss_tables.txt"
+MUTATION_FROM = "tag\tAPPLET"
+MUTATION_TO = "tag\tAPPLEZ"
+ORDER_FROM = "event\tABORT\nevent\tACCESSKEYNOTFOUND"
+ORDER_TO = "event\tACCESSKEYNOTFOUND\nevent\tABORT"
 
 
 def main() -> None:

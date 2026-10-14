@@ -1,12 +1,12 @@
 # Third-party notices
 
-The crate contains project-authored material under Apache-2.0 and migrated
-libinjection material under BSD-3-Clause. The package SPDX expression is
-`Apache-2.0 AND BSD-3-Clause`. The Apache-2.0 text is included in
-[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
+The detector source is derived from libinjection and distributed under
+BSD-3-Clause; the complete notice is in [`LICENSE`](LICENSE). Repository
+tests and maintenance tools also contain project-authored Apache-2.0 material,
+whose text is included in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
 
-The legacy SQL injection and XSS engines and their static lookup data in this
-crate are translations or derivatives of Coraza's
+The SQL injection and XSS implementation and its static lookup data are
+translations or derivatives of Coraza's
 [`libinjection-go`](https://github.com/corazawaf/libinjection-go). The corpus
 source module version and checksum are recorded in
 [`tests/parity/manifest.json`](tests/parity/manifest.json).
@@ -22,5 +22,5 @@ Fixture hashes and SQL oracle input hashes are checked by
 `cargo xtask corpus-check`. Refresh them from the version pinned in
 `xtask/tools/go.mod` with `cargo xtask corpus-refresh`.
 
-The Go oracle is used only by the development corpus refresh tool; it adds no
-runtime or Rust crate dependency.
+The pinned Go module supplies the development oracle and corpus provenance; it
+adds no runtime or Rust crate dependency.

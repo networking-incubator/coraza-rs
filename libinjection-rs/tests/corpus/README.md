@@ -10,7 +10,7 @@ To refresh after updating the pinned Go module version in
 
 ```sh
 cargo xtask corpus-refresh
-cargo test -p libinjection
+cargo test -p libperfusion
 ```
 
 The refresh imports fixtures from that module version, regenerates the SQL

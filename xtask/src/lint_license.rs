@@ -169,7 +169,7 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
 fn is_libinjection_source(path: &Path) -> bool {
     let mut components = path.components();
     while let Some(component) = components.next() {
-        if component.as_os_str() == "ya-libinjection-rs" {
+        if component.as_os_str() == "libinjection-rs" {
             return components
                 .next()
                 .is_some_and(|next| next.as_os_str() == "src" || next.as_os_str() == "build.rs");
@@ -512,10 +512,9 @@ mod tests {
 
     #[test]
     fn is_libinjection_source_only_accepts_engine_sources_and_build_script() {
-        assert!(is_libinjection_source(Path::new("ya-libinjection-rs/src/lib.rs")));
-        assert!(is_libinjection_source(Path::new("ya-libinjection-rs/build.rs")));
-        assert!(!is_libinjection_source(Path::new("ya-libinjection-rs/tests/api.rs")));
-        assert!(!is_libinjection_source(Path::new("libinjection-rs/src/lib.rs")));
+        assert!(is_libinjection_source(Path::new("libinjection-rs/src/lib.rs")));
+        assert!(is_libinjection_source(Path::new("libinjection-rs/build.rs")));
+        assert!(!is_libinjection_source(Path::new("libinjection-rs/tests/api.rs")));
     }
 
     #[test]
@@ -681,6 +680,9 @@ members = [
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("xtask-lint-license-test-{}-{id}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
         fs::create_dir_all(&dir).unwrap();
         dir
     }
