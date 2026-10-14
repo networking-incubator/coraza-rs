@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use libinjection::{
-    AnalysisSnapshot, Html5TokenKind, XssHtmlContext, analyze_sqli, analyze_xss, detect_sqli, detect_xss, html5_visit,
-    sqli_fold_visit, sqli_tokenize_visit,
-};
+use libperfusion::{Dialect, HtmlContext, HtmlTokenizer, Quote, SqlState, SqlTokenizer};
 
-const SQL_FLAGS: [u32; 6] = [9, 17, 10, 18, 12, 20];
-const HTML_CONTEXTS: [XssHtmlContext; 5] = [
-    XssHtmlContext::Data,
-    XssHtmlContext::AttrUnquoted,
-    XssHtmlContext::AttrSingle,
-    XssHtmlContext::AttrDouble,
-    XssHtmlContext::AttrBacktick,
+const SQL_CONTEXTS: [(Quote, Dialect); 6] = [
+    (Quote::None, Dialect::Ansi),
+    (Quote::None, Dialect::Mysql),
+    (Quote::Single, Dialect::Ansi),
+    (Quote::Single, Dialect::Mysql),
+    (Quote::Double, Dialect::Ansi),
+    (Quote::Double, Dialect::Mysql),
+];
+const HTML_CONTEXTS: [HtmlContext; 5] = [
+    HtmlContext::Data,
+    HtmlContext::ValueNoQuote,
+    HtmlContext::ValueSingleQuote,
+    HtmlContext::ValueDoubleQuote,
+    HtmlContext::ValueBackQuote,
 ];
 const SQL_FRAGMENTS: [&[u8]; 18] = [
     b"SELECT",
@@ -67,58 +71,43 @@ const HTML_FRAGMENTS: [&[u8]; 18] = [
 ];
 
 pub(crate) fn exercise_raw(input: &[u8]) {
+    std::hint::black_box(libperfusion::sqli(input));
+    std::hint::black_box(libperfusion::xss(input));
     exercise_sql(input);
     exercise_html(input);
 }
 
 pub(crate) fn exercise_sql(input: &[u8]) {
-    assert_snapshot(analyze_sqli(input), input);
-    std::hint::black_box(detect_sqli(input));
-
-    for flags in SQL_FLAGS {
+    for (quote, dialect) in SQL_CONTEXTS {
         let mut count = 0_usize;
-        sqli_tokenize_visit(input, flags, |token| {
+        for token in SqlTokenizer::new(input, quote, dialect) {
             count = count.saturating_add(1);
             assert!(count <= input.len().saturating_add(2));
-            assert!(token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()));
-        });
+            assert!(token.pos().checked_add(token.len()).is_some_and(|end| end <= input.len()));
+        }
+
+        let mut state = SqlState::new(input);
         count = 0;
-        sqli_fold_visit(input, flags, |token| {
+        for token in state.fold(quote, dialect) {
             count = count.saturating_add(1);
             assert!(count <= input.len().saturating_add(2));
-            assert!(token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()));
-        });
+            assert!(token.pos().checked_add(token.len()).is_some_and(|end| end <= input.len()));
+        }
     }
 }
 
 pub(crate) fn exercise_html(input: &[u8]) {
-    assert_snapshot(analyze_xss(input), input);
-    std::hint::black_box(detect_xss(input));
-
+    let start = input.as_ptr() as usize;
+    let end = start.saturating_add(input.len());
     for context in HTML_CONTEXTS {
-        let start = input.as_ptr() as usize;
-        let end = start.saturating_add(input.len());
         let mut count = 0_usize;
-        html5_visit(input, context, |kind: Html5TokenKind, value| {
+        for token in HtmlTokenizer::new(input, context) {
             count = count.saturating_add(1);
             assert!(count <= input.len().saturating_mul(2).saturating_add(16));
-            let token_start = value.as_ptr() as usize;
-            let token_end = token_start.saturating_add(value.len());
-            assert!(
-                token_start >= start && token_end <= end,
-                "{kind:?} token left input range"
-            );
-        });
-    }
-}
-
-fn assert_snapshot(snapshot: AnalysisSnapshot, input: &[u8]) {
-    for span in &snapshot.evidence.spans {
-        let start = span.offset;
-        let end = start
-            .checked_add(span.len)
-            .expect("evidence span length overflow");
-        assert!(end <= input.len());
+            let token_start = token.text.as_ptr() as usize;
+            let token_end = token_start.saturating_add(token.text.len());
+            assert!(token_start >= start && token_end <= end);
+        }
     }
 }
 

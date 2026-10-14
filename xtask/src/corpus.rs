@@ -304,7 +304,7 @@ fn refresh() -> Result<(), String> {
     fs::copy(&manifest_path, crate_root.join("tests/parity/manifest.json")).map_err(|error| error.to_string())?;
     fs::copy(&oracle_path, crate_root.join("tests/parity/sqli_oracle.tsv")).map_err(|error| error.to_string())?;
     println!(
-        "Refreshed {} fixtures from libinjection-go {version}; run `cargo test -p libinjection` to review parity.",
+        "Refreshed {} fixtures from libinjection-go {version}; run `cargo test -p libperfusion` to review parity.",
         fixtures.len()
     );
     Ok(())

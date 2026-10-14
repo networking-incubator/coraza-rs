@@ -2,7 +2,7 @@
 
 The isolated `fuzz/` package has three libFuzzer targets:
 
-- `raw_bytes` exercises analysis, full-input detection, SQL visitors, and HTML
+- `raw_bytes` exercises full-input detection, SQL visitors, and HTML
   token contexts with arbitrary bytes.
 - `sql_grammar` generates SQL keywords, quoting, comments, operators, and
   encoded fragments.
@@ -37,7 +37,7 @@ stable digest; expected compatibility verdicts are optional:
 ```sh
 python3 tools/fuzz/promote_crash.py \
   fuzz/artifacts/raw_bytes/CRASH --sqli 1 --xss 0
-cargo test -p libinjection --test fuzz_regressions
+cargo test -p libperfusion --test fuzz_regressions
 ```
 
 For a minimized Go/Rust token-stream mismatch, add the bytes to

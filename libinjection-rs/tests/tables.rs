@@ -1,0 +1,147 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//! The tables ported from libinjection, compared with the upstream sources
+
+//! selected by `LIBINJECTION_DIR`: the build-generated ones and the tables
+//! kept in the local canonical data files.
+
+#![expect(
+    clippy::tests_outside_test_module,
+    reason = "Cargo integration test targets consist of tests."
+)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "Table checks fail fast when the pinned upstream source is malformed."
+)]
+
+#[path = "upstream_common.rs"]
+mod common;
+
+use libperfusion::internals::tables::{Attribute, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS, Parser, SQL_KEYWORDS};
+
+/// The body of the C array introduced by `declaration`, comments removed.
+fn c_array_body(source: &str, declaration: &str) -> String {
+    let start = source
+        .find(declaration)
+        .unwrap_or_else(|| panic!("no `{declaration}` upstream"))
+        + declaration.len();
+    let len = source[start..].find("};").expect("unterminated array");
+    let mut body = &source[start..start + len];
+
+    let mut stripped = String::new();
+    while let Some(open) = body.find("/*") {
+        stripped.push_str(&body[..open]);
+        let close = body[open..].find("*/").expect("unterminated comment");
+        body = &body[open + close + 2..];
+    }
+    stripped.push_str(body);
+    stripped
+}
+
+/// The quoted strings of a C array body, each with the text that follows
+/// it up to the next string.
+fn c_strings(body: &str) -> Vec<(&str, &str)> {
+    let parts: Vec<&str> = body.split('"').skip(1).collect();
+    parts.chunks(2).map(|pair| (pair[0], pair[1])).collect()
+}
+
+#[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
+fn sql_keywords() {
+    let source = common::upstream_source("src/libinjection_sqli_data.h");
+    let body = c_array_body(&source, "sql_keywords[] = {");
+    // Each entry reads `{"WORD", 't'},`.
+    let upstream: Vec<(&str, u8)> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("{\"")?.strip_suffix("'},"))
+        .map(|entry| {
+            let (word, ty) = entry.rsplit_once("\", '").unwrap();
+            (word, ty.as_bytes()[0])
+        })
+        .collect();
+
+    let table: Vec<(&str, u8)> = SQL_KEYWORDS.iter().map(|&(word, ty)| (word, ty.as_byte())).collect();
+    assert!(table == upstream, "src/sqli/keyword_table.rs is out of date");
+}
+
+#[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
+fn sql_char_dispatch() {
+    let source = common::upstream_source("src/libinjection_sqli_data.h");
+    let body = c_array_body(&source, "char_parse_map[] = {");
+    // Each entry reads `&parse_white,`, in byte order.
+    let upstream: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("&parse_")?.strip_suffix(','))
+        .collect();
+    assert_eq!(upstream.len(), 256);
+
+    for (byte, name) in (0..=u8::MAX).zip(upstream) {
+        let parser = Parser::for_byte(byte);
+        if let Parser::Char(ty) = parser {
+            assert_eq!((name, ty.as_byte()), ("char", byte));
+        } else {
+            assert_eq!(format!("{parser:?}").to_lowercase(), name, "byte {byte}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
+fn xss_event_handlers() {
+    let source = common::upstream_source("src/libinjection_xss.c");
+    let body = c_array_body(&source, "BLACKATTREVENT[] = {");
+    let events: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
+    assert!(BLACK_ATTR_EVENTS[..] == events[..], "src/xss/events.rs is out of date");
+}
+
+#[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
+fn xss_attributes() {
+    let source = common::upstream_source("src/libinjection_xss.c");
+    let body = c_array_body(&source, " BLACKATTR[] = {");
+    // Each entry reads `{"NAME", TYPE_ATTR_URL},`.
+    let attrs: Vec<(&str, Attribute)> = c_strings(&body)
+        .into_iter()
+        .map(|(name, rest)| {
+            let ty = rest
+                .trim_start_matches(|c: char| c == ',' || c.is_whitespace())
+                .split('}')
+                .next()
+                .unwrap();
+            let attribute = match ty {
+                "TYPE_BLACK" => Attribute::Black,
+                "TYPE_ATTR_URL" => Attribute::Url,
+                "TYPE_STYLE" => Attribute::Style,
+                "TYPE_ATTR_INDIRECT" => Attribute::Indirect,
+                other => panic!("unknown attribute type {other}"),
+            };
+            (name, attribute)
+        })
+        .collect();
+    assert_eq!(BLACK_ATTRS[..], attrs[..]);
+}
+
+#[test]
+#[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
+fn xss_tags() {
+    let source = common::upstream_source("src/libinjection_xss.c");
+    let body = c_array_body(&source, "BLACKTAG[] = {");
+    let tags: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(BLACK_TAGS[..], tags[..]);
+}

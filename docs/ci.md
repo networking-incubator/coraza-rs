@@ -15,6 +15,8 @@ This repository uses GitHub Actions to block risky changes early.
 
 - Checks the committed fixture manifest against the Go module pinned in
   `xtask/tools/go.mod`.
+- Checks public SQLi fingerprints and XSS verdicts against the pinned C
+  reference revision in `tests/parity/manifest.json`.
 - Compares detector verdicts and fingerprints, SQL token and fold streams, and
   HTML token streams with the Go oracle.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
@@ -66,7 +68,9 @@ To run the full gate set:
 make all
 ```
 
-The full differential suites use the module pinned in `xtask/tools/go.mod`:
+The differential gates use the Go module pinned in `xtask/tools/go.mod` and a
+C checkout at the revision pinned in `libinjection-rs/tests/parity/manifest.json`.
+Set `LIBINJECTION_DIR` to that checkout before running:
 
 ```console
 make parity-differential

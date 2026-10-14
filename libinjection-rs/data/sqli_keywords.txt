@@ -1,4 +1,4 @@
-# Auto-extracted from libinjection-go v0.3.5 sqli_data.go
+# Extracted from libinjection C v4.0.0-8-gd88a8f8 (d88a8f86d617ac8dcb9169c9f34637aaac71ac76)
 # Total entries: 9352
 # Format: KEY<TAB>VALUE_BYTE
 !!	o

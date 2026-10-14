@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Deterministic raw-byte/property checks for parser progress and span bounds.
-#![expect(clippy::tests_outside_test_module, reason = "integration test binary")]
+//! Deterministic raw-byte checks for parser progress and token bounds.
 
-use libinjection::{AnalysisSnapshot, analyze_sqli, analyze_xss};
-#[cfg(feature = "legacy")]
-use libinjection::{Html5TokenKind, XssHtmlContext, html5_visit, sqli_fold_visit, sqli_tokenize_visit};
+#![expect(
+    clippy::tests_outside_test_module,
+    reason = "Cargo integration test targets consist of tests."
+)]
+
+#[path = "common/safety.rs"]
+mod safety;
 
 const SEED: u64 = 0x8D26_4F73_0AB1_C5E9;
 const FRAGMENTS: [&[u8]; 23] = [
@@ -88,105 +91,13 @@ fn generated_inputs() -> Vec<(String, Vec<u8>)> {
     cases
 }
 
-fn assert_snapshot_spans(snapshot: &AnalysisSnapshot, input: &[u8], case_id: &str, label: &str, input_hex: &str) {
-    for span in &snapshot.evidence.spans {
-        let start = span.offset;
-        let end = start.saturating_add(span.len);
-        assert!(
-            start < end,
-            "{case_id} ({input_hex}): {label} evidence span must identify at least one input byte"
-        );
-        assert!(
-            end <= input.len(),
-            "{case_id} ({input_hex}): {label} evidence span {start}..{end} exceeds input length {}",
-            input.len()
-        );
-    }
-}
-
-fn hex(input: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(input.len() * 2);
-    for byte in input {
-        output.push(char::from(
-            DIGITS.get(usize::from(byte >> 4)).copied().unwrap_or_default(),
-        ));
-        output.push(char::from(
-            DIGITS.get(usize::from(byte & 0x0F)).copied().unwrap_or_default(),
-        ));
-    }
-    output
-}
-
 #[test]
-fn deterministic_raw_and_grammar_inputs_preserve_parser_invariants() {
+fn deterministic_raw_and_grammar_inputs_preserve_parser_progress() {
     let cases = generated_inputs();
     assert_eq!(cases.len(), 768);
     for (case_id, input) in cases {
-        let input_hex = hex(&input);
-        let sqli = analyze_sqli(&input);
-        let xss = analyze_xss(&input);
-        assert_snapshot_spans(&sqli, &input, &case_id, "SQL", &input_hex);
-        assert_snapshot_spans(&xss, &input, &case_id, "XSS", &input_hex);
-
-        #[cfg(feature = "legacy")]
-        {
-            let contexts = [
-                XssHtmlContext::Data,
-                XssHtmlContext::AttrUnquoted,
-                XssHtmlContext::AttrSingle,
-                XssHtmlContext::AttrDouble,
-                XssHtmlContext::AttrBacktick,
-            ];
-            // Calling the complete public detectors exercises their internal
-            // multi-context and parser loops. Token callbacks additionally cap
-            // emitted records so a future zero-width loop fails this test.
-            std::hint::black_box(libinjection::detect_sqli(&input));
-            std::hint::black_box(libinjection::detect_xss(&input));
-            for flags in [9_u32, 17, 10, 18, 12, 20] {
-                let mut count = 0_usize;
-                sqli_tokenize_visit(&input, flags, |token| {
-                    count += 1;
-                    assert!(
-                        count <= input.len() + 2,
-                        "{case_id} ({input_hex}): SQL tokenizer stopped progressing"
-                    );
-                    assert!(
-                        token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()),
-                        "{case_id} ({input_hex}): SQL token span exceeds the input"
-                    );
-                });
-                count = 0;
-                sqli_fold_visit(&input, flags, |token| {
-                    count += 1;
-                    assert!(
-                        count <= input.len() + 2,
-                        "{case_id} ({input_hex}): SQL folder stopped progressing"
-                    );
-                    assert!(
-                        token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()),
-                        "{case_id} ({input_hex}): folded SQL token span exceeds the input"
-                    );
-                });
-            }
-            for context in contexts {
-                let mut count = 0_usize;
-                let input_start = input.as_ptr() as usize;
-                let input_end = input_start + input.len();
-                html5_visit(&input, context, |kind: Html5TokenKind, value| {
-                    count += 1;
-                    assert!(
-                        count <= input.len() * 2 + 16,
-                        "{case_id} ({input_hex}): HTML5 tokenizer stopped progressing"
-                    );
-                    let token_start = value.as_ptr() as usize;
-                    let token_end = token_start + value.len();
-                    assert!(
-                        token_start >= input_start && token_end <= input_end,
-                        "{case_id} ({input_hex}): {kind:?} token is not a slice of the original input"
-                    );
-                });
-            }
-        }
+        std::hint::black_box(libperfusion::sqli(&input));
+        std::hint::black_box(libperfusion::xss(&input));
+        safety::exercise(&input, &case_id);
     }
 }

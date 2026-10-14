@@ -18,19 +18,8 @@
 
 use std::collections::HashSet;
 
-use libinjection::{
-    AnalysisSnapshot, Html5TokenKind, XssHtmlContext, analyze_sqli, analyze_xss, detect_sqli, detect_xss, html5_visit,
-    sqli_fold_visit, sqli_tokenize_visit,
-};
-
-const SQL_FLAGS: [u32; 6] = [9, 17, 10, 18, 12, 20];
-const HTML_CONTEXTS: [XssHtmlContext; 5] = [
-    XssHtmlContext::Data,
-    XssHtmlContext::AttrUnquoted,
-    XssHtmlContext::AttrSingle,
-    XssHtmlContext::AttrDouble,
-    XssHtmlContext::AttrBacktick,
-];
+#[path = "common/safety.rs"]
+mod safety;
 
 #[derive(Debug)]
 struct Regression<'a> {
@@ -104,7 +93,7 @@ fn promoted_fuzz_findings_preserve_parser_safety_and_expected_verdicts() {
         exercise_safety(&regression);
         if let Some(expected) = regression.expected_sqli {
             assert_eq!(
-                detect_sqli(&regression.input).detected,
+                libperfusion::sqli(&regression.input).is_some(),
                 expected,
                 "{} SQL verdict",
                 regression.name
@@ -112,7 +101,7 @@ fn promoted_fuzz_findings_preserve_parser_safety_and_expected_verdicts() {
         }
         if let Some(expected) = regression.expected_xss {
             assert_eq!(
-                detect_xss(&regression.input),
+                libperfusion::xss(&regression.input),
                 expected,
                 "{} XSS verdict",
                 regression.name
@@ -122,76 +111,9 @@ fn promoted_fuzz_findings_preserve_parser_safety_and_expected_verdicts() {
 }
 
 fn exercise_safety(regression: &Regression<'_>) {
-    let input = regression.input.as_slice();
-    assert_snapshot(&analyze_sqli(input), regression);
-    assert_snapshot(&analyze_xss(input), regression);
-    std::hint::black_box(detect_sqli(input));
-    std::hint::black_box(detect_xss(input));
-
-    for flags in SQL_FLAGS {
-        let mut count = 0_usize;
-        sqli_tokenize_visit(input, flags, |token| {
-            count = count.saturating_add(1);
-            assert!(
-                count <= input.len().saturating_add(2),
-                "{} SQL tokenizer progress",
-                regression.name
-            );
-            assert!(
-                token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()),
-                "{} SQL token outside input",
-                regression.name
-            );
-        });
-        count = 0;
-        sqli_fold_visit(input, flags, |token| {
-            count = count.saturating_add(1);
-            assert!(
-                count <= input.len().saturating_add(2),
-                "{} SQL folder progress",
-                regression.name
-            );
-            assert!(
-                token.pos.checked_add(token.len).is_some_and(|end| end <= input.len()),
-                "{} folded SQL token outside input",
-                regression.name
-            );
-        });
-    }
-
-    for context in HTML_CONTEXTS {
-        let start = input.as_ptr() as usize;
-        let end = start.saturating_add(input.len());
-        let mut count = 0_usize;
-        html5_visit(input, context, |kind: Html5TokenKind, value| {
-            count = count.saturating_add(1);
-            assert!(
-                count <= input.len().saturating_mul(2).saturating_add(16),
-                "{} HTML tokenizer progress",
-                regression.name
-            );
-            let token_start = value.as_ptr() as usize;
-            let token_end = token_start.saturating_add(value.len());
-            assert!(
-                token_start >= start && token_end <= end,
-                "{} {kind:?} token left input range",
-                regression.name
-            );
-        });
-    }
-}
-
-fn assert_snapshot(snapshot: &AnalysisSnapshot, regression: &Regression<'_>) {
-    for span in &snapshot.evidence.spans {
-        let start = span.offset;
-        assert!(
-            start
-                .checked_add(span.len)
-                .is_some_and(|end| end <= regression.input.len()),
-            "{} evidence span outside input",
-            regression.name
-        );
-    }
+    safety::exercise(&regression.input, regression.name);
+    std::hint::black_box(libperfusion::sqli(&regression.input));
+    std::hint::black_box(libperfusion::xss(&regression.input));
 }
 
 fn parse_bool(value: &str, line_index: usize) -> bool {

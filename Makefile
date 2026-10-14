@@ -41,8 +41,10 @@ parity-manifest-check:
 	python3 libinjection-rs/tools/parity/test_manifest_semantics.py
 
 parity-differential:
-	cargo test -p libinjection --test oracle_differential -- --ignored --nocapture
-	cargo test -p libinjection --test generated_differential -- --ignored --nocapture
+	cargo test -p libperfusion --test upstream xss_samples -- --ignored
+	cargo test -p libperfusion --test oracle_differential pinned_c_oracle_matches_corpus_and_binary_cases -- --ignored --nocapture
+	cargo test -p libperfusion --test oracle_differential -- --ignored --nocapture
+	cargo test -p libperfusion --test generated_differential -- --ignored --nocapture
 
 # -------------------------------------------------------------------
 # Quality
@@ -67,9 +69,9 @@ audit:
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
-		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*|xtask/src/corpus\.rs'
+		--ignore-filename-regex 'src/main\.rs|xtask/src/corpus\.rs'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
-		--ignore-filename-regex 'src/main\.rs|libinjection-rs/src/sqli/legacy/.*|xtask/src/corpus\.rs'
+		--ignore-filename-regex 'src/main\.rs|xtask/src/corpus\.rs'
 
 fmt:
 	cargo +$(NIGHTLY) fmt --all
@@ -117,7 +119,7 @@ help:
 	@echo "Test:"
 	@echo "  test       verify corpus and run all tests"
 	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
-	@echo "  parity-differential   run ignored Go corpus and generated-byte parity gates"
+	@echo "  parity-differential   run pinned C/Go corpus and generated-byte parity gates"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"

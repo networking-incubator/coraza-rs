@@ -15,24 +15,23 @@
 //! Corpus driver output formatting (Go encoding).
 use std::{fs, path::Path};
 
-use libinjection::{
-    Html5TokenKind, SqliTokenInfo, XssHtmlContext, detect_sqli, detect_xss, html5_visit, sqli_fold_visit,
-    sqli_tokenize_visit,
+use libperfusion::{
+    Dialect, HtmlContext, HtmlTokenKind, HtmlTokenizer, Quote, SqlState, SqlToken, SqlTokenType, SqlTokenizer,
 };
 
 use super::corpus::{DriverKind, parse_corpus_file};
 
-fn html5_type_label(kind: Html5TokenKind) -> &'static str {
+fn html5_type_label(kind: HtmlTokenKind) -> &'static str {
     match kind {
-        Html5TokenKind::DataText => "DATA_TEXT",
-        Html5TokenKind::TagNameOpen => "TAG_NAME_OPEN",
-        Html5TokenKind::TagNameClose => "TAG_NAME_CLOSE",
-        Html5TokenKind::TagNameSelfClose => "TAG_NAME_SELFCLOSE",
-        Html5TokenKind::TagClose => "TAG_CLOSE",
-        Html5TokenKind::AttrName => "ATTR_NAME",
-        Html5TokenKind::AttrValue => "ATTR_VALUE",
-        Html5TokenKind::TagComment => "TAG_COMMENT",
-        Html5TokenKind::DocType => "DOCTYPE",
+        HtmlTokenKind::DataText => "DATA_TEXT",
+        HtmlTokenKind::TagNameOpen => "TAG_NAME_OPEN",
+        HtmlTokenKind::TagNameClose => "TAG_NAME_CLOSE",
+        HtmlTokenKind::TagNameSelfClose => "TAG_NAME_SELFCLOSE",
+        HtmlTokenKind::TagClose => "TAG_CLOSE",
+        HtmlTokenKind::AttrName => "ATTR_NAME",
+        HtmlTokenKind::AttrValue => "ATTR_VALUE",
+        HtmlTokenKind::TagComment => "TAG_COMMENT",
+        HtmlTokenKind::Doctype => "DOCTYPE",
     }
 }
 
@@ -49,8 +48,6 @@ pub(crate) fn format_sqli_expected(fingerprint: Option<&str>) -> String {
 }
 
 /// Go HTML5 corpus encoding: one token per line `TYPE,len,text`, joined by `\n`.
-///
-/// Empty token list → empty string (Go `TrimSpace` on no tokens).
 #[must_use]
 pub(crate) fn format_html5_expected(token_lines: &[String]) -> String {
     token_lines.join("\n")
@@ -69,89 +66,61 @@ pub(crate) fn format_folding_expected(token_lines: &[String]) -> String {
 }
 
 pub(crate) fn actual_folding_output(input: &str) -> String {
-    let flags = 1 | 8; // FLAG_QUOTE_NONE | FLAG_SQL_ANSI
-    let mut lines = Vec::new();
-    sqli_fold_visit(input.as_bytes(), flags, |tok| {
-        let line = format_token_line(&tok);
-        lines.push(line);
-    });
-    let joined = format_folding_expected(&lines);
-    joined.trim().to_owned()
+    let mut state = SqlState::new(input.as_bytes());
+    let lines: Vec<_> = state.fold(Quote::None, Dialect::Ansi).map(format_token_line).collect();
+    format_folding_expected(&lines).trim().to_owned()
 }
 
 pub(crate) fn actual_xss_output(input: &str) -> String {
-    let verdict = detect_xss(input.as_bytes());
-    format_xss_expected(verdict).to_owned()
+    format_xss_expected(libperfusion::xss(input.as_bytes())).to_owned()
 }
 
 pub(crate) fn actual_sqli_output(input: &str) -> String {
-    let verdict = detect_sqli(input.as_bytes());
-    let fingerprint = verdict.fingerprint.as_str();
-    format_sqli_expected(fingerprint)
+    let fingerprint = libperfusion::sqli(input.as_bytes());
+    format_sqli_expected(fingerprint.as_ref().map(libperfusion::Fingerprint::as_str))
 }
 
 pub(crate) fn actual_html5_output(input: &str) -> String {
-    let mut lines = Vec::new();
-    html5_visit(input.as_bytes(), XssHtmlContext::Data, |kind, value| {
-        let text = String::from_utf8_lossy(value);
-        lines.push(format!("{},{},{}", html5_type_label(kind), value.len(), text));
-    });
-    // Go `runXSSTest` applies `strings.TrimSpace` before compare.
+    let lines: Vec<_> = HtmlTokenizer::new(input.as_bytes(), HtmlContext::Data)
+        .map(|token| {
+            let text = String::from_utf8_lossy(token.text);
+            format!("{},{},{}", html5_type_label(token.kind), token.text.len(), text)
+        })
+        .collect();
     format_html5_expected(&lines).trim().to_owned()
 }
 
 pub(crate) fn actual_tokens_output(input: &str) -> String {
-    let flags = 1 | 8; // FLAG_QUOTE_NONE | FLAG_SQL_ANSI
-    let mut lines = Vec::new();
-    sqli_tokenize_visit(input.as_bytes(), flags, |tok| {
-        let line = format_token_line(&tok);
-        lines.push(line);
-    });
-    let joined = format_tokens_expected(&lines);
-    joined.trim().to_owned()
+    let lines: Vec<_> = SqlTokenizer::new(input.as_bytes(), Quote::None, Dialect::Ansi)
+        .map(format_token_line)
+        .collect();
+    format_tokens_expected(&lines).trim().to_owned()
 }
 
 /// Format one SQL token per Go `printToken`.
-fn format_token_line(tok: &SqliTokenInfo) -> String {
-    let cat = tok.category as char;
-    let val = String::from_utf8_lossy(tok.val.get(..tok.len).unwrap_or(&tok.val));
-
+fn format_token_line(token: SqlToken) -> String {
     let mut out = String::new();
-    out.push(cat);
+    out.push(char::from(token.kind().as_byte()));
     out.push(' ');
-    match tok.category {
-        b's' => {
-            if tok.str_open != 0 {
-                out.push(tok.str_open as char);
+    match token.kind() {
+        SqlTokenType::String | SqlTokenType::Variable => {
+            if token.kind() == SqlTokenType::Variable {
+                out.extend(std::iter::repeat_n('@', usize::from(token.variable_count().min(2))));
             }
-            out.push_str(&val);
-            if tok.str_close != 0 {
-                out.push(tok.str_close as char);
+            if let Some(open) = token.string_open() {
+                out.push(char::from(open));
             }
-        },
-        b'v' => {
-            if tok.count == 1 {
-                out.push('@');
-            } else if tok.count == 2 {
-                out.push('@');
-                out.push('@');
-            }
-            if tok.str_open != 0 {
-                out.push(tok.str_open as char);
-            }
-            out.push_str(&val);
-            if tok.str_close != 0 {
-                out.push(tok.str_close as char);
+            out.push_str(&String::from_utf8_lossy(token.value()));
+            if let Some(close) = token.string_close() {
+                out.push(char::from(close));
             }
         },
-        _ => {
-            out.push_str(&val);
-        },
+        _ => out.push_str(&String::from_utf8_lossy(token.value())),
     }
     out.trim_end_matches(['\n', '\r']).to_owned()
 }
 
-/// Walk vendored fixtures for `kind`, compare stub/engine output to `--EXPECTED--`.
+/// Walk vendored fixtures for `kind`, compare engine output to `--EXPECTED--`.
 ///
 /// Returns `(passed, failed)`.
 pub(crate) fn run_baseline(kind: DriverKind, actual: impl Fn(&str) -> String) -> (usize, usize) {
@@ -161,7 +130,7 @@ pub(crate) fn run_baseline(kind: DriverKind, actual: impl Fn(&str) -> String) ->
 
     for entry in fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
-        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if !(filename.starts_with("test-") && filename.ends_with(".txt")) {

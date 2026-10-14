@@ -50,5 +50,17 @@ jobs:
           GO_SOURCE="$(cd xtask/tools && go list -m -f '{{.Dir}}' github.com/corazawaf/libinjection-go)"
           python3 libinjection-rs/tools/parity/check_manifest.py --go-source "$GO_SOURCE"
 
-      - name: Run corpus and generated-byte Go parity gates
+      - name: Fetch the pinned C reference
+        run: |
+          set -euo pipefail
+          C_COMMIT="$(python3 -c 'import json; print(json.load(open("libinjection-rs/tests/parity/manifest.json"))["differential"]["c_reference"]["commit"])')"
+          C_DIR="$RUNNER_TEMP/libinjection-c"
+          git init --quiet "$C_DIR"
+          git -C "$C_DIR" remote add origin https://github.com/libinjection/libinjection.git
+          git -C "$C_DIR" fetch --quiet --depth=1 origin "$C_COMMIT"
+          git -C "$C_DIR" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$C_DIR" rev-parse HEAD)" = "$C_COMMIT"
+          echo "LIBINJECTION_DIR=$C_DIR" >> "$GITHUB_ENV"
+
+      - name: Run C, corpus, and generated-byte parity gates
         run: make parity-differential

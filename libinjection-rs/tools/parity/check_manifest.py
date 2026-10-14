@@ -17,6 +17,13 @@ ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tests/parity/manifest.json"
 GO_MODULE = "github.com/corazawaf/libinjection-go"
 GO_REPOSITORY = "https://github.com/corazawaf/libinjection-go"
+C_REFERENCE = {
+    "repository": "https://github.com/libinjection/libinjection",
+    "commit": "533a165ebc1f7c36ecbe3e5583990ea0db81f554",
+    "driver": "tests/c_oracle_driver.c",
+    "results": "SQLi verdict and fingerprint; XSS verdict",
+    "reviewed_xss_differences": 24,
+}
 GO_TOOLS = ROOT.parent / "xtask/tools"
 FAMILY_COUNTS = {"sqli": 54, "folding": 118, "tokens": 249, "html5": 68, "xss": 7}
 EXPECTED_KEYWORDS = 9_352
@@ -29,6 +36,7 @@ GO_KIND_TO_RUST = {
     "attributeTypeStyle": "Style",
     "attributeTypeAttrIndirect": "Indirect",
 }
+RUST_XSS_KIND = {"Black": "Deny", "Url": "Url", "Style": "Style", "Indirect": "Indirect"}
 
 
 def sha256(data: bytes) -> str:
@@ -149,33 +157,33 @@ def parse_go_dispatch(source: Path) -> list[str]:
 
 
 def parse_rust_dispatch() -> list[str]:
-    text = (ROOT / "src/sqli/legacy/parse.rs").read_text(encoding="utf-8")
-    match = re.search(r"pub\(crate\) fn dispatch\(.*?match ch \{(.*?)\n    \}\n\}", text, re.S)
+    text = (ROOT / "src/sqli/lexer.rs").read_text(encoding="utf-8")
+    match = re.search(r"pub const fn for_byte\(ch: u8\) -> Self \{\s*match ch \{(.*?)\n        \}", text, re.S)
     if not match:
-        fail("could not find Rust SQL dispatch match")
+        fail("could not find libperfusion SQL byte dispatch")
     rust_to_go = {
-        "parse_white": "parseWhite",
-        "parse_operator1": "parseOperator1",
-        "parse_operator2": "parseOperator2",
-        "parse_string": "parseString",
-        "parse_hash": "parseHash",
-        "parse_money": "parseMoney",
-        "parse_byte": "parseByte",
-        "parse_dash": "parseDash",
-        "parse_number": "parseNumber",
-        "parse_slash": "parseSlash",
-        "parse_other": "parseOther",
-        "parse_var": "parseVar",
-        "parse_bstring": "parseBString",
-        "parse_estring": "parseEString",
-        "parse_nqstring": "parseNqString",
-        "parse_qstring": "parseQString",
-        "parse_ustring": "parseUString",
-        "parse_xstring": "parseXString",
-        "parse_bword": "parseBWord",
-        "parse_backslash": "parseBackSlash",
-        "parse_tick": "parseTick",
-        "parse_word": "parseWord",
+        "White": "parseWhite",
+        "Operator1": "parseOperator1",
+        "Operator2": "parseOperator2",
+        "Other": "parseOther",
+        "Char": "parseByte",
+        "Hash": "parseHash",
+        "Dash": "parseDash",
+        "Slash": "parseSlash",
+        "Backslash": "parseBackSlash",
+        "String": "parseString",
+        "Word": "parseWord",
+        "Var": "parseVar",
+        "Number": "parseNumber",
+        "Tick": "parseTick",
+        "Ustring": "parseUString",
+        "Qstring": "parseQString",
+        "Nqstring": "parseNqString",
+        "Xstring": "parseXString",
+        "Bstring": "parseBString",
+        "Estring": "parseEString",
+        "Bword": "parseBWord",
+        "Money": "parseMoney",
     }
     mapping: list[str | None] = [None] * 256
 
@@ -187,12 +195,14 @@ def parse_rust_dispatch() -> list[str]:
             if len(value) != 1:
                 fail(f"invalid byte pattern {atom!r}")
             return ord(value)
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+", atom):
+            return int(atom, 16)
         if atom.isdecimal():
             return int(atom)
         fail(f"unsupported Rust SQL dispatch pattern: {atom!r}")
 
     def split_alternatives(pattern: str) -> list[str]:
-        atom = r"(?:b'(?:\\.|[^'\\])*'|\d+)"
+        atom = r"(?:b'(?:\\.|[^'\\])*'|0[xX][0-9a-fA-F]+|\d+)"
         alternative_re = re.compile(rf"(?:{atom}\s*\.\.=\s*{atom}|{atom}|_)")
         alternatives: list[str] = []
         position = 0
@@ -218,12 +228,12 @@ def parse_rust_dispatch() -> list[str]:
         line = line.strip()
         if not line:
             continue
-        arm = re.fullmatch(r"(.+?)\s*=>\s*(parse_\w+)\(s\),", line)
+        arm = re.fullmatch(r"(.+?)\s*=>\s*Parser::(\w+)(?:\([^)]*\))?,", line)
         if not arm:
-            fail(f"unrecognized Rust SQL dispatch arm: {line!r}")
+            fail(f"unrecognized libperfusion SQL dispatch arm: {line!r}")
         pattern, parser = arm.groups()
         if parser not in rust_to_go:
-            fail(f"no Go parser mapping for Rust {parser}")
+            fail(f"no Go parser mapping for libperfusion {parser}")
         go_parser = rust_to_go[parser]
         if pattern == "_":
             values = [value for value, selected in enumerate(mapping) if selected is None]
@@ -240,11 +250,14 @@ def parse_rust_dispatch() -> list[str]:
                     values_list.append(value_of(alternative))
             values = values_list
         for value in values:
-            if not 0 <= value < 256 or mapping[value] is not None:
-                fail(f"invalid/duplicate Rust byte dispatch value {value}")
-            mapping[value] = go_parser
+            if not 0 <= value < 256:
+                fail(f"invalid Rust byte dispatch value {value}")
+            # Rust match arms are ordered; the broad word range follows the
+            # special B/E/N/Q/U/X string-prefix arms.
+            if mapping[value] is None:
+                mapping[value] = go_parser
     if any(value is None for value in mapping):
-        fail("Rust SQL dispatch does not cover all 256 bytes")
+        fail("libperfusion SQL dispatch does not cover all 256 bytes")
     return [str(value) for value in mapping]
 
 
@@ -260,14 +273,24 @@ def go_table_entries(source: Path, var_name: str, type_name: str | None = None) 
     return [(name, None) for name in re.findall(r'"([^"]+)"', match.group(1))]
 
 
-def rust_table_entries(source_path: Path, constant: str, typed: bool = False) -> list[tuple[str, str | None]]:
-    text = source_path.read_text(encoding="utf-8")
-    match = re.search(rf"const {constant}:.*?=\s*&\[(.*?)\n\];", text, re.S)
-    if not match:
-        fail(f"could not find Rust {constant} table")
-    if typed:
-        return re.findall(r'\(b"([^"]+)",\s*DenyAttrKind::(\w+)\)', match.group(1))
-    return [(name, None) for name in re.findall(r'b"([^"]+)"', match.group(1))]
+def rust_xss_tables() -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    events: list[str] = []
+    tags: list[str] = []
+    attrs: list[tuple[str, str]] = []
+    for line in (ROOT / "data/xss_tables.txt").read_text(encoding="ascii").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        match fields:
+            case ["event", name]:
+                events.append(name)
+            case ["tag", name]:
+                tags.append(name)
+            case ["attr", name, kind] if kind in RUST_XSS_KIND:
+                attrs.append((name, RUST_XSS_KIND[kind]))
+            case _:
+                fail(f"invalid libperfusion XSS table row: {line!r}")
+    return events, tags, attrs
 
 
 def semantic_table_hash(rows: list[tuple[str, str | None]]) -> str:
@@ -276,23 +299,22 @@ def semantic_table_hash(rows: list[tuple[str, str | None]]) -> str:
 
 
 def local_table_summary() -> dict[str, object]:
+    keywords = parse_rust_keywords(ROOT / "data/sqli_keywords.txt")
+    fingerprints = sum(value == "F" for value in keywords.values())
     rust_dispatch = parse_rust_dispatch()
-    rust_xss_source = ROOT / "src/xss/legacy/deny_list.rs"
-    tags = rust_table_entries(rust_xss_source, "DENY_TAGS")
-    events = [(name, "Deny") for name, _ in rust_table_entries(rust_xss_source, "DENY_EVENTS")]
-    attrs = rust_table_entries(rust_xss_source, "DENY_ATTRS", typed=True)
+    events, tags, attrs = rust_xss_tables()
     counts = {"tags": len(tags), "events": len(events), "attributes": len(attrs)}
     if counts != EXPECTED_XSS:
-        fail(f"unexpected Rust XSS table counts: {counts}")
+        fail(f"unexpected libperfusion XSS table counts: {counts}")
     return {
-        "sql_keyword_entries": EXPECTED_KEYWORDS,
-        "sql_fingerprint_entries": EXPECTED_FINGERPRINTS,
+        "sql_keyword_entries": len(keywords),
+        "sql_fingerprint_entries": fingerprints,
         "sql_dispatch_bytes": len(rust_dispatch),
         "sql_dispatch_sha256": sha256("\n".join(rust_dispatch).encode("ascii")),
         "xss_tables": counts,
         "xss_table_sha256": {
-            "tags": semantic_table_hash(tags),
-            "events": semantic_table_hash(events),
+            "tags": semantic_table_hash([(name, None) for name in tags]),
+            "events": semantic_table_hash([(name, "Deny") for name in events]),
             "attributes": semantic_table_hash(attrs),
         },
     }
@@ -318,15 +340,13 @@ def compare_data(source: Path) -> tuple[dict[str, object], dict[str, str]]:
         differences = [f"{byte:#04x}: Go {go_dispatch[byte]}, Rust {rust_dispatch[byte]}" for byte in range(256) if go_dispatch[byte] != rust_dispatch[byte]]
         fail("SQL byte dispatch differs: " + "; ".join(differences[:8]))
 
-    xss_source = source / "xss_decls.go"
-    rust_xss_source = ROOT / "src/xss/legacy/deny_list.rs"
     go_tags = go_table_entries(source, "blackTags")
-    rust_tags = rust_table_entries(rust_xss_source, "DENY_TAGS")
     go_events = go_table_entries(source, "blackEvents", "stringType")
-    rust_events = [(name, "attributeTypeBlack") for name, _ in rust_table_entries(rust_xss_source, "DENY_EVENTS")]
     go_attrs = go_table_entries(source, "blacks", "stringType")
     mapped_go_attrs = [(name, GO_KIND_TO_RUST.get(kind, f"unknown:{kind}")) for name, kind in go_attrs]
-    rust_attrs = rust_table_entries(rust_xss_source, "DENY_ATTRS", typed=True)
+    rust_event_names, rust_tag_names, rust_attrs = rust_xss_tables()
+    rust_tags = [(name, None) for name in rust_tag_names]
+    rust_events = [(name, "attributeTypeBlack") for name in rust_event_names]
     if sorted(go_tags) != sorted(rust_tags):
         fail("XSS tag table differs from pinned Go source")
     if sorted(go_events) != sorted(rust_events):
@@ -450,6 +470,7 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
             "driver": "tools/parity/oracle_driver_test.go",
             "transport": "tab-separated case id and hex input; binary outputs are hex fields",
         },
+        "c_reference": C_REFERENCE,
         "tables": table_summary,
         "source_sha256": data_hashes,
         "fixtures": {"total": len(files), "families": counts, "files": files},

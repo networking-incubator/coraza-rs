@@ -76,8 +76,11 @@ impl DriverKind {
 /// Possible Sections of a corpus test file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
+    /// The fixture's descriptive text.
     Test,
+    /// The input passed to the detector.
     Input,
+    /// The expected detector result.
     Expected,
 }
 

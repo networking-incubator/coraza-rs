@@ -25,7 +25,6 @@ use std::{io::Write as _, path::Path, process::Command, time::Duration};
 #[path = "common/subprocess.rs"]
 mod oracle_subprocess;
 
-use libinjection::{detect_sqli, detect_xss};
 use oracle_subprocess::run_with_timeout;
 
 const SEED: u64 = 0x947E_5A13_B06C_D281;
@@ -96,55 +95,33 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
         ["cdata-standalone-regression", "cdata-early-xss-regression"]
     );
     let responses = run_oracle(manifest_dir, &cases);
-    let mut failures = Vec::new();
-    let mut accepted_exceptions = 0_usize;
-    let mut fingerprint_diagnostics = 0_usize;
     let mut perfusion_failures = Vec::new();
     let mut perfusion_exceptions = 0_usize;
     let mut perfusion_fingerprint_diagnostics = 0_usize;
 
     for (case, response) in cases.iter().zip(responses.iter()) {
         let expected = parse_result(case, response);
-        let actual = rust_result(&case.input);
         let perfusion = perfusion_result(&case.input);
-        fingerprint_diagnostics += usize::from(expected.fingerprint != actual.fingerprint);
         perfusion_fingerprint_diagnostics += usize::from(expected.fingerprint != perfusion.fingerprint);
-        if !results_match(&expected, &actual) {
-            if is_reviewed_c_aligned_sql_improvement(case, &expected, &actual) {
-                accepted_exceptions += 1;
-            } else {
-                failures.push((case.clone(), expected.clone(), actual));
-            }
-        }
         if is_reviewed_c_aligned_sql_improvement(case, &expected, &perfusion) {
             perfusion_exceptions += 1;
         } else if !results_match(&expected, &perfusion) {
-            perfusion_failures.push(format!(
-                "case={} input_hex={} expected={expected:?} actual={perfusion:?}",
-                case.id,
-                hex(&case.input),
-            ));
+            perfusion_failures.push((case.clone(), expected, perfusion));
         }
     }
 
-    assert!(
-        perfusion_failures.is_empty(),
-        "libperfusion generated Go mismatches:\n{}",
-        perfusion_failures.join("\n")
-    );
     assert_eq!(perfusion_exceptions, 1, "libperfusion Go exception inventory changed");
 
-    if failures.is_empty() {
+    if perfusion_failures.is_empty() {
         eprintln!(
-            "generated differential passed: {} deterministic raw/grammar/regression cases, accepted_exceptions={accepted_exceptions}, fingerprint_diagnostics={fingerprint_diagnostics}, libperfusion_exceptions={perfusion_exceptions}, libperfusion_fingerprint_diagnostics={perfusion_fingerprint_diagnostics}, seed=0x{SEED:016x}",
+            "generated differential passed: {} deterministic raw/grammar/regression cases, libperfusion_exceptions={perfusion_exceptions}, fingerprint_diagnostics={perfusion_fingerprint_diagnostics}, seed=0x{SEED:016x}",
             cases.len(),
         );
-        assert_eq!(accepted_exceptions, 1, "generated exception inventory changed");
         return;
     }
 
     let mut details = Vec::new();
-    for (case, expected, actual) in failures {
+    for (case, expected, actual) in perfusion_failures {
         let minimized = minimize_mismatch(manifest_dir, &case.input);
         let minimized_case = Case {
             id: "minimized".to_owned(),
@@ -156,7 +133,7 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
                 .first()
                 .map_or("<missing oracle result>", String::as_str),
         );
-        let minimized_actual = rust_result(&minimized);
+        let minimized_actual = perfusion_result(&minimized);
         details.push(format!(
             "case={} original_hex={} expected={expected:?} actual={actual:?}\n  minimized_hex={} minimized_expected={minimized_expected:?} minimized_actual={minimized_actual:?}",
             case.id,
@@ -305,23 +282,6 @@ fn assert_known_oracle_errors(case: &Case, errors: &str) -> Vec<usize> {
     Vec::new()
 }
 
-fn rust_result(input: &[u8]) -> PublicResult {
-    let sqli = detect_sqli(input);
-    PublicResult {
-        sqli: sqli.detected,
-        fingerprint: format!(
-            "{}:{:x}",
-            hex(sqli
-                .fingerprint
-                .bytes
-                .get(..usize::from(sqli.fingerprint.len))
-                .unwrap_or_default()),
-            sqli.fingerprint.len
-        ),
-        xss: Some(detect_xss(input)),
-    }
-}
-
 fn perfusion_result(input: &[u8]) -> PublicResult {
     let fingerprint = libperfusion::sqli(input);
     PublicResult {
@@ -389,7 +349,7 @@ fn minimize_mismatch(manifest_dir: &Path, original: &[u8]) -> Vec<u8> {
         let responses = run_oracle(manifest_dir, &candidates);
         let mismatch = candidates.iter().zip(responses.iter()).find(|(case, response)| {
             let expected = parse_result(case, response);
-            !results_match(&expected, &rust_result(&case.input))
+            !results_match(&expected, &perfusion_result(&case.input))
         });
         if let Some((case, _)) = mismatch {
             current.clone_from(&case.input);

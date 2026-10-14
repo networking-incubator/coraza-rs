@@ -29,7 +29,7 @@ use common::{
         run_baseline,
     },
 };
-use libinjection::detect_sqli;
+use libperfusion::sqli;
 
 #[test]
 fn corpus_case_can_be_constructed() {
@@ -240,14 +240,15 @@ fn sqli_corpus_baseline() {
             "fixture fingerprint disagrees with independent Go output for {filename}"
         );
 
-        let actual = detect_sqli(case.input.as_bytes());
+        let actual = sqli(case.input.as_bytes());
         assert_eq!(
-            actual.detected, expected_detected,
+            actual.is_some(),
+            expected_detected,
             "SQL boolean mismatch for {filename}: input={:?}",
             case.input
         );
         assert_eq!(
-            actual.fingerprint.as_str().unwrap_or(""),
+            actual.as_ref().map_or("", |fingerprint| fingerprint.as_str()),
             case.expected,
             "SQL fingerprint mismatch for {filename}: input={:?}",
             case.input

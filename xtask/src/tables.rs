@@ -76,7 +76,7 @@ fn refresh(root: &Path, upstream: &Path) -> Result<(), String> {
     let sql_rows = parse_c_sql(&sql_source)?;
     let xss_rows = parse_c_xss(&xss_source)?;
 
-    let data = root.join("ya-libinjection-rs/data");
+    let data = root.join("libinjection-rs/data");
     fs::create_dir_all(&data).map_err(|error| error.to_string())?;
     fs::write(data.join("sqli_keywords.txt"), render_sql(&revision, &sql_rows)).map_err(|error| error.to_string())?;
     fs::write(data.join("xss_tables.txt"), render_xss_data(&revision, &xss_rows)).map_err(|error| error.to_string())?;
@@ -97,7 +97,7 @@ fn refresh(root: &Path, upstream: &Path) -> Result<(), String> {
 }
 
 fn check(root: &Path) -> Result<(), String> {
-    let data = root.join("ya-libinjection-rs/data");
+    let data = root.join("libinjection-rs/data");
     let sql = fs::read_to_string(data.join("sqli_keywords.txt")).map_err(|error| error.to_string())?;
     let xss = fs::read_to_string(data.join("xss_tables.txt")).map_err(|error| error.to_string())?;
     let manifest: Value =
