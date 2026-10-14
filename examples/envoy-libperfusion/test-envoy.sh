@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-compose=(docker compose -f compose.yaml -p libperfusion-envoy-test)
+compose=(docker compose -f "$(dirname -- "${BASH_SOURCE[0]}")/compose.yaml" -p libperfusion-envoy-test)
 temp_dir=$(mktemp -d)
 
 cleanup() {
@@ -94,6 +94,10 @@ status=$(request "$temp_dir/response" --header 'cookie: payload=%253Cscript%253E
     http://127.0.0.1:10000/)
 check_status 403 "$status" 'percent-encoded cookie XSS'
 
+status=$(request "$temp_dir/response" --form-string 'query=1 UNION SELECT password FROM users' \
+    http://127.0.0.1:10000/echo)
+check_status 403 "$status" 'multipart SQLi field'
+
 status=$(request "$temp_dir/response" --header 'x-untrusted: query=1%2527%2520OR%2520%25271%2527=%25271' \
     http://127.0.0.1:10000/)
 check_status 403 "$status" 'percent-encoded custom-header SQLi'
@@ -123,8 +127,34 @@ status=$(request "$temp_dir/response" --request POST --header 'content-type: app
 check_status 413 "$status" '9 MiB upload'
 
 "${compose[@]}" down >/dev/null
+ENVOY_CONFIG=envoy.yaml "${compose[@]}" up --detach
+wait_for_envoy
+
+printf '\000\000\000\000\000' >"$temp_dir/grpc-request"
+status=$(request "$temp_dir/response" --dump-header "$temp_dir/grpc-headers" --http2-prior-knowledge \
+    --header 'content-type: application/grpc' --header 'te: trailers' \
+    --data-binary "@$temp_dir/grpc-request" \
+    http://127.0.0.1:10000/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo)
+check_status 200 "$status" 'gRPC response with trailers in detect mode'
+if ! grep --ignore-case --quiet '^grpc-status: 0' "$temp_dir/grpc-headers"; then
+    fail 'gRPC echo response did not return its success trailer'
+fi
+
+"${compose[@]}" down >/dev/null
 ENVOY_CONFIG=envoy-response-blocking.yaml "${compose[@]}" up --detach
 wait_for_envoy
+
+status=$(request "$temp_dir/response" --dump-header "$temp_dir/headers" --http2-prior-knowledge \
+    --header 'content-type: application/grpc' --header 'te: trailers' \
+    --data-binary "@$temp_dir/grpc-request" \
+    http://127.0.0.1:10000/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo)
+check_status 502 "$status" 'blocked gRPC response with trailers'
+if grep --ignore-case --quiet '^grpc-status:' "$temp_dir/headers"; then
+    fail 'blocked gRPC response retained upstream trailers'
+fi
+
+status=$(request "$temp_dir/response" http://127.0.0.1:10000/health)
+check_status 200 "$status" 'request after blocked gRPC response'
 
 status=$(request "$temp_dir/response" --dump-header "$temp_dir/headers" \
     'http://127.0.0.1:10000/?q=%253Cscript%253Ealert(1)%253C%252Fscript%253E')

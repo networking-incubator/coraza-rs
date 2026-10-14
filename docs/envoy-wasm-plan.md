@@ -130,9 +130,9 @@ Scanning chunks after forwarding headers cannot make this guarantee.
 [Proxy-Wasm ABI](https://github.com/proxy-wasm/spec/blob/main/abi-versions/v0.2.1/README.md).
 
 These host details were checked in the pinned Envoy runtime. The integration
-harness proves held request denial and generic response replacement for
-uncompressed body/header detections and oversized responses. Trailer completion
-and concurrent HTTP/2 stream behavior remain untested.
+harness covers held request denial, generic response replacement, and a blocked
+HTTP/2 gRPC response followed by trailers and a healthy request. Concurrent
+HTTP/2 stream behavior remains untested.
 
 ## Architecture and inspection contract
 
@@ -168,7 +168,7 @@ generic detector registry.
 | Plain/raw bodies | Scan raw bytes and up to four successive percent-decoded views with both detectors; keep non-UTF-8 bytes intact. |
 | URL-encoded bodies | Scan raw bytes plus each decoded name/value, retaining duplicates and empty values. |
 | JSON bodies | Scan raw bytes plus decoded keys/string values and relevant scalar representations; visit all duplicate-key entries before any map can overwrite them. |
-| Multipart bodies | Scan raw body (including part headers/payload bytes), field names and file names within bounds. Do not infer archive inspection. |
+| Multipart bodies | Scan raw body, field names, bounded text-field values and file names; parse nested JSON and URL-encoded fields. Other structured part types are incomplete. File payloads receive raw-body scanning only; do not infer archive inspection. |
 | XML, protobuf, archives or other encoded payloads | Raw byte scanning alone gives no decoded-content guarantee. Add an application-matching parser when required, otherwise report incomplete coverage or reject under strict policy. |
 
 The plugin scans exposed header/body surfaces and marks unsupported or
@@ -221,15 +221,15 @@ Implemented configuration:
 | --- | --- |
 | `request_mode`, `response_mode` | Independently `off`, `detect`, or `block`; built-in default is `detect`. |
 | Detectors | SQLi and XSS both run in each enabled direction. |
-| `max_request_body_bytes`, `max_response_body_bytes` | Hard body bounds; built-in default is 1 MiB each. |
-| Extraction budgets | Default 1,024 extracted fields, 64 KiB per field and JSON nesting depth 32. |
-| `incomplete_inspection_policy` | `reject` or `report`; built-in default is `reject`, independent of attack mode. |
+| `max_request_body_bytes`, `max_response_body_bytes` | Hard body bounds; built-in default is 1 MiB each, maximum 64 MiB each. |
+| Extraction budgets | Default 1,024 fields, 64 KiB per field and JSON depth 32; maximum 65,536 fields, 1 MiB per field and depth 128. Field bytes cannot exceed the request body limit. |
+| `incomplete_inspection_policy` | `reject` or `report`; built-in default is `reject`, applied only when that direction uses `block`. |
 
 The example uses a 1 MiB request/response bound in detect/report mode and an
 8 MiB request bound in the blocking upload profile. Limits apply to bytes
 Envoy exposes after configured request decompression. Configuration rejects
-unknown fields, invalid enum values and zero limits. The root parses
-configuration once and each stream keeps a consistent snapshot.
+unknown fields, invalid enum values, zero limits and limits above these caps.
+The root parses configuration once and each stream keeps a consistent snapshot.
 
 `detect` reports a match and releases the inspected message. `block` returns
 a generic 403 for request attacks and a 502 for rejected upstream
@@ -238,10 +238,10 @@ oversized requests 413; corresponding rejected upstream content uses a
 generic 502. Preserve a single terminal outcome per stream and prevent
 inspection of the plugin's own denial from causing a rejection loop.
 
-`off` is an explicit loss of coverage. `report` for incomplete inspection
-allows traffic with an explicit coverage event. `reject` refuses content that
-cannot be inspected within the contract. A prefix-limited miss is never a
-whole-message clean result. These controls are separate from Envoy's
+`off` is an explicit loss of coverage. `detect` always passes incomplete
+messages and reports the coverage gap. In `block`, `report` passes incomplete
+messages with an event, while `reject` refuses them. A prefix-limited miss is
+never a whole-message clean result. These controls are separate from Envoy's
 **VM failure policy**.
 
 Use explicit `failure_policy: FAIL_CLOSED` initially. `FAIL_OPEN` bypasses
@@ -440,15 +440,16 @@ Implemented in this branch:
   bounded header/body extraction, SQLi/XSS inspection and request/response
   policies.
 - Native unit tests cover configuration, query/form/header/body decoding, JSON
-  escapes and duplicate members, multipart framing, malformed URL encoding,
-  unsupported types and stream detection.
+  escapes and duplicate members, multipart text values and framing, malformed
+  URL encoding, unsupported types and stream detection.
 - Envoy 1.40.0 is pinned by image digest. The example includes a detect/report
   profile, request-blocking and response-blocking profiles, a request gzip
   decompressor and an 8 MiB upload route limit.
 - CI builds `wasm32-wasip1` and runs the Bash integration harness. The harness
   checks 160 KiB and 8 MiB request acceptance, 9 MiB rejection, request
   SQLi/XSS blocking, percent-encoded header/cookie/body detection, gzip request
-  detection, and reflected response-body/header blocking.
+  detection, multipart SQLi blocking, reflected response-body/header blocking,
+  and blocked gRPC trailers followed by a healthy request.
 
 The tested profile replaces blocked responses with a generic 502 and removes
 all upstream headers before adding the response headers for the local error.
@@ -468,6 +469,9 @@ Request attacks receive a generic 403; rejected incomplete requests receive
 - Streaming response trailers can be scanned and reported after response
   headers/body have continued, but cannot be replaced at that point. Use
   `incomplete_inspection_policy: reject` where that behavior is unacceptable.
+- Multipart file payloads receive raw-body scanning, without per-file semantic
+  parsing. Add an application-specific bounded parser if file formats need
+  structured inspection.
 - XML, gRPC/protobuf, archives and other application-specific encodings do not
   have semantic parsers here. The plugin uses raw-byte inspection and marks
   unsupported structured content incomplete.

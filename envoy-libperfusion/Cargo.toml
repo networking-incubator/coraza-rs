@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Envoy Proxy-Wasm HTTP filter backed by libperfusion"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

@@ -17,8 +17,8 @@ docker compose up
 Envoy listens on http://localhost:10000. The default envoy.yaml uses detect
 for both directions with report for incomplete inspection so the example can
 pass content types without a parser. The plugin's built-in defaults remain
-detect plus reject; production rollout should choose the incomplete policy
-deliberately.
+detect plus reject; detect always passes incomplete messages and logs the
+coverage gap. The reject policy applies in block mode.
 
 Try ordinary traffic and an encoded SQLi query:
 
@@ -71,16 +71,23 @@ Wasm artifact:
 The Bash harness uses the pinned Envoy image and Gateway API echo-basic image.
 It checks SQLi/XSS request blocking, percent-encoded headers, cookies and
 bodies, request gzip decompression, reflected response-body and response-header
-blocking, plus 8 MiB accepted versus 9 MiB rejected uploads.
+blocking, multipart SQLi, HTTP/2 gRPC trailers, plus 8 MiB accepted versus 9
+MiB rejected uploads.
 
 ## Coverage and limits
 
 The filter checks all exposed request/response header names and byte values,
 up to four successive percent-decoded views of headers and bodies, request
 paths and decoded query pairs, cookie pairs, raw bodies, form fields,
-JSON keys/string values (including duplicate keys), multipart part names and
-file names. It scans multipart part/file payloads in the raw body. SQLi and
-XSS are the only libperfusion detectors.
+JSON keys/string values (including duplicate keys), multipart names, text-field
+values and file names. Nested JSON and URL-encoded parts are parsed; other
+structured part types are marked incomplete. File payloads receive raw-body
+scanning only. SQLi and XSS are the only libperfusion detectors.
+
+Configured body limits can be at most 64 MiB; a field can be at most 1 MiB and
+cannot exceed the request body limit. Field count and JSON depth are capped at
+65,536 and 128. Envoy's own buffering limits should be set to match the plugin
+limits because the plugin cannot cap memory allocated before its callbacks.
 
 Raw and percent-decoded values are both inspected, up to four decoding layers.
 Malformed path/form encodings and values still encoded beyond that bound are

@@ -175,16 +175,16 @@ impl Inspection {
     }
 
     /// Scans raw body bytes and extracts supported structured values.
-    pub(crate) fn body(&mut self, bytes: &[u8], format: &BodyFormat) {
-        self.scan_bytes(bytes);
-        self.scan_percent_encoded_views(bytes);
+    pub(crate) fn body(&mut self, bytes: Vec<u8>, format: &BodyFormat) {
+        self.scan_bytes(&bytes);
+        self.scan_percent_encoded_views(&bytes);
 
         match format {
             BodyFormat::Raw | BodyFormat::Unsupported => {},
             BodyFormat::UrlEncoded => {
-                self.scan_form_fields(bytes);
+                self.scan_form_fields(&bytes);
             },
-            BodyFormat::Json => self.scan_json(bytes),
+            BodyFormat::Json => self.scan_json(&bytes),
             BodyFormat::Multipart(boundary) => self.scan_multipart(bytes, boundary),
         }
     }
@@ -245,17 +245,19 @@ impl Inspection {
             return;
         }
 
-        let mut decoded = bytes.to_vec();
+        let mut decoded = Vec::new();
+        let mut scratch = Vec::new();
+        let mut input = bytes;
         for _ in 0..MAX_PERCENT_DECODE_LAYERS {
-            if !contains_percent_escape(&decoded) {
+            decode_percent_escapes(input, &mut scratch);
+            self.scan_bytes(&scratch);
+            std::mem::swap(&mut decoded, &mut scratch);
+            input = &decoded;
+            if !contains_percent_escape(input) {
                 return;
             }
-            decoded = decode_percent_escapes(&decoded);
-            self.scan_bytes(&decoded);
         }
-        if contains_percent_escape(&decoded) {
-            self.mark_incomplete(Incomplete::EncodedValueRemains);
-        }
+        self.mark_incomplete(Incomplete::EncodedValueRemains);
     }
 
     /// Decodes and scans query parameters from a request path.
@@ -381,10 +383,12 @@ impl Inspection {
         }
     }
 
-    /// Parses multipart framing and scans field names and file names.
-    fn scan_multipart(&mut self, bytes: &[u8], boundary: &str) {
+    /// Parses multipart framing and scans names and bounded part bodies.
+    ///
+    /// shortcut: file parts get raw-body scanning only; add a bounded format parser if applications decode uploads.
+    fn scan_multipart(&mut self, bytes: Vec<u8>, boundary: &str) {
         let whole_stream_limit = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let content = Bytes::copy_from_slice(bytes);
+        let content = Bytes::from(bytes);
         let stream = futures::stream::once(async move { Ok::<Bytes, Infallible>(content) });
         let constraints = multer::Constraints::new().size_limit(
             multer::SizeLimit::new()
@@ -395,6 +399,7 @@ impl Inspection {
         let parsed = futures::executor::block_on(async {
             let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
             let mut field_count = 0_usize;
+            let mut field_body = Vec::new();
             while let Some(mut field) = multipart.next_field().await.map_err(|_error| ())? {
                 field_count += 1;
                 if field_count > self.max_fields {
@@ -406,10 +411,56 @@ impl Inspection {
                 } else {
                     self.mark_incomplete(Incomplete::MalformedBody);
                 }
+                let is_file = field.file_name().is_some();
+                let part_type = field.content_type();
+                let json_part = part_type.is_some_and(|content_type| {
+                    let media_type = content_type.essence_str();
+                    media_type == "application/json"
+                        || media_type.starts_with("application/") && media_type.ends_with("+json")
+                });
+                let form_part = part_type
+                    .is_some_and(|content_type| content_type.essence_str() == "application/x-www-form-urlencoded");
+                let unsupported_part = part_type.is_some_and(|content_type| {
+                    let media_type = content_type.essence_str();
+                    (media_type.starts_with("application/")
+                        && !json_part
+                        && !form_part
+                        && !matches!(
+                            media_type,
+                            "application/octet-stream" | "application/javascript" | "application/ecmascript"
+                        ))
+                        || media_type == "text/xml"
+                        || media_type.starts_with("multipart/")
+                });
                 if let Some(filename) = field.file_name() {
                     self.scan_field(filename.as_bytes());
                 }
-                while field.chunk().await.map_err(|_error| ())?.is_some() {}
+                field_body.clear();
+                let mut field_too_large = false;
+                while let Some(chunk) = field.chunk().await.map_err(|_error| ())? {
+                    if is_file || field_too_large || self.fields >= self.max_fields {
+                        continue;
+                    }
+                    let remaining = self.max_field_bytes.saturating_sub(field_body.len());
+                    if chunk.len() > remaining {
+                        self.mark_incomplete(Incomplete::FieldTooLarge);
+                        field_too_large = true;
+                        continue;
+                    }
+                    field_body.extend_from_slice(&chunk);
+                }
+                if !is_file && !field_too_large {
+                    if json_part {
+                        self.scan_json(&field_body);
+                    } else if form_part {
+                        self.scan_form_fields(&field_body);
+                    } else {
+                        if unsupported_part {
+                            self.mark_incomplete(Incomplete::UnsupportedContentType);
+                        }
+                        self.scan_field(&field_body);
+                    }
+                }
             }
             Ok::<usize, ()>(field_count)
         });
@@ -452,8 +503,9 @@ fn contains_percent_escape(bytes: &[u8]) -> bool {
 }
 
 /// Decodes valid percent escapes once and leaves other bytes unchanged.
-fn decode_percent_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut decoded = Vec::with_capacity(bytes.len());
+fn decode_percent_escapes(bytes: &[u8], decoded: &mut Vec<u8>) {
+    decoded.clear();
+    decoded.reserve(bytes.len());
     let mut index = 0;
     while let Some(byte) = bytes.get(index) {
         if *byte == b'%' {
@@ -469,7 +521,6 @@ fn decode_percent_escapes(bytes: &[u8]) -> Vec<u8> {
         decoded.push(*byte);
         index += 1;
     }
-    decoded
 }
 
 /// Returns a hexadecimal digit's numeric value.
@@ -615,14 +666,78 @@ impl<'de> Visitor<'de> for JsonVisitor<'_> {
         if self.depth >= self.inspection.max_json_depth {
             return Err(serde::de::Error::custom("JSON nesting limit exceeded"));
         }
-        while let Some(key) = map.next_key::<String>()? {
-            self.inspection.scan_field(key.as_bytes());
+        while map
+            .next_key_seed(JsonKeyScan {
+                inspection: &mut *self.inspection,
+            })?
+            .is_some()
+        {
             map.next_value_seed(JsonScan {
                 inspection: self.inspection,
                 depth: self.depth.saturating_add(1),
             })?;
         }
         Ok(())
+    }
+}
+
+/// Scans JSON object keys while serde borrows unescaped strings from the body.
+struct JsonKeyScan<'a> {
+    /// The active message inspection.
+    inspection: &'a mut Inspection,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonKeyScan<'_> {
+    type Value = ();
+
+    /// Deserializes one object key without allocating a `String` for borrowed keys.
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(JsonKeyVisitor {
+            inspection: self.inspection,
+        })
+    }
+}
+
+/// Inspects one decoded JSON object key.
+struct JsonKeyVisitor<'a> {
+    /// The active message inspection.
+    inspection: &'a mut Inspection,
+}
+
+impl<'de> Visitor<'de> for JsonKeyVisitor<'_> {
+    type Value = ();
+
+    /// Describes the object key accepted by this visitor.
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object key")
+    }
+
+    /// Scans a borrowed object key.
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.inspection.scan_field(v.as_bytes());
+        Ok(())
+    }
+
+    /// Scans a key borrowed directly from the JSON body.
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(v)
+    }
+
+    /// Scans an owned key when JSON escapes require decoding it.
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&v)
     }
 }
 
@@ -640,6 +755,11 @@ mod tests {
             .collect()
     }
 
+    /// Copies a static test fixture into the SDK's owned body type.
+    fn scan_body(inspection: &mut Inspection, bytes: &[u8], format: &super::BodyFormat) {
+        inspection.body(bytes.to_vec(), format);
+    }
+
     /// Checks decoded query and form representations.
     #[test]
     fn scans_encoded_query_and_form_fields() {
@@ -654,7 +774,7 @@ mod tests {
             ("content-type", "application/x-www-form-urlencoded"),
         ]));
 
-        inspection.body(b"comment=%3Cscript%3Ealert(1)%3C%2Fscript%3E", &format);
+        scan_body(&mut inspection, b"comment=%3Cscript%3Ealert(1)%3C%2Fscript%3E", &format);
 
         assert!(inspection.has_xss(), "decoded query and form XSS must be found");
         assert!(inspection.has_sqli(), "decoded query SQLi must be found");
@@ -670,7 +790,7 @@ mod tests {
             (":path", "/?bad=%ZZ"),
             ("content-type", "application/x-www-form-urlencoded"),
         ]));
-        inspection.body(b"bad=%E0%80", &format);
+        scan_body(&mut inspection, b"bad=%E0%80", &format);
 
         assert_eq!(inspection.incomplete(), Some(Incomplete::MalformedEncoding));
     }
@@ -719,7 +839,11 @@ mod tests {
         let config = Config::default();
         let mut inspection = Inspection::new(&config);
         let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
-        inspection.body(b"%253Cscript%253Ealert(1)%253C%252Fscript%253E", &format);
+        scan_body(
+            &mut inspection,
+            b"%253Cscript%253Ealert(1)%253C%252Fscript%253E",
+            &format,
+        );
 
         assert!(inspection.has_xss(), "encoded raw-body XSS must be inspected");
         assert_eq!(inspection.incomplete(), None, "covered layers are complete");
@@ -732,8 +856,9 @@ mod tests {
         let mut inspection = Inspection::new(&config);
         let format = inspection.headers(&headers(&[("content-type", "application/json")]));
 
-        inspection.body(
-            br#"{"comment":"\u003cscript\u003ealert(1)\u003c/script\u003e","x":"safe","x":"1 OR 1=1"}"#,
+        scan_body(
+            &mut inspection,
+            br#"{"\u003cscript\u003ealert(1)\u003c/script\u003e":"safe","x":"safe","x":"1 OR 1=1"}"#,
             &format,
         );
 
@@ -750,18 +875,93 @@ mod tests {
         let format = inspection.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
         let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"<script>.txt\"\r\nContent-Type: application/octet-stream\r\n\r\nbenign\r\n--BOUNDARY--\r\n";
 
-        inspection.body(body, &format);
+        scan_body(&mut inspection, body, &format);
 
         assert!(inspection.has_xss(), "multipart filenames must be inspected");
         assert_eq!(inspection.incomplete(), None, "valid multipart should be complete");
 
         let mut malformed = Inspection::new(&config);
-        malformed.body(b"not multipart", &format);
+        scan_body(&mut malformed, b"not multipart", &format);
         assert_eq!(
             malformed.incomplete(),
             Some(Incomplete::MalformedBody),
             "malformed multipart must be incomplete"
         );
+    }
+
+    /// Scans `SQLi` and XSS in multipart part bodies.
+    #[test]
+    fn multipart_scans_field_bodies() {
+        let config = Config::default();
+        let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"query\"\r\n\r\n1 UNION SELECT password FROM users\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"comment\"\r\n\r\n<script>alert(1)</script>\r\n--BOUNDARY--\r\n";
+        let mut raw = Inspection::new(&config);
+        raw.scan_bytes(body);
+        assert!(!raw.has_sqli(), "multipart framing alone must reproduce the SQLi miss");
+
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+
+        scan_body(&mut inspection, body, &format);
+
+        assert!(inspection.has_sqli(), "multipart SQLi fields must be inspected");
+        assert!(inspection.has_xss(), "multipart XSS fields must be inspected");
+        assert_eq!(inspection.incomplete(), None, "valid multipart should be complete");
+    }
+
+    /// Parses nested JSON fields and marks unparsed structured part types incomplete.
+    #[test]
+    fn multipart_checks_nested_json_and_unknown_structured_parts() {
+        let config = Config::default();
+        let mut json = Inspection::new(&config);
+        let format = json.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+        let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"payload\"\r\nContent-Type: application/json\r\n\r\n{\"comment\":\"\\u003cscript\\u003ealert(1)\\u003c/script\\u003e\"}\r\n--BOUNDARY--\r\n";
+
+        scan_body(&mut json, body, &format);
+
+        assert!(json.has_xss(), "nested JSON escapes must be inspected");
+        assert_eq!(json.incomplete(), None, "supported nested JSON should be complete");
+
+        let mut unsupported = Inspection::new(&config);
+        let format = unsupported.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+        let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"document\"\r\nContent-Type: application/pdf\r\n\r\nbenign\r\n--BOUNDARY--\r\n";
+
+        scan_body(&mut unsupported, body, &format);
+
+        assert_eq!(
+            unsupported.incomplete(),
+            Some(Incomplete::UnsupportedContentType),
+            "unparsed structured part types must not be treated as complete"
+        );
+    }
+
+    /// Enforces field byte and count limits for multipart parts.
+    #[test]
+    fn multipart_enforces_field_size_and_count_limits() {
+        let size_limited = Config {
+            max_field_bytes: 64,
+            ..Config::default()
+        };
+        let format = Inspection::new(&size_limited).body_format(b"multipart/form-data; boundary=BOUNDARY");
+        let mut oversized_body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n".to_vec();
+        oversized_body.extend_from_slice(&[b'a'; 65]);
+        oversized_body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+        let mut oversized = Inspection::new(&size_limited);
+
+        scan_body(&mut oversized, &oversized_body, &format);
+
+        assert_eq!(oversized.incomplete(), Some(Incomplete::FieldTooLarge));
+
+        let count_limited = Config {
+            max_fields: 4,
+            ..Config::default()
+        };
+        let mut too_many = Inspection::new(&count_limited);
+        let format = too_many.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+        let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nfirst\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nsecond\r\n--BOUNDARY--\r\n";
+
+        scan_body(&mut too_many, body, &format);
+
+        assert_eq!(too_many.incomplete(), Some(Incomplete::FieldLimit));
     }
 
     /// Checks unsupported content and JSON nesting outcomes.
@@ -782,7 +982,7 @@ mod tests {
 
         let mut json = Inspection::new(&config);
         let format = json.headers(&headers(&[("content-type", "application/json")]));
-        json.body(br#"{"x":{"y":"<script>"}}"#, &format);
+        scan_body(&mut json, br#"{"x":{"y":"<script>"}}"#, &format);
         assert_eq!(
             json.incomplete(),
             Some(Incomplete::MalformedBody),
