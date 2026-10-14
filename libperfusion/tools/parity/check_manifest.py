@@ -25,7 +25,7 @@ C_REFERENCE = {
     "reviewed_xss_differences": 24,
 }
 GO_TOOLS = ROOT.parent / "xtask/tools"
-FAMILY_COUNTS = {"sqli": 54, "folding": 118, "tokens": 249, "html5": 68, "xss": 7}
+FAMILY_COUNTS = {"sqli": 55, "folding": 119, "tokens": 249, "html5": 68, "xss": 7}
 EXPECTED_KEYWORDS = 9_352
 EXPECTED_FINGERPRINTS = 8_367
 EXPECTED_XSS = {"tags": 20, "events": 432, "attributes": 20}
@@ -441,8 +441,8 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
     counts, files = fixture_inventory()
     if counts != FAMILY_COUNTS:
         fail(f"fixture family counts differ: expected {FAMILY_COUNTS}, found {counts}")
-    if len(files) != 496:
-        fail(f"expected 496 test fixtures, found {len(files)}")
+    if len(files) != 498:
+        fail(f"expected 498 test fixtures, found {len(files)}")
 
     if source is None:
         data_hashes = {"data/sqli_keywords.txt": sha256((ROOT / "data/sqli_keywords.txt").read_bytes())}
@@ -524,7 +524,7 @@ def main() -> None:
     if current != recorded_differential:
         print("parity manifest mismatch; rerun with --update only after reviewing source/data changes", file=sys.stderr)
         raise SystemExit(1)
-    print("parity manifest verified: 496 fixtures and recorded source/table hashes")
+    print("parity manifest verified: 498 fixtures and recorded source/table hashes")
 
 
 if __name__ == "__main__":

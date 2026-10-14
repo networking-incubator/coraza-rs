@@ -209,14 +209,14 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         "libperfusion public parity mismatches:\n{}",
         result.mismatches.join("\n\n")
     );
-    assert_eq!(cases.len(), 862, "pinned differential case inventory changed");
-    assert_eq!(result.comparisons, 17_240, "defined oracle field coverage changed");
+    assert_eq!(cases.len(), 864, "pinned differential case inventory changed");
+    assert_eq!(result.comparisons, 17_280, "defined oracle field coverage changed");
     assert_eq!(
         result.oracle_errors, 0,
         "pinned Go module must complete every result field"
     );
     assert_eq!(
-        result.accepted_exceptions, 4,
+        result.accepted_exceptions, 2,
         "libperfusion deviations must stay reviewed"
     );
 }
@@ -583,16 +583,6 @@ fn reviewed_perfusion_deviation(
         return match field_index {
             2 => Some(("0", "1", true)),
             3 => Some((":0", "736f3163:4", false)),
-            _ => None,
-        };
-    }
-    if id == "sql-like-select-fingerprint" && input == b"1 LIKE (SELECT 1)" && field_index == 3 {
-        return Some(("3166284531:5", "316f284531:5", true));
-    }
-    if id == "sql-like-operand-attack" && input == b"' OR (8459 LIKE (SELECT 8459)) * 4906 -- " {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "732628316f:5", false)),
             _ => None,
         };
     }
