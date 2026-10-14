@@ -127,6 +127,15 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    pub(crate) fn new_data_at(s: &'a [u8], pos: usize) -> Self {
+        Self {
+            s,
+            pos,
+            is_close: false,
+            state: State::Data,
+        }
+    }
+
     fn token(&self, kind: TokenKind, start: usize, len: usize) -> Token<'a> {
         let s = self.s;
         Token {
@@ -288,7 +297,8 @@ impl<'a> Tokenizer<'a> {
         loop {
             match self.skip_white()? {
                 b'/' => {
-                    self.pos += 1;
+                    let remaining = &self.s[self.pos..];
+                    self.pos += remaining.iter().position(|&ch| ch != b'/').unwrap_or(remaining.len());
                     // Anything but "/>" starts this state over. Upstream
                     // loops here rather than going through the self-closing
                     // state, which would recurse once per '/'.

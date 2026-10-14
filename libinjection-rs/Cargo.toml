@@ -1,6 +1,6 @@
 [package]
 name = "libperfusion"
-version = "0.1.99"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "BSD-3-Clause"
@@ -14,7 +14,7 @@ include = ["Cargo.toml", "README.md", "LICENSE", "build.rs", "data/**", "src/**"
 bench = false
 
 [dependencies]
-memchr = { version = "2.7", default-features = false }
+memchr = { version = "2.7", default-features = false, features = ["std"] }
 
 [features]
 internals = []

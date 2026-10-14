@@ -10,8 +10,8 @@
 //! regular expressions.
 //!
 //! The port follows libinjection 4.0.0 (`d88a8f8`) and aims to give the same
-//! verdict as the C library on every input. It needs neither `std` nor an
-//! allocator.
+//! verdict as the C library on every input. It uses `std` for accelerated byte
+//! searches and does not allocate while detecting.
 //!
 //! Inputs are bytes: decode them (URL-decoding, for instance) the way the
 //! application that will consume them does before checking them.
@@ -32,7 +32,6 @@
 //!
 //! [libinjection]: https://github.com/libinjection/libinjection
 
-#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 #[expect(
@@ -128,7 +127,7 @@ pub fn xss_with_context(input: &[u8]) -> Option<HtmlContext> {
 /// Checks `input` for cross-site scripting in one caller-selected HTML context.
 #[must_use]
 pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
-    xss::is_xss(input, context)
+    xss::is_xss(input, context, None)
 }
 
 /// Checks `input` for cross-site scripting, scanning at most `max_bytes`.

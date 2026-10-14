@@ -409,3 +409,59 @@ The retained benchmark targets are
 [compare.rs](../libinjection-rs/benches/compare.rs) and
 [scaling.rs](../libinjection-rs/benches/scaling.rs). They measure only the
 selected implementation now.
+
+## Current implementation after P3 optimizations
+
+**Measured:** 2026-10-14. This section records the consolidated `libperfusion`
+crate after the performance changes; the historical tables above are unchanged.
+
+The consolidation removed an incidental `memchr/std` feature unification from
+the old crate graph. That left the new package using compile-time SSE2 instead
+of runtime AVX2 dispatch on this x86_64 host. `libperfusion` now requires `std`
+and enables `memchr/std` directly. Detection still does not allocate.
+
+The code changes skip the `sp_password` search when a longer SQL fingerprint
+cannot be rejected by the whitelist, start Data-context XSS tokenization at the
+first `<` found in the input, and consume consecutive slash bytes in one HTML
+tokenizer step. The slash tokenizer keeps the same public token boundaries.
+
+Before and after were measured in one process, alternating measurement order,
+with seven 20 ms samples per case and two runs. The baseline was the current
+P3 working tree before these changes. The CPU frequency was not locked.
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| XSS encoded URL at end, 1 MiB | 26.6–26.9 µs | 9.4–9.5 µs | 65% faster |
+| SQLi attack at start, 1 MiB | 48.0–48.1 µs | 9.1–9.5 µs | 80–81% faster |
+| XSS slash miss, 10 MiB | 8.44–8.72 ms | 3.89–3.95 ms | 54–55% faster |
+| XSS repeated-angle miss, 1 MiB | 5.71–5.72 ms | 5.68 ms | within 1% |
+| SQLi attack after whitespace, 1 MiB | 0.71–0.73 ms | 0.67–0.69 ms | about 5% faster |
+| SQLi plain miss, 1 MiB | 0.47–0.48 ms | 0.47 ms | within 1% |
+| SQLi escaped-quote miss, 51,202 bytes | 55.5–56.8 µs | 55.2–56.5 µs | within 1% |
+
+The same paired check compared all 496 corpus inputs. Each hit/miss group was
+within 3% of the baseline. A standalone corpus run measured 159.6 / 155.4 ns
+per SQLi hit / miss and 30.8 / 85.3 ns per XSS hit / miss. The 130-case full
+scaling sweep verified every expected hit and miss before timing.
+
+Against the previous report's unpaired scaling run, SQLi attack-at-start at
+1 MiB changed from 26.7 µs to 9.09 µs, XSS encoded-URL-at-end from 17.6 µs to
+9.55 µs, and the 10 MiB slash miss from 8.48 ms to 3.89 ms. The escaped-quote
+miss stayed level at 55.58 µs versus 55.9 µs. The standalone angle-noise result
+was 6.45 ms versus 5.74 ms; the paired before/after runs differed by less than
+1%, so the standalone increase is not repeatable as a code regression.
+
+The `speed` benchmark compared the port against libinjection C at
+`533a165ebc1f7c36ecbe3e5583990ea0db81f554`, built with `cc -O3`. Port/C ratios
+were 0.54–0.57× for SQLi workloads and 0.28–0.41× for XSS workloads, so the
+Rust port was 1.8–3.6× faster in every measured group. The benchmark used a
+temporary copy of C's sample data with nine already-reviewed C-only XSS cases
+removed so its aggregate hit-count assertion passed. The full C differential
+still checked all 862 cases and retained the same 24 reviewed differences.
+
+The final source also passed exact before/after comparisons on 100,000
+deterministic SQLi, XSS, and context inputs; 486 repeated-slash boundary inputs
+kept identical HTML token streams in all five contexts. Pinned C and Go v0.3.5
+differentials passed with their existing reviewed exceptions. These checks do
+not replace broader fuzzing or make the unlocked-frequency timings portable to
+other CPUs.
