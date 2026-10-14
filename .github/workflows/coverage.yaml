@@ -24,4 +24,4 @@ jobs:
           persist-credentials: false
 
       - name: Check coverage
-        uses: ./.github/actions/coverage-check
+        uses: $/.github/actions/coverage-check

@@ -7,3 +7,8 @@ failure remains, report it clearly and do not claim that lint passed.
 
 The pull request CI also runs `make lint`; local lint is still required during
 development so failures are caught before the final review.
+
+## GitHub Actions
+
+Reference actions from this repository with `uses: $/.github/...` rather than
+`uses: ./.github/...`.

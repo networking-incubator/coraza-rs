@@ -6,7 +6,7 @@ runs:
   using: composite
   steps:
     - name: Set up Rust
-      uses: ./.github/actions/setup-rust
+      uses: $/.github/actions/setup-rust
       with:
         cache-suffix: coverage
 

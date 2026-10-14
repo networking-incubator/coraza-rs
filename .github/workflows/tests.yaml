@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust (stable + nightly fmt)
-        uses: ./.github/actions/setup-rust-lint
+        uses: $/.github/actions/setup-rust-lint
 
       - name: Cache cargo-machete
         id: cache-machete
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Test
         run: make test
@@ -88,7 +88,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           cache-suffix: envoy-wasm
 
@@ -142,7 +142,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           cache-suffix: features
 
