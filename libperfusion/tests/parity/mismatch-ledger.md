@@ -3,12 +3,12 @@
 The selected oracle is `libinjection-go` v0.3.5, pinned in
 `xtask/tools/go.mod` with checksum
 `h1:Zj2AAAKnaRtoLCXYqmc/wzCVAVXxe81UpF5JblL4WQA=`. The direct suite covers
-853 corpus and binary cases across SQL/XSS public results, SQL token and fold
+862 corpus and binary cases across SQL/XSS public results, SQL token and fold
 streams, and five HTML contexts. The generated suite covers 770 deterministic
 byte and grammar inputs.
 
-The direct suite compares 17,060 defined fields. All 853 cases complete
-without oracle errors; 849 match all three public fields. Four exact cases
+The direct suite compares 17,240 defined fields. All 862 cases complete
+without oracle errors; 858 match all three public fields. Four exact cases
 contain seven reviewed public-result differences. Parser stream differences
 are reported as diagnostics and do not relax the public-result gate.
 
@@ -92,7 +92,8 @@ completes every result field in the checked-in baseline.
 ## Provenance
 
 Compatibility is selected against Go v0.3.5 on Go 1.27.1/linux/amd64. The
-recorded C references were `d88a8f86d617ac8dcb9169c9f34637aaac71ac76` and
-`533a165ebc1f7c36ecbe3e5583990ea0db81f554`; they informed the reviewed
-exceptions but are not CI oracles. The checked-in differential workflow runs
-against the pinned Go module.
+shipped tables were extracted from C revision
+`d88a8f86d617ac8dcb9169c9f34637aaac71ac76`, recorded in `data/tables.json`.
+The checked-in differential workflow runs both the pinned Go module and the C
+checkout at `533a165ebc1f7c36ecbe3e5583990ea0db81f554`, recorded in
+`tests/parity/manifest.json`, as CI oracles.

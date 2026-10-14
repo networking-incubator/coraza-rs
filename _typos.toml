@@ -7,6 +7,7 @@ extend-exclude = [
 [default]
 extend-ignore-re = [
     '<XML ID="xss"><I><B>&lt;IMG SRC="javas<!-- -->cript:javascript:alert\(1\)"&gt;</B></I></XML><SPAN DATASRC="#xss" DATAFLD="B" DATAFORMATAS="HTML"></SPAN>',
+    'x:ontimer=.*cript\$x:alert\(1\)',
 ]
 
 [default.extend-words]

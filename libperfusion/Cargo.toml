@@ -8,7 +8,16 @@ repository.workspace = true
 description = "A pure Rust port of libinjection for SQL injection and XSS detection"
 keywords = ["libinjection", "sqli", "xss", "sql-injection", "waf"]
 readme = "README.md"
-include = ["Cargo.toml", "README.md", "LICENSE", "build.rs", "data/**", "src/**"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "LICENSES/**",
+    "THIRD_PARTY_NOTICES.md",
+    "build.rs",
+    "data/**",
+    "src/**",
+]
 
 [lib]
 bench = false
