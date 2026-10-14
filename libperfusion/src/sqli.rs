@@ -132,7 +132,7 @@ pub(crate) struct State<'a, L = BuiltinSqlLookup> {
     lexer: Lexer<'a, L>,
     /// One more slot than a fingerprint needs, since a sixth token is
     /// sometimes read to decide the type of the fifth.
-    pub tokens: [Token; 8],
+    pub tokens: [Token; MAX_TOKENS + 1],
     fingerprint: Fingerprint,
     folded_len: usize,
 }
@@ -148,7 +148,7 @@ impl<'a, L: SqlLookup> State<'a, L> {
         Self {
             input,
             lexer: Lexer::with_lookup(input, quote, dialect, lookup),
-            tokens: [Token::default(); 8],
+            tokens: [Token::default(); MAX_TOKENS + 1],
             fingerprint: Fingerprint::default(),
             folded_len: 0,
         }
@@ -159,7 +159,7 @@ impl<'a, L: SqlLookup> State<'a, L> {
         let quote = self.lexer.quote;
         let dialect = self.lexer.dialect;
         self.lexer.reset(quote, dialect);
-        self.tokens = [Token::default(); 8];
+        self.tokens = [Token::default(); MAX_TOKENS + 1];
         self.fingerprint = Fingerprint::default();
         self.folded_len = 0;
     }
@@ -329,7 +329,7 @@ impl<'a, L: SqlLookup> State<'a, L> {
 
     pub(crate) fn fold_in_context(&mut self, quote: Quote, dialect: Dialect) -> usize {
         self.lexer.reset(quote, dialect);
-        self.tokens = [Token::default(); 8];
+        self.tokens = [Token::default(); MAX_TOKENS + 1];
         self.fingerprint = Fingerprint::default();
         self.folded_len = self.fold();
         self.folded_len

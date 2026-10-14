@@ -47,7 +47,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fuzz/corpus/raw_bytes" "$RUNNER_TEMP/fuzz/corpus/sql_grammar" "$RUNNER_TEMP/fuzz/corpus/html_grammar"
           mkdir -p "$RUNNER_TEMP/fuzz/artifacts/raw_bytes" "$RUNNER_TEMP/fuzz/artifacts/sql_grammar" "$RUNNER_TEMP/fuzz/artifacts/html_grammar"
           export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
-          cargo +nightly-2026-10-06 fuzz run raw_bytes "$RUNNER_TEMP/fuzz/corpus/raw_bytes" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65535 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/raw_bytes/" > "$RUNNER_TEMP/fuzz/raw_bytes.log" 2>&1
+          cargo +nightly-2026-10-06 fuzz run raw_bytes "$RUNNER_TEMP/fuzz/corpus/raw_bytes" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=262144 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/raw_bytes/" > "$RUNNER_TEMP/fuzz/raw_bytes.log" 2>&1
           cargo +nightly-2026-10-06 fuzz run sql_grammar "$RUNNER_TEMP/fuzz/corpus/sql_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/sql_grammar/" > "$RUNNER_TEMP/fuzz/sql_grammar.log" 2>&1
           cargo +nightly-2026-10-06 fuzz run html_grammar "$RUNNER_TEMP/fuzz/corpus/html_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/html_grammar/" > "$RUNNER_TEMP/fuzz/html_grammar.log" 2>&1
           tail -n 4 "$RUNNER_TEMP/fuzz/raw_bytes.log"

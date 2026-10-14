@@ -19,7 +19,7 @@ From `libperfusion/`, run:
 
 ```sh
 cargo +nightly fuzz run raw_bytes -- \
-  -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65535
+  -seed=20261007 -max_total_time=60 -timeout=5 -max_len=262144
 cargo +nightly fuzz run sql_grammar -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096
 cargo +nightly fuzz run html_grammar -- \
