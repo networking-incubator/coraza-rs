@@ -25,9 +25,10 @@
 
 mod complex;
 mod encoding;
+mod html_entities;
 mod simple;
 
-pub use complex::{normalise_path, normalise_path_win};
+pub use complex::{html_entity_decode, normalise_path, normalise_path_win};
 pub use encoding::{
     base64_decode, base64_decode_ext, base64_encode, hex_decode, hex_encode, length, md5_hash, none, remove_nulls,
     replace_nulls, sha1_hash, url_encode,
