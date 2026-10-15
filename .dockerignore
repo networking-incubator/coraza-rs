@@ -7,3 +7,5 @@
 !libperfusion/**
 !xtask/
 !xtask/Cargo.toml
+!xtask/src/
+!xtask/src/**

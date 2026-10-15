@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{convert::Infallible, str};
+use std::{collections::VecDeque, convert::Infallible, str};
 
 use bytes::Bytes;
 use serde::{
@@ -24,6 +24,8 @@ use crate::config::Config;
 
 /// shortcut: stops at four layers; raise the bound if a supported app decodes more.
 const MAX_PERCENT_DECODE_LAYERS: usize = 4;
+/// Keeps each `SQLi` detector call bounded while overlapping later token starts.
+const SQLI_WINDOW_TOKENS: usize = 8;
 
 /// A reason a message could not be fully inspected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,34 @@ struct Findings {
     sqli: bool,
     /// Whether XSS was found.
     xss: bool,
+}
+
+/// Scans bounded windows anchored at each SQL token start.
+fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
+    let mut tokenizer = libperfusion::SqlTokenizer::new(bytes, libperfusion::Quote::None, libperfusion::Dialect::Ansi);
+    let mut starts = VecDeque::with_capacity(SQLI_WINDOW_TOKENS + 1);
+    starts.extend(tokenizer.by_ref().take(SQLI_WINDOW_TOKENS + 1).map(|token| token.pos()));
+
+    while let Some(start) = starts.front().copied() {
+        let end = starts
+            .get(SQLI_WINDOW_TOKENS)
+            .copied()
+            .unwrap_or(bytes.len())
+            .min(start.saturating_add(libperfusion::MAX_INPUT_LEN));
+        if let Some(window) = bytes.get(start..end) {
+            if libperfusion::sqli(window).is_some() {
+                return true;
+            }
+        }
+
+        starts.pop_front();
+        let Some(token) = tokenizer.next() else {
+            break;
+        };
+        starts.push_back(token.pos());
+    }
+
+    false
 }
 
 impl Inspection {
@@ -235,7 +265,7 @@ impl Inspection {
 
     /// Runs both detectors over this byte slice, which is bounded by adapter limits.
     fn scan_bytes(&mut self, bytes: &[u8]) {
-        self.findings.sqli |= libperfusion::sqli_with_limit(bytes, bytes.len()).is_some();
+        self.findings.sqli |= has_sqli_in_overlapping_windows(bytes);
         self.findings.xss |= libperfusion::xss_with_limit(bytes, bytes.len());
     }
 
@@ -866,6 +896,22 @@ mod tests {
         );
     }
 
+    /// Restarts raw-body `SQLi` scanning after benign SQL tokens.
+    #[test]
+    fn scans_sqli_after_benign_sql_tokens_in_raw_body() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+
+        scan_body(
+            &mut inspection,
+            b"SELECT 1; SELECT 2; SELECT 3; SELECT 4; SELECT 5; 1 UNION SELECT password FROM users",
+            &format,
+        );
+
+        assert!(inspection.has_sqli(), "SQLi after benign SQL tokens must be found");
+    }
+
     /// Scans XSS at the end of a raw body longer than libperfusion's input limit.
     #[test]
     fn scans_xss_at_end_of_large_raw_body() {
@@ -942,7 +988,10 @@ mod tests {
         let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"query\"\r\n\r\n1 UNION SELECT password FROM users\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"comment\"\r\n\r\n<script>alert(1)</script>\r\n--BOUNDARY--\r\n";
         let mut raw = Inspection::new(&config);
         raw.scan_bytes(body);
-        assert!(!raw.has_sqli(), "multipart framing alone must reproduce the SQLi miss");
+        assert!(
+            raw.has_sqli(),
+            "SQLi after multipart framing must be found by raw scanning"
+        );
 
         let mut inspection = Inspection::new(&config);
         let format = inspection.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));

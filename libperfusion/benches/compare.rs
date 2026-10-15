@@ -151,29 +151,47 @@ fn median(samples: &mut [f64]) -> f64 {
     samples[samples.len() / 2]
 }
 
-fn benchmark<T>(inputs: &[Vec<u8>], detect: impl Fn(&[u8]) -> T) -> f64 {
-    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
-    for _ in 0..SAMPLE_COUNT {
-        samples.push(measure(inputs, &detect));
+fn benchmark_pair<T, U>(
+    name: &str,
+    inputs: &[Vec<u8>],
+    capped_detect: impl Fn(&[u8]) -> T,
+    caller_bounded_detect: impl Fn(&[u8]) -> U,
+) -> (f64, f64) {
+    let mut capped_samples = Vec::with_capacity(SAMPLE_COUNT);
+    let mut caller_bounded_samples = Vec::with_capacity(SAMPLE_COUNT);
+
+    for sample in 0..SAMPLE_COUNT {
+        let (capped, caller_bounded, order) = if sample % 2 == 0 {
+            let capped = measure(inputs, &capped_detect);
+            let caller_bounded = measure(inputs, &caller_bounded_detect);
+            (capped, caller_bounded, "capped-first")
+        } else {
+            let caller_bounded = measure(inputs, &caller_bounded_detect);
+            let capped = measure(inputs, &capped_detect);
+            (capped, caller_bounded, "caller-bounded-first")
+        };
+        println!(
+            "{name:<10} sample={:>2}/{SAMPLE_COUNT} order={order} | capped {:>8.1} ns/input | caller-bounded {:>8.1} ns/input",
+            sample + 1,
+            capped,
+            caller_bounded,
+        );
+        capped_samples.push(capped);
+        caller_bounded_samples.push(caller_bounded);
     }
-    median(&mut samples)
+
+    (median(&mut capped_samples), median(&mut caller_bounded_samples))
 }
 
 fn main() {
     for workload in workloads() {
         let (capped, caller_bounded) = match workload.detector {
-            Detector::Sqli => (
-                benchmark(&workload.inputs, libperfusion::sqli),
-                benchmark(&workload.inputs, |input| {
-                    libperfusion::sqli_with_limit(input, input.len())
-                }),
-            ),
-            Detector::Xss => (
-                benchmark(&workload.inputs, libperfusion::xss),
-                benchmark(&workload.inputs, |input| {
-                    libperfusion::xss_with_limit(input, input.len())
-                }),
-            ),
+            Detector::Sqli => benchmark_pair(workload.name, &workload.inputs, libperfusion::sqli, |input| {
+                libperfusion::sqli_with_limit(input, input.len())
+            }),
+            Detector::Xss => benchmark_pair(workload.name, &workload.inputs, libperfusion::xss, |input| {
+                libperfusion::xss_with_limit(input, input.len())
+            }),
         };
         println!(
             "{:<10} {:>5} inputs | capped {:>8.1} ns/input | caller-bounded {:>8.1} ns/input",
