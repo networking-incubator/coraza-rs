@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::VecDeque, convert::Infallible, str};
+use std::{convert::Infallible, str};
 
 use bytes::Bytes;
 use serde::{
@@ -24,8 +24,30 @@ use crate::config::Config;
 
 /// shortcut: stops at four layers; raise the bound if a supported app decodes more.
 const MAX_PERCENT_DECODE_LAYERS: usize = 4;
-/// Keeps each `SQLi` detector call bounded while overlapping later token starts.
-const SQLI_WINDOW_TOKENS: usize = 8;
+/// Bytes per detector window: the largest input libperfusion accepts whole.
+///
+/// Scanning in byte windows rather than token windows keeps every detector
+/// call library-equivalent: a window is a contiguous byte range, so a leading
+/// string delimiter stays in frame and folding sees the same context the
+/// library would.
+const WINDOW_BYTES: usize = libperfusion::MAX_INPUT_LEN;
+/// Overlap between consecutive windows.
+///
+/// A fingerprint spans at most five folded tokens and a token holds at most
+/// `TOKEN_SIZE` (32) bytes, so this is far more than a payload straddling a
+/// window boundary can need to land wholly inside one window.
+const WINDOW_OVERLAP: usize = 4 * 1024;
+/// Distance between consecutive window starts.
+const WINDOW_STRIDE: usize = WINDOW_BYTES - WINDOW_OVERLAP;
+/// Largest window that also gets token-anchored restarts.
+///
+/// A benign SQL prefix changes the folded state of the whole input, so a
+/// payload after one can need a restart to surface. Restarts cost one
+/// detector call each, so they are confined to windows small enough that the
+/// extra calls stay cheap; larger inputs rely on the overlapping windows.
+const RESTART_MAX_BYTES: usize = 8 * 1024;
+/// Upper bound on token-anchored restarts per window.
+const MAX_RESTARTS: usize = 16;
 
 /// A reason a message could not be fully inspected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,32 +134,87 @@ struct Findings {
     xss: bool,
 }
 
-/// Scans bounded windows anchored at each SQL token start.
-fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
-    let mut tokenizer = libperfusion::SqlTokenizer::new(bytes, libperfusion::Quote::None, libperfusion::Dialect::Ansi);
-    let mut starts = VecDeque::with_capacity(SQLI_WINDOW_TOKENS + 1);
-    starts.extend(tokenizer.by_ref().take(SQLI_WINDOW_TOKENS + 1).map(|token| token.pos()));
-
-    while let Some(start) = starts.front().copied() {
-        let end = starts
-            .get(SQLI_WINDOW_TOKENS)
-            .copied()
-            .unwrap_or(bytes.len())
-            .min(start.saturating_add(libperfusion::MAX_INPUT_LEN));
-        if let Some(window) = bytes.get(start..end) {
-            if libperfusion::sqli(window).is_some() {
-                return true;
-            }
-        }
-
-        starts.pop_front();
-        let Some(token) = tokenizer.next() else {
-            break;
-        };
-        starts.push_back(token.pos());
+/// Runs `detect` over overlapping byte windows of the input.
+///
+/// Windows are anchored at byte offsets, starting at zero, so no leading byte
+/// is ever skipped and every call sees a contiguous range the detector can
+/// take whole. The number of calls is `O(len / WINDOW_STRIDE)` rather than
+/// `O(tokens)`.
+fn scan_overlapping_windows(bytes: &[u8], detect: impl Fn(&[u8]) -> bool) -> bool {
+    if bytes.is_empty() {
+        return false;
     }
 
-    false
+    let mut start = 0_usize;
+    loop {
+        let end = start.saturating_add(WINDOW_BYTES).min(bytes.len());
+        let Some(window) = bytes.get(start..end) else {
+            return false;
+        };
+        if detect(window) {
+            return true;
+        }
+        if end == bytes.len() {
+            return false;
+        }
+        start = start.saturating_add(WINDOW_STRIDE);
+    }
+}
+
+/// Reports whether any window of `bytes` reads as `SQLi`.
+///
+/// Each window is first tested whole, which reproduces the verdict
+/// `libperfusion::sqli()` would give for that range, and then from a bounded
+/// set of token-anchored restarts so a benign SQL prefix cannot mask a
+/// payload that follows it.
+fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
+    scan_overlapping_windows(bytes, |window| {
+        libperfusion::sqli(window).is_some() || has_sqli_from_token_restart(window)
+    })
+}
+
+/// Reports whether any window of `bytes` reads as XSS.
+///
+/// `xss_with_limit` skips libperfusion's own input-length guard, so bounding
+/// the scan here is what keeps a large body from being scanned unbounded.
+fn has_xss_in_overlapping_windows(bytes: &[u8]) -> bool {
+    scan_overlapping_windows(bytes, |window| libperfusion::xss_with_limit(window, window.len()))
+}
+
+/// Re-tests a window from a bounded, evenly spread set of token starts.
+///
+/// Each restart backs up over an opening string delimiter so the quote stays
+/// in frame: `SqlToken::pos()` points at a string's body, one byte past the
+/// delimiter that opened it.
+fn has_sqli_from_token_restart(window: &[u8]) -> bool {
+    if window.len() > RESTART_MAX_BYTES {
+        return false;
+    }
+
+    let tokens = tokenizer(window).count();
+    if tokens < 2 {
+        return false;
+    }
+    let step = tokens.div_ceil(MAX_RESTARTS).max(1);
+
+    tokenizer(window)
+        .enumerate()
+        .skip(1)
+        .filter(|(index, _)| index % step == 0)
+        .take(MAX_RESTARTS)
+        .any(|(_, token)| {
+            let start = token
+                .pos()
+                .saturating_sub(usize::from(token.string_open().is_some()));
+            window
+                .get(start..)
+                .is_some_and(|tail| libperfusion::sqli(tail).is_some())
+        })
+}
+
+/// Builds the tokenizer used to locate restart offsets.
+fn tokenizer(window: &[u8]) -> libperfusion::SqlTokenizer<'_> {
+    libperfusion::SqlTokenizer::new(window, libperfusion::Quote::None, libperfusion::Dialect::Ansi)
 }
 
 impl Inspection {
@@ -263,10 +340,10 @@ impl Inspection {
         self.scan_percent_encoded_views(bytes);
     }
 
-    /// Runs both detectors over this byte slice, which is bounded by adapter limits.
+    /// Runs both detectors over this byte slice in bounded overlapping windows.
     fn scan_bytes(&mut self, bytes: &[u8]) {
         self.findings.sqli |= has_sqli_in_overlapping_windows(bytes);
-        self.findings.xss |= libperfusion::xss_with_limit(bytes, bytes.len());
+        self.findings.xss |= has_xss_in_overlapping_windows(bytes);
     }
 
     /// Scans bounded percent-decoded views while retaining the original bytes.
@@ -877,6 +954,101 @@ mod tests {
 
         assert!(inspection.has_xss(), "encoded raw-body XSS must be inspected");
         assert_eq!(inspection.incomplete(), None, "covered layers are complete");
+    }
+
+    /// Payloads whose first byte is the string delimiter that opens the injection.
+    ///
+    /// These are the canonical boolean-blind strings. An earlier token-anchored
+    /// scanner dropped the opening quote, because a string token's position is
+    /// its body, so none of them were detected.
+    const LEADING_QUOTE_PAYLOADS: [&[u8]; 4] = [b"' OR ''='", b"' OR 'x'='x", b"\" OR \"\"=\"", b"'IS UNIONb<NULL"];
+
+    /// Detects leading-delimiter `SQLi` in headers, raw bodies and multipart parts.
+    #[test]
+    fn detects_leading_quote_payloads_on_every_surface() {
+        let config = Config::default();
+
+        for payload in LEADING_QUOTE_PAYLOADS {
+            let text = String::from_utf8_lossy(payload).into_owned();
+
+            let mut header = Inspection::new(&config);
+            header.headers(&headers(&[("x-search", &text)]));
+            assert!(
+                header.has_sqli(),
+                "header value starting with a delimiter must be detected: {text:?}"
+            );
+
+            let mut raw = Inspection::new(&config);
+            let format = raw.headers(&headers(&[("content-type", "text/plain")]));
+            scan_body(&mut raw, payload, &format);
+            assert!(raw.has_sqli(), "raw body starting with a delimiter must be detected: {text:?}");
+
+            let mut multipart = Inspection::new(&config);
+            let format = multipart.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+            let mut body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n".to_vec();
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+            scan_body(&mut multipart, &body, &format);
+            assert!(
+                multipart.has_sqli(),
+                "multipart part starting with a delimiter must be detected: {text:?}"
+            );
+        }
+    }
+
+    /// The window scanner must never be less sensitive than the library it wraps.
+    ///
+    /// Holding this property is what keeps the filter's verdict equivalent to
+    /// `libperfusion::sqli()` for every input the library accepts whole.
+    #[test]
+    fn window_scan_is_never_weaker_than_whole_input_sqli() {
+        let mut corpus: Vec<&[u8]> = vec![
+            b"1' OR '1'='1",
+            b"1 UNION SELECT password FROM users",
+            b"admin'--",
+            b"1; EXEC xp_cmdshell('dir')",
+            b"1' AND substr(a,1,1)='a",
+            // Inputs the report recorded as lost by the token-window scanner.
+            b"'--FROM&& 1bCAST*LIKE,1 ",
+            b"NOT*1,|| INT<passwordLIKEANDCASTNULL/ISBETWEENIS --, '=' WHERE/",
+            b"1,users)*INTWHERE1users IS - UNIONWHERE|| ",
+            b"\"IS UNIONb<NULL",
+            b"BETWEEN ||EXECpassword+ */ OR)INTSELECT <*/ INTb<#\"=AS\"\"/*&&",
+        ];
+        corpus.extend_from_slice(&LEADING_QUOTE_PAYLOADS);
+
+        for case in corpus {
+            if case.len() <= libperfusion::MAX_INPUT_LEN && libperfusion::sqli(case).is_some() {
+                assert!(
+                    super::has_sqli_in_overlapping_windows(case),
+                    "window scan lost a detection the library makes: {:?}",
+                    String::from_utf8_lossy(case)
+                );
+            }
+        }
+    }
+
+    /// Keeps whole-message inspection off the pathological per-token path.
+    ///
+    /// This is a tripwire for order-of-magnitude regressions, not a
+    /// measurement: the bound is far above the expected cost so it stays
+    /// stable on a loaded or unoptimised builder.
+    #[test]
+    fn inspects_dense_token_body_within_time_budget() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+        let body = vec![b','; 1024 * 1024];
+
+        let started = std::time::Instant::now();
+        scan_body(&mut inspection, &body, &format);
+        let elapsed = started.elapsed();
+        eprintln!("1 MiB dense-token body inspected in {elapsed:?}");
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "1 MiB of dense tokens took {elapsed:?}; the per-token scanner cost ~221 ms in release"
+        );
     }
 
     /// Scans `SQLi` at the end of a raw body longer than libperfusion's input limit.
