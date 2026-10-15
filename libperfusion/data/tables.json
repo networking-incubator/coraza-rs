@@ -1,4 +1,19 @@
 {
+  "local": {
+    "sql": {
+      "entries": 29,
+      "file": "sqli_keywords_local.txt",
+      "sha256": "d6fb4572ed201908c3a950588851f77058af229b03a7aa67a96adb2261963b57"
+    },
+    "xss": {
+      "attributes": 12,
+      "entries": 13,
+      "events": 0,
+      "file": "xss_tables_local.txt",
+      "sha256": "abad7872e7a2aa3a9dd59db93279d3dfe34328e99218bdebe91e7deb649925b5",
+      "tags": 1
+    }
+  },
   "schema": 1,
   "source": {
     "commit": "d88a8f86d617ac8dcb9169c9f34637aaac71ac76",
@@ -6,14 +21,14 @@
     "version": "v4.0.0-8-gd88a8f8"
   },
   "sql": {
-    "entries": 9381,
-    "sha256": "d0ac94c702edd05bc27110fab914d6934ad1ef58e8eef8a55f6ab09ca46fcd87"
+    "entries": 9352,
+    "sha256": "d9f0395d3e9b90c70c59f45d6be0408ef493bd854933b276e44614cb9d6b56bd"
   },
   "xss": {
-    "attributes": 32,
-    "entries": 485,
+    "attributes": 20,
+    "entries": 472,
     "events": 432,
-    "sha256": "cf390e3d2c444960ccefbac5c91107390202ba521a7686ca32aab61c0d32336d",
-    "tags": 21
+    "sha256": "810bc9a015c0c3d699e498e6f486a718dd216f966844b8b5732129028290aff6",
+    "tags": 20
   }
 }

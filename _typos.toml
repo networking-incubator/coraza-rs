@@ -1,6 +1,7 @@
 [files]
 extend-exclude = [
     "libperfusion/data/sqli_keywords.txt",
+    "libperfusion/data/sqli_keywords_local.txt",
     "libperfusion/tests/corpus/test-*.txt",
 ]
 

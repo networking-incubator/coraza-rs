@@ -60,6 +60,86 @@ fn c_strings(body: &str) -> Vec<(&str, &str)> {
     parts.chunks(2).map(|pair| (pair[0], pair[1])).collect()
 }
 
+/// The non-comment rows of a canonical data file, split on tabs.
+fn data_rows(name: &str) -> Vec<Vec<String>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split('\t').map(str::to_owned).collect())
+        .collect()
+}
+
+/// `build.rs` merges the upstream-generated tables with the local
+/// supplements, so a `tables-refresh` that rewrites only the upstream files
+/// must not drop the local rows.
+#[test]
+fn local_supplements_are_merged_into_the_generated_tables() {
+    let sql_local = data_rows("sqli_keywords_local.txt");
+    assert!(!sql_local.is_empty(), "no local SQL rows to merge");
+    for row in &sql_local {
+        let (key, value) = (row[0].as_str(), row[1].as_str());
+        let found = SQL_KEYWORDS
+            .iter()
+            .find(|&&(word, _)| word == key)
+            .unwrap_or_else(|| panic!("local SQL row {key} is missing from the generated table"));
+        assert_eq!(String::from_utf8(vec![found.1.as_byte()]).unwrap(), value, "{key}");
+    }
+    for row in data_rows("sqli_keywords.txt") {
+        assert!(
+            SQL_KEYWORDS.iter().any(|&(word, _)| word == row[0]),
+            "upstream SQL row {} is missing from the generated table",
+            row[0]
+        );
+    }
+    // The lookup hash table and upstream's binary search both need this.
+    assert!(
+        SQL_KEYWORDS.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "the merged SQL table is not sorted or has duplicates"
+    );
+
+    let xss_local = data_rows("xss_tables_local.txt");
+    assert!(!xss_local.is_empty(), "no local XSS rows to merge");
+    for row in &xss_local {
+        match row[0].as_str() {
+            "tag" => assert!(BLACK_TAGS.contains(&row[1].as_str()), "local tag {} is missing", row[1]),
+            "event" => assert!(
+                BLACK_ATTR_EVENTS.contains(&row[1].as_str()),
+                "local event {} is missing",
+                row[1]
+            ),
+            "attr" => {
+                let attribute = match row[2].as_str() {
+                    "Black" => Attribute::Black,
+                    "Url" => Attribute::Url,
+                    "Style" => Attribute::Style,
+                    "Indirect" => Attribute::Indirect,
+                    other => panic!("unknown attribute type {other}"),
+                };
+                assert!(
+                    BLACK_ATTRS.contains(&(row[1].as_str(), attribute)),
+                    "local attribute {} is missing",
+                    row[1]
+                );
+            },
+            other => panic!("unknown local XSS row kind {other}"),
+        }
+    }
+    // The upstream rows come first, so the local ones only extend each table.
+    let upstream_xss = data_rows("xss_tables.txt");
+    let upstream_tags = upstream_xss.iter().filter(|row| row[0] == "tag").count();
+    let upstream_attrs = upstream_xss.iter().filter(|row| row[0] == "attr").count();
+    assert_eq!(
+        BLACK_TAGS.len(),
+        upstream_tags + xss_local.iter().filter(|r| r[0] == "tag").count()
+    );
+    assert_eq!(
+        BLACK_ATTRS.len(),
+        upstream_attrs + xss_local.iter().filter(|r| r[0] == "attr").count()
+    );
+}
+
 #[test]
 #[ignore = "exact table comparison; requires upstream sources via LIBINJECTION_DIR"]
 fn sql_keywords() {
@@ -75,7 +155,17 @@ fn sql_keywords() {
         })
         .collect();
 
-    let table: Vec<(&str, u8)> = SQL_KEYWORDS.iter().map(|&(word, ty)| (word, ty.as_byte())).collect();
+    // The generated table merges the local supplement in, so compare only
+    // the upstream-derived rows; the merge itself is checked above.
+    let local: Vec<String> = data_rows("sqli_keywords_local.txt")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    let table: Vec<(&str, u8)> = SQL_KEYWORDS
+        .iter()
+        .filter(|&&(word, _)| !local.iter().any(|key| key == word))
+        .map(|&(word, ty)| (word, ty.as_byte()))
+        .collect();
     assert!(table == upstream, "src/sqli/keyword_table.rs is out of date");
 }
 
@@ -107,7 +197,11 @@ fn xss_event_handlers() {
     let source = common::upstream_source("src/libinjection_xss.c");
     let body = c_array_body(&source, "BLACKATTREVENT[] = {");
     let events: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
-    assert!(BLACK_ATTR_EVENTS[..] == events[..], "src/xss/events.rs is out of date");
+    // Local supplement rows are appended after the upstream ones.
+    assert!(
+        BLACK_ATTR_EVENTS[..events.len()] == events[..],
+        "src/xss/events.rs is out of date"
+    );
 }
 
 #[test]
@@ -134,7 +228,7 @@ fn xss_attributes() {
             (name, attribute)
         })
         .collect();
-    assert_eq!(BLACK_ATTRS[..], attrs[..]);
+    assert_eq!(BLACK_ATTRS[..attrs.len()], attrs[..]);
 }
 
 #[test]
@@ -143,5 +237,5 @@ fn xss_tags() {
     let source = common::upstream_source("src/libinjection_xss.c");
     let body = c_array_body(&source, "BLACKTAG[] = {");
     let tags: Vec<&str> = c_strings(&body).into_iter().map(|(name, _)| name).collect();
-    assert_eq!(BLACK_TAGS[..], tags[..]);
+    assert_eq!(BLACK_TAGS[..tags.len()], tags[..]);
 }

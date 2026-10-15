@@ -101,7 +101,8 @@ these shapes; each is covered by a test in `tests/regressions.rs`.
 | `#` comment whitelist narrowed | suppresses every `sc` whose comment starts with `#` | suppressed unless the comment closes a string the input did not open and ends the input | `admin'#` is a complete MySQL authentication bypass; the blanket suppression dates from a corpus in which a bare `#` in prose was common |
 | `--` comment whitelist narrowed | suppresses any comment token longer than two bytes | allowed through when the comment body is entirely whitespace and ends the input | ANSI SQL and MySQL both require whitespace after `--`, so `admin'-- ` is the more canonical terminator and the whitelist was inverted relative to exploitability |
 | 8 stacked-statement fingerprints added | `01;ES`, `01;T`, `0S;ES`, `0S;T`, `01;TN`, `0S;TN`, `01;TC`, `0S;TC` absent | present | Length-4 coverage is thin upstream, so `1;WAITFOR DELAY '0:0:5'` passed while `1;WAITFOR DELAY '0:0:5',` was caught |
-| 21 dialect identifiers added | absent | present | A callable missing from the table is classified `Bareword`, which moves the fingerprint off the denylist; see `data/sqli_keywords.txt` |
+| 21 dialect identifiers added | absent | present | A callable missing from the table is classified `Bareword`, which moves the fingerprint off the denylist; see `data/sqli_keywords_local.txt` |
+| 12 URL-bearing attributes and the `MATH` tag added | absent | present | `SRCSET`, `PING`, `CITE`, and the rest carry a URL that upstream never inspects, and no black tag backstops them; see `data/xss_tables_local.txt` |
 
 Identifiers were chosen to have no plausible reading as ordinary prose.
 Common English words that appear in the dialect references -- `WINDOW`,
@@ -116,9 +117,18 @@ fully qualified names such as `UTL_INADDR.GET_HOST_ADDRESS`, and classifying
 the bare package stops the lexer merging the dotted form, which *loses* a
 detection the table already had.
 
-`differential.tables` and `differential.source_sha256` in
-`tests/parity/manifest.json`, and `sql` in `data/tables.json`, are updated to
-match. The pinned Go and C oracles still describe upstream, so the optional
+The added rows live in `data/sqli_keywords_local.txt` and
+`data/xss_tables_local.txt`, not in the upstream-generated
+`data/sqli_keywords.txt` and `data/xss_tables.txt`. `build.rs` merges each
+supplement into the matching upstream table at compile time, so
+`cargo xtask tables-refresh --upstream <checkout>` can rewrite the upstream
+files from a newer C revision without dropping the local rows. The
+upstream-generated files therefore stay byte-identical to what the pinned
+revision produces, and `tables` and `source_sha256` in
+`tests/parity/manifest.json` and `sql`/`xss` in `data/tables.json` continue to
+describe upstream alone; the supplements are pinned by `local` in
+`data/tables.json` and verified by `cargo xtask tables-check`. The pinned Go
+and C oracles still describe upstream, so the optional
 `make parity-differential` gate reports these shapes as differences.
 
 ## Provenance

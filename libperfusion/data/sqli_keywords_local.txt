@@ -1,0 +1,37 @@
+# Local SQL additions, merged with data/sqli_keywords.txt at build time.
+#
+# These rows are authored by this project, not extracted from libinjection.
+# Keep them here so `cargo xtask tables-refresh` can rewrite the upstream
+# file without losing them. Entries must be sorted, unique, and absent from
+# the upstream table; build.rs merges the two tables and rejects duplicates.
+#
+# Format: KEY<TAB>VALUE_BYTE
+01;ES	F
+01;T	F
+01;TC	F
+01;TN	F
+0S;ES	F
+0S;T	F
+0S;TC	F
+0S;TN	F
+ATTACH	T
+COPY	T
+DETACH	T
+GTID_SUBSET	f
+GTID_SUBTRACT	f
+JSONB_EXTRACT_PATH	f
+JSON_AGG	f
+JSON_EXTRACT	f
+JSON_QUERY	f
+JSON_TABLE	f
+JSON_VALUE	f
+LO_EXPORT	f
+LO_IMPORT	f
+OPENJSON	f
+STRING_SPLIT	f
+SYSTEM_TIME	k
+TABLESAMPLE	k
+UNPIVOT	k
+VACUUM	T
+WAIT_FOR_EXECUTED_GTID_SET	f
+XP_CMDSHELL	f

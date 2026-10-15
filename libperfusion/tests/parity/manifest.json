@@ -2541,19 +2541,19 @@
       "reviewed_xss_differences": 24
     },
     "tables": {
-      "sql_keyword_entries": 9381,
-      "sql_fingerprint_entries": 8375,
+      "sql_keyword_entries": 9352,
+      "sql_fingerprint_entries": 8367,
       "sql_dispatch_bytes": 256,
       "sql_dispatch_sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e",
       "xss_tables": {
-        "tags": 21,
+        "tags": 20,
         "events": 432,
-        "attributes": 32
+        "attributes": 20
       },
       "xss_table_sha256": {
-        "tags": "05163aeade51774a2909afc58566e2d7c4479512b2cdf5bf9f6d0325136c2842",
+        "tags": "7c67dd16500749855f3752ea228ed62ce3d8bb68b5f7ef4b8d466975593419fe",
         "events": "745e347f29e0052ad0431d9149f721c30e6d3b1e68abdebca17db62a8febd9c1",
-        "attributes": "00d12d12aaf3035c3427a786c68640ff2ce7cd89af61ce878219028a318acac4"
+        "attributes": "f6182c0a6a197aa07bdabb8fa969941a6a4e35eebbfec2282a39fac47b9c52bc"
       }
     },
     "source_sha256": {
@@ -2566,7 +2566,7 @@
       "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
       "xss.go": "768f919a0f0dd54cb9777fee388c539632b16f1ccec8701529c4d476d96e4aaf",
       "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023",
-      "data/sqli_keywords.txt": "c38b748b91b5a2093b91066975372ede052c1bef5aa7eee0d00eb660809ea811"
+      "data/sqli_keywords.txt": "1914890e6eb9166066ad587db18b7c2309830a0612533fbf97744ca260079bfd"
     },
     "exceptions": [],
     "expected_oracle_errors": []
