@@ -111,10 +111,20 @@ impl Config {
             || config.max_response_body_bytes > MAX_BODY_BYTES
             || config.max_field_bytes > MAX_FIELD_BYTES
             || config.max_field_bytes > config.max_request_body_bytes
+            || config.max_field_bytes > config.max_response_body_bytes
             || config.max_fields > MAX_FIELDS
             || config.max_json_depth > MAX_JSON_DEPTH
         {
             return Err(ConfigError::LimitTooLarge);
+        }
+        if config.has_inert_incomplete_policy() {
+            log::warn!(
+                "libperfusion: incomplete_inspection_policy=reject has no effect while request_mode={:?} \
+                 and response_mode={:?}; incomplete messages will be forwarded. Set mode=block in the \
+                 direction that must fail closed.",
+                config.request_mode,
+                config.response_mode
+            );
         }
         Ok(config)
     }
@@ -122,6 +132,18 @@ impl Config {
     /// Rejects incomplete inspection only when that direction is blocking.
     pub(crate) fn rejects_incomplete(&self, mode: Mode) -> bool {
         mode == Mode::Block && self.incomplete_inspection_policy == IncompletePolicy::Reject
+    }
+
+    /// Reports a reject policy that no direction can ever act on.
+    ///
+    /// `rejects_incomplete` requires `Mode::Block`, so pairing the strict
+    /// policy with two non-blocking modes reduces every incomplete signal to
+    /// a log line. That combination is the shipped default, which invites
+    /// operators to believe they have fail-closed behaviour when they do not.
+    pub(crate) fn has_inert_incomplete_policy(&self) -> bool {
+        self.incomplete_inspection_policy == IncompletePolicy::Reject
+            && self.request_mode != Mode::Block
+            && self.response_mode != Mode::Block
     }
 }
 
@@ -135,7 +157,9 @@ impl Default for Config {
             incomplete_inspection_policy: IncompletePolicy::Reject,
             max_request_body_bytes: 1024 * 1024,
             max_response_body_bytes: 1024 * 1024,
-            max_fields: 1024,
+            // Header name and value each count as a field, so a budget in the
+            // low thousands is consumed quickly by header-heavy meshes.
+            max_fields: 8192,
             max_field_bytes: 64 * 1024,
             max_json_depth: 32,
         }
@@ -209,6 +233,33 @@ mod tests {
                 "configuration must exceed a supported maximum"
             );
         }
+    }
+
+    /// Flags a reject policy that no configured direction can act on.
+    #[test]
+    fn detects_inert_incomplete_policy_combination() {
+        assert!(
+            Config::default().has_inert_incomplete_policy(),
+            "the shipped default pairs a reject policy with two detect modes"
+        );
+
+        let blocking = Config {
+            request_mode: Mode::Block,
+            ..Config::default()
+        };
+        assert!(
+            !blocking.has_inert_incomplete_policy(),
+            "a blocking direction makes the reject policy effective"
+        );
+
+        let reporting = Config {
+            incomplete_inspection_policy: IncompletePolicy::Report,
+            ..Config::default()
+        };
+        assert!(
+            !reporting.has_inert_incomplete_policy(),
+            "a report policy is self-consistent in detect mode"
+        );
     }
 
     /// Keeps incomplete messages passable in detect mode despite a reject policy.
