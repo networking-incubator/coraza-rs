@@ -34,16 +34,16 @@ const SAMPLE_TIME: std::time::Duration = std::time::Duration::from_millis(15);
 const LONG_INPUT: usize = 4_096;
 
 #[derive(Clone, Copy, Debug)]
-enum Detector {
+pub(crate) enum Detector {
     Sqli,
     Xss,
 }
 
-struct Workload {
-    detector: Detector,
-    shape: &'static str,
-    input: Vec<u8>,
-    expected_hit: bool,
+pub(crate) struct Workload {
+    pub(crate) detector: Detector,
+    pub(crate) shape: &'static str,
+    pub(crate) input: Vec<u8>,
+    pub(crate) expected_hit: bool,
 }
 
 fn repeated(pattern: &[u8], size: usize) -> Vec<u8> {
@@ -122,7 +122,7 @@ fn add(workloads: &mut Vec<Workload>, detector: Detector, shape: &'static str, i
     clippy::too_many_lines,
     reason = "The workload matrix keeps each generated input shape beside its detector and expected verdict."
 )]
-fn workloads() -> Vec<Workload> {
+pub(crate) fn workloads() -> Vec<Workload> {
     let mut workloads = Vec::new();
     let xss_head = b"<script>alert(1)</script>";
     let xss_tail = b"<a href='&#x6a;avascript:alert(1)'>x</a>";
@@ -265,8 +265,8 @@ fn workloads() -> Vec<Workload> {
 
 fn verify(workload: &Workload) -> &'static str {
     let detected = match workload.detector {
-        Detector::Sqli => libperfusion::sqli(&workload.input).is_some(),
-        Detector::Xss => libperfusion::xss(&workload.input),
+        Detector::Sqli => libperfusion::sqli_with_limit(&workload.input, workload.input.len()).is_some(),
+        Detector::Xss => libperfusion::xss_with_limit(&workload.input, workload.input.len()),
     };
     assert_eq!(
         detected,
@@ -324,8 +324,18 @@ fn main() {
     );
     for (workload, outcome) in workloads.iter().zip(&outcomes) {
         match workload.detector {
-            Detector::Sqli => run(workload, "SQLi", libperfusion::sqli, outcome),
-            Detector::Xss => run(workload, "XSS", libperfusion::xss, outcome),
+            Detector::Sqli => run(
+                workload,
+                "SQLi",
+                |input| libperfusion::sqli_with_limit(input, input.len()),
+                outcome,
+            ),
+            Detector::Xss => run(
+                workload,
+                "XSS",
+                |input| libperfusion::xss_with_limit(input, input.len()),
+                outcome,
+            ),
         }
     }
 }

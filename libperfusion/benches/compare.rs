@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Measure libperfusion on the pinned repository corpus:
+//! Compare capped and caller-bounded libperfusion APIs on the repository corpus:
 //! `cargo bench -p libperfusion --bench compare`.
 
 #![expect(
@@ -161,15 +161,26 @@ fn benchmark<T>(inputs: &[Vec<u8>], detect: impl Fn(&[u8]) -> T) -> f64 {
 
 fn main() {
     for workload in workloads() {
-        let time = match workload.detector {
-            Detector::Sqli => benchmark(&workload.inputs, libperfusion::sqli),
-            Detector::Xss => benchmark(&workload.inputs, libperfusion::xss),
+        let (capped, caller_bounded) = match workload.detector {
+            Detector::Sqli => (
+                benchmark(&workload.inputs, libperfusion::sqli),
+                benchmark(&workload.inputs, |input| {
+                    libperfusion::sqli_with_limit(input, input.len())
+                }),
+            ),
+            Detector::Xss => (
+                benchmark(&workload.inputs, libperfusion::xss),
+                benchmark(&workload.inputs, |input| {
+                    libperfusion::xss_with_limit(input, input.len())
+                }),
+            ),
         };
         println!(
-            "{:<10} {:>5} inputs | libperfusion {:>8.1} ns/input",
+            "{:<10} {:>5} inputs | capped {:>8.1} ns/input | caller-bounded {:>8.1} ns/input",
             workload.name,
             workload.inputs.len(),
-            time
+            capped,
+            caller_bounded
         );
     }
 }

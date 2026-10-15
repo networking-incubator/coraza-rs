@@ -95,6 +95,49 @@ static ATTRIBUTE_NAME_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r/=>");
 /// What ends an unquoted attribute value: whitespace or '>'.
 static UNQUOTED_VALUE_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r>");
 
+/// Short spans are cheaper to check directly before searching multiple delimiter groups.
+const HTML_SCALAR_PREFIX: usize = 128;
+
+/// Returns the earliest match from a small group of accelerated byte searches.
+fn first_match(s: &[u8], matches: [Option<usize>; 3]) -> usize {
+    matches.into_iter().flatten().min().unwrap_or(s.len())
+}
+
+/// Finds HTML whitespace without treating NUL as whitespace in tokenizer spans.
+fn html_space_cspan(s: &[u8]) -> usize {
+    first_match(
+        s,
+        [
+            memchr::memchr3(b' ', b'\t', b'\n', s),
+            memchr::memchr3(0x0B, 0x0C, b'\r', s),
+            None,
+        ],
+    )
+}
+
+/// Finds the end of an attribute name using the HTML delimiter bytes.
+fn attribute_name_cspan(s: &[u8]) -> usize {
+    if s.len() <= HTML_SCALAR_PREFIX {
+        return cspan(s, &ATTRIBUTE_NAME_END);
+    }
+
+    let prefix = cspan(&s[..HTML_SCALAR_PREFIX], &ATTRIBUTE_NAME_END);
+    if prefix < HTML_SCALAR_PREFIX {
+        return prefix;
+    }
+
+    HTML_SCALAR_PREFIX + attribute_name_rest_cspan(&s[HTML_SCALAR_PREFIX..])
+}
+
+/// Searches the long attribute-name tail after the scalar prefix has no match.
+#[inline(never)]
+fn attribute_name_rest_cspan(s: &[u8]) -> usize {
+    first_match(
+        s,
+        [Some(html_space_cspan(s)), memchr::memchr3(b'/', b'=', b'>', s), None],
+    )
+}
+
 /// Upstream's `h5_is_white`, a `strchr` that also matches NUL.
 fn is_white(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | 0)
@@ -322,7 +365,7 @@ impl<'a> Tokenizer<'a> {
         let s = self.s;
         let start = self.pos;
         // The first byte is part of the name, whatever it is.
-        let end = start + 1 + cspan(&s[start + 1..], &ATTRIBUTE_NAME_END);
+        let end = start + 1 + attribute_name_cspan(&s[start + 1..]);
         (self.state, self.pos) = match s.get(end) {
             None => (State::Eof, end),
             Some(b'/') => (State::SelfClosingStartTag, end + 1),
@@ -600,6 +643,13 @@ impl<'a> Iterator for Tokenizer<'a> {
 mod tests {
     use super::*;
 
+    /// Collects token kinds and owned token bytes for direct context assertions.
+    fn token_pairs(context: Context, input: &[u8]) -> Vec<(TokenKind, Vec<u8>)> {
+        Tokenizer::new(input, context)
+            .map(|token| (token.kind, token.text.to_vec()))
+            .collect()
+    }
+
     #[test]
     fn attribute_tokens_preserve_embedded_nul_bytes_and_spans() {
         let input = b"<a on\0error=ja\0va:>";
@@ -613,6 +663,84 @@ mod tests {
             tokens
                 .iter()
                 .any(|token| token.kind == TokenKind::AttrValue && token.text == b"ja\0va:")
+        );
+    }
+
+    #[test]
+    fn accelerated_attribute_name_span_matches_the_byte_table_for_every_byte() {
+        let lengths = [
+            0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+        ];
+        for byte in u8::MIN..=u8::MAX {
+            for length in lengths {
+                if length == 0 {
+                    assert_eq!(attribute_name_cspan(&[]), cspan(&[], &ATTRIBUTE_NAME_END));
+                    continue;
+                }
+                for position in 0..length {
+                    let mut input = vec![b'a'; length];
+                    input[position] = byte;
+                    assert_eq!(
+                        attribute_name_cspan(&input),
+                        cspan(&input, &ATTRIBUTE_NAME_END),
+                        "attribute-name delimiter {byte:#04x} at {position}/{length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accelerated_html_spans_return_the_earliest_of_multiple_delimiters() {
+        let delimiters = [b' ', b'\t', b'\n', 0x0B, 0x0C, b'\r', b'/', b'=', b'>'];
+        for length in [2, 3, 7, 16, 31, 64, 65, 127] {
+            for first in delimiters {
+                for second in delimiters {
+                    let mut input = vec![b'a'; length];
+                    let early = length / 3;
+                    let late = length * 2 / 3;
+                    input[early] = first;
+                    input[late] = second;
+                    assert_eq!(
+                        attribute_name_cspan(&input),
+                        cspan(&input, &ATTRIBUTE_NAME_END),
+                        "attribute-name delimiters {first:#04x}, {second:#04x} in {length} bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_delimiters_preserve_tokens_in_all_starting_contexts() {
+        assert_eq!(
+            token_pairs(Context::Data, b"<a href=value>"),
+            vec![
+                (TokenKind::TagNameOpen, b"a".to_vec()),
+                (TokenKind::AttrName, b"href".to_vec()),
+                (TokenKind::AttrValue, b"value".to_vec()),
+                (TokenKind::TagNameClose, b">".to_vec()),
+            ]
+        );
+        assert_eq!(
+            token_pairs(Context::ValueNoQuote, b"href=value>"),
+            vec![
+                (TokenKind::AttrName, b"href".to_vec()),
+                (TokenKind::AttrValue, b"value".to_vec()),
+                (TokenKind::TagNameClose, b">".to_vec()),
+            ]
+        );
+        assert_eq!(
+            token_pairs(Context::ValueSingleQuote, b"value'"),
+            vec![(TokenKind::AttrValue, b"value".to_vec())]
+        );
+        assert_eq!(
+            token_pairs(Context::ValueDoubleQuote, b"value\""),
+            vec![(TokenKind::AttrValue, b"value".to_vec())]
+        );
+        assert_eq!(
+            token_pairs(Context::ValueBackQuote, b"value`"),
+            vec![(TokenKind::AttrValue, b"value".to_vec())]
         );
     }
 }

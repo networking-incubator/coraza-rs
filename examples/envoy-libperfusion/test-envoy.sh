@@ -47,6 +47,34 @@ check_status() {
     [[ $actual == "$expected" ]] || fail "$description returned HTTP $actual, expected $expected"
 }
 
+# Creates an exactly 8 MiB text body with a detector probe in its final bytes.
+make_large_body_with_tail() {
+    local destination=$1
+    local payload=$2
+    local body_size=$((8 * 1024 * 1024))
+    local padding_size=$((body_size - ${#payload}))
+    local actual_size
+
+    head -c "$padding_size" /dev/zero | tr '\000' ' ' >"$destination"
+    printf '%s' "$payload" >>"$destination"
+    actual_size=$(wc -c <"$destination")
+    [[ $actual_size -eq $body_size ]] || fail "$destination is not exactly $body_size bytes"
+}
+
+# Creates an exactly 8 MiB body with NUL padding and a detector probe at the end.
+make_large_nul_body_with_tail() {
+    local destination=$1
+    local payload=$2
+    local body_size=$((8 * 1024 * 1024))
+    local padding_size=$((body_size - ${#payload}))
+    local actual_size
+
+    head -c "$padding_size" /dev/zero >"$destination"
+    printf '%s' "$payload" >>"$destination"
+    actual_size=$(wc -c <"$destination")
+    [[ $actual_size -eq $body_size ]] || fail "$destination is not exactly $body_size bytes"
+}
+
 request() {
     local output=$1
     shift
@@ -145,6 +173,26 @@ dd if=/dev/zero of="$temp_dir/upload" bs=1048576 count=8 status=none
 status=$(request "$temp_dir/response" --request POST --header 'content-type: application/octet-stream' \
     --data-binary "@$temp_dir/upload" http://127.0.0.1:10000/upload)
 check_status 200 "$status" '8 MiB upload'
+
+make_large_body_with_tail "$temp_dir/upload-sqli-at-end" '1 UNION SELECT password FROM users'
+status=$(request "$temp_dir/response" --request POST --header 'content-type: text/plain' \
+    --data-binary "@$temp_dir/upload-sqli-at-end" http://127.0.0.1:10000/upload)
+check_status 403 "$status" '8 MiB SQLi at end of request body'
+
+make_large_body_with_tail "$temp_dir/upload-xss-at-end" '<script>alert(1)</script>'
+status=$(request "$temp_dir/response" --request POST --header 'content-type: text/plain' \
+    --data-binary "@$temp_dir/upload-xss-at-end" http://127.0.0.1:10000/upload)
+check_status 403 "$status" '8 MiB XSS at end of request body'
+
+make_large_nul_body_with_tail "$temp_dir/upload-nul-sqli-at-end" '1 UNION SELECT password FROM users'
+status=$(request "$temp_dir/response" --request POST --header 'content-type: text/plain' \
+    --data-binary "@$temp_dir/upload-nul-sqli-at-end" http://127.0.0.1:10000/upload)
+check_status 403 "$status" '8 MiB NUL-padded SQLi at end of request body'
+
+make_large_nul_body_with_tail "$temp_dir/upload-nul-xss-at-end" '<script>alert(1)</script>'
+status=$(request "$temp_dir/response" --request POST --header 'content-type: text/plain' \
+    --data-binary "@$temp_dir/upload-nul-xss-at-end" http://127.0.0.1:10000/upload)
+check_status 403 "$status" '8 MiB NUL-padded XSS at end of request body'
 
 dd if=/dev/zero of="$temp_dir/upload-too-large" bs=1048576 count=9 status=none
 status=$(request "$temp_dir/response" --request POST --header 'content-type: application/octet-stream' \
