@@ -165,7 +165,29 @@ pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
 /// Checks `input` for cross-site scripting, scanning at most `max_bytes`.
 ///
 /// Equivalent to `xss(&input[..max_bytes.min(input.len())])`.
+///
+/// Note this deliberately skips the [`MAX_INPUT_LEN`] guard that [`xss()`]
+/// applies, so passing `input.len()` scans the whole input however large it
+/// is. Callers that need a bound must impose their own.
 #[must_use]
 pub fn xss_with_limit(input: &[u8], max_bytes: usize) -> bool {
     xss::detect(input.get(..max_bytes.min(input.len())).unwrap_or_default())
+}
+
+/// Checks `input` for script-executing constructs in a CSS declaration.
+///
+/// The HTML contexts of [`xss()`] only see a value once it is inside a tag,
+/// so a value reflected directly into a `style="..."` attribute or a
+/// `<style>` block -- `background:url(javascript:alert(1))`,
+/// `width:expression(alert(1))` -- reaches them in the one form they cannot
+/// read. Use this when a field is known to land in CSS.
+///
+/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
+/// scanning.
+#[must_use]
+pub fn xss_in_css_value(input: &[u8]) -> bool {
+    if input.len() > MAX_INPUT_LEN {
+        return false;
+    }
+    xss::is_css_value_xss(input)
 }
