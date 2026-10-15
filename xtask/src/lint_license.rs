@@ -59,6 +59,10 @@ const CORAZA_SOURCE_HEADERS: [&str; 2] = [
     "// Copyright 2024 Coraza Rust Contributors\n// SPDX-License-Identifier: Apache-2.0\n",
 ];
 
+/// Header for the Go standard library entity table retained under BSD-3-Clause.
+const GO_HTML_SOURCE_HEADER: &str =
+    "// Copyright 2010 The Go Authors. All rights reserved.\n// SPDX-License-Identifier: BSD-3-Clause\n";
+
 /// Directory names skipped while walking the workspace for `.rs` files.
 const SKIPPED_DIRS: [&str; 3] = ["target", ".git", "coraza-rs"];
 
@@ -157,7 +161,9 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
             path: path.clone(),
             message: err.to_string(),
         })?;
-        let has_expected_header = if is_libinjection_source(&path) {
+        let has_expected_header = if is_go_html_source(&member_dirs, &path) {
+            content.starts_with(GO_HTML_SOURCE_HEADER)
+        } else if is_libinjection_source(&path) {
             content.starts_with(LIBINJECTION_SOURCE_HEADER)
         } else if is_coraza_source(&member_dirs, &path) {
             content.starts_with(LICENSE_HEADER)
@@ -191,6 +197,14 @@ fn is_libinjection_source(path: &Path) -> bool {
 fn is_coraza_source(member_dirs: &[PathBuf], path: &Path) -> bool {
     member_dirs.iter().any(|member_dir| {
         member_dir.file_name().is_some_and(|name| name == "coraza") && path.starts_with(member_dir.join("src"))
+    })
+}
+
+/// Accept the Go header only on the imported HTML entity table.
+fn is_go_html_source(member_dirs: &[PathBuf], path: &Path) -> bool {
+    member_dirs.iter().any(|member_dir| {
+        member_dir.file_name().is_some_and(|name| name == "coraza")
+            && path == member_dir.join("src/transformations/html_entities.rs")
     })
 }
 
@@ -548,6 +562,23 @@ mod tests {
         assert_eq!(
             collect_violations(&root).unwrap(),
             vec![root.join("ordinary/src/copied.rs")]
+        );
+    }
+
+    #[test]
+    fn go_html_header_is_scoped_to_the_entity_table() {
+        let root = write_temp_workspace_at(
+            tempfile_dir().join("coraza").join("project"),
+            &["coraza"],
+            &[
+                ("coraza/src/transformations/html_entities.rs", GO_HTML_SOURCE_HEADER),
+                ("coraza/src/other.rs", GO_HTML_SOURCE_HEADER),
+            ],
+        );
+
+        assert_eq!(
+            collect_violations(&root).unwrap(),
+            vec![root.join("coraza/src/other.rs")]
         );
     }
 

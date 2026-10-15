@@ -22,6 +22,16 @@
 
 use super::TransformationResult;
 
+/// Decodes HTML5 character references as Go Coraza does.
+///
+/// Unknown references and bytes that are not UTF-8 are preserved. The changed
+/// flag follows Go Coraza and reports whether the output length differs.
+pub fn html_entity_decode(input: &[u8]) -> TransformationResult {
+    let decoded = super::html_entities::unescape(input);
+    let changed = decoded.len() != input.len();
+    (decoded, changed, None)
+}
+
 /// Normalizes slash-separated paths using Go's `path.Clean` behavior.
 pub fn normalise_path(input: &[u8]) -> TransformationResult {
     if input.is_empty() {
@@ -150,7 +160,30 @@ fn strip_trailing_dots_and_spaces(path: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalise_path, normalise_path_win};
+    use super::{html_entity_decode, normalise_path, normalise_path_win};
+
+    #[test]
+    fn html_entity_decode_matches_go_and_keeps_invalid_bytes() {
+        for (input, output) in [
+            (
+                b"&lt;script+&gt;alert(1);&lt;/script&gt".as_slice(),
+                b"<script+>alert(1);</script>".as_slice(),
+            ),
+            (b"%24&lcub;j&#110;di", b"%24{jndi"),
+            (b"&unknown;&lt", b"&unknown;<"),
+            (
+                b"&#128;&#0;&#xD800;&#x110000;",
+                "\u{20ac}\u{fffd}\u{fffd}\u{fffd}".as_bytes(),
+            ),
+            (b"\xff&lt;\xfe", b"\xff<\xfe"),
+        ] {
+            let (result, changed, error) = html_entity_decode(input);
+            assert_eq!(result, output);
+            assert_eq!(changed, result.len() != input.len());
+            assert_eq!(error, None);
+        }
+        assert_eq!(html_entity_decode(b"plain").0, b"plain");
+    }
 
     #[test]
     fn normalise_path_matches_go_and_preserves_binary_segments() {
