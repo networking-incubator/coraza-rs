@@ -11,6 +11,30 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//! Message inspection: field extraction, decoding and detector dispatch.
+//!
+//! # Documented detection limits
+//!
+//! These are properties of the detector this filter wraps, not defects to be
+//! worked around here. Operators cannot compensate for limits they do not
+//! know about, so they are recorded where the dispatch happens.
+//!
+//! - **Injection into a statement, not a statement as a value.** libinjection and therefore libperfusion detect a
+//!   fragment injected into an existing SQL statement. A *complete* statement supplied as a parameter value -- `SELECT
+//!   * FROM users`, `DROP TABLE users`, `DELETE FROM users` -- is not reported, because its shape is not an injection
+//!   shape. This matters in front of GraphQL resolvers, report builders and admin consoles, where a whole statement in
+//!   a parameter is itself the attack. Detecting it needs an opt-in signal with a separate false-positive profile and
+//!   is deliberately not enabled here.
+//! - **No XML parsing.** An XML body is scanned raw and marked [`Incomplete::UnsupportedContentType`]; its elements are
+//!   not decoded.
+//! - **No `Content-Encoding` decoding.** A compressed body that reaches the filter is marked
+//!   [`Incomplete::UnsupportedContentEncoding`] rather than decompressed; Envoy is expected to have decoded it first.
+//! - **Binary file parts are not semantically parsed.** A multipart part that both carries a filename and declares an
+//!   image, audio, video or octet-stream type gets raw-body scanning only.
+//!
+//! Every limit above produces an [`Incomplete`] reason except the first,
+//! whose shape is simply not recognised. Whether an incomplete message is
+//! rejected depends on the mode and policy pair; see [`crate::config`].
 
 use std::{convert::Infallible, str};
 
@@ -214,9 +238,7 @@ fn has_sqli_from_token_restart(window: &[u8]) -> bool {
         .filter(|(index, _)| index % step == 0)
         .take(MAX_RESTARTS)
         .any(|(_, token)| {
-            let start = token
-                .pos()
-                .saturating_sub(usize::from(token.string_open().is_some()));
+            let start = token.pos().saturating_sub(usize::from(token.string_open().is_some()));
             window
                 .get(start..)
                 .is_some_and(|tail| libperfusion::sqli(tail).is_some())
@@ -316,6 +338,7 @@ impl Inspection {
         self.fields = 0;
         self.scan_bytes(&bytes);
         self.scan_percent_encoded_views(&bytes);
+        self.scan_normalized_view(&bytes);
 
         match format {
             BodyFormat::Raw | BodyFormat::Unsupported => {},
@@ -365,16 +388,45 @@ impl Inspection {
     fn scan_value(&mut self, bytes: &[u8]) {
         if bytes.len() > self.max_field_bytes {
             self.mark_incomplete(Incomplete::FieldTooLarge);
+            // Coverage is genuinely partial, but padding a parameter past the
+            // limit must not buy complete invisibility. Inspect a bounded
+            // head and tail; total cost stays bounded by max_field_bytes.
+            let half = self.max_field_bytes / 2;
+            if let Some(head) = bytes.get(..half) {
+                self.scan_bytes(head);
+                self.scan_percent_encoded_views(head);
+            }
+            if let Some(tail) = bytes.get(bytes.len().saturating_sub(half)..) {
+                self.scan_bytes(tail);
+                self.scan_percent_encoded_views(tail);
+            }
             return;
         }
         self.scan_bytes(bytes);
         self.scan_percent_encoded_views(bytes);
+        self.scan_normalized_view(bytes);
     }
 
     /// Runs both detectors over this byte slice in bounded overlapping windows.
     fn scan_bytes(&mut self, bytes: &[u8]) {
         self.findings.sqli |= has_sqli_in_overlapping_windows(bytes);
         self.findings.xss |= has_xss_in_overlapping_windows(bytes);
+    }
+
+    /// Scans a view with NULs removed and Unicode whitespace folded to space.
+    ///
+    /// libperfusion keeps upstream's byte-level behaviour: a NUL inside a SQL
+    /// keyword defeats the lookup, and UTF-8 NBSP (`C2 A0`) is not
+    /// whitespace although the Latin-1 byte `A0` is. Neither parses on a
+    /// mainstream engine directly, but middleware that strips NULs or applies
+    /// Unicode normalisation before the query is built closes that gap for
+    /// the attacker. Scanning a normalised view costs one extra pass and
+    /// closes the whole differential class.
+    fn scan_normalized_view(&mut self, bytes: &[u8]) {
+        let Some(view) = normalize_separators(bytes) else {
+            return;
+        };
+        self.scan_bytes(&view);
     }
 
     /// Scans bounded percent-decoded views while retaining the original bytes.
@@ -388,6 +440,16 @@ impl Inspection {
         let mut input = bytes;
         for _ in 0..MAX_PERCENT_DECODE_LAYERS {
             decode_percent_escapes(input, &mut scratch);
+            // A layer that reproduced its own input cannot reveal anything a
+            // further layer would, so stop instead of rescanning it.
+            //
+            // Note the escape *count* is deliberately not used as a progress
+            // signal: "%253C" decodes to "%3C", which is genuine progress
+            // with the count unchanged, so requiring a strict decrease would
+            // abandon ordinary double-encoded input one layer early.
+            if scratch == input {
+                return;
+            }
             self.scan_bytes(&scratch);
             std::mem::swap(&mut decoded, &mut scratch);
             input = &decoded;
@@ -533,14 +595,25 @@ impl Inspection {
         let constraints = multer::Constraints::new().size_limit(
             multer::SizeLimit::new()
                 .whole_stream(whole_stream_limit)
-                .per_field(whole_stream_limit),
+                // Bound each part by configuration rather than by the length
+                // of the body being parsed, which no part can ever exceed and
+                // so disabled the constraint entirely.
+                .per_field(u64::try_from(self.max_field_bytes).unwrap_or(u64::MAX)),
         );
 
+        // The stream is a single already-materialised chunk, so this future
+        // cannot pend. That matters: the Wasm VM is single-threaded with no
+        // reactor, so a genuinely streaming source here would deadlock the
+        // worker thread permanently.
         let parsed = futures::executor::block_on(async {
             let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
             let mut field_count = 0_usize;
             let mut field_body = Vec::new();
-            while let Some(mut field) = multipart.next_field().await.map_err(|_error| ())? {
+            while let Some(mut field) = multipart
+                .next_field()
+                .await
+                .map_err(|error| size_aware_reason(&error))?
+            {
                 field_count += 1;
                 if field_count > self.max_fields {
                     self.mark_incomplete(Incomplete::FieldLimit);
@@ -551,8 +624,20 @@ impl Inspection {
                 } else {
                     self.mark_incomplete(Incomplete::MalformedBody);
                 }
-                let is_file = field.file_name().is_some();
                 let part_type = field.content_type();
+                // `filename` is attacker-controlled, so keying "do not parse
+                // this" on its presence alone let `; filename="x"` on an
+                // ordinary text field downgrade it to raw-only scanning.
+                // Skip the body only when the part also declares a type that
+                // is genuinely binary.
+                let declared_binary = part_type.is_some_and(|content_type| {
+                    let media_type = content_type.essence_str();
+                    media_type.starts_with("image/")
+                        || media_type.starts_with("audio/")
+                        || media_type.starts_with("video/")
+                        || media_type == "application/octet-stream"
+                });
+                let is_file = field.file_name().is_some() && declared_binary;
                 let json_part = part_type.is_some_and(|content_type| {
                     let media_type = content_type.essence_str();
                     media_type == "application/json"
@@ -577,7 +662,7 @@ impl Inspection {
                 }
                 field_body.clear();
                 let mut field_too_large = false;
-                while let Some(chunk) = field.chunk().await.map_err(|_error| ())? {
+                while let Some(chunk) = field.chunk().await.map_err(|error| size_aware_reason(&error))? {
                     if is_file || field_too_large || self.fields >= self.max_fields {
                         continue;
                     }
@@ -602,11 +687,13 @@ impl Inspection {
                     }
                 }
             }
-            Ok::<usize, ()>(field_count)
+            Ok::<usize, Incomplete>(field_count)
         });
 
-        if parsed.is_err() || parsed.is_ok_and(|field_count| field_count == 0) {
-            self.mark_incomplete(Incomplete::MalformedBody);
+        match parsed {
+            Err(reason) => self.mark_incomplete(reason),
+            Ok(0) => self.mark_incomplete(Incomplete::MalformedBody),
+            Ok(_) => {},
         }
     }
 }
@@ -631,6 +718,67 @@ fn has_valid_percent_escapes(bytes: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Maps a multipart parse failure to the reason that describes it.
+///
+/// `per_field` is bound to `max_field_bytes`, so multer refuses an oversized
+/// part before it is buffered. That is a size refusal, not malformed
+/// framing, and it carries a different status code.
+fn size_aware_reason(error: &multer::Error) -> Incomplete {
+    match *error {
+        multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => Incomplete::FieldTooLarge,
+        _ => Incomplete::MalformedBody,
+    }
+}
+
+/// Removes NULs and folds Unicode whitespace to a space.
+///
+/// Returns `None` when the input holds neither, so the common case costs one
+/// scan and no allocation. The folded set is the Unicode whitespace a
+/// normalising middleware is liable to turn into an ASCII space: `U+00A0`,
+/// `U+1680`, `U+2000`-`U+200A`, `U+2028`, `U+2029`, `U+202F`, `U+205F` and
+/// `U+3000`.
+fn normalize_separators(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !bytes.iter().any(|byte| matches!(byte, 0 | 0xC2 | 0xE1 | 0xE2 | 0xE3)) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut changed = false;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == 0 {
+            index += 1;
+            changed = true;
+            continue;
+        }
+        let rest = bytes.get(index..).unwrap_or_default();
+        if let Some(width) = unicode_space_width(rest) {
+            out.push(b' ');
+            index += width;
+            changed = true;
+            continue;
+        }
+        out.push(byte);
+        index += 1;
+    }
+    changed.then_some(out)
+}
+
+/// Returns the encoded length of a Unicode whitespace character at the front.
+fn unicode_space_width(rest: &[u8]) -> Option<usize> {
+    match *rest.first()? {
+        0xC2 if rest.get(1) == Some(&0xA0) => Some(2),
+        0xE1 if rest.get(1) == Some(&0x9A) && rest.get(2) == Some(&0x80) => Some(3),
+        0xE2 if rest.get(1) == Some(&0x80) => match rest.get(2)? {
+            0x80..=0x8A | 0xA8 | 0xA9 | 0xAF => Some(3),
+            _ => None,
+        },
+        0xE2 if rest.get(1) == Some(&0x81) && rest.get(2) == Some(&0x9F) => Some(3),
+        0xE3 if rest.get(1) == Some(&0x80) && rest.get(2) == Some(&0x80) => Some(3),
+        _ => None,
+    }
 }
 
 /// Returns whether a byte slice contains a valid percent escape.
@@ -1014,7 +1162,10 @@ mod tests {
             let mut raw = Inspection::new(&config);
             let format = raw.headers(&headers(&[("content-type", "text/plain")]));
             scan_body(&mut raw, payload, &format);
-            assert!(raw.has_sqli(), "raw body starting with a delimiter must be detected: {text:?}");
+            assert!(
+                raw.has_sqli(),
+                "raw body starting with a delimiter must be detected: {text:?}"
+            );
 
             let mut multipart = Inspection::new(&config);
             let format = multipart.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
@@ -1076,7 +1227,6 @@ mod tests {
         let started = std::time::Instant::now();
         scan_body(&mut inspection, &body, &format);
         let elapsed = started.elapsed();
-        eprintln!("1 MiB dense-token body inspected in {elapsed:?}");
 
         assert!(
             elapsed < std::time::Duration::from_secs(10),
@@ -1103,7 +1253,10 @@ mod tests {
             );
 
             scan_body(&mut inspection, payload, &format);
-            assert!(inspection.has_sqli(), "body SQLi must be found despite Upgrade: {upgrade:?}");
+            assert!(
+                inspection.has_sqli(),
+                "body SQLi must be found despite Upgrade: {upgrade:?}"
+            );
         }
 
         for upgrade in ["websocket", "WebSocket", " h2c "] {
@@ -1163,11 +1316,77 @@ mod tests {
         for media_type in ["text/json", "text/x-json", "model/gltf+json"] {
             let mut inspection = Inspection::new(&config);
             let format = inspection.headers(&headers(&[("content-type", media_type)]));
-            assert_eq!(format, super::BodyFormat::Json, "{media_type} should select the JSON parser");
+            assert_eq!(
+                format,
+                super::BodyFormat::Json,
+                "{media_type} should select the JSON parser"
+            );
 
             scan_body(&mut inspection, br#"{"u":"<script>alert(1)</script>"}"#, &format);
             assert!(inspection.has_xss(), "{media_type} bodies must be JSON-decoded");
         }
+    }
+
+    /// Inspects a bounded head and tail of a field that exceeds its byte bound.
+    #[test]
+    fn oversized_fields_are_truncated_not_discarded() {
+        let config = Config {
+            max_field_bytes: 64,
+            ..Config::default()
+        };
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "application/json")]));
+
+        let mut value = "a".repeat(200);
+        value.push_str("1 UNION SELECT password FROM users");
+        let body = format!("{{\"u\":\"{value}\"}}");
+        scan_body(&mut inspection, body.as_bytes(), &format);
+
+        assert!(
+            inspection.has_sqli(),
+            "padding a field past the limit must not hide its contents"
+        );
+        assert_eq!(
+            inspection.incomplete(),
+            Some(Incomplete::FieldTooLarge),
+            "coverage is still partial and must be reported"
+        );
+    }
+
+    /// Scans text multipart parts even when they carry a filename.
+    #[test]
+    fn multipart_inspects_textual_parts_that_declare_a_filename() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "multipart/form-data; boundary=BOUNDARY")]));
+        // The payload only exists after JSON unescaping, so the raw pass
+        // cannot see it: only semantic parsing of the part can.
+        let body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"q\"; filename=\"x.json\"\r\nContent-Type: application/json\r\n\r\n{\"u\":\"\\u003cscript\\u003ealert(1)\\u003c/script\\u003e\"}\r\n--BOUNDARY--\r\n";
+
+        scan_body(&mut inspection, body, &format);
+
+        assert!(
+            inspection.has_xss(),
+            "a filename must not downgrade a textual part to raw-only scanning"
+        );
+    }
+
+    /// Scans views with NULs removed and Unicode whitespace folded to space.
+    #[test]
+    fn scans_nul_stripped_and_unicode_whitespace_normalised_views() {
+        let config = Config::default();
+
+        let mut nul = Inspection::new(&config);
+        nul.headers(&headers(&[("x-q", "UNI\0ON SELECT a FROM b")]));
+        assert!(nul.has_sqli(), "a NUL inside a SQL keyword must not hide it");
+
+        let mut nbsp = Inspection::new(&config);
+        nbsp.headers(&headers(&[("x-q", "1'\u{a0}OR\u{a0}'1'='1")]));
+        assert!(nbsp.has_sqli(), "UTF-8 NBSP must not hide a logic operator");
+
+        let mut clean = Inspection::new(&config);
+        clean.headers(&headers(&[("x-q", "an ordinary value")]));
+        assert!(!clean.has_sqli(), "normalisation must not invent detections");
     }
 
     /// Scans `SQLi` at the end of a raw body longer than libperfusion's input limit.
