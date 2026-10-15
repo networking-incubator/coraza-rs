@@ -78,7 +78,16 @@ static EVENT_SPANS: [(usize, usize); 26] = {
 };
 
 /// URL schemes that can run script. "JAVA" covers `java:` and `javascript:`.
-const BLACK_URL_SCHEMES: [&[u8]; 4] = [b"DATA", b"VIEW-SOURCE", b"JAVA", b"VBSCRIPT"];
+const BLACK_URL_SCHEMES: [&[u8]; 6] = [
+    b"DATA",
+    b"VIEW-SOURCE",
+    b"JAVA",
+    b"VBSCRIPT",
+    // Script-capable only in narrow circumstances, but cheap to cover: the
+    // scan is linear over six entries.
+    b"BLOB",
+    b"FILESYSTEM",
+];
 
 const MAX_NORMALIZED_TOKEN_LEN: usize = 64;
 
@@ -115,13 +124,27 @@ fn comment_starts_with_keyword(comment: &[u8], keyword: [u8; 6]) -> bool {
 /// Decodes one character of HTML-encoded text, returning it and the number
 /// of bytes it took. `None` if `src` is empty.
 ///
-/// Only numeric entities are decoded, decimal (`&#65;`) or hexadecimal
-/// (`&#x41;`), with or without the closing ';'. Anything else, a named
-/// entity included, is the byte it starts with.
+/// Numeric entities are decoded, decimal (`&#65;`) or hexadecimal
+/// (`&#x41;`), with or without the closing ';'. The handful of named
+/// entities that can smuggle a URL scheme past a prefix comparison are
+/// decoded too; any other named entity is the byte it starts with.
+///
+/// Full HTML5 named-entity support (2 231 entries) is deliberately not
+/// provided: it would add meaningful table weight to the Wasm artifact for
+/// references that cannot change a scheme match.
 fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
     const AMPERSAND: (u32, usize) = (b'&' as u32, 1);
     /// Above this, the entity is given up on and read as a plain '&'.
     const MAX: u32 = 0x0010_00FF;
+    /// Named references a browser honours inside an attribute value, which
+    /// therefore split a scheme such as `ja&Tab;vascript:`.
+    const NAMED: [(&[u8], u32); 5] = [
+        (b"TAB;", 0x09),
+        (b"NEWLINE;", 0x0A),
+        (b"COLON;", 0x3A),
+        (b"NUL;", 0x00),
+        (b"SOL;", 0x2F),
+    ];
 
     let &first = src.first()?;
     let is_hex = matches!(src.get(2), Some(b'x' | b'X'));
@@ -129,6 +152,17 @@ fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
         return Some((u32::from(first), 1));
     }
     if src.get(1) != Some(&b'#') {
+        // The scan stays O(1): the table is five entries and the longest
+        // name bounds how far each comparison reads.
+        let rest = src.get(1..).unwrap_or_default();
+        for (name, value) in NAMED {
+            let Some(candidate) = rest.get(..name.len()) else {
+                continue;
+            };
+            if candidate.eq_ignore_ascii_case(name) {
+                return Some((value, name.len() + 1));
+            }
+        }
         return Some(AMPERSAND);
     }
 
@@ -170,7 +204,10 @@ fn htmlencode_startswith(mut prefix: &[u8], mut src: &[u8]) -> bool {
         }
         first = false;
 
-        if cb == 0 || cb == 10 {
+        // Browsers strip tab and newlines while parsing a URL, so they do
+        // not break a scheme: "java&Tab;script:" runs. NUL is skipped for
+        // the same reason upstream skips it.
+        if matches!(cb, 0 | 9 | 10 | 13) {
             continue;
         }
 

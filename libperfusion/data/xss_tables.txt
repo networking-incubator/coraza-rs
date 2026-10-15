@@ -452,6 +452,18 @@ attr	STYLE	Style
 attr	TO	Url
 attr	VALUES	Url
 attr	XLINK:HREF	Url
+attr	SRCSET	Url
+attr	SRCDOC	Black
+attr	PING	Url
+attr	FORMTARGET	Url
+attr	CITE	Url
+attr	LONGDESC	Url
+attr	MANIFEST	Url
+attr	DATA	Url
+attr	CODEBASE	Url
+attr	ARCHIVE	Url
+attr	PROFILE	Url
+attr	ACTIONTYPE	Url
 tag	APPLET
 tag	BASE
 tag	COMMENT
@@ -464,6 +476,7 @@ tag	IMPORT
 tag	ISINDEX
 tag	LINK
 tag	LISTENER
+tag	MATH
 tag	META
 tag	NOSCRIPT
 tag	OBJECT

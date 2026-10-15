@@ -10,10 +10,10 @@
     "sha256": "d0ac94c702edd05bc27110fab914d6934ad1ef58e8eef8a55f6ab09ca46fcd87"
   },
   "xss": {
-    "attributes": 20,
-    "entries": 472,
+    "attributes": 32,
+    "entries": 485,
     "events": 432,
-    "sha256": "810bc9a015c0c3d699e498e6f486a718dd216f966844b8b5732129028290aff6",
-    "tags": 20
+    "sha256": "cf390e3d2c444960ccefbac5c91107390202ba521a7686ca32aab61c0d32336d",
+    "tags": 21
   }
 }
