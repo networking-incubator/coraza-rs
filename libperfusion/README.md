@@ -36,6 +36,13 @@ The default CI gate checks the corpus and generated inputs against the pinned
 tables retain their source revision in their headers and are checked with
 `cargo xtask tables-check`.
 
+`data/sqli_keywords.txt` and `data/xss_tables.txt` are generated from the
+pinned C revision and are rewritten wholesale by `cargo xtask tables-refresh`.
+Rows this project adds go in `data/sqli_keywords_local.txt` and
+`data/xss_tables_local.txt` instead, so a refresh cannot drop them; `build.rs`
+merges each supplement into the matching upstream table at compile time and
+rejects a row that duplicates or contradicts an upstream one.
+
 Run the usual checks from the repository root. The parity target needs Go
 1.27.1 and `LIBINJECTION_DIR` set to the C revision in the parity manifest.
 

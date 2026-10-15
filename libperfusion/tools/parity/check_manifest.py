@@ -29,10 +29,6 @@ FAMILY_COUNTS = {"sqli": 55, "folding": 119, "tokens": 249, "html5": 68, "xss": 
 EXPECTED_KEYWORDS = 9_352
 EXPECTED_FINGERPRINTS = 8_367
 EXPECTED_XSS = {"tags": 20, "events": 432, "attributes": 20}
-# The shipped tables deliberately carry entries upstream does not; see
-# tests/parity/mismatch-ledger.md. EXPECTED_XSS stays the upstream shape so
-# the Go comparison still describes upstream.
-EXPECTED_LOCAL_XSS = {"tags": 21, "events": 432, "attributes": 32}
 EXPECTED_ORACLE_ERRORS: list[dict[str, object]] = []
 GO_KIND_TO_RUST = {
     "attributeTypeBlack": "Deny",
@@ -308,7 +304,7 @@ def local_table_summary() -> dict[str, object]:
     rust_dispatch = parse_rust_dispatch()
     events, tags, attrs = rust_xss_tables()
     counts = {"tags": len(tags), "events": len(events), "attributes": len(attrs)}
-    if counts != EXPECTED_LOCAL_XSS:
+    if counts != EXPECTED_XSS:
         fail(f"unexpected libperfusion XSS table counts: {counts}")
     return {
         "sql_keyword_entries": len(keywords),

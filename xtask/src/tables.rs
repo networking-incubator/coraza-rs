@@ -29,6 +29,15 @@ use sha2::{Digest as _, Sha256};
 
 const REPOSITORY: &str = "https://github.com/libinjection/libinjection";
 
+/// Upstream-generated SQL table, rewritten by `tables-refresh`.
+const SQL_FILE: &str = "sqli_keywords.txt";
+/// Upstream-generated XSS table, rewritten by `tables-refresh`.
+const XSS_FILE: &str = "xss_tables.txt";
+/// Locally authored SQL additions, never rewritten by `tables-refresh`.
+const LOCAL_SQL_FILE: &str = "sqli_keywords_local.txt";
+/// Locally authored XSS additions, never rewritten by `tables-refresh`.
+const LOCAL_XSS_FILE: &str = "xss_tables_local.txt";
+
 #[derive(Args)]
 pub(crate) struct RefreshArgs {
     /// libinjection C checkout (or a directory containing its `src/` files).
@@ -41,7 +50,7 @@ pub(crate) fn check_or_exit() {
         eprintln!("table check failed: {error}");
         std::process::exit(1);
     }
-    println!("SQL and XSS tables match their recorded semantic hashes");
+    println!("upstream and local SQL and XSS tables match their recorded semantic hashes");
 }
 
 pub(crate) fn refresh_or_exit(args: &RefreshArgs) {
@@ -78,45 +87,78 @@ fn refresh(root: &Path, upstream: &Path) -> Result<(), String> {
 
     let data = root.join("libperfusion/data");
     fs::create_dir_all(&data).map_err(|error| error.to_string())?;
-    fs::write(data.join("sqli_keywords.txt"), render_sql(&revision, &sql_rows)).map_err(|error| error.to_string())?;
-    fs::write(data.join("xss_tables.txt"), render_xss_data(&revision, &xss_rows)).map_err(|error| error.to_string())?;
+    // Only the upstream-generated files are rewritten: the local supplements
+    // stay as they are, and build.rs merges both at compile time.
+    fs::write(data.join(SQL_FILE), render_sql(&revision, &sql_rows)).map_err(|error| error.to_string())?;
+    fs::write(data.join(XSS_FILE), render_xss_data(&revision, &xss_rows)).map_err(|error| error.to_string())?;
+    let (local_sql, local_xss) = read_local(&data)?;
+    merged_sql(&sql_rows, &local_sql)?;
+    merged_xss(&xss_rows, &local_xss)?;
     fs::write(
         data.join("tables.json"),
-        render_manifest(&revision, &sql_rows, &xss_rows),
+        render_manifest(&revision, &sql_rows, &xss_rows, &local_sql, &local_xss),
     )
     .map_err(|error| error.to_string())?;
 
     check(root)?;
     println!(
-        "Refreshed {} SQL and {} XSS rows from {}",
+        "Refreshed {} SQL and {} XSS rows from {}, keeping {} local SQL and {} local XSS rows",
         sql_rows.len(),
         xss_rows.len(),
-        revision.commit
+        revision.commit,
+        local_sql.len(),
+        local_xss.len()
     );
     Ok(())
 }
 
+/// Parsed `KEY<TAB>BYTE` SQL rows.
+type SqlRows = Vec<(String, u8)>;
+/// Parsed XSS rows, each a `kind`, `name`, and optional attribute type.
+type XssRows = Vec<Vec<String>>;
+
+/// Reads and validates the locally authored supplement tables.
+fn read_local(data: &Path) -> Result<(SqlRows, XssRows), String> {
+    let sql = fs::read_to_string(data.join(LOCAL_SQL_FILE)).map_err(|error| format!("{LOCAL_SQL_FILE}: {error}"))?;
+    let xss = fs::read_to_string(data.join(LOCAL_XSS_FILE)).map_err(|error| format!("{LOCAL_XSS_FILE}: {error}"))?;
+    Ok((parse_sql_data(&sql)?, parse_xss_rows(&xss)?))
+}
+
+/// The table build.rs generates: upstream rows and local rows, sorted.
+fn merged_sql(upstream: &[(String, u8)], local: &[(String, u8)]) -> Result<SqlRows, String> {
+    let mut rows = upstream.to_vec();
+    rows.extend_from_slice(local);
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    validate_sql_rows(&rows).map_err(|error| format!("{LOCAL_SQL_FILE} does not merge with {SQL_FILE}: {error}"))?;
+    Ok(rows)
+}
+
+/// The rows build.rs generates: upstream rows first, local rows after them.
+fn merged_xss(upstream: &[Vec<String>], local: &[Vec<String>]) -> Result<XssRows, String> {
+    let mut rows = upstream.to_vec();
+    rows.extend_from_slice(local);
+    validate_xss_rows(&rows).map_err(|error| format!("{LOCAL_XSS_FILE} does not merge with {XSS_FILE}: {error}"))?;
+    Ok(rows)
+}
+
 fn check(root: &Path) -> Result<(), String> {
     let data = root.join("libperfusion/data");
-    let sql = fs::read_to_string(data.join("sqli_keywords.txt")).map_err(|error| error.to_string())?;
-    let xss = fs::read_to_string(data.join("xss_tables.txt")).map_err(|error| error.to_string())?;
+    let sql = fs::read_to_string(data.join(SQL_FILE)).map_err(|error| error.to_string())?;
+    let xss = fs::read_to_string(data.join(XSS_FILE)).map_err(|error| error.to_string())?;
     let manifest: Value =
         serde_json::from_slice(&fs::read(data.join("tables.json")).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     let sql_rows = parse_sql_data(&sql)?;
     let xss_rows = parse_xss_data(&xss)?;
-    let events = xss_rows
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "event"))
-        .count();
-    let attributes = xss_rows
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "attr"))
-        .count();
-    let tags = xss_rows
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "tag"))
-        .count();
+    let (local_sql, local_xss) = read_local(&data)?;
+    // The supplements must stay disjoint from the upstream rows: build.rs
+    // rejects the merged table otherwise.
+    merged_sql(&sql_rows, &local_sql)?;
+    merged_xss(&xss_rows, &local_xss)?;
+    if manifest.get("local") != Some(&local_section(&local_sql, &local_xss)) {
+        return Err("local supplement tables differ from the \"local\" section of data/tables.json".into());
+    }
+    let (events, attributes, tags) = xss_counts(&xss_rows);
     let expected_sql_hash = sql_hash(&sql_rows);
     let expected_xss_hash = xss_hash(&xss_rows);
 
@@ -175,6 +217,32 @@ fn check(root: &Path) -> Result<(), String> {
         return Err("local table data differs from data/tables.json; review and refresh it".into());
     }
     Ok(())
+}
+
+/// Counts the `event`, `attr`, and `tag` rows of an XSS table.
+fn xss_counts(rows: &[Vec<String>]) -> (usize, usize, usize) {
+    let count = |kind: &str| {
+        rows.iter()
+            .filter(|row| row.first().is_some_and(|row_kind| row_kind == kind))
+            .count()
+    };
+    (count("event"), count("attr"), count("tag"))
+}
+
+/// The `"local"` section of `data/tables.json` for the supplement tables.
+fn local_section(sql: &[(String, u8)], xss: &[Vec<String>]) -> Value {
+    let (events, attributes, tags) = xss_counts(xss);
+    json!({
+        "sql": { "file": LOCAL_SQL_FILE, "entries": sql.len(), "sha256": sql_hash(sql) },
+        "xss": {
+            "file": LOCAL_XSS_FILE,
+            "entries": xss.len(),
+            "events": events,
+            "attributes": attributes,
+            "tags": tags,
+            "sha256": xss_hash(xss)
+        }
+    })
 }
 
 struct Revision {
@@ -445,7 +513,9 @@ fn validate_sql_rows(rows: &[(String, u8)]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_xss_data(source: &str) -> Result<Vec<Vec<String>>, String> {
+/// Parses XSS rows without requiring every kind: a supplement table may
+/// carry only some of them.
+fn parse_xss_rows(source: &str) -> Result<Vec<Vec<String>>, String> {
     let mut rows = Vec::new();
     for line in source
         .lines()
@@ -463,11 +533,17 @@ fn parse_xss_data(source: &str) -> Result<Vec<Vec<String>>, String> {
         }
         rows.push(fields);
     }
+    check_unique_xss_rows(&rows)?;
+    Ok(rows)
+}
+
+fn parse_xss_data(source: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = parse_xss_rows(source)?;
     validate_xss_rows(&rows)?;
     Ok(rows)
 }
 
-fn validate_xss_rows(rows: &[Vec<String>]) -> Result<(), String> {
+fn check_unique_xss_rows(rows: &[Vec<String>]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for row in rows {
         let (Some(kind), Some(name)) = (row.first(), row.get(1)) else {
@@ -477,6 +553,11 @@ fn validate_xss_rows(rows: &[Vec<String>]) -> Result<(), String> {
             return Err(format!("invalid or duplicate XSS table entry: {row:?}"));
         }
     }
+    Ok(())
+}
+
+fn validate_xss_rows(rows: &[Vec<String>]) -> Result<(), String> {
+    check_unique_xss_rows(rows)?;
     for kind in ["event", "attr", "tag"] {
         if !rows
             .iter()
@@ -513,24 +594,20 @@ fn render_xss_data(revision: &Revision, rows: &[Vec<String>]) -> String {
     out
 }
 
-fn render_manifest(revision: &Revision, sql: &[(String, u8)], xss: &[Vec<String>]) -> Vec<u8> {
-    let events = xss
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "event"))
-        .count();
-    let attributes = xss
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "attr"))
-        .count();
-    let tags = xss
-        .iter()
-        .filter(|row| row.first().is_some_and(|kind| kind == "tag"))
-        .count();
+fn render_manifest(
+    revision: &Revision,
+    sql: &[(String, u8)],
+    xss: &[Vec<String>],
+    local_sql: &[(String, u8)],
+    local_xss: &[Vec<String>],
+) -> Vec<u8> {
+    let (events, attributes, tags) = xss_counts(xss);
     serde_json::to_vec_pretty(&json!({
         "schema": 1,
         "source": { "repository": REPOSITORY, "version": revision.version, "commit": revision.commit },
         "sql": { "entries": sql.len(), "sha256": sql_hash(sql) },
-        "xss": { "entries": xss.len(), "events": events, "attributes": attributes, "tags": tags, "sha256": xss_hash(xss) }
+        "xss": { "entries": xss.len(), "events": events, "attributes": attributes, "tags": tags, "sha256": xss_hash(xss) },
+        "local": local_section(local_sql, local_xss)
     }))
     .unwrap()
 }
@@ -584,5 +661,40 @@ mod tests {
                 vec!["tag", "SCRIPT"],
             ]
         );
+    }
+
+    #[test]
+    fn merges_local_rows_and_rejects_collisions() {
+        let upstream = vec![("A".to_owned(), b'k'), ("C".to_owned(), b'k')];
+        let local = vec![("B".to_owned(), b'f')];
+        assert_eq!(
+            merged_sql(&upstream, &local).unwrap(),
+            [("A".to_owned(), b'k'), ("B".to_owned(), b'f'), ("C".to_owned(), b'k')]
+        );
+        assert!(merged_sql(&upstream, &[("C".to_owned(), b'f')]).is_err());
+
+        let upstream = vec![
+            vec!["event".to_owned(), "LOAD".to_owned()],
+            vec!["attr".to_owned(), "HREF".to_owned(), "Url".to_owned()],
+            vec!["tag".to_owned(), "SCRIPT".to_owned()],
+        ];
+        let local = vec![vec!["tag".to_owned(), "MATH".to_owned()]];
+        assert_eq!(merged_xss(&upstream, &local).unwrap().len(), 4);
+        let collision = vec![vec!["attr".to_owned(), "HREF".to_owned(), "Black".to_owned()]];
+        assert!(merged_xss(&upstream, &collision).is_err());
+    }
+
+    #[test]
+    fn local_supplements_may_hold_only_some_row_kinds() {
+        let rows = parse_xss_rows("# comment\nattr\tSRCDOC\tBlack\ntag\tMATH\n").unwrap();
+        assert_eq!(xss_counts(&rows), (0, 1, 1));
+        // The upstream table must still carry every kind.
+        assert!(parse_xss_data("attr\tSRCDOC\tBlack\n").is_err());
+        let section = local_section(&[("VACUUM".to_owned(), b'T')], &rows);
+        assert_eq!(
+            section.get("xss").and_then(|xss| xss.get("file")),
+            Some(&json!(LOCAL_XSS_FILE))
+        );
+        assert_eq!(section.get("sql").and_then(|sql| sql.get("entries")), Some(&json!(1)));
     }
 }

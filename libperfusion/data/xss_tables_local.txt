@@ -1,0 +1,22 @@
+# Local XSS additions, merged with data/xss_tables.txt at build time.
+#
+# These rows are authored by this project, not extracted from libinjection.
+# Keep them here so `cargo xtask tables-refresh` can rewrite the upstream
+# file without losing them. Entries must be unique and absent from the
+# upstream table; build.rs appends them to the upstream rows of the same
+# kind and rejects duplicates.
+#
+# Format: event<TAB>NAME, attr<TAB>NAME<TAB>TYPE, tag<TAB>NAME
+attr	ACTIONTYPE	Url
+attr	ARCHIVE	Url
+attr	CITE	Url
+attr	CODEBASE	Url
+attr	DATA	Url
+attr	FORMTARGET	Url
+attr	LONGDESC	Url
+attr	MANIFEST	Url
+attr	PING	Url
+attr	PROFILE	Url
+attr	SRCDOC	Black
+attr	SRCSET	Url
+tag	MATH

@@ -13,6 +13,11 @@ source module version and checksum are recorded in
 The upstream license is reproduced in
 [the Go license file](LICENSES/libinjection-go-BSD-3-Clause.txt).
 
+`data/sqli_keywords_local.txt` and `data/xss_tables_local.txt` are not
+upstream-derived: they hold rows authored by this project and merged into the
+generated tables by `build.rs`. The deviations they introduce are recorded in
+[the mismatch ledger](tests/parity/mismatch-ledger.md).
+
 The translated engine descends from Nick Galbreath's original libinjection C
 implementation. Its BSD-3-Clause notice is preserved in the
 [C license file](LICENSES/libinjection-C-BSD-3-Clause.txt), from the upstream
