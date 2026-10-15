@@ -48,6 +48,14 @@ const WINDOW_STRIDE: usize = WINDOW_BYTES - WINDOW_OVERLAP;
 const RESTART_MAX_BYTES: usize = 8 * 1024;
 /// Upper bound on token-anchored restarts per window.
 const MAX_RESTARTS: usize = 16;
+/// Upgrade tokens that really do switch the connection to a protocol whose
+/// body this filter cannot inspect as a single HTTP message.
+///
+/// An upgrade the proxy has not negotiated is only a client proposal: Envoy
+/// forwards an unmatched `Upgrade` as an ordinary request, which the upstream
+/// then parses as ordinary HTTP. Treating any value as streaming let one
+/// header turn off body inspection entirely.
+const STREAMING_UPGRADES: [&[u8]; 3] = [b"websocket", b"h2c", b"connect"];
 
 /// A reason a message could not be fully inspected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,9 +119,12 @@ pub(crate) enum BodyFormat {
 pub(crate) struct Inspection {
     /// Detector results for the message.
     findings: Findings,
-    /// Number of decoded fields inspected so far.
+    /// Number of decoded fields inspected in the current surface.
+    ///
+    /// Reset when body scanning starts so headers and body each get the full
+    /// budget and neither can starve the other.
     fields: usize,
-    /// Maximum number of decoded fields.
+    /// Maximum number of decoded fields per surface.
     max_fields: usize,
     /// Maximum size of one decoded field.
     max_field_bytes: usize,
@@ -257,10 +268,21 @@ impl Inspection {
             self.scan_field(value);
 
             if (name.eq_ignore_ascii_case(":method") && value.eq_ignore_ascii_case(b"CONNECT"))
-                || name.eq_ignore_ascii_case("upgrade")
-                || name.eq_ignore_ascii_case(":status") && value.starts_with(b"101")
+                || (name.eq_ignore_ascii_case(":status") && value.as_slice() == b"101")
             {
                 self.mark_streaming();
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                let token = trim_ascii(value);
+                if STREAMING_UPGRADES
+                    .iter()
+                    .any(|protocol| token.eq_ignore_ascii_case(protocol))
+                {
+                    self.mark_streaming();
+                } else {
+                    // The body still has to be inspected: the upstream will
+                    // read it as ordinary HTTP whatever this header claims.
+                    self.mark_incomplete(Incomplete::MalformedContentType);
+                }
             } else if name.eq_ignore_ascii_case(":path") {
                 self.scan_path(value);
                 self.scan_query(value);
@@ -282,7 +304,16 @@ impl Inspection {
     }
 
     /// Scans raw body bytes and extracts supported structured values.
+    ///
+    /// The raw bytes are always scanned before dispatching to a format
+    /// parser. That unconditional pass is what makes the filter resistant to
+    /// content-type confusion, so it must not be made conditional on the
+    /// selected format.
     pub(crate) fn body(&mut self, bytes: Vec<u8>, format: &BodyFormat) {
+        // Headers and body draw on separate field budgets. Sharing one
+        // counter let padding headers exhaust it before the body parser ran,
+        // which silently hid every structured field in the body.
+        self.fields = 0;
         self.scan_bytes(&bytes);
         self.scan_percent_encoded_views(&bytes);
 
@@ -438,7 +469,9 @@ impl Inspection {
         if media_type == "application/x-www-form-urlencoded" {
             BodyFormat::UrlEncoded
         } else if media_type == "application/json"
-            || (media_type.starts_with("application/") && media_type.ends_with("+json"))
+            || media_type == "text/json"
+            || media_type == "text/x-json"
+            || media_type.ends_with("+json")
         {
             BodyFormat::Json
         } else if media_type == "multipart/form-data" {
@@ -1051,6 +1084,92 @@ mod tests {
         );
     }
 
+    /// Inspects bodies whose request carried an upgrade the proxy never negotiated.
+    #[test]
+    fn inspects_body_unless_the_upgrade_is_a_known_streaming_protocol() {
+        let config = Config::default();
+        let payload = b"u=1%27+OR+%271%27%3D%271+UNION+SELECT+password+FROM+users";
+
+        for upgrade in ["bogus", "", "anything-at-all"] {
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[
+                (":method", "POST"),
+                ("upgrade", upgrade),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ]));
+            assert!(
+                !inspection.is_streaming(),
+                "an unnegotiated upgrade {upgrade:?} must not skip body inspection"
+            );
+
+            scan_body(&mut inspection, payload, &format);
+            assert!(inspection.has_sqli(), "body SQLi must be found despite Upgrade: {upgrade:?}");
+        }
+
+        for upgrade in ["websocket", "WebSocket", " h2c "] {
+            let mut inspection = Inspection::new(&config);
+            inspection.headers(&headers(&[(":method", "GET"), ("upgrade", upgrade)]));
+            assert!(
+                inspection.is_streaming(),
+                "a real streaming upgrade {upgrade:?} must bypass full-body buffering"
+            );
+        }
+    }
+
+    /// Matches the switching-protocols status exactly rather than by prefix.
+    #[test]
+    fn treats_only_an_exact_101_status_as_streaming() {
+        let config = Config::default();
+
+        let mut switching = Inspection::new(&config);
+        switching.headers(&headers(&[(":status", "101")]));
+        assert!(switching.is_streaming(), "101 switches protocols");
+
+        let mut other = Inspection::new(&config);
+        other.headers(&headers(&[(":status", "1015")]));
+        assert!(!other.is_streaming(), "1015 is not a switching-protocols status");
+    }
+
+    /// Keeps the body parser funded when headers consume their whole budget.
+    #[test]
+    fn header_flood_does_not_blind_the_body_parser() {
+        let config = Config {
+            max_fields: 8,
+            ..Config::default()
+        };
+        let mut inspection = Inspection::new(&config);
+
+        let mut entries = vec![(String::from("content-type"), b"application/json".to_vec())];
+        for index in 0..32 {
+            entries.push((format!("x-pad-{index}"), b"pad".to_vec()));
+        }
+        let format = inspection.headers(&entries);
+
+        // The attack exists only after JSON unescaping, so the raw pass
+        // cannot see it and only the body parser can.
+        scan_body(&mut inspection, br#"{"u":"<script>alert(1)</script>"}"#, &format);
+
+        assert!(
+            inspection.has_xss(),
+            "a JSON-escaped payload must stay visible behind a header flood"
+        );
+    }
+
+    /// Parses JSON bodies declared with the text/json family.
+    #[test]
+    fn treats_text_json_as_a_json_body() {
+        let config = Config::default();
+
+        for media_type in ["text/json", "text/x-json", "model/gltf+json"] {
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[("content-type", media_type)]));
+            assert_eq!(format, super::BodyFormat::Json, "{media_type} should select the JSON parser");
+
+            scan_body(&mut inspection, br#"{"u":"<script>alert(1)</script>"}"#, &format);
+            assert!(inspection.has_xss(), "{media_type} bodies must be JSON-decoded");
+        }
+    }
+
     /// Scans `SQLi` at the end of a raw body longer than libperfusion's input limit.
     #[test]
     fn scans_sqli_at_end_of_large_raw_body() {
@@ -1218,8 +1337,10 @@ mod tests {
 
         assert_eq!(oversized.incomplete(), Some(Incomplete::FieldTooLarge));
 
+        // The body carries its own field budget, so this has to be low enough
+        // to be exhausted by the parts themselves rather than by the headers.
         let count_limited = Config {
-            max_fields: 4,
+            max_fields: 3,
             ..Config::default()
         };
         let mut too_many = Inspection::new(&count_limited);
