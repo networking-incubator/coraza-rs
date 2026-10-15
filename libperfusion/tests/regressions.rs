@@ -204,3 +204,69 @@ fn sqli_added_keywords_do_not_flag_ordinary_prose() {
         );
     }
 }
+
+#[test]
+fn xss_detects_url_bearing_attributes() {
+    // These attributes carry a URL but were absent from the table, and
+    // neither IMG nor SOURCE is a black tag, so there was no backstop.
+    for payload in [
+        br#"<img srcset="javascript:alert(1)">"#.as_slice(),
+        br#"<source srcset="javascript:alert(1)">"#,
+        br#"<a ping="javascript:alert(1)">"#,
+        br#"<blockquote cite="javascript:alert(1)">"#,
+        br#"<img longdesc="javascript:alert(1)">"#,
+        br#"<html manifest="javascript:alert(1)">"#,
+    ] {
+        assert!(
+            libperfusion::xss(payload),
+            "URL attribute not detected: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    // A Url-typed attribute only flags a script-capable scheme, so ordinary
+    // markup is untouched.
+    for benign in [
+        br#"<img srcset="photo-2x.png 2x, photo.png 1x">"#.as_slice(),
+        br#"<a ping="/track">ok</a>"#,
+        br#"<blockquote cite="https://example.com/post">hi</blockquote>"#,
+        br#"<div data="/model.swf">"#,
+    ] {
+        assert!(
+            !libperfusion::xss(benign),
+            "ordinary markup flagged: {:?}",
+            String::from_utf8_lossy(benign)
+        );
+    }
+}
+
+#[test]
+fn xss_decodes_scheme_relevant_named_entities() {
+    // &Tab; and friends are valid HTML5 named references that browsers
+    // honour inside an attribute value, so they split a scheme.
+    for payload in [
+        br#"<a href="ja&Tab;vascript:alert(1)">"#.as_slice(),
+        br#"<a href="java&NewLine;script:alert(1)">"#,
+        br#"<a href="javascript&colon;alert(1)">"#,
+    ] {
+        assert!(
+            libperfusion::xss(payload),
+            "named-entity scheme not detected: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    // Unrelated named entities still read as a literal '&'.
+    assert!(!libperfusion::xss(b"<p>Tom &amp; Jerry</p>"));
+    assert!(!libperfusion::xss(b"a &lt; b and c &gt; d"));
+}
+
+#[test]
+fn xss_covers_blob_filesystem_and_mathml() {
+    assert!(libperfusion::xss(br#"<a href="blob:https://x/y">"#));
+    assert!(libperfusion::xss(br#"<a href="filesystem:http://x/y">"#));
+    assert!(libperfusion::xss(
+        b"<math><maction actiontype=statusline#javascript:alert(1)>x</maction></math>"
+    ));
+    assert!(!libperfusion::xss(br#"<a href="https://example.com/">link</a>"#));
+}
