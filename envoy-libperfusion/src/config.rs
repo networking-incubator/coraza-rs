@@ -17,13 +17,26 @@ use std::fmt::{self, Display, Formatter};
 use serde::Deserialize;
 
 /// Maximum request or response body buffered by the plugin.
-const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+///
+/// The host copies the whole buffer into Wasm linear memory, and the
+/// percent-decode scratch buffers hold further copies, so the ceiling has to
+/// fit the VM's configured memory budget with room to spare. An allocation
+/// failure in a Proxy-Wasm filter aborts the VM rather than degrading, which
+/// would take the filter and the traffic it protects offline, so this is
+/// deliberately far below what wasm32 could address.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum size of one extracted field.
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
 /// Maximum number of extracted fields in one message.
 const MAX_FIELDS: usize = 65_536;
 /// Maximum JSON nesting depth accepted by the plugin.
-const MAX_JSON_DEPTH: usize = 128;
+///
+/// Each level adds serde's `deserialize_any` dispatch frame plus
+/// `serde_json`'s own recursion. The default `wasm32` stack is one mebibyte
+/// and a stack overflow in Wasm is an unrecoverable trap, so the ceiling is
+/// held well inside it; raising `max_json_depth` toward it should be
+/// validated against the deployment's configured stack size.
+const MAX_JSON_DEPTH: usize = 64;
 
 /// Chooses what to do with a direction's detections.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
