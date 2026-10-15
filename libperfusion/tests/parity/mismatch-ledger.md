@@ -90,6 +90,37 @@ not token bytes:
 Oracle errors and panics fail the comparison. The pinned Go main oracle
 completes every result field in the checked-in baseline.
 
+## Deliberate detection deviations from upstream
+
+The following changes make this port detect inputs upstream misses. They are
+deviations from `d88a8f8` by design, so the pinned oracle will disagree on
+these shapes; each is covered by a test in `tests/regressions.rs`.
+
+| Change | Upstream | libperfusion | Reason |
+| --- | --- | --- | --- |
+| `#` comment whitelist narrowed | suppresses every `sc` whose comment starts with `#` | suppressed unless the comment closes a string the input did not open and ends the input | `admin'#` is a complete MySQL authentication bypass; the blanket suppression dates from a corpus in which a bare `#` in prose was common |
+| `--` comment whitelist narrowed | suppresses any comment token longer than two bytes | allowed through when the comment body is entirely whitespace and ends the input | ANSI SQL and MySQL both require whitespace after `--`, so `admin'-- ` is the more canonical terminator and the whitelist was inverted relative to exploitability |
+| 8 stacked-statement fingerprints added | `01;ES`, `01;T`, `0S;ES`, `0S;T`, `01;TN`, `0S;TN`, `01;TC`, `0S;TC` absent | present | Length-4 coverage is thin upstream, so `1;WAITFOR DELAY '0:0:5'` passed while `1;WAITFOR DELAY '0:0:5',` was caught |
+| 21 dialect identifiers added | absent | present | A callable missing from the table is classified `Bareword`, which moves the fingerprint off the denylist; see `data/sqli_keywords.txt` |
+
+Identifiers were chosen to have no plausible reading as ordinary prose.
+Common English words that appear in the dialect references -- `WINDOW`,
+`FILTER`, `GROUPS`, `WITHIN`, `LATERAL`, `RETURNING`, `PIVOT`, `UPSERT`,
+`PROGRAM` -- were deliberately **not** added: adding them produced a false
+positive on the sentence "please copy the program to the new window"
+(`nTnkn`). `tests/regressions.rs` asserts the retained set leaves prose alone.
+
+Bare Oracle package names (`UTL_HTTP`, `UTL_INADDR`, `DBMS_PIPE`,
+`DBMS_LOCK`) were likewise **not** added. The table already carries them as
+fully qualified names such as `UTL_INADDR.GET_HOST_ADDRESS`, and classifying
+the bare package stops the lexer merging the dotted form, which *loses* a
+detection the table already had.
+
+`differential.tables` and `differential.source_sha256` in
+`tests/parity/manifest.json`, and `sql` in `data/tables.json`, are updated to
+match. The pinned Go and C oracles still describe upstream, so the optional
+`make parity-differential` gate reports these shapes as differences.
+
 ## Provenance
 
 Compatibility is selected against the pinned Go main commit using Go

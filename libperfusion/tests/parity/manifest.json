@@ -2541,8 +2541,8 @@
       "reviewed_xss_differences": 24
     },
     "tables": {
-      "sql_keyword_entries": 9352,
-      "sql_fingerprint_entries": 8367,
+      "sql_keyword_entries": 9381,
+      "sql_fingerprint_entries": 8375,
       "sql_dispatch_bytes": 256,
       "sql_dispatch_sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e",
       "xss_tables": {
@@ -2566,7 +2566,7 @@
       "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
       "xss.go": "768f919a0f0dd54cb9777fee388c539632b16f1ccec8701529c4d476d96e4aaf",
       "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023",
-      "data/sqli_keywords.txt": "1914890e6eb9166066ad587db18b7c2309830a0612533fbf97744ca260079bfd"
+      "data/sqli_keywords.txt": "c38b748b91b5a2093b91066975372ede052c1bef5aa7eee0d00eb660809ea811"
     },
     "exceptions": [],
     "expected_oracle_errors": []

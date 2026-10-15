@@ -6,8 +6,8 @@
     "version": "v4.0.0-8-gd88a8f8"
   },
   "sql": {
-    "entries": 9352,
-    "sha256": "d9f0395d3e9b90c70c59f45d6be0408ef493bd854933b276e44614cb9d6b56bd"
+    "entries": 9381,
+    "sha256": "d0ac94c702edd05bc27110fab914d6934ad1ef58e8eef8a55f6ab09ca46fcd87"
   },
   "xss": {
     "attributes": 20,

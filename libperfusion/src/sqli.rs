@@ -232,9 +232,21 @@ impl<'a, L: SqlLookup> State<'a, L> {
                     return stats.tokens != 2;
                 }
 
-                // A '#' comment: too many false positives.
+                // A '#' comment. Upstream suppresses these outright because a
+                // bare '#' in free text was a common false positive, but '#'
+                // is MySQL's end-of-line comment and the standard terminator
+                // in authentication-bypass payloads. Narrow the suppression
+                // the same way the '-' case below is narrowed: it is only
+                // SQLi when it closes an unterminated string and ends the
+                // input ("admin'#"), not when it merely appears in text.
+                // `str_open` is None when the string was opened by the
+                // surrounding query rather than by the input, which is what
+                // separates an injection that closes it ("admin'#") from a
+                // self-contained literal followed by a comment ("'abc' #x").
                 if tokens[1].byte(0) == b'#' {
-                    return false;
+                    return tokens[0].ty == TokenType::String
+                        && tokens[0].str_open.is_none()
+                        && tokens[1].pos + tokens[1].len == self.input.len();
                 }
 
                 // For "nc", only a "/*" comment counts: trailing "--" and
@@ -277,9 +289,19 @@ impl<'a, L: SqlLookup> State<'a, L> {
                 }
 
                 // Many people put "--" in plain text, so only an input that
-                // ends with it is flagged: "1--" but not "1-- foo".
+                // ends with it is flagged: "1--" but not "1-- foo". ANSI SQL
+                // and MySQL both require whitespace after "--" for it to open
+                // a comment, so "-- " is the more canonical terminator and
+                // suppressing it inverts the whitelist relative to
+                // exploitability. Keep the suppression for prose, but let a
+                // comment whose body is entirely whitespace and which ends
+                // the input through.
                 if tokens[1].len > 2 && tokens[1].byte(0) == b'-' {
-                    return false;
+                    let body = tokens[1].value().get(2..).unwrap_or_default();
+                    let terminates = tokens[1].pos + tokens[1].len == self.input.len();
+                    if !(terminates && body.iter().all(u8::is_ascii_whitespace)) {
+                        return false;
+                    }
                 }
             },
             3 => {
