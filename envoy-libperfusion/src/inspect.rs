@@ -212,8 +212,13 @@ fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
 ///
 /// `xss_with_limit` skips libperfusion's own input-length guard, so bounding
 /// the scan here is what keeps a large body from being scanned unbounded.
+/// The CSS-value check runs alongside the HTML contexts because the filter
+/// sees a field value without the template around it, which is exactly the
+/// form a value reflected into a `style="..."` attribute arrives in.
 fn has_xss_in_overlapping_windows(bytes: &[u8]) -> bool {
-    scan_overlapping_windows(bytes, |window| libperfusion::xss_with_limit(window, window.len()))
+    scan_overlapping_windows(bytes, |window| {
+        libperfusion::xss_with_limit(window, window.len()) || libperfusion::xss_in_css_value(window)
+    })
 }
 
 /// Re-tests a window from a bounded, evenly spread set of token starts.
@@ -482,20 +487,29 @@ impl Inspection {
     }
 
     /// Decodes URL-encoded fields and records malformed encodings.
+    ///
+    /// `form_urlencoded` splits on `&` only, while the original CGI
+    /// specification and the applications that still follow it also accept
+    /// `;`. Splitting on it first keeps per-field attribution for those
+    /// deployments; a literal `;` inside a value has to be sent as `%3B` to
+    /// survive either reading, so nothing that was one field becomes
+    /// unreadable.
     fn scan_form_fields(&mut self, bytes: &[u8]) {
         if !has_valid_percent_escapes(bytes) {
             self.mark_incomplete(Incomplete::MalformedEncoding);
         }
-        for (name, value) in form_urlencoded::parse(bytes) {
-            if self.fields >= self.max_fields {
-                self.mark_incomplete(Incomplete::FieldLimit);
-                break;
+        for segment in bytes.split(|byte| *byte == b';') {
+            for (name, value) in form_urlencoded::parse(segment) {
+                if self.fields >= self.max_fields {
+                    self.mark_incomplete(Incomplete::FieldLimit);
+                    return;
+                }
+                if name.contains('\u{fffd}') || value.contains('\u{fffd}') {
+                    self.mark_incomplete(Incomplete::MalformedEncoding);
+                }
+                self.scan_field(name.as_bytes());
+                self.scan_field(value.as_bytes());
             }
-            if name.contains('\u{fffd}') || value.contains('\u{fffd}') {
-                self.mark_incomplete(Incomplete::MalformedEncoding);
-            }
-            self.scan_field(name.as_bytes());
-            self.scan_field(value.as_bytes());
         }
     }
 
@@ -1387,6 +1401,35 @@ mod tests {
         let mut clean = Inspection::new(&config);
         clean.headers(&headers(&[("x-q", "an ordinary value")]));
         assert!(!clean.has_sqli(), "normalisation must not invent detections");
+    }
+
+    /// Attributes semicolon-separated query parameters as separate fields.
+    #[test]
+    fn splits_semicolon_separated_query_parameters() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        inspection.headers(&headers(&[(":path", "/x?a=1;b=1%27+OR+%271%27%3D%271")]));
+
+        assert!(
+            inspection.has_sqli(),
+            "a parameter after a ';' separator must be inspected"
+        );
+    }
+
+    /// Detects script reflected into a standalone CSS value.
+    #[test]
+    fn detects_css_value_payloads_in_fields() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        inspection.headers(&headers(&[("x-style", "background:url(javascript:alert(1))")]));
+        assert!(inspection.has_xss(), "CSS-context XSS must be inspected");
+
+        let mut benign = Inspection::new(&config);
+        benign.headers(&headers(&[(
+            "x-style",
+            "background:url(data:image/png;base64,iVBORw0KGgo=)",
+        )]));
+        assert!(!benign.has_xss(), "an inline image must not be flagged");
     }
 
     /// Scans `SQLi` at the end of a raw body longer than libperfusion's input limit.

@@ -271,6 +271,64 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
         .map(|&(_, attribute)| attribute)
 }
 
+/// Schemes that run script from a CSS `url()`.
+///
+/// `DATA` is deliberately excluded: `url(data:image/png;base64,...)` is
+/// ordinary stylesheet content, so treating it as script here would flag
+/// benign CSS.
+const SCRIPT_URL_SCHEMES: [&[u8]; 3] = [b"JAVA", b"VBSCRIPT", b"VIEW-SOURCE"];
+
+/// Constructs that execute script from inside a CSS declaration.
+///
+/// The HTML contexts only see a value once it is inside a tag, so a value
+/// reflected straight into a `style="..."` attribute or a `<style>` block is
+/// invisible to them: `<div style="x:expression(alert(1))">` is detected but
+/// the bare `x:expression(alert(1))` is not. The patterns here are the ones
+/// with no benign reading in a stylesheet.
+pub(crate) fn is_css_value_xss(input: &[u8]) -> bool {
+    const NEEDLES: [&[u8]; 3] = [b"EXPRESSION(", b"-MOZ-BINDING", b"BEHAVIOR:"];
+
+    if NEEDLES
+        .iter()
+        .any(|needle| find_ascii_case_insensitive(input, needle).is_some())
+    {
+        return true;
+    }
+
+    // url(...) holding a script-capable scheme, allowing for the whitespace
+    // and quoting CSS permits between the paren and the scheme.
+    let mut from = 0;
+    while let Some(at) = find_ascii_case_insensitive(input.get(from..).unwrap_or_default(), b"URL(") {
+        let after = from.saturating_add(at).saturating_add(4);
+        let rest = input.get(after..).unwrap_or_default();
+        let start = rest
+            .iter()
+            .position(|&byte| !byte.is_ascii_whitespace() && byte != b'\'' && byte != b'"')
+            .unwrap_or(rest.len());
+        let value = rest.get(start..).unwrap_or_default();
+        if SCRIPT_URL_SCHEMES
+            .iter()
+            .any(|scheme| htmlencode_startswith(scheme, value))
+        {
+            return true;
+        }
+        from = after;
+    }
+    false
+}
+
+/// Finds `needle` in `haystack`, comparing ASCII case-insensitively.
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len().saturating_sub(needle.len())).find(|&at| {
+        haystack
+            .get(at..at.saturating_add(needle.len()))
+            .is_some_and(|window| window.eq_ignore_ascii_case(needle))
+    })
+}
+
 fn is_black_url(url: &[u8]) -> bool {
     // Skip whitespace, and high-bit bytes with it: they are not ASCII, Opera
     // sometimes takes UTF-8 whitespace, and EUC-JP ignores some of them.

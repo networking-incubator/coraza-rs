@@ -270,3 +270,44 @@ fn xss_covers_blob_filesystem_and_mathml() {
     ));
     assert!(!libperfusion::xss(br#"<a href="https://example.com/">link</a>"#));
 }
+
+#[test]
+fn xss_detects_script_in_a_standalone_css_value() {
+    // The HTML contexts only see a value once it is inside a tag, so a value
+    // reflected straight into style="..." reaches them in the one form they
+    // cannot read.
+    for payload in [
+        b"background:url(javascript:alert(1))".as_slice(),
+        b"width:expression(alert(1))",
+        b"x:EXPRESSION(alert(1))",
+        b"-moz-binding:url(http://x/x.xml#x)",
+        b"behavior:url(#default#time2)",
+        b"background:url('javascript:alert(1)')",
+        b"background:url(JaVaScRiPt:alert(1))",
+    ] {
+        assert!(
+            libperfusion::xss_in_css_value(payload),
+            "CSS payload not detected: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    // Ordinary stylesheet content, including the data: URLs that make up
+    // most inline images, must not flag.
+    for benign in [
+        b"background:url(/img/bg.png)".as_slice(),
+        b"background:url(data:image/png;base64,iVBORw0KGgo=)",
+        b"color:red; font-weight:bold",
+        b"background:url('https://cdn.example.com/x.png')",
+        b"a normal sentence about expression and behaviour",
+        b"My expression of gratitude",
+        b"url(",
+        b"",
+    ] {
+        assert!(
+            !libperfusion::xss_in_css_value(benign),
+            "ordinary CSS flagged: {:?}",
+            String::from_utf8_lossy(benign)
+        );
+    }
+}
