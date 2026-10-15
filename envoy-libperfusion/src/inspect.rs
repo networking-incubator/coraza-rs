@@ -233,10 +233,10 @@ impl Inspection {
         self.scan_percent_encoded_views(bytes);
     }
 
-    /// Runs both libperfusion detectors on a byte sequence.
+    /// Runs both detectors over this byte slice, which is bounded by adapter limits.
     fn scan_bytes(&mut self, bytes: &[u8]) {
-        self.findings.sqli |= libperfusion::sqli(bytes).is_some();
-        self.findings.xss |= libperfusion::xss(bytes);
+        self.findings.sqli |= libperfusion::sqli_with_limit(bytes, bytes.len()).is_some();
+        self.findings.xss |= libperfusion::xss_with_limit(bytes, bytes.len());
     }
 
     /// Scans bounded percent-decoded views while retaining the original bytes.
@@ -847,6 +847,52 @@ mod tests {
 
         assert!(inspection.has_xss(), "encoded raw-body XSS must be inspected");
         assert_eq!(inspection.incomplete(), None, "covered layers are complete");
+    }
+
+    /// Scans `SQLi` at the end of a raw body longer than libperfusion's input limit.
+    #[test]
+    fn scans_sqli_at_end_of_large_raw_body() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+        let mut body = vec![b' '; libperfusion::MAX_INPUT_LEN];
+        body.extend_from_slice(b"1 UNION SELECT password FROM users");
+
+        scan_body(&mut inspection, &body, &format);
+
+        assert!(
+            inspection.has_sqli(),
+            "SQLi at the end of a large body must be inspected"
+        );
+    }
+
+    /// Scans XSS at the end of a raw body longer than libperfusion's input limit.
+    #[test]
+    fn scans_xss_at_end_of_large_raw_body() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+        let mut body = vec![b' '; libperfusion::MAX_INPUT_LEN];
+        body.extend_from_slice(b"<script>alert(1)</script>");
+
+        scan_body(&mut inspection, &body, &format);
+
+        assert!(inspection.has_xss(), "XSS at the end of a large body must be inspected");
+    }
+
+    /// Scans findings after NUL padding in a raw body.
+    #[test]
+    fn scans_findings_after_nul_padding() {
+        let config = Config::default();
+        let mut inspection = Inspection::new(&config);
+        let format = inspection.headers(&[]);
+        let mut body = vec![0; libperfusion::MAX_INPUT_LEN];
+        body.extend_from_slice(b"1 UNION SELECT password FROM users <script>alert(1)</script>");
+
+        scan_body(&mut inspection, &body, &format);
+
+        assert!(inspection.has_sqli(), "SQLi after NUL bytes must be inspected");
+        assert!(inspection.has_xss(), "XSS after NUL bytes must be inspected");
     }
 
     /// Checks JSON escapes and duplicate object members.

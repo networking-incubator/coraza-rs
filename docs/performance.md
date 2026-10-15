@@ -90,8 +90,8 @@ exceed the 15 ms target, so those samples contain one call. The timer is checked
 after batches of calls for small inputs to reduce timer overhead.
 
 The measurements were taken with these commands at the time. The current
-`compare` target benchmarks libperfusion alone and cannot reproduce this
-historical pairwise comparison:
+`compare` target measures two libperfusion API entry points; it cannot
+reproduce this historical cross-implementation comparison:
 
     taskset -c 3 cargo bench -p libperfusion --bench compare
     taskset -c 3 cargo bench -p libperfusion --bench scaling
@@ -407,8 +407,9 @@ behavior.
 
 The retained benchmark targets are
 [compare.rs](../libperfusion/benches/compare.rs) and
-[scaling.rs](../libperfusion/benches/scaling.rs). They measure only the
-selected implementation now.
+[scaling.rs](../libperfusion/benches/scaling.rs). `compare` times the capped
+and caller-bounded APIs; `scaling` verifies expected verdicts and times the
+caller-bounded API over generated inputs.
 
 ## Current implementation after P3 optimizations
 
@@ -465,3 +466,146 @@ kept identical HTML token streams in all five contexts. At measurement time,
 pinned C and Go v0.3.5 differentials passed with their reviewed exceptions.
 These checks do not replace broader fuzzing or make the unlocked-frequency
 timings portable to other CPUs.
+
+## Caller-bounded scan benchmark
+
+**Measured:** 2026-10-15, on the `feature/envoy-libperfusion-wasm` working tree
+at HEAD `90ac00e898e6b6528141a8fd7221926a97fe087a`, including the uncommitted
+Envoy adapter change to call `sqli_with_limit` and `xss_with_limit` over the
+complete admitted slice.
+
+The default libperfusion `sqli` and `xss` APIs reject inputs longer than
+65,536 bytes without scanning. The adapter now passes the bounded body slice's
+full length to the caller-bounded APIs, so content after that boundary is
+inspected. The larger scan cost below is the intended coverage for oversized
+inputs; the capped API does not provide a valid performance baseline for those
+inputs because it skips them.
+
+### Corpus API comparison
+
+Command: `taskset -c 3 cargo bench -p libperfusion --bench compare`. It verified
+and timed all 498 repository corpus inputs. Each group reports the median of
+five 100 ms samples; capped is measured before caller-bounded in this run.
+
+| Workload | Inputs | Capped ns/input | Caller-bounded ns/input | Change |
+| --- | ---: | ---: | ---: | ---: |
+| SQLi hit | 98 | 160.6 | 163.2 | +1.6% |
+| SQLi miss | 400 | 159.0 | 160.6 | +1.0% |
+| XSS hit | 17 | 31.3 | 31.4 | +0.3% |
+| XSS miss | 481 | 84.4 | 84.8 | +0.5% |
+
+This same-build API comparison shows no material corpus-size regression. The
+differences are below 2% and should be treated as measurement noise, not a
+stable throughput change.
+
+### Full-input scaling
+
+Command: `taskset -c 3 cargo bench -p libperfusion --bench scaling`. The full
+sweep verified the expected hit or miss for all 130 generated inputs before
+timing. The table shows representative 1 MiB detector cases and the larger
+XSS cases; values are median nanoseconds per call with the observed range.
+
+| Detector and shape | Bytes | Median [min–max] |
+| --- | ---: | ---: |
+| SQLi plain miss | 1,048,576 | 248,603 [246,830–250,023] ns |
+| SQLi operator-noise miss | 1,048,576 | 4,605,121 [4,572,595–4,650,371] ns |
+| SQLi attack after leading whitespace | 1,048,576 | 452,805 [450,426–456,331] ns |
+| XSS encoded URL at end | 1,048,576 | 8,907 [8,821–8,937] ns |
+| XSS slash miss | 1,048,576 | 484,481 [481,929–487,232] ns |
+| XSS slash miss | 5,242,880 | 2,454,625 [2,404,365–2,507,982] ns |
+| XSS slash miss | 10,485,760 | 5,076,110 [5,010,463–5,307,288] ns |
+| XSS benign tag stream miss | 1,048,576 | 4,075,107 [4,046,884–4,098,804] ns |
+| XSS benign tag stream miss | 5,242,880 | 20,134,946 [20,012,275–20,537,493] ns |
+| XSS benign tag stream miss | 10,485,760 | 42,607,847 [40,553,244–42,717,203] ns |
+
+From 1 to 10 MiB, the slash and benign-tag XSS misses took about 10.5 times
+longer for 10 times as many bytes. These tested shapes therefore scaled close
+to linearly. Latency depends strongly on the input shape: the 10 MiB benign
+tag stream took 42.6 ms, while the slash miss took 5.08 ms.
+
+### C speed comparison
+
+The optional `speed` target completed against libinjection C revision
+`d88a8f86d617ac8dcb9169c9f34637aaac71ac76`, built with GCC 16.2.1 and `-O3`.
+The source was from a temporary copy of the upstream checkout with the nine
+reviewed C-only XSS samples listed by `C_XSS_SAMPLE_DIFFERENCES` in
+`libperfusion/tests/oracle_differential.rs` removed. With the full sample set,
+the target stops on the known nine-hit difference (C detects 81,397 XSS
+samples; Rust detects 81,388). This filtering changes only the benchmark input
+set; it does not modify the checkout or the differential tests.
+
+Across the seven measured workload groups, libperfusion's port/C timing ratio
+was 0.54–0.59× for SQLi and 0.29–0.39× for XSS. Ratios below 1 mean the port
+was faster on these workloads. This C comparison calls the capped public APIs
+on sample inputs; it does not measure the Envoy adapter or multi-megabyte body
+scanning.
+
+### Environment and limits
+
+The runs used an AMD Ryzen 7 PRO 7840HS, Linux 7.2.9, rustc/cargo 1.97.1, and
+GCC 16.2.1. Processes were pinned to logical CPU 3, but CPU frequency was not
+locked (observed range 419–5,138 MHz). The full-input numbers are single-thread
+detector timings over in-memory data; they do not include Envoy/WASM execution,
+request parsing, concurrency, or end-to-end proxy latency.
+
+### Recheck against the prior generated-measurement column
+
+The full scaling sweep was rerun and compared row by row with the
+`YA after all optimizations` medians above. Of 124 matching rows, 74 current
+medians were lower, 47 were higher, and 3 were within 0.05% of the prior
+median. The geometric mean of current/prior latency was 0.911 overall (0.781
+for SQLi and 0.974 for XSS). Six newer 4 KiB prose/JSON/base64 cases have no
+row in that table and are not included.
+
+| Detector | Matched rows | Current median lower | Higher | Within 0.05% | Current range above prior range | Below | Overlapping |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SQLi | 38 | 34 | 4 | 0 | 1 | 24 | 13 |
+| XSS | 86 | 40 | 43 | 3 | 27 | 18 | 41 |
+| All | 124 | 74 | 47 | 3 | 28 | 42 | 54 |
+
+The XSS `comment_miss` family was slower at every tested size, with the
+current median 10–26% above the prior median. All five current samples for
+each size were above the prior row's observed range.
+
+| Bytes | Prior median ns | Current median ns | Change |
+| ---: | ---: | ---: | ---: |
+| 64 | 147.5 | 163.5 | +10.8% |
+| 256 | 375.4 | 413.9 | +10.3% |
+| 1,024 | 1,229.2 | 1,454.8 | +18.4% |
+| 4,096 | 4,778.9 | 5,630.5 | +17.8% |
+| 16,384 | 19,044.5 | 23,936.8 | +25.7% |
+| 65,536 | 76,743.0 | 91,990.7 | +19.9% |
+| 262,144 | 303,491.1 | 375,443.9 | +23.7% |
+| 1,048,576 | 1,260,437.7 | 1,416,794.7 | +12.4% |
+
+Several XSS `angle_noise_miss` sizes were also higher: 256 bytes (+14.9%),
+4 KiB (+17.7%), 16 KiB (+17.6%), and 256 KiB (+22.1%). These standalone results
+include slower synthetic rows, despite the faster overall geometric mean and
+the near-flat corpus API comparison. They do not isolate the implementation
+change responsible for a timing difference. The reported
+min/max values come from separate runs with unlocked CPU frequency; they show
+observed spread, not statistical confidence intervals.
+
+Subsequent paired comparisons across five executable layouts confirmed native
+code-layout sensitivity but did not confirm a persistent tag-stream slowdown. See the
+[investigation and fix plan](performance-regression-plan.md) before attributing
+these historical timing differences to a particular implementation change.
+
+## Native HTML scanner follow-up (2026-10-15)
+
+The long attribute-name scan now keeps the scalar path for spans up to 128
+bytes and uses memchr on the tail of longer spans. This targets the confirmed
+native scalar-loop cliff without changing SQL's shared delimiter search. In
+three paired runs across five code layouts, 4 KiB plain XSS misses measured
+0.270× the same-source control median (about 3.7× faster); 16 KiB measured
+0.210×. The 64-byte plain XSS miss median was 1.026×, with each run median
+below 1.05×. Across all 130 cases, the median of each case's three run-level
+medians stayed at or below 1.05. Run 1 alone had nine run-level medians above
+1.05 (seven SQL plain misses and two 64-byte XSS misses); runs 2 and 3 had none.
+
+The historical YA after all optimizations tables above are unchanged. These
+new ratios compare the candidate with a same-source control and expose the
+remaining layout spread; they are not absolute latency values or measurements
+inside Envoy/WASM. The [per-case results](performance-investigation/cspan-comparison.tsv)
+and [raw samples](performance-investigation/cspan-samples.tsv.gz) preserve the
+full native comparison.
