@@ -240,6 +240,44 @@ fn is_black_tag(name: &[u8]) -> bool {
         || name.starts_with(b"XSL")
 }
 
+/// Which `(first letter, length)` shapes [`BLACK_ATTRS`] contains, one
+/// bitmap of lengths per letter.
+///
+/// [`BLACK_ATTRS`] is scanned linearly because it has to stay in table
+/// order: `tests/tables.rs` pins the upstream rows ahead of the local
+/// supplement. That makes the cost of every miss proportional to the table
+/// length, and the supplement made the table half again as long. A name
+/// whose shape is absent cannot be in the table, so this skips the scan and
+/// keeps the miss path -- which is every ordinary attribute in ordinary
+/// markup -- independent of how many rows the table has.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Const initializer: the loop bound guards BLACK_ATTRS[i]; names are non-empty \
+              upper-case ASCII &str, so .as_bytes()[0] - b'A' is 0..=25 and indexes [u64; 26]. \
+              A name outside A-Z or longer than 63 bytes fails to compile."
+)]
+static ATTR_NAME_SHAPES: [u64; 26] = {
+    let mut shapes = [0_u64; 26];
+    let mut i = 0;
+    while i < BLACK_ATTRS.len() {
+        let name = BLACK_ATTRS[i].0.as_bytes();
+        shapes[(name[0] - b'A') as usize] |= 1 << name.len();
+        i += 1;
+    }
+    shapes
+};
+
+/// Whether [`BLACK_ATTRS`] holds any name of `name`'s letter and length.
+fn attr_shape_present(name: &[u8]) -> bool {
+    let Some(index) = name.first().and_then(|first| first.checked_sub(b'A')) else {
+        return false;
+    };
+    let Some(&lengths) = ATTR_NAME_SHAPES.get(usize::from(index)) else {
+        return false;
+    };
+    name.len() < u64::BITS as usize && lengths & (1_u64 << name.len()) != 0
+}
+
 fn black_attr(name: &[u8]) -> Option<Attribute> {
     let mut normalized = [0; MAX_NORMALIZED_TOKEN_LEN];
     let len = normalize_name(name, &mut normalized)?;
@@ -265,6 +303,10 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
         }
     }
 
+    if !attr_shape_present(name) {
+        return None;
+    }
+
     BLACK_ATTRS
         .iter()
         .find(|(known, _)| name == known.as_bytes())
@@ -276,7 +318,13 @@ fn black_attr(name: &[u8]) -> Option<Attribute> {
 /// `DATA` is deliberately excluded: `url(data:image/png;base64,...)` is
 /// ordinary stylesheet content, so treating it as script here would flag
 /// benign CSS.
-const SCRIPT_URL_SCHEMES: [&[u8]; 3] = [b"JAVA", b"VBSCRIPT", b"VIEW-SOURCE"];
+///
+/// Each prefix carries its `:`. [`is_black_url`] can match the bare `JAVA`
+/// because an HTML URL attribute holds nothing but a URL, so a relative
+/// path never reaches it as a scheme to classify; a CSS `url()` does take
+/// relative paths, and matching a bare scheme name flagged
+/// `url(java-logo.png)`.
+const SCRIPT_URL_SCHEMES: [&[u8]; 3] = [b"JAVASCRIPT:", b"VBSCRIPT:", b"VIEW-SOURCE:"];
 
 /// Constructs that execute script from inside a CSS declaration.
 ///
@@ -329,11 +377,43 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
     })
 }
 
+/// The upper-case first letters of [`BLACK_URL_SCHEMES`], as an A-Z bitmap.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Const initializer: the loop bound guards BLACK_URL_SCHEMES[i]; every scheme is a \
+              non-empty upper-case ASCII literal, so [0] - b'A' is 0..=25. A scheme outside A-Z \
+              fails to compile."
+)]
+const SCHEME_FIRST_LETTERS: u32 = {
+    let mut letters = 0_u32;
+    let mut i = 0;
+    while i < BLACK_URL_SCHEMES.len() {
+        letters |= 1 << (BLACK_URL_SCHEMES[i][0] - b'A');
+        i += 1;
+    }
+    letters
+};
+
 fn is_black_url(url: &[u8]) -> bool {
     // Skip whitespace, and high-bit bytes with it: they are not ASCII, Opera
     // sometimes takes UTF-8 whitespace, and EUC-JP ignores some of them.
     let start = url.iter().position(|&ch| ch > 32 && ch < 127).unwrap_or(url.len());
     let url = url.get(start..).unwrap_or_default();
+
+    // Every scheme comparison restarts the entity decoder, so a URL that
+    // cannot begin any of them is worth ruling out once. Only a literal
+    // first byte can be judged here: `&` may decode to any letter, and the
+    // bytes `htmlencode_startswith` skips were removed just above.
+    match url.first() {
+        None => return false,
+        Some(&b'&') => {},
+        Some(&first) => {
+            let letter = first.to_ascii_uppercase().wrapping_sub(b'A');
+            if letter >= 26 || SCHEME_FIRST_LETTERS & (1 << letter) == 0 {
+                return false;
+            }
+        },
+    }
 
     BLACK_URL_SCHEMES
         .iter()

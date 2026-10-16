@@ -87,13 +87,16 @@ fn refresh(root: &Path, upstream: &Path) -> Result<(), String> {
 
     let data = root.join("libperfusion/data");
     fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+    // The merge build.rs performs is validated before anything is written:
+    // a new upstream revision that collides with a local row must leave the
+    // checkout as it was, not half-rewritten and unbuildable.
+    let (local_sql, local_xss) = read_local(&data)?;
+    merged_sql(&sql_rows, &local_sql)?;
+    merged_xss(&xss_rows, &local_xss)?;
     // Only the upstream-generated files are rewritten: the local supplements
     // stay as they are, and build.rs merges both at compile time.
     fs::write(data.join(SQL_FILE), render_sql(&revision, &sql_rows)).map_err(|error| error.to_string())?;
     fs::write(data.join(XSS_FILE), render_xss_data(&revision, &xss_rows)).map_err(|error| error.to_string())?;
-    let (local_sql, local_xss) = read_local(&data)?;
-    merged_sql(&sql_rows, &local_sql)?;
-    merged_xss(&xss_rows, &local_xss)?;
     fs::write(
         data.join("tables.json"),
         render_manifest(&revision, &sql_rows, &xss_rows, &local_sql, &local_xss),
@@ -663,9 +666,13 @@ mod tests {
         );
     }
 
+    fn upstream_sql() -> SqlRows {
+        vec![("A".to_owned(), b'k'), ("C".to_owned(), b'k')]
+    }
+
     #[test]
     fn merges_local_rows_and_rejects_collisions() {
-        let upstream = vec![("A".to_owned(), b'k'), ("C".to_owned(), b'k')];
+        let upstream = upstream_sql();
         let local = vec![("B".to_owned(), b'f')];
         assert_eq!(
             merged_sql(&upstream, &local).unwrap(),
@@ -682,6 +689,30 @@ mod tests {
         assert_eq!(merged_xss(&upstream, &local).unwrap().len(), 4);
         let collision = vec![vec!["attr".to_owned(), "HREF".to_owned(), "Black".to_owned()]];
         assert!(merged_xss(&upstream, &collision).is_err());
+
+        // A supplement that repeats itself is rejected by the same check, so
+        // the duplicate never reaches the generated table.
+        let repeated = vec![
+            vec!["tag".to_owned(), "MATH".to_owned()],
+            vec!["tag".to_owned(), "MATH".to_owned()],
+        ];
+        assert!(merged_xss(&upstream, &repeated).is_err());
+        assert!(merged_sql(&upstream_sql(), &[("B".to_owned(), b'f'), ("B".to_owned(), b'f')]).is_err());
+    }
+
+    /// The checked-in tables merge, so `tables-refresh` never half-writes.
+    #[test]
+    fn checked_in_tables_merge_without_collisions() {
+        let data = workspace_root().join("libperfusion/data");
+        let upstream_sql = parse_sql_data(&fs::read_to_string(data.join(SQL_FILE)).unwrap()).unwrap();
+        let upstream_xss = parse_xss_data(&fs::read_to_string(data.join(XSS_FILE)).unwrap()).unwrap();
+        let (local_sql, local_xss) = read_local(&data).unwrap();
+
+        let sql = merged_sql(&upstream_sql, &local_sql).unwrap();
+        let xss = merged_xss(&upstream_xss, &local_xss).unwrap();
+
+        assert_eq!(sql.len(), upstream_sql.len() + local_sql.len());
+        assert_eq!(xss.len(), upstream_xss.len() + local_xss.len());
     }
 
     #[test]

@@ -2538,7 +2538,7 @@
       "commit": "533a165ebc1f7c36ecbe3e5583990ea0db81f554",
       "driver": "tests/c_oracle_driver.c",
       "results": "SQLi verdict and fingerprint; XSS verdict",
-      "reviewed_xss_differences": 24
+      "reviewed_xss_differences": 20
     },
     "tables": {
       "sql_keyword_entries": 9352,

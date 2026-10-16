@@ -534,6 +534,12 @@ the target stops on the known nine-hit difference (C detects 81,397 XSS
 samples; Rust detects 81,388). This filtering changes only the benchmark input
 set; it does not modify the checkout or the differential tests.
 
+> Superseded. The `speed` target now carries a reviewed `hit_delta` per
+> workload, so it runs on the unmodified sample set and still fails on any
+> unreviewed disagreement. The constant was also renamed to
+> `C_XSS_SAMPLE_VERDICTS`, and the current sample counts are in
+> `libperfusion/tests/parity/mismatch-ledger.md`.
+
 Across the seven measured workload groups, libperfusion's port/C timing ratio
 was 0.54–0.59× for SQLi and 0.29–0.39× for XSS. Ratios below 1 mean the port
 was faster on these workloads. This C comparison calls the capped public APIs

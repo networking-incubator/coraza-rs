@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Check the pinned libinjection provenance, data tables, and corpus inventory."""
+"""Check the pinned libinjection provenance, data tables, and corpus inventory.
+
+Scope: every table comparison here is against the *upstream-generated*
+``data/sqli_keywords.txt`` and ``data/xss_tables.txt``. Those two files stay
+byte-for-byte what the pinned revision produces, so comparing them to the
+pinned Go source for exact equality is correct and must stay strict.
+
+The compiled tables are deliberately larger: ``build.rs`` merges
+``data/sqli_keywords_local.txt`` and ``data/xss_tables_local.txt`` into them.
+Those supplements are this project's own additions, are pinned by the
+``local`` section of ``data/tables.json``, and are verified by
+``cargo xtask tables-check``; they are intentionally absent from the parity
+manifest, which describes upstream alone. What this script does check about
+them is that they cannot silently change the meaning of an upstream row --
+see :func:`check_local_supplements`.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +37,9 @@ C_REFERENCE = {
     "commit": "533a165ebc1f7c36ecbe3e5583990ea0db81f554",
     "driver": "tests/c_oracle_driver.c",
     "results": "SQLi verdict and fingerprint; XSS verdict",
-    "reviewed_xss_differences": 24,
+    # Was 24; the local MATH tag row closed four of them. See
+    # tests/parity/mismatch-ledger.md.
+    "reviewed_xss_differences": 20,
 }
 GO_TOOLS = ROOT.parent / "xtask/tools"
 FAMILY_COUNTS = {"sqli": 55, "folding": 119, "tokens": 249, "html5": 68, "xss": 7}
@@ -293,6 +310,53 @@ def rust_xss_tables() -> tuple[list[str], list[str], list[tuple[str, str]]]:
     return events, tags, attrs
 
 
+def parse_local_xss_rows() -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    path = ROOT / "data/xss_tables_local.txt"
+    for line_number, line in enumerate(path.read_text(encoding="ascii").splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        match fields:
+            case ["event" | "tag", name] if name:
+                rows.append((fields[0], name))
+            case ["attr", name, kind] if name and kind in RUST_XSS_KIND:
+                rows.append(("attr", name))
+            case _:
+                fail(f"invalid local XSS table row at {path}:{line_number}: {line!r}")
+    return rows
+
+
+def check_local_supplements() -> None:
+    """Verify the local additions only ever extend the upstream tables.
+
+    The manifest hashes upstream alone, so a local row that repeats or
+    redefines an upstream row would change the compiled tables while leaving
+    every recorded hash intact. ``build.rs`` rejects such a merge at compile
+    time; this repeats the check here so the parity gate reports it as a
+    provenance problem rather than as a build failure.
+    """
+    upstream_keywords = parse_rust_keywords(ROOT / "data/sqli_keywords.txt")
+    local_keywords = parse_rust_keywords(ROOT / "data/sqli_keywords_local.txt")
+    collisions = sorted(set(local_keywords) & set(upstream_keywords))[:5]
+    if collisions:
+        fail(f"data/sqli_keywords_local.txt redefines upstream SQL keywords: {collisions}")
+
+    upstream_events, upstream_tags, upstream_attrs = rust_xss_tables()
+    upstream_xss = (
+        {("event", name) for name in upstream_events}
+        | {("tag", name) for name in upstream_tags}
+        | {("attr", name) for name, _ in upstream_attrs}
+    )
+    local_xss = parse_local_xss_rows()
+    duplicates = sorted({row for row in local_xss if local_xss.count(row) > 1})[:5]
+    if duplicates:
+        fail(f"data/xss_tables_local.txt repeats rows: {duplicates}")
+    overlaps = sorted(set(local_xss) & upstream_xss)[:5]
+    if overlaps:
+        fail(f"data/xss_tables_local.txt redefines upstream XSS rows: {overlaps}")
+
+
 def semantic_table_hash(rows: list[tuple[str, str | None]]) -> str:
     normalized = [name if kind is None else f"{name}\t{kind}" for name, kind in rows]
     return sha256("\n".join(sorted(normalized)).encode("ascii"))
@@ -443,6 +507,10 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
         fail(f"fixture family counts differ: expected {FAMILY_COUNTS}, found {counts}")
     if len(files) != 498:
         fail(f"expected 498 test fixtures, found {len(files)}")
+    # Runs on both paths: the upstream-versus-source comparison below stays
+    # exact, and this is what keeps the local supplements from quietly
+    # changing what those exact hashes describe.
+    check_local_supplements()
 
     if source is None:
         data_hashes = {"data/sqli_keywords.txt": sha256((ROOT / "data/sqli_keywords.txt").read_bytes())}

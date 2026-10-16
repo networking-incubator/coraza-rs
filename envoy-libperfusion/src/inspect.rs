@@ -299,15 +299,32 @@ impl Inspection {
             {
                 self.mark_streaming();
             } else if name.eq_ignore_ascii_case("upgrade") {
-                let token = trim_ascii(value);
-                if STREAMING_UPGRADES
-                    .iter()
-                    .any(|protocol| token.eq_ignore_ascii_case(protocol))
-                {
+                // RFC 9110 section 7.8 makes `Upgrade` a comma-separated
+                // list, so `websocket, h2c` is one header offering two
+                // protocols. Comparing the whole value made every list an
+                // unrecognised upgrade.
+                let mut tokens = 0_usize;
+                let mut unrecognized = false;
+                for token in value.split(|&byte| byte == b',').map(trim_ascii) {
+                    if token.is_empty() {
+                        // The grammar permits empty list elements.
+                        continue;
+                    }
+                    tokens += 1;
+                    if !STREAMING_UPGRADES
+                        .iter()
+                        .any(|protocol| token.eq_ignore_ascii_case(protocol))
+                    {
+                        unrecognized = true;
+                    }
+                }
+                if tokens > 0 && !unrecognized {
                     self.mark_streaming();
                 } else {
                     // The body still has to be inspected: the upstream will
                     // read it as ordinary HTTP whatever this header claims.
+                    // One unrecognised element is enough, because the server
+                    // may select it and leave the exchange on plain HTTP.
                     self.mark_incomplete(Incomplete::MalformedContentType);
                 }
             } else if name.eq_ignore_ascii_case(":path") {
@@ -606,14 +623,17 @@ impl Inspection {
         let whole_stream_limit = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let content = Bytes::from(bytes);
         let stream = futures::stream::once(async move { Ok::<Bytes, Infallible>(content) });
-        let constraints = multer::Constraints::new().size_limit(
-            multer::SizeLimit::new()
-                .whole_stream(whole_stream_limit)
-                // Bound each part by configuration rather than by the length
-                // of the body being parsed, which no part can ever exceed and
-                // so disabled the constraint entirely.
-                .per_field(u64::try_from(self.max_field_bytes).unwrap_or(u64::MAX)),
-        );
+        // Only the whole stream is bounded here. A `per_field` limit is a
+        // parse-aborting error in multer: the field size counter is not reset
+        // until a new part starts, so `next_field` keeps returning
+        // `FieldSizeExceeded` and every part after an oversized one is left
+        // unparsed. One oversized benign part would then hide the attack in
+        // the part behind it. The per-part budget is enforced below instead,
+        // by dropping the oversized part's buffered body and moving on to
+        // the next part, which bounds memory the same way without losing
+        // the parts behind it.
+        let constraints =
+            multer::Constraints::new().size_limit(multer::SizeLimit::new().whole_stream(whole_stream_limit));
 
         // The stream is a single already-materialised chunk, so this future
         // cannot pend. That matters: the Wasm VM is single-threaded with no
@@ -682,6 +702,9 @@ impl Inspection {
                     }
                     let remaining = self.max_field_bytes.saturating_sub(field_body.len());
                     if chunk.len() > remaining {
+                        // The part is dropped, not the parse: the loop goes
+                        // on to the next part. Its bytes were already covered
+                        // by the unconditional raw scan of the whole body.
                         self.mark_incomplete(Incomplete::FieldTooLarge);
                         field_too_large = true;
                         continue;
@@ -736,9 +759,9 @@ fn has_valid_percent_escapes(bytes: &[u8]) -> bool {
 
 /// Maps a multipart parse failure to the reason that describes it.
 ///
-/// `per_field` is bound to `max_field_bytes`, so multer refuses an oversized
-/// part before it is buffered. That is a size refusal, not malformed
-/// framing, and it carries a different status code.
+/// Only the whole stream is bounded by a multer constraint, so a size
+/// refusal here means the body outgrew the materialised request. It is not
+/// malformed framing, and it carries a different status code.
 fn size_aware_reason(error: &multer::Error) -> Incomplete {
     match *error {
         multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => Incomplete::FieldTooLarge,
@@ -1283,6 +1306,36 @@ mod tests {
         }
     }
 
+    /// Reads `Upgrade` as the comma-separated list RFC 9110 defines.
+    #[test]
+    fn upgrade_lists_are_split_before_the_allowlist_is_consulted() {
+        let config = Config::default();
+        let payload = b"u=1%27+OR+%271%27%3D%271+UNION+SELECT+password+FROM+users";
+
+        for upgrade in ["websocket, h2c", "h2c,websocket", " websocket ,, connect "] {
+            let mut inspection = Inspection::new(&config);
+            inspection.headers(&headers(&[(":method", "GET"), ("upgrade", upgrade)]));
+            assert!(
+                inspection.is_streaming(),
+                "every element of {upgrade:?} is a negotiated upgrade"
+            );
+        }
+
+        // One unrecognised element is enough: the server may select it and
+        // leave the exchange on ordinary HTTP.
+        for upgrade in ["websocket, bogus", "bogus, h2c", ",", " "] {
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[
+                (":method", "POST"),
+                ("upgrade", upgrade),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ]));
+            assert!(!inspection.is_streaming(), "{upgrade:?} must not skip body inspection");
+            scan_body(&mut inspection, payload, &format);
+            assert!(inspection.has_sqli(), "body SQLi must be found despite {upgrade:?}");
+        }
+    }
+
     /// Matches the switching-protocols status exactly rather than by prefix.
     #[test]
     fn treats_only_an_exact_101_status_as_streaming() {
@@ -1612,6 +1665,65 @@ mod tests {
         scan_body(&mut too_many, body, &format);
 
         assert_eq!(too_many.incomplete(), Some(Incomplete::FieldLimit));
+    }
+
+    /// Keeps parsing the parts that follow an oversized one.
+    ///
+    /// A `per_field` multer constraint made an oversized part abort the whole
+    /// parse: multer does not reset the field size counter until the next
+    /// part starts, so `next_field` kept returning the same error and every
+    /// later part went unparsed. One oversized benign part in front of the
+    /// payload was enough to turn structured part parsing off.
+    ///
+    /// The payloads are JSON-escaped so only the per-part JSON pass can see
+    /// them: the unconditional raw scan of the whole body reads `<` and
+    /// ` ` literally and finds nothing.
+    #[test]
+    fn multipart_oversized_part_does_not_stop_later_parts() {
+        let config = Config {
+            max_field_bytes: 64,
+            ..Config::default()
+        };
+        let format = Inspection::new(&config).body_format(b"multipart/form-data; boundary=BOUNDARY");
+        let escaped_xss = r#"{"c":"\u003cscript\u003ealert(1)\u003c/script\u003e"}"#;
+        let escaped_sqli = r#"{"q":"1\u0020UNION\u0020SELECT\u0020a"}"#;
+
+        let mut body = b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"pad\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&[b'a'; 4096]);
+        body.extend_from_slice(
+            b"\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"q\"\r\nContent-Type: application/json\r\n\r\n",
+        );
+        body.extend_from_slice(escaped_sqli.as_bytes());
+        body.extend_from_slice(
+            b"\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"c\"\r\nContent-Type: application/json\r\n\r\n",
+        );
+        body.extend_from_slice(escaped_xss.as_bytes());
+        body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+
+        // Proves the payloads really are invisible without per-part parsing.
+        let mut raw = Inspection::new(&config);
+        scan_body(&mut raw, &body, &super::BodyFormat::Raw);
+        assert!(
+            !raw.has_sqli() && !raw.has_xss(),
+            "the escaped payloads must be invisible to the raw body scan"
+        );
+
+        let mut padded = Inspection::new(&config);
+        scan_body(&mut padded, &body, &format);
+
+        assert!(
+            padded.has_sqli(),
+            "SQLi in the part after an oversized one must still be parsed"
+        );
+        assert!(
+            padded.has_xss(),
+            "XSS two parts after an oversized one must still be parsed"
+        );
+        assert_eq!(
+            padded.incomplete(),
+            Some(Incomplete::FieldTooLarge),
+            "the oversized part is still reported as partial coverage"
+        );
     }
 
     /// Checks unsupported content and JSON nesting outcomes.

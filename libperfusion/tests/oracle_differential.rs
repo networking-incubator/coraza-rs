@@ -101,7 +101,14 @@ const C_XSS_DIFFERENCES: [(&str, &[u8], bool, bool); 13] = [
         true,
     ),
 ];
-const C_XSS_SAMPLE_DIFFERENCES: [(&str, &[u8], bool, bool); 9] = [
+/// Pinned C and libperfusion XSS verdicts for the sample inputs the direct
+/// corpus does not carry.
+///
+/// The booleans are `(C, libperfusion)`. Rows where they differ are the
+/// reviewed C deviations; rows where they agree were reviewed deviations
+/// that the local XSS table additions closed, and are kept so a regression
+/// back to the old verdict fails the gate.
+const C_XSS_SAMPLE_VERDICTS: [(&str, &[u8], bool, bool); 9] = [
     (
         "xss-html5secorg.txt:232",
         b"test 83 <x:template xmlns:x=\"http://www.wapforum.org/2001/wml\" x:ontimer=\"$(x:unesc)j$(y:escape)a$(z:noecs)v$(x)a$(y)s$(z)cript$x:alert(1)\"><x:timer value=\"1\"/></x:template>",
@@ -130,25 +137,25 @@ const C_XSS_SAMPLE_DIFFERENCES: [(&str, &[u8], bool, bool); 9] = [
         "xss-soaj1664ashar-pastebin-u6FY1xDA.txt:78",
         b"74) <math><a xlink:href=\"//jsfiddle.net/t846h/\">click",
         true,
-        false,
+        true,
     ),
     (
         "xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102",
         b"97) <math><a xlink:href=\"//jsfiddle.net/t846h/\">click",
         true,
-        false,
+        true,
     ),
     (
         "xss-xenotix.txt:693",
         b"<math><a xlink:href=\"//XXXxenotixXXX:3555/xss_serve_payloads/bmpz.bmp\">KCF",
         true,
-        false,
+        true,
     ),
     (
         "xss-xenotix.txt:694",
         b"<math><a xlink:href=\"//XXXxenotixXXX:3555/xss_serve_payloads/kcf.js\">KCF",
         true,
-        false,
+        true,
     ),
     (
         "xss-xenotix.txt:1196",
@@ -216,7 +223,7 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         "pinned Go module must complete every result field"
     );
     assert_eq!(
-        result.accepted_exceptions, 2,
+        result.accepted_exceptions, 6,
         "libperfusion deviations must stay reviewed"
     );
 }
@@ -282,7 +289,7 @@ fn pinned_c_oracle_matches_corpus_and_binary_cases() {
         }
     }
     assert!(mismatches.is_empty(), "C oracle mismatches:\n{}", mismatches.join("\n"));
-    assert_eq!(reviewed_xss_differences, 24, "C XSS deviation inventory changed");
+    assert_eq!(reviewed_xss_differences, 20, "C XSS deviation inventory changed");
     eprintln!(
         "C differential passed: {} public SQL/XSS results, {reviewed_xss_differences} reviewed XSS differences",
         cases.len()
@@ -290,9 +297,13 @@ fn pinned_c_oracle_matches_corpus_and_binary_cases() {
 }
 
 fn c_xss_difference(id: &str, input: &[u8], c_result: bool, rust_result: bool) -> bool {
-    C_XSS_DIFFERENCES.iter().chain(C_XSS_SAMPLE_DIFFERENCES.iter()).any(
+    C_XSS_DIFFERENCES.iter().chain(C_XSS_SAMPLE_VERDICTS.iter()).any(
         |(case_id, expected_input, expected_c, expected_rust)| {
-            id == *case_id && input == *expected_input && c_result == *expected_c && rust_result == *expected_rust
+            expected_c != expected_rust
+                && id == *case_id
+                && input == *expected_input
+                && c_result == *expected_c
+                && rust_result == *expected_rust
         },
     ) || match id {
         "xss-svg-prefix-overlong-control" => {
@@ -373,7 +384,7 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
         cases.push((id.to_owned(), input.to_vec()));
     }
     cases.extend(
-        C_XSS_SAMPLE_DIFFERENCES
+        C_XSS_SAMPLE_VERDICTS
             .iter()
             .map(|(id, input, ..)| ((*id).to_owned(), (*input).to_vec())),
     );
@@ -585,6 +596,18 @@ fn reviewed_perfusion_deviation(
             3 => Some((":0", "736f3163:4", false)),
             _ => None,
         };
+    }
+    // `<math>` is in the local XSS tag supplement, so these four flag where
+    // Go main allows. The pinned C reference agrees with libperfusion on all
+    // four; see `tests/parity/mismatch-ledger.md`.
+    if field_index == 21
+        && C_XSS_SAMPLE_VERDICTS
+            .iter()
+            .any(|(case_id, case_input, c_result, rust_result)| {
+                id == *case_id && input == *case_input && *c_result && *rust_result
+            })
+    {
+        return Some(("0", "1", true));
     }
     None
 }
