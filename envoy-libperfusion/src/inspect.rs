@@ -259,8 +259,23 @@ fn has_xss_in_overlapping_windows(bytes: &[u8]) -> bool {
 ///
 /// What is left uncovered is a payload buried mid-window behind more than
 /// `TAIL_RESTARTS` trailing tokens; it is found only if a spaced restart
-/// happens to land on it. Closing that needs a restart at every token, which
-/// at about a microsecond per detector call is milliseconds per window.
+/// happens to land on it. That residual is deliberate, and the alternatives
+/// to it were measured rather than assumed:
+///
+/// * A restart at *every* token start, keeping this bounded span, was timed on this adapter: an 8 `KiB` quote-dense
+///   value goes from 0.67 ms to 25.7 ms, and 8 `KiB` of dense operators from 0.36 ms to 4.6 ms. A field costing 25 ms
+///   to inspect is a denial of service of its own, so that buys one bypass by opening another.
+/// * Restarting only at tokens that can begin an injection bounds nothing: the padding is attacker-chosen, and the
+///   worst case above is quote padding, which is injection-capable already.
+/// * Reporting the shortfall as an `Incomplete` reason, so the reject policy could cover it, fires on any value past
+///   roughly 48 tokens -- ordinary prose, ordinary JSON -- which makes the strict policy reject normal traffic instead
+///   of closing a gap.
+///
+/// The underlying property is libinjection's: a fingerprint describes the
+/// start of an input, so a payload behind benign tokens is invisible unless
+/// something restarts on it. These sweeps are more than upstream does, not
+/// a guarantee, and `the_dense_tail_sweep_reaches_its_documented_depth`
+/// pins where they stop.
 ///
 /// Each restart stops after `stride + RESTART_SPAN_MARGIN` bytes rather than
 /// running to the end of the window. That is what pays for the extra
