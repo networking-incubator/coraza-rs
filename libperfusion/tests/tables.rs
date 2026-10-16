@@ -61,14 +61,25 @@ fn c_strings(body: &str) -> Vec<(&str, &str)> {
 }
 
 /// The non-comment rows of a canonical data file, split on tabs.
+///
+/// Reads the files the way `build.rs` and `xtask` both do: a trailing `\r`
+/// is accepted, any other surrounding whitespace is an error rather than
+/// something to trim. Three readers parse these files -- the build script
+/// that compiles them in, `xtask` that hashes them, and this test -- so the
+/// rule has to be one rule.
 fn data_rows(name: &str) -> Vec<Vec<String>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.split('\t').map(str::to_owned).collect())
-        .collect()
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        assert_eq!(line.trim(), line, "{name}: surrounding whitespace in row {line:?}");
+        rows.push(line.split('\t').map(str::to_owned).collect());
+    }
+    rows
 }
 
 /// `build.rs` merges the upstream-generated tables with the local
@@ -97,6 +108,26 @@ fn local_supplements_are_merged_into_the_generated_tables() {
     assert!(
         SQL_KEYWORDS.windows(2).all(|pair| pair[0].0 < pair[1].0),
         "the merged SQL table is not sorted or has duplicates"
+    );
+
+    // Exactly the two files merged, nothing else. `data_rows` reads them
+    // under the same whitespace rule `build.rs` applies, so a build script
+    // that drifted from it -- keeping a leading space in a key, or taking an
+    // indented `#` line for a row -- shows up here as a table that is not
+    // what the files say.
+    let mut expected: Vec<(String, String)> = data_rows("sqli_keywords.txt")
+        .into_iter()
+        .chain(sql_local.clone())
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+    expected.sort();
+    let generated: Vec<(String, String)> = SQL_KEYWORDS
+        .iter()
+        .map(|&(word, kind)| (word.to_owned(), String::from_utf8(vec![kind.as_byte()]).unwrap()))
+        .collect();
+    assert_eq!(
+        generated, expected,
+        "the generated SQL table is not exactly the upstream and local files merged"
     );
 
     let xss_local = data_rows("xss_tables_local.txt");

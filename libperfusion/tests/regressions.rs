@@ -402,6 +402,14 @@ fn xss_detects_script_in_a_standalone_css_value() {
         b"background:url(java\nscript:alert(1))",
         b"background:url(vbscript:msgbox(1))",
         b"background:url(view-source:https://example.com/)",
+        // The identifier-boundary rule must not hide a real one that
+        // follows a benign property of the same ending.
+        b"scroll-behavior:smooth;behavior:url(#default#time2)",
+        b"overscroll-behavior:contain;x:expression(alert(1))",
+        // At the very start, and after separators that end an identifier.
+        b"behavior:url(#default#time2)",
+        b"x:EXPRESSION(alert(1))",
+        b"{expression(alert(1))}",
     ] {
         assert!(
             libperfusion::xss_in_css_value(payload),
@@ -421,6 +429,14 @@ fn xss_detects_script_in_a_standalone_css_value() {
         b"My expression of gratitude",
         b"url(",
         b"",
+        // Real properties that end with one of the needles. Matching
+        // `BEHAVIOR:` anywhere flagged every one of these.
+        b"scroll-behavior:smooth",
+        b"overscroll-behavior:contain",
+        b"overscroll-behavior-y:none",
+        b"-webkit-overflow-scrolling:touch;scroll-behavior:auto",
+        b"--my-expression:1",
+        b"foo-moz-binding:1",
         // A relative path is the common case a bare scheme name got wrong:
         // matching "JAVA" without its colon flagged every java-* asset.
         b"background:url(java-logo.png)",

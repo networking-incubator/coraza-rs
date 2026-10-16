@@ -337,10 +337,7 @@ const SCRIPT_URL_SCHEMES: [&[u8]; 3] = [b"JAVASCRIPT:", b"VBSCRIPT:", b"VIEW-SOU
 pub(crate) fn is_css_value_xss(input: &[u8]) -> bool {
     const NEEDLES: [&[u8]; 3] = [b"EXPRESSION(", b"-MOZ-BINDING", b"BEHAVIOR:"];
 
-    if NEEDLES
-        .iter()
-        .any(|needle| find_ascii_case_insensitive(input, needle).is_some())
-    {
+    if NEEDLES.iter().any(|needle| starts_an_identifier(input, needle)) {
         return true;
     }
 
@@ -364,6 +361,39 @@ pub(crate) fn is_css_value_xss(input: &[u8]) -> bool {
         from = after;
     }
     false
+}
+
+/// Whether `input` holds `needle` at the start of a CSS identifier.
+///
+/// These needles are property names and function names, so a match that
+/// continues an identifier is a *different* name: `scroll-behavior:smooth`
+/// and `overscroll-behavior:contain` both contain `BEHAVIOR:`, and neither
+/// runs script. Every occurrence is tried, so a real one later in the value
+/// is still found -- `scroll-behavior:smooth;behavior:url(#x)` flags.
+fn starts_an_identifier(input: &[u8], needle: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(at) = find_ascii_case_insensitive(input.get(from..).unwrap_or_default(), needle) {
+        let at = from.saturating_add(at);
+        let continues_identifier = at
+            .checked_sub(1)
+            .and_then(|before| input.get(before))
+            .copied()
+            .is_some_and(is_css_identifier_byte);
+        if !continues_identifier {
+            return true;
+        }
+        from = at.saturating_add(1);
+    }
+    false
+}
+
+/// Whether `byte` can appear inside a CSS identifier.
+///
+/// CSS identifiers run over letters, digits, `-`, `_`, and everything
+/// non-ASCII; the escape forms cannot produce one of these needles without
+/// also producing one of these bytes first.
+const fn is_css_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte >= 0x80
 }
 
 /// Finds `needle` in `haystack`, comparing ASCII case-insensitively.

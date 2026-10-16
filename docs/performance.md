@@ -534,10 +534,15 @@ the target stops on the known nine-hit difference (C detects 81,397 XSS
 samples; Rust detects 81,388). This filtering changes only the benchmark input
 set; it does not modify the checkout or the differential tests.
 
-> Superseded. The `speed` target now carries a reviewed `hit_delta` per
-> workload, so it runs on the unmodified sample set and still fails on any
-> unreviewed disagreement. The constant was also renamed to
-> `C_XSS_SAMPLE_VERDICTS`, and the current sample counts are in
+> Superseded. The `speed` target runs on the unmodified sample set and
+> checks correctness **input by input**: `benches/speed.c` prints a verdict
+> per input next to its timing, and `REVIEWED_DIFFERENCES` in
+> `benches/speed.rs` pins the nine inputs the two sides are known to read
+> differently, by their exact bytes. An unreviewed disagreement fails before
+> any time is reported. An earlier version of this compared per-workload hit
+> *counts*, which one new false positive cancelling one lost detection would
+> have satisfied. The constant naming the C-only XSS samples was also renamed
+> to `C_XSS_SAMPLE_VERDICTS`, and the current counts are in
 > `libperfusion/tests/parity/mismatch-ledger.md`.
 
 Across the seven measured workload groups, libperfusion's port/C timing ratio

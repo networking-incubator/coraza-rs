@@ -54,10 +54,42 @@ fn reject_duplicates<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Re
 /// A parsed SQL row: the key and its generated token type name.
 type SqlRow<'a> = (&'a str, &'static str);
 
+/// Classifies one line of a `KEY<TAB>BYTE` table.
+///
+/// `Ok(None)` is a blank line or a comment. Surrounding whitespace is an
+/// error rather than something to trim: trimming and not trimming are both
+/// defensible, and the two readers of these files disagreeing about it is
+/// what matters. `xtask`'s `parse_sql_data` hashes what it parses while this
+/// generates the compiled table, so a row they read differently -- a leading
+/// space makes `" FOO"` a key here and `"FOO"` there -- would ship a table
+/// the recorded hash does not describe. Rejecting the ambiguity in both
+/// keeps them in step. Only a trailing `\r` is accepted, so a CRLF checkout
+/// still builds.
+///
+/// Keep this in step with `parse_sql_data` in `xtask/src/tables.rs`;
+/// `tables-check` asserts the two agree.
+fn sql_row_line(line: &str) -> Result<Option<&str>, Box<dyn std::error::Error>> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.trim() != line {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("surrounding whitespace in SQL table row {line:?}"),
+        )
+        .into());
+    }
+    Ok(Some(line))
+}
+
 /// Parses `KEY<TAB>BYTE` rows, rejecting malformed, unknown, or non-ASCII ones.
 fn sql_rows(text: &str) -> Result<Vec<SqlRow<'_>>, Box<dyn std::error::Error>> {
     let mut rows = Vec::new();
-    for line in text.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
+    for line in text.lines() {
+        let Some(line) = sql_row_line(line)? else {
+            continue;
+        };
         let (key, byte) = line
             .split_once('\t')
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("no tab in row {line:?}")))?;
