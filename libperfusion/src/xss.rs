@@ -138,13 +138,14 @@ fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
     const MAX: u32 = 0x0010_00FF;
     /// Named references a browser honours inside an attribute value, which
     /// therefore split a scheme such as `ja&Tab;vascript:`.
-    const NAMED: [(&[u8], u32); 5] = [
-        (b"TAB;", 0x09),
-        (b"NEWLINE;", 0x0A),
-        (b"COLON;", 0x3A),
-        (b"NUL;", 0x00),
-        (b"SOL;", 0x2F),
-    ];
+    ///
+    /// Matched case-sensitively, with the exact spelling the HTML standard
+    /// defines, because named references are case-sensitive and the case
+    /// variants are different characters or nothing at all: `&colon;` is
+    /// `:` but `&Colon;` is `∷` (U+2237), and `&tab;` is not a reference.
+    /// Decoding those as `:` and tab reported schemes a browser does not
+    /// see. `&NUL;` is likewise absent: the standard does not define it.
+    const NAMED: [(&[u8], u32); 4] = [(b"Tab;", 0x09), (b"NewLine;", 0x0A), (b"colon;", 0x3A), (b"sol;", 0x2F)];
 
     let &first = src.first()?;
     let is_hex = matches!(src.get(2), Some(b'x' | b'X'));
@@ -152,14 +153,14 @@ fn html_decode_char_at(src: &[u8]) -> Option<(u32, usize)> {
         return Some((u32::from(first), 1));
     }
     if src.get(1) != Some(&b'#') {
-        // The scan stays O(1): the table is five entries and the longest
+        // The scan stays O(1): the table is four entries and the longest
         // name bounds how far each comparison reads.
         let rest = src.get(1..).unwrap_or_default();
         for (name, value) in NAMED {
             let Some(candidate) = rest.get(..name.len()) else {
                 continue;
             };
-            if candidate.eq_ignore_ascii_case(name) {
+            if candidate == name {
                 return Some((value, name.len() + 1));
             }
         }

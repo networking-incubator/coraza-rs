@@ -148,9 +148,11 @@ The `MATH` tag can also fire on benign MathML; `data/xss_tables_local.txt`
 documents the trade-off and how to drop the row.
 
 `XP_CMDSHELL` was in the dialect list and has been removed: classifying it
-as a `Function` *lost* detections, because `'AND 1.-1LIKE.1 EXEC xp_cmdshell
-'dir ` (sqli-phpids.txt:264) and `'; EXEC xp_cmdshell 'dir'--` moved from
-the listed `s&1Tn`/`s;Tns` fingerprints to the unlisted `s&1Tf`/`s;Tfs`.
+as a `Function` *lost* detections, because
+`'AND 1.-1LIKE.1 EXEC xp_cmdshell 'dir<SP>` (sqli-phpids.txt:264, where
+`<SP>` stands for the trailing space the payload ends with) and
+`'; EXEC xp_cmdshell 'dir'--` moved from the listed `s&1Tn`/`s;Tns`
+fingerprints to the unlisted `s&1Tf`/`s;Tfs`.
 `EXEC` already carries the Tsql classification that makes the shape
 recognisable. This is the same hazard as the bare Oracle package names
 below, and `tests/regressions.rs` now pins all three payloads.

@@ -281,6 +281,46 @@ fn xss_decodes_scheme_relevant_named_entities() {
     // Unrelated named entities still read as a literal '&'.
     assert!(!libperfusion::xss(b"<p>Tom &amp; Jerry</p>"));
     assert!(!libperfusion::xss(b"a &lt; b and c &gt; d"));
+
+    // Named references are case-sensitive, so the case variants are other
+    // characters or no reference at all: `&Colon;` is U+2237 PROPORTION,
+    // and neither `&tab;` nor `&NUL;` is defined. Decoding them as `:`,
+    // tab and NUL reported schemes a browser never resolves.
+    for benign in [
+        br#"<a href="ja&tab;vascript:alert(1)">"#.as_slice(),
+        br#"<a href="ja&TAB;vascript:alert(1)">"#,
+        br#"<a href="ja&NUL;vascript:alert(1)">"#,
+    ] {
+        assert!(
+            !libperfusion::xss(benign),
+            "undefined or differently-cased named reference decoded: {:?}",
+            String::from_utf8_lossy(benign)
+        );
+    }
+
+    // The CSS check is where the colon itself has to decode, so it is what
+    // shows `&Colon;` (U+2237) apart from `&colon;` (U+003A). A URL
+    // attribute cannot: it matches the bare `JAVA` prefix upstream uses,
+    // whatever follows it.
+    assert!(libperfusion::xss_in_css_value(
+        b"background:url(javascript&colon;alert(1))"
+    ));
+    assert!(!libperfusion::xss_in_css_value(
+        b"background:url(javascript&Colon;alert(1))"
+    ));
+    assert!(!libperfusion::xss_in_css_value(
+        b"background:url(javascript&COLON;alert(1))"
+    ));
+    assert!(libperfusion::xss_in_css_value(
+        b"background:url(java&NewLine;script:alert(1))"
+    ));
+    assert!(!libperfusion::xss_in_css_value(
+        b"background:url(java&newline;script:alert(1))"
+    ));
+
+    // The defined spellings keep working, in their own case.
+    assert!(libperfusion::xss(br#"<a href="ja&Tab;vascript:alert(1)">"#));
+    assert!(libperfusion::xss(br#"<a href="java&NewLine;script:alert(1)">"#));
 }
 
 #[test]
