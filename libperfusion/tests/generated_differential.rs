@@ -103,14 +103,16 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
         let expected = parse_result(case, response);
         let perfusion = perfusion_result(&case.input);
         perfusion_fingerprint_diagnostics += usize::from(expected.fingerprint != perfusion.fingerprint);
-        if is_reviewed_c_aligned_sql_improvement(case, &expected, &perfusion) {
+        if is_reviewed_c_aligned_sql_improvement(case, &expected, &perfusion)
+            || is_reviewed_hash_comment_deviation(case, &expected, &perfusion)
+        {
             perfusion_exceptions += 1;
         } else if !results_match(&expected, &perfusion) {
             perfusion_failures.push((case.clone(), expected, perfusion));
         }
     }
 
-    assert_eq!(perfusion_exceptions, 1, "libperfusion Go exception inventory changed");
+    assert_eq!(perfusion_exceptions, 8, "libperfusion Go exception inventory changed");
 
     if perfusion_failures.is_empty() {
         eprintln!(
@@ -147,6 +149,35 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
     );
 }
 
+/// Generated inputs where the narrowed `#` comment whitelist makes
+/// libperfusion report the `sc` fingerprint that Go main suppresses.
+///
+/// Each one minimizes to `'#` or `"#`, the shape of the `admin'#`
+/// authentication bypass. The deviation is deliberate and is described in
+/// `tests/parity/mismatch-ledger.md`; the inputs are pinned by hex, so an
+/// unrelated new difference still fails the gate.
+const HASH_COMMENT_SQL_DEVIATIONS: [(&str, &str); 7] = [
+    (
+        "raw-0043",
+        "20233c5a622a0d603b3a302020583e3b266026ff323a805a5aff2522235920005a5c3222302623302f",
+    ),
+    ("raw-0060", "303d32ff0a003a22235a305a25005a2d23205c602aff20"),
+    ("raw-0075", "27232580630d3e266331ff58633dff632058632023203e592a316332"),
+    ("raw-0227", "2320800d3c3a3e253e2d25602223233d592d2259"),
+    (
+        "raw-0292",
+        "62272f260d603b5a5a61585c25ff0d26ff2080302f3032805c603b3b3b2a582223",
+    ),
+    (
+        "raw-0365",
+        "2f23800d6100603200303c2f3e235a32318030000a590a3c2f2d32ff632f20582f2560265a5a2060205a3b003e3e30ff63005932270a25592761ff275a003e630d3b3c6127610a2220233e003000592f0d00302d203a0d2062603e",
+    ),
+    (
+        "raw-0373",
+        "633a202a26300a302a6120ff3c3d3e3a3b20325858303e5aff3c233222000d5c6031272023625cffff31633d3c5c63268058203b3c63613b3e32263c2d",
+    ),
+];
+
 fn is_reviewed_c_aligned_sql_improvement(case: &Case, expected: &PublicResult, actual: &PublicResult) -> bool {
     case.id == "raw-0265"
         && case.input
@@ -158,6 +189,18 @@ fn is_reviewed_c_aligned_sql_improvement(case: &Case, expected: &PublicResult, a
         && expected.xss == Some(false)
         && actual.sqli
         && actual.xss == Some(false)
+}
+
+/// The `'#`/`"#` fingerprint deviations listed in
+/// [`HASH_COMMENT_SQL_DEVIATIONS`], and only those.
+fn is_reviewed_hash_comment_deviation(case: &Case, expected: &PublicResult, actual: &PublicResult) -> bool {
+    HASH_COMMENT_SQL_DEVIATIONS
+        .iter()
+        .any(|(id, input_hex)| case.id == *id && hex(&case.input) == *input_hex)
+        && !expected.sqli
+        && actual.sqli
+        && actual.fingerprint == "7363:2"
+        && expected.xss == actual.xss
 }
 
 fn generated_cases() -> Vec<Case> {

@@ -150,8 +150,10 @@ fn count_samples(prefix: &str, detect: impl Fn(&[u8]) -> bool) -> (usize, usize)
     (flagged, samples.len() - flagged)
 }
 
-// The SQL counts match upstream at d88a8f8. The pinned Go main commit allows
-// nine XSS samples that C flags; those exact cases are in the parity ledger.
+// The SQLi detection count matches upstream at d88a8f8. The false-positive
+// and XSS counts do not, because the local table and whitelist changes are
+// deliberate deviations; every differing sample is listed in the parity
+// ledger, `tests/parity/mismatch-ledger.md`.
 
 #[test]
 #[ignore = "upstream sample comparison; requires upstream data files via LIBINJECTION_DIR"]
@@ -163,15 +165,24 @@ fn sqli_samples() {
 #[test]
 #[ignore = "upstream sample comparison; requires upstream data files via LIBINJECTION_DIR"]
 fn sqli_false_positive_samples() {
+    // Upstream flags 21 of these 423 and passes 402. The narrowed `#`
+    // comment whitelist adds four: `7" #2 CIRCULAR NEEDLE`, `"#2 MOM"`,
+    // `BAMBOO CHARCOAL SOAP 1 '#`, and `FOO BAR'# BLAH` all have the exact
+    // quote-then-hash token shape of the `admin'#` authentication bypass,
+    // so no rule separates them. The cost is recorded in the parity ledger.
     let (flagged, passed) = count_samples("false_", |s| libperfusion::sqli(s).is_some());
-    assert_eq!((flagged, passed), (21, 402));
+    assert_eq!((flagged, passed), (25, 398));
 }
 
 #[test]
 #[ignore = "upstream sample comparison; requires upstream data files via LIBINJECTION_DIR"]
 fn xss_samples() {
+    // Upstream C flags 81,397 of these 81,417 and the pinned Go main flags
+    // 81,388. The local `MATH` tag row closes four of the nine C-only
+    // detections -- the `<math><a xlink:href=...>` samples listed in the
+    // parity ledger -- so libperfusion flags 81,392.
     let (flagged, missed) = count_samples("xss", libperfusion::xss);
-    assert_eq!((flagged, missed), (81_388, 29));
+    assert_eq!((flagged, missed), (81_392, 25));
 }
 
 /// The checks of `src/test_error_handling.c` that carry over: the port has

@@ -168,6 +168,28 @@ fn sqli_classifies_modern_dialect_functions() {
 }
 
 #[test]
+fn sqli_keeps_extended_stored_procedures_as_barewords() {
+    // `XP_CMDSHELL` was added to the dialect table as a Function and that
+    // *lost* detections: the listed `s&1Tn` and `s;Tns` fingerprints became
+    // the unlisted `s&1Tf` and `s;Tfs`. `EXEC`/`EXECUTE` already carries the
+    // Tsql classification that makes the shape recognisable, so the
+    // procedure name is left as a Bareword, exactly as the qualified Oracle
+    // package names are. The first payload is sqli-phpids.txt:264 of the
+    // pinned upstream sample data.
+    for payload in [
+        b"'AND 1.-1LIKE.1 EXEC xp_cmdshell 'dir ".as_slice(),
+        b"'; EXEC xp_cmdshell 'dir'--",
+        b"1; EXEC xp_cmdshell('dir')",
+    ] {
+        assert!(
+            libperfusion::sqli(payload).is_some(),
+            "extended stored procedure call not detected: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+#[test]
 fn sqli_keeps_qualified_oracle_package_calls() {
     // The table carries these as fully qualified names, so the bare package
     // name must not be classified separately: that would stop the lexer
@@ -262,6 +284,56 @@ fn xss_decodes_scheme_relevant_named_entities() {
 }
 
 #[test]
+fn xss_lookup_fast_paths_do_not_lose_encoded_or_odd_shaped_names() {
+    // `black_attr` skips the table scan for a `(first letter, length)` shape
+    // the table does not hold, and `is_black_url` skips the scheme scan for
+    // a first byte no scheme starts with. Neither may be reachable by an
+    // attacker: an entity-encoded first byte is still `&`, the leading
+    // bytes the URL comparison ignores are stripped before the check, and a
+    // NUL anywhere in a name is removed before its length is taken.
+    for payload in [
+        // An entity hides the scheme's first letter behind `&`.
+        br#"<a href="&#106;avascript:alert(1)">"#.as_slice(),
+        br#"<a href="&#x6a;avascript:alert(1)">"#,
+        br#"<a href="&#0000106;avascript:alert(1)">"#,
+        // Leading control bytes and NULs inside the scheme.
+        b"<a href=\"\x01\x02javascript:alert(1)\">",
+        b"<a href=\"ja\0vascript:alert(1)\">",
+        // NULs inside the attribute name change its byte length.
+        b"<a h\0ref=\"javascript:alert(1)\">",
+        b"<a \0\0href=\"javascript:alert(1)\">",
+        b"<a s\0rc=\"javascript:alert(1)\">",
+        // Mixed case reaches the table through the same normalisation.
+        br#"<a HrEf="JaVaScRiPt:alert(1)">"#,
+        // A local supplement row, to cover the widened table.
+        br#"<img srcset="javascript:alert(1)">"#,
+    ] {
+        assert!(
+            libperfusion::xss(payload),
+            "fast path lost a detection: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    // `href="java-logo.png"` is deliberately absent: `is_black_url` matches
+    // the bare `JAVA` upstream uses to cover `java:` and `javascript:`, so
+    // the pinned references flag it too. Only the CSS `url()` check, which
+    // does take relative paths, requires the colon.
+    for benign in [
+        br#"<a href="/docs/javadoc/index.html">"#.as_slice(),
+        br#"<a hreflang="en" lang="en">text</a>"#,
+        br#"<div data-javascript="no">"#,
+        br#"<img srcset="/img/a.png 1x, /img/b.png 2x">"#,
+    ] {
+        assert!(
+            !libperfusion::xss(benign),
+            "fast path gained a false positive: {:?}",
+            String::from_utf8_lossy(benign)
+        );
+    }
+}
+
+#[test]
 fn xss_covers_blob_filesystem_and_mathml() {
     assert!(libperfusion::xss(br#"<a href="blob:https://x/y">"#));
     assert!(libperfusion::xss(br#"<a href="filesystem:http://x/y">"#));
@@ -284,6 +356,12 @@ fn xss_detects_script_in_a_standalone_css_value() {
         b"behavior:url(#default#time2)",
         b"background:url('javascript:alert(1)')",
         b"background:url(JaVaScRiPt:alert(1))",
+        // The colon may be encoded; the scheme name may be split by the
+        // bytes a URL parser drops.
+        b"background:url(javascript&#58;alert(1))",
+        b"background:url(java\nscript:alert(1))",
+        b"background:url(vbscript:msgbox(1))",
+        b"background:url(view-source:https://example.com/)",
     ] {
         assert!(
             libperfusion::xss_in_css_value(payload),
@@ -303,6 +381,13 @@ fn xss_detects_script_in_a_standalone_css_value() {
         b"My expression of gratitude",
         b"url(",
         b"",
+        // A relative path is the common case a bare scheme name got wrong:
+        // matching "JAVA" without its colon flagged every java-* asset.
+        b"background:url(java-logo.png)",
+        b"background:url('javascript-hints.svg')",
+        b"background:url(/assets/javastuff/sprite.png)",
+        b"background:url(vbscript-tutorial.gif)",
+        b"background:url(view-source-icon.png)",
     ] {
         assert!(
             !libperfusion::xss_in_css_value(benign),

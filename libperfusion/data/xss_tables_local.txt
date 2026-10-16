@@ -19,4 +19,12 @@ attr	PING	Url
 attr	PROFILE	Url
 attr	SRCDOC	Black
 attr	SRCSET	Url
+# MATH is deliberately aggressive and is the one row here that can fire on
+# benign markup: `<math><mi>x</mi></math>` is valid MathML and this flags it.
+# It stays because `<math>` is an HTML integration point -- `annotation-xml`
+# with `encoding="text/html"`, and `<math><mtext>` in some engines, switch the
+# tokenizer back into HTML and run embedded `<script>` or `<svg>` -- and no
+# other black tag backstops that. Applications that legitimately serve MathML
+# should delete this row: it is a local supplement, so removing it changes no
+# upstream table and no parity hash.
 tag	MATH

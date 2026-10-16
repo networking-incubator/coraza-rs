@@ -83,6 +83,14 @@ struct Workload {
     name: &'static str,
     detection: Detection,
     inputs: Vec<Vec<u8>>,
+    /// Reviewed detections this port has that libinjection does not, minus
+    /// the ones libinjection has that it does not.
+    ///
+    /// Correctness is checked before any time is reported, so a workload
+    /// where the two deliberately disagree has to say by how much. Every
+    /// value here is derived from the sample inventory in
+    /// `tests/parity/mismatch-ledger.md` and asserted in `tests/upstream.rs`.
+    hit_delta: isize,
 }
 
 struct Timing {
@@ -222,26 +230,35 @@ fn main() {
             name: "sqli: upstream's speed test",
             detection: Detection::Sqli,
             inputs: speed_test_inputs("src/test_speed_sqli.c"),
+            hit_delta: 0,
         },
         Workload {
             name: "sqli: attack samples",
             detection: Detection::Sqli,
             inputs: samples("sqli-"),
+            hit_delta: 0,
         },
         Workload {
             name: "sqli: benign samples",
             detection: Detection::Sqli,
             inputs: samples("false_"),
+            // The narrowed `#` comment whitelist flags four catalogue
+            // strings that share the `admin'#` token shape.
+            hit_delta: 4,
         },
         Workload {
             name: "xss: upstream's speed test",
             detection: Detection::Xss,
             inputs: speed_test_inputs("src/test_speed_xss.c"),
+            hit_delta: 0,
         },
         Workload {
             name: "xss: attack samples",
             detection: Detection::Xss,
             inputs: samples("xss"),
+            // Nine C-only detections remain; the local `MATH` tag row
+            // closed four of the original thirteen.
+            hit_delta: -5,
         },
         // What is not XSS is the expensive case: nothing stops the search
         // before every context has been tried.
@@ -249,11 +266,13 @@ fn main() {
             name: "xss: sqli attack samples",
             detection: Detection::Xss,
             inputs: samples("sqli-"),
+            hit_delta: 0,
         },
         Workload {
             name: "xss: benign samples",
             detection: Detection::Xss,
             inputs: samples("false_"),
+            hit_delta: 0,
         },
     ];
 
@@ -287,9 +306,13 @@ fn main() {
                 let theirs = time_libinjection(&driver, workload, budget);
                 (theirs, ours, "port first")
             };
+            let expected_hits = isize::try_from(theirs.hits)
+                .expect("hit count fits isize")
+                .saturating_add(workload.hit_delta);
             assert_eq!(
-                theirs.hits, ours.hits,
-                "{}: the two sides disagree on what is an attack",
+                isize::try_from(ours.hits).expect("hit count fits isize"),
+                expected_hits,
+                "{}: the two sides disagree on what is an attack beyond the reviewed deviations",
                 workload.name
             );
 

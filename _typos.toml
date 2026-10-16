@@ -11,6 +11,18 @@ extend-ignore-re = [
     'x:ontimer=.*cript\$x:alert\(1\)',
 ]
 
+[default.extend-identifiers]
+# Detector fixture literals, keyed on the whole identifier so the words they
+# split into ("UNIO", "SELEC") stay typos everywhere else.
+#
+# "UNIONb" is SQLi fixture bytes in envoy-libperfusion/src/inspect.rs: the
+# payload runs the keyword straight into the next token, and those exact
+# bytes are what the regression reproduces.
+UNIONb = "UNIONb"
+# "SELEC" is the truncated keyword libperfusion/src/sqli/keywords.rs looks up
+# to assert that a prefix of a keyword does not match one.
+SELEC = "SELEC"
+
 [default.extend-words]
 # Libinjection fingerprint marker and browser event name.
 UE = "UE"
