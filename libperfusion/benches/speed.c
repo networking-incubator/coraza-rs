@@ -7,7 +7,12 @@
  * Reads one hex-encoded input per line on stdin, then runs the detection
  * over all of them, round after round, for about <seconds>. Prints the time
  * the best round took per input, in nanoseconds, and the number of inputs
- * detected.
+ * detected, then a second line holding one '0' or '1' per input, in the
+ * order they were read.
+ *
+ * The per-input line is what lets the Rust side check correctness input by
+ * input rather than by comparing totals, which an equal number of
+ * disagreements in each direction hides.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -72,6 +77,7 @@ int main(int argc, char **argv) {
     size_t passes = 1;
     size_t hits = 0;
     size_t rounds = 0;
+    size_t index;
     double best = 0;
     double started;
 
@@ -129,5 +135,9 @@ int main(int argc, char **argv) {
     }
 
     printf("%f %zu\n", best / (double)(passes * count), hits / passes);
+    for (index = 0; index < count; index++) {
+        putchar(detect(inputs[index].data, inputs[index].len) ? '1' : '0');
+    }
+    putchar('\n');
     return 0;
 }

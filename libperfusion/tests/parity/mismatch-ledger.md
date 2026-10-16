@@ -147,6 +147,13 @@ generated suite.
 The `MATH` tag can also fire on benign MathML; `data/xss_tables_local.txt`
 documents the trade-off and how to drop the row.
 
+The same inventory is pinned a second time, by exact bytes, in
+`REVIEWED_DIFFERENCES` in `benches/speed.rs`: that benchmark checks the port
+against libinjection C input by input before it reports any timing, and the
+nine rows there are these four false positives and the five C-only XSS
+samples above. Changing this table without changing that one fails the
+benchmark.
+
 `XP_CMDSHELL` was in the dialect list and has been removed: classifying it
 as a `Function` *lost* detections, because
 `'AND 1.-1LIKE.1 EXEC xp_cmdshell 'dir<SP>` (sqli-phpids.txt:264, where

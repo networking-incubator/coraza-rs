@@ -70,8 +70,27 @@ const WINDOW_STRIDE: usize = WINDOW_BYTES - WINDOW_OVERLAP;
 /// detector call each, so they are confined to windows small enough that the
 /// extra calls stay cheap; larger inputs rely on the overlapping windows.
 const RESTART_MAX_BYTES: usize = 8 * 1024;
-/// Upper bound on token-anchored restarts per window.
+/// Upper bound on byte-spaced restarts per window.
 const MAX_RESTARTS: usize = 16;
+/// Upper bound on restarts in the dense sweep of a window's last tokens.
+///
+/// A fingerprint is taken from the first five *folded* tokens of whatever a
+/// restart hands the detector, so a restart only surfaces a payload it lands
+/// on: a few benign tokens in front push the payload out of frame. Complete
+/// coverage would therefore need a restart at every token, and at roughly a
+/// microsecond per detector call that is milliseconds per window. The spaced
+/// sweep cannot be made dense enough to be complete, so the end of the
+/// window -- which is where padding-then-payload puts the payload -- is
+/// swept token by token instead.
+const TAIL_RESTARTS: usize = 32;
+/// How far past its stride a restart keeps scanning.
+///
+/// A fingerprint spans at most five folded tokens and a token holds at most
+/// `TOKEN_SIZE` (32) bytes, so 160 bytes carries any fingerprint whole. This
+/// is the margin on top of the stride, so a payload anywhere between two
+/// restarts is still complete inside the earlier one's span; the size is the
+/// same generous multiple of 160 that `WINDOW_OVERLAP` uses.
+const RESTART_SPAN_MARGIN: usize = 1024;
 /// Upgrade tokens that really do switch the connection to a protocol whose
 /// body this filter cannot inspect as a single HTTP message.
 ///
@@ -221,33 +240,80 @@ fn has_xss_in_overlapping_windows(bytes: &[u8]) -> bool {
     })
 }
 
-/// Re-tests a window from a bounded, evenly spread set of token starts.
+/// Re-tests a window from a bounded set of token starts.
 ///
 /// Each restart backs up over an opening string delimiter so the quote stays
 /// in frame: `SqlToken::pos()` points at a string's body, one byte past the
 /// delimiter that opened it.
+///
+/// Two sweeps, because one cannot do both jobs:
+///
+/// * A **byte-spaced** sweep across the window. Spacing used to be by token *index* -- one restart every `tokens /
+///   MAX_RESTARTS` -- which let the sender widen the gap at will: 4 `KiB` of short benign tokens puts the restarts ~60
+///   tokens apart, and a fingerprint is taken from the first five *folded* tokens of what the restart hands the
+///   detector, so a payload that far past one is folded away before the fingerprint forms. Byte spacing makes the gap a
+///   property of the window length, which `RESTART_MAX_BYTES` bounds, rather than of anything in the window.
+/// * A **dense tail** sweep over the last `TAIL_RESTARTS` token starts. Byte spacing alone is not enough: a restart
+///   only surfaces a payload it lands on, so what matters is landing on the payload's first token, and no bounded
+///   spacing guarantees that. Padding-then-payload puts the payload at the end, so the end is swept token by token.
+///
+/// What is left uncovered is a payload buried mid-window behind more than
+/// `TAIL_RESTARTS` trailing tokens; it is found only if a spaced restart
+/// happens to land on it. Closing that needs a restart at every token, which
+/// at about a microsecond per detector call is milliseconds per window.
+///
+/// Each restart stops after `stride + RESTART_SPAN_MARGIN` bytes rather than
+/// running to the end of the window. That is what pays for the extra
+/// restarts: the total scanned is now bounded by roughly one window plus
+/// `(MAX_RESTARTS + TAIL_RESTARTS) * RESTART_SPAN_MARGIN`, where before it
+/// was `MAX_RESTARTS` whole tails.
 fn has_sqli_from_token_restart(window: &[u8]) -> bool {
     if window.len() > RESTART_MAX_BYTES {
         return false;
     }
 
-    let tokens = tokenizer(window).count();
-    if tokens < 2 {
-        return false;
-    }
-    let step = tokens.div_ceil(MAX_RESTARTS).max(1);
+    let stride = window.len().div_ceil(MAX_RESTARTS).max(1);
+    // The window has already been tested whole, so the token at offset zero
+    // is not a restart.
+    let mut anchor = 1_usize;
+    // Ring buffer of the last TAIL_RESTARTS restart offsets.
+    let mut tail = [0_usize; TAIL_RESTARTS];
+    let mut seen = 0_usize;
 
-    tokenizer(window)
-        .enumerate()
-        .skip(1)
-        .filter(|(index, _)| index % step == 0)
-        .take(MAX_RESTARTS)
-        .any(|(_, token)| {
-            let start = token.pos().saturating_sub(usize::from(token.string_open().is_some()));
-            window
-                .get(start..)
-                .is_some_and(|tail| libperfusion::sqli(tail).is_some())
-        })
+    for token in tokenizer(window) {
+        let pos = token.pos();
+        let start = pos.saturating_sub(usize::from(token.string_open().is_some()));
+        if let Some(slot) = tail.get_mut(seen % TAIL_RESTARTS) {
+            *slot = start;
+        }
+        seen = seen.saturating_add(1);
+
+        if pos < anchor {
+            continue;
+        }
+        if restart_detects(window, start, stride) {
+            return true;
+        }
+        anchor = pos.saturating_add(stride);
+    }
+
+    let kept = seen.min(TAIL_RESTARTS);
+    (0..kept).any(|offset| {
+        let index = seen.saturating_sub(kept).saturating_add(offset) % TAIL_RESTARTS;
+        tail.get(index)
+            .is_some_and(|&start| start > 0 && restart_detects(window, start, stride))
+    })
+}
+
+/// Runs the detector on one restart's bounded span of `window`.
+fn restart_detects(window: &[u8], start: usize, stride: usize) -> bool {
+    let end = start
+        .saturating_add(stride)
+        .saturating_add(RESTART_SPAN_MARGIN)
+        .min(window.len());
+    window
+        .get(start..end)
+        .is_some_and(|tail| libperfusion::sqli(tail).is_some())
 }
 
 /// Builds the tokenizer used to locate restart offsets.
@@ -507,27 +573,50 @@ impl Inspection {
     ///
     /// `form_urlencoded` splits on `&` only, while the original CGI
     /// specification and the applications that still follow it also accept
-    /// `;`. Splitting on it first keeps per-field attribution for those
-    /// deployments; a literal `;` inside a value has to be sent as `%3B` to
-    /// survive either reading, so nothing that was one field becomes
-    /// unreadable.
+    /// `;`. Which one the upstream does is not knowable from here, so both
+    /// readings are scanned.
+    ///
+    /// Only splitting on `;` was a coverage gap: under the `&`-only reading
+    /// `q=1;SHUTDOWN` is a single value holding a stacked statement, but
+    /// splitting first handed this pass `q=1` and `SHUTDOWN` separately and
+    /// neither is `SQLi` alone. Only *not* splitting loses per-field
+    /// attribution where `;` really does separate pairs. A literal `;`
+    /// inside a value has to be sent as `%3B` to survive either reading, so
+    /// nothing that was one field becomes unreadable.
     fn scan_form_fields(&mut self, bytes: &[u8]) {
         if !has_valid_percent_escapes(bytes) {
             self.mark_incomplete(Incomplete::MalformedEncoding);
         }
-        for segment in bytes.split(|byte| *byte == b';') {
-            for (name, value) in form_urlencoded::parse(segment) {
-                if self.fields >= self.max_fields {
-                    self.mark_incomplete(Incomplete::FieldLimit);
+        if !self.scan_form_pairs(bytes) {
+            return;
+        }
+        // The two readings only differ when a `;` is actually there, and
+        // repeating the first would spend the field budget twice.
+        if bytes.contains(&b';') {
+            for segment in bytes.split(|byte| *byte == b';') {
+                if !self.scan_form_pairs(segment) {
                     return;
                 }
-                if name.contains('\u{fffd}') || value.contains('\u{fffd}') {
-                    self.mark_incomplete(Incomplete::MalformedEncoding);
-                }
-                self.scan_field(name.as_bytes());
-                self.scan_field(value.as_bytes());
             }
         }
+    }
+
+    /// Scans one `&`-separated run of form pairs.
+    ///
+    /// Returns whether the field budget allows the caller to continue.
+    fn scan_form_pairs(&mut self, segment: &[u8]) -> bool {
+        for (name, value) in form_urlencoded::parse(segment) {
+            if self.fields >= self.max_fields {
+                self.mark_incomplete(Incomplete::FieldLimit);
+                return false;
+            }
+            if name.contains('\u{fffd}') || value.contains('\u{fffd}') {
+                self.mark_incomplete(Incomplete::MalformedEncoding);
+            }
+            self.scan_field(name.as_bytes());
+            self.scan_field(value.as_bytes());
+        }
+        true
     }
 
     /// Scans semicolon-separated cookie names and values.
@@ -1516,6 +1605,159 @@ mod tests {
         );
 
         assert!(inspection.has_sqli(), "SQLi after benign SQL tokens must be found");
+    }
+
+    /// Finds `SQLi` behind benign padding of any length.
+    ///
+    /// Restarts used to be spaced one every `tokens / MAX_RESTARTS`, so the
+    /// more tokens came first the further apart they sat. A fingerprint is
+    /// taken from the first five *folded* tokens of whatever a restart hands
+    /// the detector, so past a few hundred bytes of padding no restart
+    /// landed close enough and the payload went unseen.
+    ///
+    /// The padding is ordinary words: benign on its own, and -- as the
+    /// assertion below pins -- enough to hide this payload from a
+    /// whole-input scan, so only a nearby restart can find it.
+    #[test]
+    fn scans_sqli_behind_benign_padding_of_any_length() {
+        let config = Config::default();
+        let payload = b"1 UNION SELECT password FROM users";
+
+        for repeats in [1_usize, 4, 16, 64, 128, 256] {
+            let mut body = b"alpha beta gamma delta ".repeat(repeats);
+            let padding = body.len();
+            body.extend_from_slice(payload);
+
+            if padding > 64 {
+                assert!(
+                    libperfusion::sqli(&body).is_none(),
+                    "{padding} bytes of padding must mask the payload from a whole-input scan, \
+                     or this test is not exercising the restarts"
+                );
+            }
+
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+            scan_body(&mut inspection, &body, &format);
+
+            assert!(
+                inspection.has_sqli(),
+                "SQLi behind {padding} bytes of benign padding must be found"
+            );
+        }
+    }
+
+    /// Finds `SQLi` at any leading offset, with padding on both sides.
+    ///
+    /// Sweeps the payload across the window so no single offset can be the
+    /// one the restart spacing happens to land on. The trailing padding is
+    /// held inside the dense tail sweep: what is guaranteed is the payload
+    /// being among the window's last `TAIL_RESTARTS` tokens, not its
+    /// distance from the front.
+    #[test]
+    fn scans_sqli_at_any_offset_inside_a_padded_window() {
+        let config = Config::default();
+        let payload = b"1 UNION SELECT password FROM users";
+        let filler = b"alpha beta gamma delta ";
+        // Four tokens per repeat, so this stays well inside TAIL_RESTARTS.
+        let trailing = filler.repeat(4);
+
+        for offset in [0_usize, 1, 97, 512, 1_000, 2_048, 3_333, 6_000, 7_900] {
+            let mut body = filler.repeat(offset.div_ceil(filler.len()));
+            body.truncate(offset);
+            body.extend_from_slice(payload);
+            body.extend_from_slice(&trailing);
+
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+            scan_body(&mut inspection, &body, &format);
+
+            assert!(inspection.has_sqli(), "SQLi at offset {offset} must be found");
+        }
+    }
+
+    /// Pins how far the dense tail sweep reaches.
+    ///
+    /// Beyond it a payload is found only when a byte-spaced restart happens
+    /// to land on its first token, which is not something to claim. This
+    /// records where the guarantee ends, so a change to `TAIL_RESTARTS` or
+    /// to the spacing moves a boundary in a test rather than silently.
+    #[test]
+    fn the_dense_tail_sweep_reaches_its_documented_depth() {
+        let config = Config::default();
+        let payload = b"1 UNION SELECT password FROM users";
+        let filler = b"alpha beta gamma delta ";
+        let scan = |body: &[u8]| {
+            let mut inspection = Inspection::new(&config);
+            let format = inspection.headers(&headers(&[("content-type", "text/plain")]));
+            scan_body(&mut inspection, body, &format);
+            inspection.has_sqli()
+        };
+
+        // Six payload tokens plus 24 trailing ones is inside the sweep.
+        let mut inside = filler.repeat(64);
+        inside.extend_from_slice(payload);
+        inside.extend_from_slice(&filler.repeat(6));
+        assert!(libperfusion::sqli(&inside).is_none(), "the padding must mask it");
+        assert!(scan(&inside), "a payload inside the tail sweep must be found");
+
+        // Far enough from the end that only the spaced sweep could reach it.
+        let mut outside = filler.repeat(64);
+        outside.extend_from_slice(payload);
+        outside.extend_from_slice(&filler.repeat(64));
+        assert!(libperfusion::sqli(&outside).is_none(), "the padding must mask it");
+        assert!(
+            !scan(&outside),
+            "if this now passes, the sweep got deeper or the spacing finer; move this \
+             boundary and the TAIL_RESTARTS documentation with it"
+        );
+    }
+
+    /// Reads a form body under both the `&`-only and the CGI `;` splits.
+    ///
+    /// Splitting on `;` first took `q=1;SHUTDOWN` apart into `q=1` and
+    /// `SHUTDOWN`, neither of which is `SQLi` alone. A framework that does not
+    /// honour `;` as a separator sees one field holding a stacked statement,
+    /// and this pass -- the one that applies the form decoding the raw body
+    /// scan does not, `+` to space among it -- never looked at it.
+    ///
+    /// `scan_form_fields` is called directly. Through `body()` the
+    /// unconditional raw and percent-decoded body scans reach these payloads
+    /// anyway; the point here is that the field pass does not depend on
+    /// another layer being complete.
+    #[test]
+    fn form_fields_are_read_both_with_and_without_the_semicolon_split() {
+        let config = Config::default();
+
+        for body in [
+            b"q=1;SHUTDOWN".as_slice(),
+            b"a=hello&q=1;SHUTDOWN",
+            b"q=1;SHUTDOWN&a=hello",
+            b"q=1;WAITFOR+DELAY+%270%3A0%3A5%27",
+        ] {
+            let mut inspection = Inspection::new(&config);
+            inspection.scan_form_fields(body);
+            assert!(
+                inspection.has_sqli(),
+                "the &-only reading of {:?} holds a stacked statement",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        // The `;` reading still attributes its own pairs: this payload only
+        // decodes correctly once the body is split on `;`.
+        let mut split = Inspection::new(&config);
+        split.scan_form_fields(b"a=1;q=%27+OR+%271%27%3D%271");
+        assert!(
+            split.has_sqli(),
+            "a pair after a `;` separator must still be decoded on its own"
+        );
+
+        // Reading twice must not cost the budget twice when there is no `;`
+        // for the two readings to disagree about.
+        let mut plain = Inspection::new(&config);
+        plain.scan_form_fields(b"a=1&b=2&c=3");
+        assert_eq!(plain.fields, 6, "one reading of a body with no `;` in it");
     }
 
     /// Scans XSS at the end of a raw body longer than libperfusion's input limit.

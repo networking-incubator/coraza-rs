@@ -457,13 +457,34 @@ fn expect(bytes: &[u8], pos: &mut usize, expected: u8) -> Result<(), String> {
     Ok(())
 }
 
+/// Classifies one line of a `KEY<TAB>BYTE` table.
+///
+/// `None` is a blank line or a comment. This is the same rule
+/// `sql_row_line` applies in `libperfusion/build.rs`, and it has to stay
+/// that way: this function's output is what the recorded `sha256` in
+/// `data/tables.json` is taken over, while build.rs's output is the table
+/// that actually ships. A row the two read differently -- `" FOO\tk"` is a
+/// key of `" FOO"` under one reading and `"FOO"` under the other -- would
+/// put a table in the binary that the manifest does not describe. Rather
+/// than pick a trimming rule, both reject the ambiguity. `sql_row_rules_match`
+/// pins the agreement.
+fn sql_row_line(line: &str) -> Result<Option<&str>, String> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.trim() != line {
+        return Err(format!("surrounding whitespace in SQL table row {line:?}"));
+    }
+    Ok(Some(line))
+}
+
 fn parse_sql_data(source: &str) -> Result<Vec<(String, u8)>, String> {
     let mut rows = Vec::new();
-    for line in source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
+    for line in source.lines() {
+        let Some(line) = sql_row_line(line)? else {
+            continue;
+        };
         let (key, value) = line
             .split_once('\t')
             .ok_or_else(|| format!("missing tab in {line:?}"))?;
@@ -698,6 +719,42 @@ mod tests {
         ];
         assert!(merged_xss(&upstream, &repeated).is_err());
         assert!(merged_sql(&upstream_sql(), &[("B".to_owned(), b'f'), ("B".to_owned(), b'f')]).is_err());
+    }
+
+    /// `sql_row_line` here and `sql_row_line` in `libperfusion/build.rs`
+    /// must classify every line the same way.
+    ///
+    /// A build script cannot depend on this crate, so the rule is stated
+    /// twice. This battery is the contract: `libperfusion/tests/tables.rs`
+    /// runs the same cases against what build.rs actually generated, so a
+    /// copy that drifts fails there.
+    #[test]
+    fn sql_row_rules_match() {
+        // Accepted, and read exactly as written.
+        for (line, expected) in [
+            ("FOO\tk", Some("FOO\tk")),
+            ("FOO\tk\r", Some("FOO\tk")),
+            ("01;ES\tF", Some("01;ES\tF")),
+            ("", None),
+            ("\r", None),
+            ("# comment", None),
+            ("#", None),
+        ] {
+            assert_eq!(sql_row_line(line).unwrap(), expected, "{line:?}");
+        }
+
+        // Rejected: both readers would otherwise disagree about the key,
+        // the value, or whether the line is a comment at all.
+        for line in [
+            " FOO\tk",
+            "FOO\tk ",
+            "FOO\tk\t",
+            "\tFOO\tk",
+            "  # indented comment",
+            "FOO\tk \r",
+        ] {
+            assert!(sql_row_line(line).is_err(), "{line:?} must be rejected");
+        }
     }
 
     /// The checked-in tables merge, so `tables-refresh` never half-writes.
