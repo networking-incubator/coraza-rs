@@ -10,6 +10,7 @@ description = "Core types and transformations for a separate Rust implementation
 [dependencies]
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = "0.10"
+regex = "1.10"
 sha1 = "0.10"
 
 [lints]
