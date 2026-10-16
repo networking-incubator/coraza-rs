@@ -46,6 +46,14 @@ pub type TransformationResult = (Vec<u8>, bool, Option<TransformationError>);
 /// A transformation function used by a rule's transformation chain.
 pub type Transformation = fn(&[u8]) -> TransformationResult;
 
+/// Returns bytes as text, borrowing valid UTF-8 and replacing invalid sequences.
+pub(crate) fn text_of(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(bytes),
+    }
+}
+
 /// Error reported by a transformation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformationError {
