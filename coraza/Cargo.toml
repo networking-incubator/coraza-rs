@@ -1,0 +1,14 @@
+[package]
+name = "coraza"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coraza WAF core types and configuration model"
+
+[dependencies]
+libperfusion = { version = "0.1.0", path = "../libperfusion" }
+
+[lints]
+workspace = true

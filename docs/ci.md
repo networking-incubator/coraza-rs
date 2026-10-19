@@ -85,6 +85,9 @@ Each commit must be:
 - signed (`git commit -S`)
 - signed off (`git commit -s`)
 
+The approved exception for imported Coraza commits without source signoffs is
+listed in the [Coraza import history](coraza-import-history.md).
+
 You can do both in one command:
 
 ```console

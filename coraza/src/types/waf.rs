@@ -6,8 +6,7 @@
 //! This module contains types for configuring the WAF engine behavior,
 //! audit logging, and rule processing.
 
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 /// Status of the audit logging engine.
 ///
@@ -25,7 +24,7 @@ pub enum AuditEngineStatus {
 
 impl AuditEngineStatus {
     /// Returns the string representation of the audit engine status.
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             AuditEngineStatus::On => "On",
             AuditEngineStatus::Off => "Off",
@@ -43,6 +42,7 @@ impl fmt::Display for AuditEngineStatus {
 /// Error type for invalid audit engine status parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseAuditEngineStatusError {
+    /// Original value that failed to parse.
     input: String,
 }
 
@@ -62,12 +62,22 @@ impl FromStr for AuditEngineStatus {
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::AuditEngineStatus;
     /// use std::str::FromStr;
     ///
-    /// assert_eq!(AuditEngineStatus::from_str("on").unwrap(), AuditEngineStatus::On);
-    /// assert_eq!(AuditEngineStatus::from_str("OFF").unwrap(), AuditEngineStatus::Off);
-    /// assert_eq!(AuditEngineStatus::from_str("RelevantOnly").unwrap(), AuditEngineStatus::RelevantOnly);
+    /// use coraza::types::AuditEngineStatus;
+    ///
+    /// assert_eq!(
+    ///     AuditEngineStatus::from_str("on").unwrap(),
+    ///     AuditEngineStatus::On
+    /// );
+    /// assert_eq!(
+    ///     AuditEngineStatus::from_str("OFF").unwrap(),
+    ///     AuditEngineStatus::Off
+    /// );
+    /// assert_eq!(
+    ///     AuditEngineStatus::from_str("RelevantOnly").unwrap(),
+    ///     AuditEngineStatus::RelevantOnly
+    /// );
     /// assert!(AuditEngineStatus::from_str("invalid").is_err());
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -75,9 +85,7 @@ impl FromStr for AuditEngineStatus {
             "on" => Ok(AuditEngineStatus::On),
             "off" => Ok(AuditEngineStatus::Off),
             "relevantonly" => Ok(AuditEngineStatus::RelevantOnly),
-            _ => Err(ParseAuditEngineStatusError {
-                input: s.to_string(),
-            }),
+            _ => Err(ParseAuditEngineStatusError { input: s.to_owned() }),
         }
     }
 }
@@ -98,7 +106,7 @@ pub enum RuleEngineStatus {
 
 impl RuleEngineStatus {
     /// Returns the string representation of the rule engine status.
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             RuleEngineStatus::On => "On",
             RuleEngineStatus::DetectionOnly => "DetectionOnly",
@@ -116,6 +124,7 @@ impl fmt::Display for RuleEngineStatus {
 /// Error type for invalid rule engine status parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseRuleEngineStatusError {
+    /// Original value that failed to parse.
     input: String,
 }
 
@@ -135,12 +144,22 @@ impl FromStr for RuleEngineStatus {
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::RuleEngineStatus;
     /// use std::str::FromStr;
     ///
-    /// assert_eq!(RuleEngineStatus::from_str("on").unwrap(), RuleEngineStatus::On);
-    /// assert_eq!(RuleEngineStatus::from_str("DetectionOnly").unwrap(), RuleEngineStatus::DetectionOnly);
-    /// assert_eq!(RuleEngineStatus::from_str("OFF").unwrap(), RuleEngineStatus::Off);
+    /// use coraza::types::RuleEngineStatus;
+    ///
+    /// assert_eq!(
+    ///     RuleEngineStatus::from_str("on").unwrap(),
+    ///     RuleEngineStatus::On
+    /// );
+    /// assert_eq!(
+    ///     RuleEngineStatus::from_str("DetectionOnly").unwrap(),
+    ///     RuleEngineStatus::DetectionOnly
+    /// );
+    /// assert_eq!(
+    ///     RuleEngineStatus::from_str("OFF").unwrap(),
+    ///     RuleEngineStatus::Off
+    /// );
     /// assert!(RuleEngineStatus::from_str("invalid").is_err());
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -148,9 +167,7 @@ impl FromStr for RuleEngineStatus {
             "on" => Ok(RuleEngineStatus::On),
             "detectiononly" => Ok(RuleEngineStatus::DetectionOnly),
             "off" => Ok(RuleEngineStatus::Off),
-            _ => Err(ParseRuleEngineStatusError {
-                input: s.to_string(),
-            }),
+            _ => Err(ParseRuleEngineStatusError { input: s.to_owned() }),
         }
     }
 }
@@ -167,7 +184,7 @@ pub enum BodyLimitAction {
 
 impl BodyLimitAction {
     /// Returns the string representation of the body limit action.
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             BodyLimitAction::ProcessPartial => "ProcessPartial",
             BodyLimitAction::Reject => "Reject",
@@ -175,8 +192,8 @@ impl BodyLimitAction {
     }
 
     /// Returns the numeric value.
-    pub const fn as_u8(&self) -> u8 {
-        *self as u8
+    pub const fn as_u8(self) -> u8 {
+        self as u8
     }
 }
 
@@ -228,32 +245,35 @@ impl AuditLogPart {
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::AuditLogPart;
+    /// use coraza::types::AuditLogPart;
     ///
     /// assert_eq!(AuditLogPart::Header.as_char(), 'A');
     /// assert_eq!(AuditLogPart::RequestHeaders.as_char(), 'B');
     /// assert_eq!(AuditLogPart::EndMarker.as_char(), 'Z');
     /// ```
-    pub const fn as_char(&self) -> char {
-        *self as u8 as char
+    pub const fn as_char(self) -> char {
+        self as u8 as char
     }
 
     /// Returns the byte representation of the audit log part.
-    pub const fn as_u8(&self) -> u8 {
-        *self as u8
+    pub const fn as_u8(self) -> u8 {
+        self as u8
     }
 
-    /// Creates an AuditLogPart from a character.
+    /// Creates an `AuditLogPart` from a character.
     ///
     /// Returns None if the character doesn't correspond to a valid part.
     ///
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::AuditLogPart;
+    /// use coraza::types::AuditLogPart;
     ///
     /// assert_eq!(AuditLogPart::from_char('A'), Some(AuditLogPart::Header));
-    /// assert_eq!(AuditLogPart::from_char('B'), Some(AuditLogPart::RequestHeaders));
+    /// assert_eq!(
+    ///     AuditLogPart::from_char('B'),
+    ///     Some(AuditLogPart::RequestHeaders)
+    /// );
     /// assert_eq!(AuditLogPart::from_char('X'), None);
     /// ```
     pub const fn from_char(c: char) -> Option<Self> {
@@ -275,7 +295,7 @@ impl AuditLogPart {
     }
 
     /// Returns true if this part is mandatory (A or Z).
-    pub const fn is_mandatory(&self) -> bool {
+    pub const fn is_mandatory(self) -> bool {
         matches!(self, AuditLogPart::Header | AuditLogPart::EndMarker)
     }
 }
@@ -289,6 +309,7 @@ impl fmt::Display for AuditLogPart {
 /// Error type for invalid audit log part parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseAuditLogPartError {
+    /// Original character that failed to parse.
     input: char,
 }
 
@@ -309,6 +330,7 @@ impl TryFrom<char> for AuditLogPart {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests assert successful parsing")]
 mod tests {
     use super::*;
 
@@ -323,22 +345,13 @@ mod tests {
     fn test_audit_engine_status_display() {
         assert_eq!(format!("{}", AuditEngineStatus::On), "On");
         assert_eq!(format!("{}", AuditEngineStatus::Off), "Off");
-        assert_eq!(
-            format!("{}", AuditEngineStatus::RelevantOnly),
-            "RelevantOnly"
-        );
+        assert_eq!(format!("{}", AuditEngineStatus::RelevantOnly), "RelevantOnly");
     }
 
     #[test]
     fn test_audit_engine_status_parse() {
-        assert_eq!(
-            "on".parse::<AuditEngineStatus>().unwrap(),
-            AuditEngineStatus::On
-        );
-        assert_eq!(
-            "OFF".parse::<AuditEngineStatus>().unwrap(),
-            AuditEngineStatus::Off
-        );
+        assert_eq!("on".parse::<AuditEngineStatus>().unwrap(), AuditEngineStatus::On);
+        assert_eq!("OFF".parse::<AuditEngineStatus>().unwrap(), AuditEngineStatus::Off);
         assert_eq!(
             "RelevantOnly".parse::<AuditEngineStatus>().unwrap(),
             AuditEngineStatus::RelevantOnly
@@ -365,19 +378,13 @@ mod tests {
     #[test]
     fn test_rule_engine_status_display() {
         assert_eq!(format!("{}", RuleEngineStatus::On), "On");
-        assert_eq!(
-            format!("{}", RuleEngineStatus::DetectionOnly),
-            "DetectionOnly"
-        );
+        assert_eq!(format!("{}", RuleEngineStatus::DetectionOnly), "DetectionOnly");
         assert_eq!(format!("{}", RuleEngineStatus::Off), "Off");
     }
 
     #[test]
     fn test_rule_engine_status_parse() {
-        assert_eq!(
-            "on".parse::<RuleEngineStatus>().unwrap(),
-            RuleEngineStatus::On
-        );
+        assert_eq!("on".parse::<RuleEngineStatus>().unwrap(), RuleEngineStatus::On);
         assert_eq!(
             "DetectionOnly".parse::<RuleEngineStatus>().unwrap(),
             RuleEngineStatus::DetectionOnly
@@ -386,10 +393,7 @@ mod tests {
             "detectiononly".parse::<RuleEngineStatus>().unwrap(),
             RuleEngineStatus::DetectionOnly
         );
-        assert_eq!(
-            "OFF".parse::<RuleEngineStatus>().unwrap(),
-            RuleEngineStatus::Off
-        );
+        assert_eq!("OFF".parse::<RuleEngineStatus>().unwrap(), RuleEngineStatus::Off);
     }
 
     #[test]
@@ -412,10 +416,7 @@ mod tests {
 
     #[test]
     fn test_body_limit_action_display() {
-        assert_eq!(
-            format!("{}", BodyLimitAction::ProcessPartial),
-            "ProcessPartial"
-        );
+        assert_eq!(format!("{}", BodyLimitAction::ProcessPartial), "ProcessPartial");
         assert_eq!(format!("{}", BodyLimitAction::Reject), "Reject");
     }
 
@@ -432,10 +433,7 @@ mod tests {
     #[test]
     fn test_audit_log_part_from_char() {
         assert_eq!(AuditLogPart::from_char('A'), Some(AuditLogPart::Header));
-        assert_eq!(
-            AuditLogPart::from_char('B'),
-            Some(AuditLogPart::RequestHeaders)
-        );
+        assert_eq!(AuditLogPart::from_char('B'), Some(AuditLogPart::RequestHeaders));
         assert_eq!(AuditLogPart::from_char('Z'), Some(AuditLogPart::EndMarker));
         assert_eq!(AuditLogPart::from_char('X'), None);
         assert_eq!(AuditLogPart::from_char('a'), None); // Case sensitive
@@ -444,10 +442,7 @@ mod tests {
     #[test]
     fn test_audit_log_part_try_from() {
         assert_eq!(AuditLogPart::try_from('A').unwrap(), AuditLogPart::Header);
-        assert_eq!(
-            AuditLogPart::try_from('K').unwrap(),
-            AuditLogPart::RulesMatched
-        );
+        assert_eq!(AuditLogPart::try_from('K').unwrap(), AuditLogPart::RulesMatched);
         assert!(AuditLogPart::try_from('X').is_err());
     }
 

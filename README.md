@@ -10,6 +10,7 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
+| `coraza/` | Coraza WAF crate; currently contains the core rule and engine configuration types. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
