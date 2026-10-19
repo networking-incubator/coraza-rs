@@ -22,7 +22,6 @@
     reason = "Missing expected tokens should fail the test immediately."
 )]
 
-
 use libperfusion::{Dialect, HtmlContext, MAX_INPUT_LEN};
 
 #[test]
