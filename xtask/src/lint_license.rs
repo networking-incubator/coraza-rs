@@ -53,6 +53,12 @@ const LIBINJECTION_SOURCE_HEADER: &str = "// Copyright (c) 2012-2016, Nick Galbr
 // See the crate's LICENSE for the complete terms.
 ";
 
+/// Existing Apache-2.0 headers preserved on upstream Coraza source.
+const CORAZA_SOURCE_HEADERS: [&str; 2] = [
+    "// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors\n// SPDX-License-Identifier: Apache-2.0\n",
+    "// Copyright 2024 Coraza Rust Contributors\n// SPDX-License-Identifier: Apache-2.0\n",
+];
+
 /// Directory names skipped while walking the workspace for `.rs` files.
 const SKIPPED_DIRS: [&str; 3] = ["target", ".git", "coraza-rs"];
 
@@ -151,12 +157,15 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
             path: path.clone(),
             message: err.to_string(),
         })?;
-        let expected_header = if is_libinjection_source(&path) {
-            LIBINJECTION_SOURCE_HEADER
+        let has_expected_header = if is_libinjection_source(&path) {
+            content.starts_with(LIBINJECTION_SOURCE_HEADER)
+        } else if is_coraza_source(&path) {
+            content.starts_with(LICENSE_HEADER)
+                || CORAZA_SOURCE_HEADERS.iter().any(|header| content.starts_with(header))
         } else {
-            LICENSE_HEADER
+            content.starts_with(LICENSE_HEADER)
         };
-        if !content.starts_with(expected_header) {
+        if !has_expected_header {
             violations.push(path);
         }
     }
@@ -173,6 +182,17 @@ fn is_libinjection_source(path: &Path) -> bool {
             return components
                 .next()
                 .is_some_and(|next| next.as_os_str() == "src" || next.as_os_str() == "build.rs");
+        }
+    }
+    false
+}
+
+/// Upstream Coraza headers are accepted only on Rust files under `coraza/src`.
+fn is_coraza_source(path: &Path) -> bool {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == "coraza" {
+            return components.next().is_some_and(|next| next.as_os_str() == "src");
         }
     }
     false
@@ -515,6 +535,23 @@ mod tests {
         assert!(is_libinjection_source(Path::new("libperfusion/src/lib.rs")));
         assert!(is_libinjection_source(Path::new("libperfusion/build.rs")));
         assert!(!is_libinjection_source(Path::new("libperfusion/tests/api.rs")));
+    }
+
+    #[test]
+    fn upstream_coraza_headers_are_accepted_only_under_coraza_source() {
+        let root = write_temp_workspace(
+            &["coraza", "ordinary"],
+            &[
+                ("coraza/src/ported_2022.rs", CORAZA_SOURCE_HEADERS[0]),
+                ("coraza/src/ported_2024.rs", CORAZA_SOURCE_HEADERS[1]),
+                ("ordinary/src/copied.rs", CORAZA_SOURCE_HEADERS[0]),
+            ],
+        );
+
+        assert_eq!(
+            collect_violations(&root).unwrap(),
+            vec![root.join("ordinary/src/copied.rs")]
+        );
     }
 
     #[test]

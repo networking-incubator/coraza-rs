@@ -6,8 +6,7 @@
 //! Severity levels range from Emergency (0, most severe) to Debug (7, least severe).
 //! These are used to categorize the importance of rule matches and determine logging behavior.
 
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 /// Represents the severity of a triggered rule.
 ///
@@ -21,7 +20,7 @@ use std::str::FromStr;
 /// - Info (6) - Informational messages
 /// - Debug (7) - Debug-level messages
 ///
-/// RuleSeverity is used by error callbacks to determine whether to log an error.
+/// `RuleSeverity` is used by error callbacks to determine whether to log an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum RuleSeverity {
@@ -49,12 +48,12 @@ impl RuleSeverity {
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::RuleSeverity;
+    /// use coraza::types::RuleSeverity;
     ///
     /// assert_eq!(RuleSeverity::Emergency.as_str(), "emergency");
     /// assert_eq!(RuleSeverity::Warning.as_str(), "warning");
     /// ```
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             RuleSeverity::Emergency => "emergency",
             RuleSeverity::Alert => "alert",
@@ -72,13 +71,13 @@ impl RuleSeverity {
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::RuleSeverity;
+    /// use coraza::types::RuleSeverity;
     ///
     /// assert_eq!(RuleSeverity::Emergency.as_int(), 0);
     /// assert_eq!(RuleSeverity::Debug.as_int(), 7);
     /// ```
-    pub const fn as_int(&self) -> u8 {
-        *self as u8
+    pub const fn as_int(self) -> u8 {
+        self as u8
     }
 }
 
@@ -91,6 +90,7 @@ impl fmt::Display for RuleSeverity {
 /// Error type for invalid severity parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseSeverityError {
+    /// Original value that failed to parse.
     input: String,
 }
 
@@ -105,19 +105,29 @@ impl std::error::Error for ParseSeverityError {}
 impl FromStr for RuleSeverity {
     type Err = ParseSeverityError;
 
-    /// Parses a string into a RuleSeverity.
+    /// Parses a string into a `RuleSeverity`.
     ///
     /// Accepts either numeric values (0-7) or string names (case-insensitive).
     ///
     /// # Examples
     ///
     /// ```
-    /// use coraza_rs::types::RuleSeverity;
     /// use std::str::FromStr;
     ///
-    /// assert_eq!(RuleSeverity::from_str("0").unwrap(), RuleSeverity::Emergency);
-    /// assert_eq!(RuleSeverity::from_str("emergency").unwrap(), RuleSeverity::Emergency);
-    /// assert_eq!(RuleSeverity::from_str("Warning").unwrap(), RuleSeverity::Warning);
+    /// use coraza::types::RuleSeverity;
+    ///
+    /// assert_eq!(
+    ///     RuleSeverity::from_str("0").unwrap(),
+    ///     RuleSeverity::Emergency
+    /// );
+    /// assert_eq!(
+    ///     RuleSeverity::from_str("emergency").unwrap(),
+    ///     RuleSeverity::Emergency
+    /// );
+    /// assert_eq!(
+    ///     RuleSeverity::from_str("Warning").unwrap(),
+    ///     RuleSeverity::Warning
+    /// );
     /// assert!(RuleSeverity::from_str("invalid").is_err());
     /// assert!(RuleSeverity::from_str("8").is_err());
     /// ```
@@ -135,9 +145,7 @@ impl FromStr for RuleSeverity {
                 5 => Ok(RuleSeverity::Notice),
                 6 => Ok(RuleSeverity::Info),
                 7 => Ok(RuleSeverity::Debug),
-                _ => Err(ParseSeverityError {
-                    input: s.to_string(),
-                }),
+                _ => Err(ParseSeverityError { input: s.to_owned() }),
             };
         }
 
@@ -151,14 +159,13 @@ impl FromStr for RuleSeverity {
             "notice" => Ok(RuleSeverity::Notice),
             "info" => Ok(RuleSeverity::Info),
             "debug" => Ok(RuleSeverity::Debug),
-            _ => Err(ParseSeverityError {
-                input: s.to_string(),
-            }),
+            _ => Err(ParseSeverityError { input: s.to_owned() }),
         }
     }
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests assert successful parsing")]
 mod tests {
     use super::*;
 
@@ -195,10 +202,7 @@ mod tests {
 
     #[test]
     fn test_parse_from_number() {
-        assert_eq!(
-            "0".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Emergency
-        );
+        assert_eq!("0".parse::<RuleSeverity>().unwrap(), RuleSeverity::Emergency);
         assert_eq!("1".parse::<RuleSeverity>().unwrap(), RuleSeverity::Alert);
         assert_eq!("2".parse::<RuleSeverity>().unwrap(), RuleSeverity::Critical);
         assert_eq!("3".parse::<RuleSeverity>().unwrap(), RuleSeverity::Error);
@@ -210,51 +214,21 @@ mod tests {
 
     #[test]
     fn test_parse_from_string() {
-        assert_eq!(
-            "emergency".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Emergency
-        );
-        assert_eq!(
-            "alert".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Alert
-        );
-        assert_eq!(
-            "critical".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Critical
-        );
-        assert_eq!(
-            "error".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Error
-        );
-        assert_eq!(
-            "warning".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Warning
-        );
-        assert_eq!(
-            "notice".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Notice
-        );
+        assert_eq!("emergency".parse::<RuleSeverity>().unwrap(), RuleSeverity::Emergency);
+        assert_eq!("alert".parse::<RuleSeverity>().unwrap(), RuleSeverity::Alert);
+        assert_eq!("critical".parse::<RuleSeverity>().unwrap(), RuleSeverity::Critical);
+        assert_eq!("error".parse::<RuleSeverity>().unwrap(), RuleSeverity::Error);
+        assert_eq!("warning".parse::<RuleSeverity>().unwrap(), RuleSeverity::Warning);
+        assert_eq!("notice".parse::<RuleSeverity>().unwrap(), RuleSeverity::Notice);
         assert_eq!("info".parse::<RuleSeverity>().unwrap(), RuleSeverity::Info);
-        assert_eq!(
-            "debug".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Debug
-        );
+        assert_eq!("debug".parse::<RuleSeverity>().unwrap(), RuleSeverity::Debug);
     }
 
     #[test]
     fn test_parse_case_insensitive() {
-        assert_eq!(
-            "EMERGENCY".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Emergency
-        );
-        assert_eq!(
-            "Warning".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Warning
-        );
-        assert_eq!(
-            "DeBuG".parse::<RuleSeverity>().unwrap(),
-            RuleSeverity::Debug
-        );
+        assert_eq!("EMERGENCY".parse::<RuleSeverity>().unwrap(), RuleSeverity::Emergency);
+        assert_eq!("Warning".parse::<RuleSeverity>().unwrap(), RuleSeverity::Warning);
+        assert_eq!("DeBuG".parse::<RuleSeverity>().unwrap(), RuleSeverity::Debug);
     }
 
     #[test]
