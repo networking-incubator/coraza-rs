@@ -21,14 +21,14 @@
 //! Single-value collection implementation.
 
 use super::MatchData;
-use crate::types::RuleVariable;
+use crate::{transformations::text_of, types::RuleVariable};
 
-/// A collection that holds a single string value.
+/// A collection that holds a single byte value.
 ///
 /// Used for variables like `REQUEST_URI`, `REQUEST_METHOD`, and others.
 pub struct Single {
     /// The stored value.
-    data: String,
+    data: Vec<u8>,
     /// The variable this collection represents.
     variable: RuleVariable,
 }
@@ -41,7 +41,7 @@ impl Single {
     )]
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
-            data: String::new(),
+            data: Vec::new(),
             variable,
         }
     }
@@ -51,18 +51,23 @@ impl Single {
         not(test),
         expect(dead_code, reason = "used by transaction storage in a later port slice")
     )]
-    pub(crate) fn set(&mut self, value: impl Into<String>) {
-        self.data = value.into();
+    pub(crate) fn set(&mut self, value: impl AsRef<[u8]>) {
+        self.data = value.as_ref().to_vec();
     }
 
-    /// The value; empty if unset.
-    pub fn get(&self) -> &str {
+    /// The stored bytes; empty if unset.
+    pub fn get_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// The value as text, replacing invalid UTF-8 sequences; empty if unset.
+    pub fn get(&self) -> std::borrow::Cow<'_, str> {
+        text_of(&self.data)
     }
 
     /// The value as match data, with no key.
     pub fn find_all(&self) -> Vec<MatchData> {
-        vec![MatchData::without_key(self.variable, self.data.as_bytes())]
+        vec![MatchData::without_key(self.variable, self.data.as_slice())]
     }
 
     /// Name of the variable this value holds (e.g. `REQUEST_URI`).
@@ -73,7 +78,7 @@ impl Single {
 
 impl std::fmt::Display for Single {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.name(), self.data)
+        write!(f, "{}: {}", self.name(), text_of(&self.data))
     }
 }
 
@@ -111,6 +116,21 @@ mod tests {
             matches.first().map(|matched| matched.value.as_slice()),
             Some(&b"/api/users"[..])
         );
+    }
+
+    #[test]
+    fn test_single_preserves_invalid_utf8_bytes() {
+        let mut single = Single::new(RuleVariable::RequestURI);
+        single.set(b"/\xff");
+
+        assert_eq!(single.get_bytes(), b"/\xff");
+        assert_eq!(single.get(), "/\u{fffd}");
+        let matches = single.find_all();
+        assert_eq!(
+            matches.first().map(|matched| matched.value.as_slice()),
+            Some(&b"/\xff"[..])
+        );
+        assert_eq!(single.to_string(), "REQUEST_URI: /\u{fffd}");
     }
 
     #[test]
