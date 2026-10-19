@@ -231,3 +231,67 @@ fn for_each_utf8(input: &[u8], mut visit: impl FnMut(Result<char, u8>)) {
 fn is_trim_space(byte: u8) -> bool {
     TRIM_SPACES.contains(&byte)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compress_whitespace, lowercase, remove_whitespace, trim, trim_left, trim_right, uppercase, url_decode,
+    };
+
+    #[test]
+    fn case_mapping_preserves_malformed_bytes_and_maps_unicode() {
+        let (lower, lower_changed, lower_error) = lowercase(b"TEST \xff \xc3\x84");
+        assert_eq!(lower, b"test \xff \xc3\xa4");
+        assert!(lower_changed);
+        assert_eq!(lower_error, None);
+
+        let (upper, upper_changed, upper_error) = uppercase(b"gro\xc3\x9f");
+        assert_eq!(upper, b"GROSS");
+        assert!(upper_changed);
+        assert_eq!(upper_error, None);
+    }
+
+    #[test]
+    fn trim_variants_preserve_non_whitespace_bytes() {
+        assert_eq!(trim(b"\t \xff value \r"), (b"\xff value".to_vec(), true, None));
+        assert_eq!(trim_left(b" \xffvalue"), (b"\xffvalue".to_vec(), true, None));
+        assert_eq!(trim_right(b"value\xff "), (b"value\xff".to_vec(), true, None));
+        assert_eq!(trim(b"value"), (b"value".to_vec(), false, None));
+    }
+
+    #[test]
+    fn whitespace_transforms_handle_unicode_and_malformed_bytes() {
+        let (removed, removed_changed, removed_error) = remove_whitespace(b"a \t\xc2\xa0\xffb");
+        assert_eq!(removed, b"a\xffb");
+        assert!(removed_changed);
+        assert_eq!(removed_error, None);
+
+        let (compressed, compressed_changed, compressed_error) = compress_whitespace(b"\t \xc2\xa0\xe3\x80\x80X");
+        assert_eq!(compressed, b" X");
+        assert!(compressed_changed);
+        assert_eq!(compressed_error, None);
+
+        let (unchanged, changed, error) = compress_whitespace(b"word");
+        assert_eq!(unchanged, b"word");
+        assert!(!changed);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn url_decode_preserves_decoded_binary_and_invalid_escapes() {
+        let (decoded, changed, error) = url_decode(b"a%00%FF+z");
+        assert_eq!(decoded, b"a\x00\xff z");
+        assert!(changed);
+        assert_eq!(error, None);
+
+        let (invalid, invalid_changed, invalid_error) = url_decode(b"%G1%");
+        assert_eq!(invalid, b"%G1%");
+        assert!(invalid_changed);
+        assert_eq!(invalid_error, None);
+
+        let (unchanged, unchanged_changed, unchanged_error) = url_decode(b"plain");
+        assert_eq!(unchanged, b"plain");
+        assert!(!unchanged_changed);
+        assert_eq!(unchanged_error, None);
+    }
+}
