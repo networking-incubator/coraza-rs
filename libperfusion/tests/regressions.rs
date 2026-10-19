@@ -22,7 +22,6 @@
     reason = "Missing expected tokens should fail the test immediately."
 )]
 
-
 #[test]
 fn sqli_number_comment_after_leading_whitespace() {
     // The byte after the number is read at its offset, not at its length.

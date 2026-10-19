@@ -391,7 +391,6 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
     cases
 }
 
-
 fn append_additional_direct_cases(cases: &mut Vec<(String, Vec<u8>)>) {
     for (id, bytes) in [
         (
