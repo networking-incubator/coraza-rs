@@ -1,5 +1,12 @@
 # Coraza source import history
 
+This repository contains a separate Rust implementation based on Coraza source
+attributed to Juan Pablo Tosso and the OWASP Coraza contributors. The Rust port
+was authored by Alex Snaps in `coraza-rs-alex` and integrated here by Coraza
+Kubernetes Operator contributors. It is not the upstream Go implementation or
+a complete Coraza engine. The source files retain the original Coraza
+attribution and Apache-2.0 license notice.
+
 The port preserves source authorship, author dates, commit messages, and
 existing signoff trailers. Importing files under `coraza/` rewrites commit
 hashes, so signatures on source commits cannot be retained; imported commits

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Core Rust types for the Coraza Web Application Firewall.
+//! Core types for a separate Rust implementation based on Coraza.
+//!
+//! This crate is not the upstream Go implementation or a complete WAF engine.
+//! The port is based on the original Coraza, created by Juan Pablo Tosso and
+//! the OWASP Coraza contributors.
 
 pub mod types;

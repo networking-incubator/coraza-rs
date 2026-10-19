@@ -10,13 +10,18 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
-| `coraza/` | Coraza WAF crate; currently contains the core rule and engine configuration types. |
+| `coraza/` | Separate Rust Coraza implementation; currently contains selected core types and is not a complete WAF engine. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
 | `xtask/` | Internal commands for checking and refreshing pinned corpora and generated tables. |
 | `docs/` | CI, performance, and design documentation. |
 | `.github/workflows/` | Build, test, parity, fuzz, coverage, and supply-chain workflows. |
+
+The Rust crate is a separate implementation based on Coraza, created by Juan
+Pablo Tosso and the OWASP Coraza contributors. It is not the upstream Go
+project. See the
+[Coraza import history](docs/coraza-import-history.md) for provenance.
 
 ## Use the library
 
