@@ -116,9 +116,9 @@ impl FromStr for RulePhase {
     ///
     /// Accepts:
     /// - Numeric values 1-5 (as strings)
-    /// - "request" → Phase 2 (`RequestBody`)
-    /// - "response" → Phase 4 (`ResponseBody`)
-    /// - "logging" → Phase 5 (Logging)
+    /// - "request" maps to Phase 2 (`RequestBody`)
+    /// - "response" maps to Phase 4 (`ResponseBody`)
+    /// - "logging" maps to Phase 5 (Logging)
     ///
     /// Note: Phase 0 (Unknown) cannot be parsed and values outside 1-5 return an error.
     ///

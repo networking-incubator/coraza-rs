@@ -159,7 +159,7 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
         })?;
         let has_expected_header = if is_libinjection_source(&path) {
             content.starts_with(LIBINJECTION_SOURCE_HEADER)
-        } else if is_coraza_source(&path) {
+        } else if is_coraza_source(&member_dirs, &path) {
             content.starts_with(LICENSE_HEADER)
                 || CORAZA_SOURCE_HEADERS.iter().any(|header| content.starts_with(header))
         } else {
@@ -188,14 +188,10 @@ fn is_libinjection_source(path: &Path) -> bool {
 }
 
 /// Upstream Coraza headers are accepted only on Rust files under `coraza/src`.
-fn is_coraza_source(path: &Path) -> bool {
-    let mut components = path.components();
-    while let Some(component) = components.next() {
-        if component.as_os_str() == "coraza" {
-            return components.next().is_some_and(|next| next.as_os_str() == "src");
-        }
-    }
-    false
+fn is_coraza_source(member_dirs: &[PathBuf], path: &Path) -> bool {
+    member_dirs.iter().any(|member_dir| {
+        member_dir.file_name().is_some_and(|name| name == "coraza") && path.starts_with(member_dir.join("src"))
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -538,8 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn upstream_coraza_headers_are_accepted_only_under_coraza_source() {
-        let root = write_temp_workspace(
+    fn upstream_coraza_headers_are_scoped_when_checkout_has_coraza_ancestor() {
+        let root = write_temp_workspace_at(
+            tempfile_dir().join("coraza").join("project"),
             &["coraza", "ordinary"],
             &[
                 ("coraza/src/ported_2022.rs", CORAZA_SOURCE_HEADERS[0]),
@@ -688,7 +685,11 @@ members = [
     }
 
     fn write_temp_workspace(members: &[&str], files: &[(&str, &str)]) -> PathBuf {
-        let root = tempfile_dir();
+        write_temp_workspace_at(tempfile_dir(), members, files)
+    }
+
+    fn write_temp_workspace_at(root: PathBuf, members: &[&str], files: &[(&str, &str)]) -> PathBuf {
+        fs::create_dir_all(&root).unwrap();
         let member_list = members
             .iter()
             .map(|member| format!("\"{member}\""))

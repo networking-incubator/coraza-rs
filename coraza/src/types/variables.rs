@@ -127,13 +127,13 @@ pub enum RuleVariable {
     RequestHeaders,
     /// `RESPONSE_HEADERS` - Response headers (collection)
     ResponseHeaders,
-    /// `RESPONSE_BODY_PROCESSOR` - Name of response body processor
+    /// `RES_BODY_PROCESSOR` - Name of response body processor
     ResBodyProcessor,
     /// `GEO` - Geographic location information of client (collection)
     Geo,
     /// `REQUEST_COOKIES_NAMES` - Names of request cookies (collection)
     RequestCookiesNames,
-    /// `FILES_TMP_NAMES` - Names of temporary uploaded files (collection)
+    /// `FILES_TMPNAMES` - Names of temporary uploaded files (collection)
     FilesTmpNames,
     /// `ARGS_NAMES` - Names of all arguments (POST and GET, collection)
     ArgsNames,
@@ -203,13 +203,13 @@ pub enum RuleVariable {
     Userid,
     /// `IP` - Kept for compatibility (unsupported)
     IP,
-    /// `RESBODY_ERROR` - Response body processor error flag
+    /// `RES_BODY_ERROR` - Response body processor error flag
     ResBodyError,
-    /// `RESBODY_ERROR_MSG` - Response body processor error message
+    /// `RES_BODY_ERROR_MSG` - Response body processor error message
     ResBodyErrorMsg,
-    /// `RESBODY_PROCESSOR_ERROR` - Response body processor error flag
+    /// `RES_BODY_PROCESSOR_ERROR` - Response body processor error flag
     ResBodyProcessorError,
-    /// `RESBODY_PROCESSOR_ERROR_MSG` - Response body processor error message
+    /// `RES_BODY_PROCESSOR_ERROR_MSG` - Response body processor error message
     ResBodyProcessorErrorMsg,
     /// `TIME` - Formatted time string (hour:minute:second)
     Time,
@@ -289,10 +289,10 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
     (RuleVariable::RequestCookies, "REQUEST_COOKIES"),
     (RuleVariable::RequestHeaders, "REQUEST_HEADERS"),
     (RuleVariable::ResponseHeaders, "RESPONSE_HEADERS"),
-    (RuleVariable::ResBodyProcessor, "RESBODY_PROCESSOR"),
+    (RuleVariable::ResBodyProcessor, "RES_BODY_PROCESSOR"),
     (RuleVariable::Geo, "GEO"),
     (RuleVariable::RequestCookiesNames, "REQUEST_COOKIES_NAMES"),
-    (RuleVariable::FilesTmpNames, "FILES_TMP_NAMES"),
+    (RuleVariable::FilesTmpNames, "FILES_TMPNAMES"),
     (RuleVariable::ArgsNames, "ARGS_NAMES"),
     (RuleVariable::ArgsGetNames, "ARGS_GET_NAMES"),
     (RuleVariable::ArgsPostNames, "ARGS_POST_NAMES"),
@@ -334,10 +334,10 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
     (RuleVariable::Sessionid, "SESSIONID"),
     (RuleVariable::Userid, "USERID"),
     (RuleVariable::IP, "IP"),
-    (RuleVariable::ResBodyError, "RESBODY_ERROR"),
-    (RuleVariable::ResBodyErrorMsg, "RESBODY_ERROR_MSG"),
-    (RuleVariable::ResBodyProcessorError, "RESBODY_PROCESSOR_ERROR"),
-    (RuleVariable::ResBodyProcessorErrorMsg, "RESBODY_PROCESSOR_ERROR_MSG"),
+    (RuleVariable::ResBodyError, "RES_BODY_ERROR"),
+    (RuleVariable::ResBodyErrorMsg, "RES_BODY_ERROR_MSG"),
+    (RuleVariable::ResBodyProcessorError, "RES_BODY_PROCESSOR_ERROR"),
+    (RuleVariable::ResBodyProcessorErrorMsg, "RES_BODY_PROCESSOR_ERROR_MSG"),
     (RuleVariable::Time, "TIME"),
     (RuleVariable::TimeDay, "TIME_DAY"),
     (RuleVariable::TimeEpoch, "TIME_EPOCH"),
@@ -516,6 +516,25 @@ mod tests {
 
         for (name, expected) in &variables {
             assert_eq!(name.parse::<RuleVariable>().unwrap(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_coraza_canonical_names() {
+        let variables = [
+            ("RES_BODY_PROCESSOR", RuleVariable::ResBodyProcessor),
+            ("FILES_TMPNAMES", RuleVariable::FilesTmpNames),
+            ("RES_BODY_ERROR", RuleVariable::ResBodyError),
+            ("RES_BODY_ERROR_MSG", RuleVariable::ResBodyErrorMsg),
+            ("RES_BODY_PROCESSOR_ERROR", RuleVariable::ResBodyProcessorError),
+            ("RES_BODY_PROCESSOR_ERROR_MSG", RuleVariable::ResBodyProcessorErrorMsg),
+        ];
+
+        for (name, expected) in variables {
+            let parsed = name.parse::<RuleVariable>().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.name(), name);
+            assert_eq!(name.to_lowercase().parse::<RuleVariable>().unwrap(), expected);
         }
     }
 
