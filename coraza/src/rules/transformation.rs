@@ -26,8 +26,8 @@
 //!
 //! Values pass from one transformation to the next as bytes, so that one can produce
 //! bytes that aren't UTF-8 (`t:sha1`, `t:urlDecode` of `%ff`) for the next
-//! (`t:hexEncode`). The result becomes text for the operator: each invalid sequence
-//! is then replaced by U+FFFD.
+//! (`t:hexEncode`). The chain returns bytes to the operator; lossy UTF-8 conversion
+//! applies only when a text view is needed, not before matching.
 //!
 //! # Modes
 //!
