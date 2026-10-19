@@ -3,6 +3,8 @@ extend-exclude = [
     "libperfusion/data/sqli_keywords.txt",
     "libperfusion/data/sqli_keywords_local.txt",
     "libperfusion/tests/corpus/test-*.txt",
+    # Exact HTML5 entity names and code-point mappings from Go's html package.
+    "coraza/src/transformations/html_entities.rs",
 ]
 
 [default]

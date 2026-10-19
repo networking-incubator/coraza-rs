@@ -476,11 +476,21 @@ pub fn apply_audit_log_parts(
         }
     }
 
-    Ok(ORDERED_AUDIT_LOG_PARTS
-        .iter()
-        .filter(|part| selected.contains(part))
-        .copied()
-        .collect())
+    let mut parts = Vec::with_capacity(selected.len());
+    if selected.contains(&AuditLogPart::Header) {
+        parts.push(AuditLogPart::Header);
+    }
+    parts.extend(
+        ORDERED_AUDIT_LOG_PARTS
+            .iter()
+            .filter(|part| selected.contains(part))
+            .copied(),
+    );
+    if selected.contains(&AuditLogPart::EndMarker) {
+        parts.push(AuditLogPart::EndMarker);
+    }
+
+    Ok(parts)
 }
 
 #[cfg(test)]
@@ -649,6 +659,17 @@ mod tests {
         assert!(parse_audit_log_parts("ABCD").is_err());
         assert!(parse_audit_log_parts("AMZ").is_err());
         assert!(parse_audit_log_parts("A\u{1f600}Z").is_err());
+
+        let base_with_mandatory_parts = parse_audit_log_parts("ABZ").unwrap();
+        assert_eq!(
+            apply_audit_log_parts(&base_with_mandatory_parts, "+C").unwrap(),
+            [
+                AuditLogPart::Header,
+                AuditLogPart::RequestHeaders,
+                AuditLogPart::RequestBody,
+                AuditLogPart::EndMarker,
+            ]
+        );
 
         let base = [AuditLogPart::RequestHeaders, AuditLogPart::RequestBody];
         assert_eq!(
