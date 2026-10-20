@@ -1,0 +1,23 @@
+[package]
+name = "coraza-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+coraza = { path = ".." }
+libfuzzer-sys = "0.4"
+regex = "1.10"
+winnow = "1.0.4"
+
+[[bin]]
+name = "coraza_variable_list"
+path = "fuzz_targets/coraza_variable_list.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

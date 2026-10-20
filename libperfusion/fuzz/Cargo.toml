@@ -8,11 +8,8 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-coraza = { path = "../../coraza" }
 libfuzzer-sys = "0.4"
 libperfusion = { path = ".." }
-regex = "1.10"
-winnow = "1.0.4"
 
 [[bin]]
 name = "raw_bytes"
@@ -31,13 +28,6 @@ bench = false
 [[bin]]
 name = "html_grammar"
 path = "fuzz_targets/html_grammar.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "coraza_variable_list"
-path = "fuzz_targets/coraza_variable_list.rs"
 test = false
 doc = false
 bench = false

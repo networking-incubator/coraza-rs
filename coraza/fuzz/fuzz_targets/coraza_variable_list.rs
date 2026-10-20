@@ -108,7 +108,7 @@ mod types {
 }
 
 #[allow(unfulfilled_lint_expectations)]
-#[path = "../../../coraza/src/seclang/variable_parser.rs"]
+#[path = "../../src/seclang/variable_parser.rs"]
 mod variable_parser;
 
 fuzz_target!(|data: &[u8]| {
