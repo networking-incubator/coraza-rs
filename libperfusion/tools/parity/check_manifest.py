@@ -530,8 +530,12 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
             "version": version,
             "module_sum": module_sum,
             "go_toolchain_flavors": [
-                {"version": "go1.27.1", "go_experiment": ""},
-                {"version": "go1.27.1-X:nodwarf5", "go_experiment": "nodwarf5"},
+                {"version": "go1.27.x", "minimum_patch": 1, "go_experiment": ""},
+                {
+                    "version": "go1.27.x-X:nodwarf5",
+                    "minimum_patch": 1,
+                    "go_experiment": "nodwarf5",
+                },
             ],
             "goos": "linux",
             "goarch": "amd64",

@@ -35,11 +35,16 @@ actual_go_version="$(go version | awk '{print $3}')"
 actual_go_experiment="$(go env GOEXPERIMENT)"
 actual_goos="$(go env GOOS)"
 actual_goarch="$(go env GOARCH)"
-case "$actual_go_version:$actual_go_experiment" in
-	'go1.27.1:') ;;
-	'go1.27.1-X:nodwarf5:nodwarf5') ;;
+if [[ "$actual_go_version" =~ ^go1\.27\.[1-9][0-9]*(-X:nodwarf5)?$ ]]; then
+	toolchain_flavor="${BASH_REMATCH[1]:-}"
+else
+	toolchain_flavor='unsupported'
+fi
+case "$toolchain_flavor:$actual_go_experiment" in
+	':') ;;
+	'-X:nodwarf5:nodwarf5') ;;
 	*)
-		printf 'oracle requires go1.27.1 with no experiment or GOEXPERIMENT=nodwarf5; got %s with GOEXPERIMENT=%s\n' \
+		printf 'oracle requires Go 1.27.1 or a newer 1.27 patch with no experiment, or the nodwarf5 flavor; got %s with GOEXPERIMENT=%s\n' \
 			"$actual_go_version" "${actual_go_experiment:-<empty>}" >&2
 		exit 2
 		;;
