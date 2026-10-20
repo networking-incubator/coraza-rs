@@ -24,10 +24,10 @@ use std::{borrow::Cow, str::FromStr as _};
 
 use regex::RegexBuilder;
 use winnow::{
-    combinator::{alt, eof, not, opt, preceded, repeat, terminated},
+    combinator::{alt, eof, not, opt, repeat, terminated},
     error::EmptyError,
     prelude::*,
-    token::{any, one_of, take_till},
+    token::{any, take_till},
 };
 
 use crate::{
@@ -82,7 +82,7 @@ impl VariableList {
                 Element::Exclude(variable, key) => {
                     for spec in variables.iter_mut().filter(|spec| spec.variable() == *variable) {
                         match key {
-                            VariableKey::String(key) => spec.add_exception_string(key.clone()),
+                            VariableKey::String(key) => spec.add_exception_string(key),
                             VariableKey::Regex(key) => spec.add_exception_regex(key.clone()),
                         }
                     }
@@ -100,8 +100,6 @@ struct WrittenVariable<'a> {
     markers: Markers,
     /// Optional key, path, or regex as written.
     key: WrittenKey<'a>,
-    /// Whether a quote in the key is not closed.
-    unclosed_quote: bool,
 }
 
 /// Count and negation flags from one variable expression.
@@ -117,6 +115,8 @@ type ParsedName<'a> = (Cow<'a, [u8]>, Markers);
 
 /// The selector text following a variable name.
 enum WrittenKey<'a> {
+    /// No selector was written.
+    None,
     /// Literal key text.
     Text(Vec<u8>),
     /// `XPath` or JSON path bytes.
@@ -132,27 +132,19 @@ impl WrittenVariable<'_> {
         let variable = RuleVariable::from_str(&name)
             .map_err(|error| CompileError::new(format!("invalid variable name '{name}': {error}")))?;
 
-        if matches!(
-            &self.key,
-            WrittenKey::Text(text) | WrittenKey::Regex(text) if !text.is_empty()
-        ) && !variable.can_be_selected()
-        {
+        let has_selector = !matches!(&self.key, WrittenKey::None);
+        if has_selector && !variable.can_be_selected() {
             return Err(CompileError::new(format!(
                 "attempting to select a value inside a non-selectable collection: {name}"
             )));
         }
 
         let (text, key) = match &self.key {
+            WrittenKey::None => (&[][..], String::new()),
             WrittenKey::Text(text) => (text.as_slice(), String::from_utf8_lossy(text).into_owned()),
             WrittenKey::Path(path) => (*path, String::from_utf8_lossy(path).into_owned()),
             WrittenKey::Regex(pattern) => (pattern.as_slice(), format!("/{}/", String::from_utf8_lossy(pattern))),
         };
-        if self.unclosed_quote {
-            return Err(CompileError::new(format!(
-                "unclosed quote: {:?}",
-                String::from_utf8_lossy(text)
-            )));
-        }
 
         Ok(ParsedVariable {
             variable,
@@ -176,23 +168,18 @@ struct ParsedVariable {
 fn written_variable<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenVariable<'i>, EmptyError> {
     not(eof).parse_next(input)?;
     let (name, markers) = name(input)?;
-    let (key, unclosed_quote) = match opt(b':').parse_next(input)? {
+    let key = match opt(b':').parse_next(input)? {
         None => {
             opt(b'|').parse_next(input)?;
-            (WrittenKey::Text(Vec::new()), false)
+            WrittenKey::None
         },
         Some(_) if *name == *b"XML" || *name == *b"JSON" => {
             let path = terminated(take_till(0.., b'|'), opt(b'|')).parse_next(input)?;
-            (WrittenKey::Path(path), false)
+            WrittenKey::Path(path)
         },
         Some(_) => key(input)?,
     };
-    Ok(WrittenVariable {
-        name,
-        markers,
-        key,
-        unclosed_quote,
-    })
+    Ok(WrittenVariable { name, markers, key })
 }
 
 /// Parse a variable name, removing `!` and `&` markers before resolving it.
@@ -228,45 +215,36 @@ fn name<'i>(input: &mut &'i [u8]) -> winnow::Result<ParsedName<'i>, EmptyError> 
 }
 
 /// Parse a collection key, regex, or quoted key.
-fn key<'i>(input: &mut &'i [u8]) -> winnow::Result<(WrittenKey<'i>, bool), EmptyError> {
-    let piece = alt((
-        take_till(1.., (b'|', b'/', b'\'')).map(Some),
-        terminated(one_of((b'/', b'\'')), eof).take().map(Some),
-        b'\''.value(None),
-    ));
-    let (mut text, is_quoted): (Vec<u8>, bool) = repeat(0.., piece)
-        .fold(
-            || (Vec::new(), false),
-            |(mut text, is_quoted), piece| match piece {
-                Some(piece) => {
-                    text.extend_from_slice(piece);
-                    (text, is_quoted)
-                },
-                None => (text, true),
-            },
-        )
-        .parse_next(input)?;
+fn key<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenKey<'i>, EmptyError> {
+    if opt(b'\'').parse_next(input)?.is_some() {
+        let text = take_till(0.., b'\'').parse_next(input)?;
+        b'\''.parse_next(input)?;
+        finish_key(input)?;
+        return Ok(WrittenKey::Text(text.to_vec()));
+    }
 
-    let (parsed_key, is_closed_regex) =
-        if let Some((pattern, is_closed)) = opt(preceded(b'/', pattern)).parse_next(input)? {
-            text.extend_from_slice(pattern);
-            (WrittenKey::Regex(text), is_closed)
-        } else {
-            opt(b'|').parse_next(input)?;
-            (WrittenKey::Text(text), false)
-        };
-    let unclosed_quote = is_quoted && input.first().is_some_and(|&byte| byte != b'\'');
-    let skipped = match (is_quoted, is_closed_regex) {
-        (true, _) => 2,
-        (false, true) => 1,
-        (false, false) => 0,
-    };
-    repeat::<_, _, (), _, _>(0..=skipped, any).parse_next(input)?;
-    Ok((parsed_key, unclosed_quote))
+    let mut text = take_till(0.., (b'|', b'/', b'\'')).parse_next(input)?.to_vec();
+    if input.first() == Some(&b'/') {
+        b'/'.parse_next(input)?;
+        text.extend_from_slice(pattern(input)?);
+        finish_key(input)?;
+        Ok(WrittenKey::Regex(text))
+    } else {
+        finish_key(input)?;
+        Ok(WrittenKey::Text(text))
+    }
 }
 
-/// Parse the contents and optional closing slash of a regex key.
-fn pattern<'i>(input: &mut &'i [u8]) -> winnow::Result<(&'i [u8], bool), EmptyError> {
+/// Consume the variable separator, or require the selector to end at EOF.
+fn finish_key(input: &mut &[u8]) -> winnow::Result<(), EmptyError> {
+    if opt(b'|').parse_next(input)?.is_none() {
+        eof.parse_next(input)?;
+    }
+    Ok(())
+}
+
+/// Parse the contents of a slash-delimited regex key and require its closing slash.
+fn pattern<'i>(input: &mut &'i [u8]) -> winnow::Result<&'i [u8], EmptyError> {
     let parsed = repeat::<_, _, (), _, _>(
         0..,
         alt((
@@ -277,13 +255,8 @@ fn pattern<'i>(input: &mut &'i [u8]) -> winnow::Result<(&'i [u8], bool), EmptyEr
     )
     .take()
     .parse_next(input)?;
-    let is_closed = opt(b'/').parse_next(input)?.is_some();
-    let parsed = if is_closed {
-        parsed
-    } else {
-        parsed.strip_suffix(b"/").unwrap_or(parsed)
-    };
-    Ok((parsed, is_closed))
+    b'/'.parse_next(input)?;
+    Ok(parsed)
 }
 
 /// One operation in an ordered variable list.
@@ -379,6 +352,16 @@ mod tests {
     }
 
     #[test]
+    fn regex_exclusions_follow_regex_case_rules() {
+        let mut args = Map::new_case_sensitive(RuleVariable::Args);
+        args.add("Foo", b"1");
+        args.add("foo", b"2");
+
+        assert_eq!(matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &args), ["2"]);
+        assert_eq!(matches("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &args), ["1"]);
+    }
+
+    #[test]
     fn count_and_negation_apply_to_prior_specs() {
         let mut map = Map::new_case_sensitive(RuleVariable::Args);
         map.add("id", b"123");
@@ -415,16 +398,26 @@ mod tests {
         assert!(parse_variables("").is_err());
         assert!(parse_variables("INVALID_VAR").is_err());
         assert!(parse_variables("REQUEST_URI:foo").is_err());
+        assert!(parse_variables("REQUEST_URI://").is_err());
         assert_eq!(
             parse_variables("REQUEST_URI:/foo/").err(),
             parse_variables("REQUEST_URI:foo").err()
         );
         assert!(parse_variables("ARGS|!ARGS").is_err());
         assert!(parse_variables("ARGS:/[/").is_err());
+        assert!(parse_variables("ARGS:/^id$").is_err());
+        assert!(parse_variables("ARGS:/^id$/!ARGS:secret").is_err());
     }
 
     #[test]
     fn preserves_upstream_quoting_and_terminal_delimiter_behavior() {
+        let mut args = Map::new_case_sensitive(RuleVariable::Args);
+        args.add("id", b"123");
+
+        assert_eq!(matches("ARGS:'id'", RuleVariable::Args, &args), ["123"]);
+        assert_eq!(parsed("ARGS:'id'|TX").len(), 2);
+        assert_eq!(matches("ARGS:'id'|TX", RuleVariable::Args, &args), ["123"]);
+        assert!(parse_variables("ARGS:'id").is_err());
         assert_eq!(parsed("ARGS:'/a/'|TX").len(), 2);
         assert!(parse_variables("ARGS:'/a/|TX").is_err());
         assert!(parse_variables("ARGS|ARGS:").is_err());

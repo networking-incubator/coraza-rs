@@ -73,9 +73,9 @@ pub(crate) struct VariableException {
 
 impl VariableException {
     /// Create a literal-key exception.
-    fn new_string(key: String) -> Self {
+    fn new_string(key: &str) -> Self {
         Self {
-            key: Some(key),
+            key: Some(key.to_lowercase()),
             regex: None,
         }
     }
@@ -89,14 +89,13 @@ impl VariableException {
     }
 
     /// Check whether `key` is excluded.
-    fn matches(&self, key: &str) -> bool {
-        let key_lower = key.to_lowercase();
+    fn matches(&self, key: &str, key_lower: &str) -> bool {
         if let Some(regex) = &self.regex {
-            return regex.is_match(&key_lower);
+            return regex.is_match(key);
         }
         self.key
             .as_ref()
-            .is_some_and(|excluded| excluded.is_empty() || excluded.to_lowercase() == key_lower)
+            .is_some_and(|excluded| excluded.is_empty() || excluded == key_lower)
     }
 }
 
@@ -156,11 +155,11 @@ impl VariableSpec {
     }
 
     /// Exclude a key without regard to case.
-    pub(crate) fn add_exception_string(&mut self, key: String) {
+    pub(crate) fn add_exception_string(&mut self, key: &str) {
         self.exceptions.push(VariableException::new_string(key));
     }
 
-    /// Exclude keys matched by `regex` without regard to case.
+    /// Exclude keys matched by `regex`, using its configured case sensitivity.
     pub(crate) fn add_exception_regex(&mut self, regex: Regex) {
         self.exceptions.push(VariableException::new_regex(regex));
     }
@@ -176,34 +175,44 @@ impl VariableSpec {
         };
 
         let mut matches = Vec::new();
-        let mut count = 0;
-        let mut keep = |matched| {
-            count += 1;
-            if !self.count {
-                matches.push(matched);
-            }
-        };
-        let kept = |key: &str| !self.exceptions.iter().any(|exception| exception.matches(key));
+        let mut count: usize = 0;
+        let count_mode = self.count;
+        let has_literal_exceptions = self.exceptions.iter().any(|exception| exception.key.is_some());
+        {
+            let mut record = |variable: RuleVariable, key: &str, value: &[u8]| {
+                if count_mode {
+                    count = count.saturating_add(1);
+                } else {
+                    matches.push(MatchData::new(variable, key, value));
+                }
+            };
+            let keep = |key: &str| {
+                let key_lower = has_literal_exceptions.then(|| key.to_lowercase());
+                let key_lower = key_lower.as_deref().unwrap_or(key);
+                !self
+                    .exceptions
+                    .iter()
+                    .any(|exception| exception.matches(key, key_lower))
+            };
 
-        match (collection, &self.key) {
-            (CollectionView::Map(map), _) => self.select(map, |key, value| {
-                if kept(key) {
-                    keep(MatchData::new(map.variable(), key, value));
-                }
-            }),
-            (CollectionView::Names(variable, map), _) => self.select(map, |key, _| {
-                if kept(key) {
-                    keep(MatchData::new(variable, key, key.as_bytes()));
-                }
-            }),
-            (CollectionView::Single(single), None) => {
-                for matched in single.find_all() {
-                    if kept(&matched.key) {
-                        keep(matched);
+            match (collection, &self.key) {
+                (CollectionView::Map(map), _) => self.select(map, |key, value| {
+                    if keep(key) {
+                        record(map.variable(), key, value);
                     }
-                }
-            },
-            (CollectionView::Single(_), Some(_)) => {},
+                }),
+                (CollectionView::Names(variable, map), _) => self.select(map, |key, _| {
+                    if keep(key) {
+                        record(variable, key, key.as_bytes());
+                    }
+                }),
+                (CollectionView::Single(single), None) => {
+                    if keep("") {
+                        record(single.variable(), "", single.get_bytes());
+                    }
+                },
+                (CollectionView::Single(_), Some(_)) => {},
+            }
         }
 
         if self.count {
@@ -295,7 +304,7 @@ mod tests {
         map.add("Host", b"example.test");
         map.add("Cookie", b"a=b");
         let mut spec = VariableSpec::new(RuleVariable::RequestHeaders);
-        spec.add_exception_string("HOST".to_owned());
+        spec.add_exception_string("HOST");
 
         let matches = spec.get_matches(Some(CollectionView::Map(&map)));
 

@@ -60,8 +60,8 @@ mod rules {
             self.count = count;
         }
 
-        pub(crate) fn add_exception_string(&mut self, key: String) {
-            self.exceptions.push(VariableKey::String(key));
+        pub(crate) fn add_exception_string(&mut self, key: &str) {
+            self.exceptions.push(VariableKey::String(key.to_owned()));
         }
 
         pub(crate) fn add_exception_regex(&mut self, regex: Regex) {
