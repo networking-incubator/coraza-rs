@@ -216,22 +216,33 @@ pub fn url_decode_uni(input: &[u8]) -> TransformationResult {
         let suffix = input.get(offset..).unwrap_or_default();
         if byte == b'%' {
             if matches!(suffix.get(1), Some(b'u' | b'U')) {
-                let digits = suffix.get(2..6).unwrap_or_default();
-                if digits.len() == 4 && digits.iter().all(u8::is_ascii_hexdigit) {
-                    let upper = digits.get(..2).and_then(x2c);
-                    let lower = digits.get(2..4).and_then(x2c);
-                    if let (Some(upper), Some(lower)) = (upper, lower) {
-                        let code = u16::from_be_bytes([upper, lower]);
-                        let fallback = if upper == 0xFF && lower > 0 && lower < 0x5F {
-                            lower + 0x20
-                        } else {
-                            lower
-                        };
-                        output.push(best_fit_ascii(code).unwrap_or(fallback));
-                        offset += 6;
-                        changed = true;
-                        continue;
+                if let Some(code) = suffix.get(2..6).and_then(parse_unicode_code_unit) {
+                    if (0xD800..=0xDBFF).contains(&code)
+                        && suffix.get(6) == Some(&b'%')
+                        && matches!(suffix.get(7), Some(b'u' | b'U'))
+                        && let Some(low) = suffix.get(8..12).and_then(parse_unicode_code_unit)
+                        && (0xDC00..=0xDFFF).contains(&low)
+                    {
+                        let scalar = 0x10000 + ((u32::from(code) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                        if let Some(character) = char::from_u32(scalar) {
+                            let mut encoded = [0; 4];
+                            output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                            offset += 12;
+                            changed = true;
+                            continue;
+                        }
                     }
+
+                    let [upper, lower] = code.to_be_bytes();
+                    let fallback = if upper == 0xFF && lower > 0 && lower < 0x5F {
+                        lower + 0x20
+                    } else {
+                        lower
+                    };
+                    output.push(best_fit_ascii(code).unwrap_or(fallback));
+                    offset += 6;
+                    changed = true;
+                    continue;
                 }
                 output.extend_from_slice(suffix.get(..2).unwrap_or_default());
                 offset += 2;
@@ -352,12 +363,27 @@ fn is_css_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\x0c' | b'\n' | b'\t' | b'\r' | b'\x0b')
 }
 
-/// Appends an ASCII character directly or an IIS escape for a non-ASCII character.
+/// Parses four hexadecimal digits as a UTF-16 code unit.
+fn parse_unicode_code_unit(digits: &[u8]) -> Option<u16> {
+    if digits.len() != 4 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+
+    Some(u16::from_be_bytes([
+        digits.get(..2).and_then(x2c)?,
+        digits.get(2..4).and_then(x2c)?,
+    ]))
+}
+
+/// Appends ASCII directly and non-ASCII characters as UTF-16 IIS escapes.
 fn append_character(output: &mut Vec<u8>, character: char) {
     if character.is_ascii() {
         output.push(character as u8);
     } else {
-        append_unicode_escape(output, u32::from(character));
+        let mut code_units = [0; 2];
+        for code_unit in character.encode_utf16(&mut code_units) {
+            append_unicode_escape(output, u32::from(*code_unit));
+        }
     }
 }
 
@@ -457,6 +483,10 @@ mod tests {
             true,
         );
         assert_result(url_decode_uni, b"%uff41%u4e2d%uff80%ff", b"a-\x80\xff", true);
+        assert_result(url_decode_uni, b"%uD83D%uDE00", "\u{1f600}".as_bytes(), true);
+        assert_result(url_decode_uni, b"%uD83D", b"=", true);
+        assert_result(url_decode_uni, b"%uDE00", b"\0", true);
+        assert_result(url_decode_uni, b"%uD83D%uGGGG", b"=%uGGGG", true);
         assert_result(url_decode_uni, b"%GG%2%u12%uGGGG", b"%GG%2%u12%uGGGG", false);
         assert_result(url_decode_uni, b"%u12%20", b"%u12 ", true);
     }
@@ -466,7 +496,7 @@ mod tests {
         assert_result(utf8_to_unicode, b"Hello", b"Hello", false);
         assert_result(utf8_to_unicode, b"caf\xc3\xa9", b"caf%u00e9", true);
         assert_result(utf8_to_unicode, b"\xe4\xb8\xad", b"%u4e2d", true);
-        assert_result(utf8_to_unicode, b"\xf0\x9f\x98\x80", b"%u1f600", true);
+        assert_result(utf8_to_unicode, b"\xf0\x9f\x98\x80", b"%ud83d%ude00", true);
         assert_result(utf8_to_unicode, b"a\xff\xfe", b"a%ufffd%ufffd", true);
     }
 }
