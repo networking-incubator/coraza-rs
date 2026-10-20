@@ -8,12 +8,8 @@ The isolated `fuzz/` package has three libFuzzer targets:
   encoded fragments.
 - `html_grammar` generates tags, attributes, URLs, comments, CDATA, and
   entities.
-- `coraza_variable_list` exercises the SecLang variable-list parser with
-  UTF-8 text derived from arbitrary bytes; invalid sequences are replaced by
-  U+FFFD before parsing.
 
 The libperfusion detector targets check parser progress and token/span bounds.
-The Coraza target exercises SecLang variable-list parsing with arbitrary text.
 Fuzz dependencies stay separate from the published library dependencies.
 
 ## Run a campaign
@@ -28,8 +24,6 @@ cargo fuzz run raw_bytes -- \
 cargo fuzz run sql_grammar -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096
 cargo fuzz run html_grammar -- \
-  -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096
-cargo fuzz run coraza_variable_list -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096
 ```
 
