@@ -32,7 +32,7 @@ pub use phase::{ParsePhaseError, RulePhase};
 pub use severity::{ParseSeverityError, RuleSeverity};
 pub use variables::{ParseVariableError, RuleVariable};
 pub use waf::{
-    AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, ParseAuditEngineStatusError,
-    ParseAuditLogPartError, ParseAuditLogPartsError, ParseRuleEngineStatusError, RuleEngineStatus,
-    apply_audit_log_parts, parse_audit_log_parts,
+    AuditEngineStatus, AuditLogFormat, AuditLogPart, AuditLogParts, AuditLogType, BodyLimitAction,
+    ParseAuditEngineStatusError, ParseAuditLogFormatError, ParseAuditLogPartError, ParseAuditLogPartsError,
+    ParseAuditLogTypeError, ParseRuleEngineStatusError, RuleEngineStatus, apply_audit_log_parts, parse_audit_log_parts,
 };
