@@ -399,6 +399,68 @@ impl RuleVariable {
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// Whether the variable accepts a collection key selector.
+    pub const fn can_be_selected(self) -> bool {
+        matches!(
+            self,
+            Self::ResponseHeadersNames
+                | Self::RequestHeadersNames
+                | Self::Args
+                | Self::ArgsGet
+                | Self::ArgsPost
+                | Self::ArgsPath
+                | Self::FilesSizes
+                | Self::FilesNames
+                | Self::FilesTmpContent
+                | Self::MultipartFilename
+                | Self::MultipartName
+                | Self::MatchedVarsNames
+                | Self::MatchedVars
+                | Self::Files
+                | Self::RequestCookies
+                | Self::RequestHeaders
+                | Self::ResponseHeaders
+                | Self::Geo
+                | Self::RequestCookiesNames
+                | Self::FilesTmpNames
+                | Self::ArgsNames
+                | Self::ArgsGetNames
+                | Self::ArgsPostNames
+                | Self::TX
+                | Self::Rule
+                | Self::JSON
+                | Self::XML
+                | Self::Env
+                | Self::IP
+                | Self::MultipartPartHeaders
+        )
+    }
+
+    /// Whether keys of this variable are matched case-sensitively.
+    pub const fn has_case_sensitive_keys(self) -> bool {
+        matches!(
+            self,
+            Self::Args
+                | Self::ArgsGet
+                | Self::ArgsPost
+                | Self::ArgsPath
+                | Self::ArgsNames
+                | Self::ArgsGetNames
+                | Self::ArgsPostNames
+                | Self::Files
+                | Self::FilesTmpNames
+                | Self::FilesSizes
+                | Self::FilesNames
+                | Self::MultipartPartHeaders
+                | Self::MultipartName
+                | Self::MultipartFilename
+                | Self::RequestXML
+                | Self::ResponseArgs
+                | Self::ResponseXML
+                | Self::Env
+        )
+    }
 }
 
 impl fmt::Display for RuleVariable {
