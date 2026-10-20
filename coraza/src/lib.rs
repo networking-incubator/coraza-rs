@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Core types, WAF configuration, transaction variable storage, byte utilities,
-//! and transformations for a separate Rust implementation based on Coraza.
+//! Core types, WAF configuration, transaction variable storage, operators,
+//! byte utilities, and transformations for a separate Rust implementation based
+//! on Coraza.
 //!
 //! This crate is not the upstream Go implementation or a complete WAF engine.
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
@@ -21,6 +22,7 @@
 
 pub mod collection;
 pub mod config;
+pub mod operators;
 mod rules;
 #[cfg_attr(
     not(test),
