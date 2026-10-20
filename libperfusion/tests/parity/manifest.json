@@ -2520,11 +2520,13 @@
       "module_sum": "h1:IYJ0i4VxE2/ypgknP6JXxob1mNB83n2JXWpxnAzP/Co=",
       "go_toolchain_flavors": [
         {
-          "version": "go1.27.1",
+          "version": "go1.27.x",
+          "minimum_patch": 1,
           "go_experiment": ""
         },
         {
-          "version": "go1.27.1-X:nodwarf5",
+          "version": "go1.27.x-X:nodwarf5",
+          "minimum_patch": 1,
           "go_experiment": "nodwarf5"
         }
       ],
