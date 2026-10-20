@@ -55,10 +55,6 @@ impl CollectionView<'_> {
 
 /// Key selector for a rule variable.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "constructed by SecLang variable parsing in a later port slice")
-)]
 pub(crate) enum VariableKey {
     /// Match one key, respecting the collection's case sensitivity.
     String(String),
@@ -68,10 +64,6 @@ pub(crate) enum VariableKey {
 
 /// A key excluded from a variable's matches.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "constructed by SecLang variable parsing in a later port slice")
-)]
 pub(crate) struct VariableException {
     /// A literal key to exclude, or `None` when using a regex.
     key: Option<String>,
@@ -116,10 +108,6 @@ impl PartialEq for VariableException {
 
 /// Selects collection values by key, regex, exclusions, or count.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the rule engine in a later port slice")
-)]
 pub(crate) struct VariableSpec {
     /// The variable identifier selected by this specification.
     variable: RuleVariable,
@@ -133,10 +121,6 @@ pub(crate) struct VariableSpec {
 
 impl VariableSpec {
     /// Select every value from `variable`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
             variable,
@@ -147,10 +131,6 @@ impl VariableSpec {
     }
 
     /// Select the value stored under one key.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn new_string(variable: RuleVariable, key: String) -> Self {
         Self {
             variable,
@@ -161,10 +141,6 @@ impl VariableSpec {
     }
 
     /// Select values whose keys match `regex`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn new_regex(variable: RuleVariable, regex: Regex) -> Self {
         Self {
             variable,
@@ -175,28 +151,16 @@ impl VariableSpec {
     }
 
     /// Enable count mode, returning the number of selected values.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "configured by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn set_count(&mut self, count: bool) {
         self.count = count;
     }
 
     /// Exclude a key without regard to case.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "configured by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn add_exception_string(&mut self, key: String) {
         self.exceptions.push(VariableException::new_string(key));
     }
 
     /// Exclude keys matched by `regex` without regard to case.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "configured by SecLang variable parsing in a later port slice")
-    )]
     pub(crate) fn add_exception_regex(&mut self, regex: Regex) {
         self.exceptions.push(VariableException::new_regex(regex));
     }
@@ -251,6 +215,11 @@ impl VariableSpec {
         } else {
             matches
         }
+    }
+
+    /// The variable identifier selected by this specification.
+    pub(crate) fn variable(&self) -> RuleVariable {
+        self.variable
     }
 
     /// Visit the map entries selected by this specification.

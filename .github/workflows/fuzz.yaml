@@ -39,20 +39,22 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo +1.97.1 install --root "$RUNNER_TEMP/cargo-fuzz" --locked cargo-fuzz --version 0.13.2
 
-      - name: Run raw-byte and SQL/HTML grammar campaigns
+      - name: Run detector and SecLang grammar campaigns
         env:
           ASAN_OPTIONS: detect_leaks=0
         working-directory: libperfusion
         run: |
-          mkdir -p "$RUNNER_TEMP/fuzz/corpus/raw_bytes" "$RUNNER_TEMP/fuzz/corpus/sql_grammar" "$RUNNER_TEMP/fuzz/corpus/html_grammar"
-          mkdir -p "$RUNNER_TEMP/fuzz/artifacts/raw_bytes" "$RUNNER_TEMP/fuzz/artifacts/sql_grammar" "$RUNNER_TEMP/fuzz/artifacts/html_grammar"
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/raw_bytes" "$RUNNER_TEMP/fuzz/corpus/sql_grammar" "$RUNNER_TEMP/fuzz/corpus/html_grammar" "$RUNNER_TEMP/fuzz/corpus/coraza_variable_list"
+          mkdir -p "$RUNNER_TEMP/fuzz/artifacts/raw_bytes" "$RUNNER_TEMP/fuzz/artifacts/sql_grammar" "$RUNNER_TEMP/fuzz/artifacts/html_grammar" "$RUNNER_TEMP/fuzz/artifacts/coraza_variable_list"
           export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
           cargo +nightly-2026-10-06 fuzz run raw_bytes "$RUNNER_TEMP/fuzz/corpus/raw_bytes" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=262144 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/raw_bytes/" > "$RUNNER_TEMP/fuzz/raw_bytes.log" 2>&1
           cargo +nightly-2026-10-06 fuzz run sql_grammar "$RUNNER_TEMP/fuzz/corpus/sql_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/sql_grammar/" > "$RUNNER_TEMP/fuzz/sql_grammar.log" 2>&1
           cargo +nightly-2026-10-06 fuzz run html_grammar "$RUNNER_TEMP/fuzz/corpus/html_grammar" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/html_grammar/" > "$RUNNER_TEMP/fuzz/html_grammar.log" 2>&1
+          cargo +nightly-2026-10-06 fuzz run coraza_variable_list "$RUNNER_TEMP/fuzz/corpus/coraza_variable_list" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_variable_list/" > "$RUNNER_TEMP/fuzz/coraza_variable_list.log" 2>&1
           tail -n 4 "$RUNNER_TEMP/fuzz/raw_bytes.log"
           tail -n 4 "$RUNNER_TEMP/fuzz/sql_grammar.log"
           tail -n 4 "$RUNNER_TEMP/fuzz/html_grammar.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/coraza_variable_list.log"
 
       - name: Upload fuzz logs and findings
         if: always()

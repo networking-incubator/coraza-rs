@@ -21,6 +21,11 @@
 
 pub mod collection;
 mod rules;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by rule compilation in a later port slice")
+)]
+mod seclang;
 pub mod transformations;
 pub mod types;
 pub mod utils;
