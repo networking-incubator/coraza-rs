@@ -32,3 +32,7 @@ pub mod types;
 pub mod utils;
 
 pub use rules::TransformationChain;
+pub use types::{
+    AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, RuleEngineStatus, RulePhase, RuleSeverity,
+    RuleVariable,
+};
