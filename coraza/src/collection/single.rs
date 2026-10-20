@@ -74,6 +74,11 @@ impl Single {
     pub fn name(&self) -> &str {
         self.variable.name()
     }
+
+    /// The variable this single value represents.
+    pub fn variable(&self) -> RuleVariable {
+        self.variable
+    }
 }
 
 impl std::fmt::Display for Single {

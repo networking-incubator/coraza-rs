@@ -21,5 +21,6 @@
 //! Rule helpers used by the Coraza engine.
 
 mod transformation;
+mod variable;
 
 pub use transformation::TransformationChain;
