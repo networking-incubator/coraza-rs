@@ -246,6 +246,9 @@ pub enum RuleVariable {
     TimeWday,
     /// `TIME_YEAR` - Current four-digit year
     TimeYear,
+    // Kept last to preserve the existing as_u8 values.
+    /// `ARGUMENTS_LIMIT_REACHED` - Set to 1 when the argument limit drops a value
+    ArgumentsLimitReached,
 }
 
 /// Lookup table of variable variants and names in enum order.
@@ -364,6 +367,7 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
     (RuleVariable::TimeSec, "TIME_SEC"),
     (RuleVariable::TimeWday, "TIME_WDAY"),
     (RuleVariable::TimeYear, "TIME_YEAR"),
+    (RuleVariable::ArgumentsLimitReached, "ARGUMENTS_LIMIT_REACHED"),
 ];
 
 impl RuleVariable {
@@ -591,6 +595,7 @@ mod tests {
             ("ENV", RuleVariable::Env),
             ("TIME", RuleVariable::Time),
             ("TIME_YEAR", RuleVariable::TimeYear),
+            ("ARGUMENTS_LIMIT_REACHED", RuleVariable::ArgumentsLimitReached),
         ];
 
         for (name, expected) in &variables {
@@ -629,6 +634,9 @@ mod tests {
             );
         }
 
-        assert_eq!(usize::from(RuleVariable::TimeYear.as_u8()) + 1, VARIABLES.len());
+        assert_eq!(
+            usize::from(RuleVariable::ArgumentsLimitReached.as_u8()) + 1,
+            VARIABLES.len()
+        );
     }
 }

@@ -35,10 +35,6 @@ pub struct Single {
 
 impl Single {
     /// Create a new single-value collection.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
             data: Vec::new(),
@@ -47,10 +43,6 @@ impl Single {
     }
 
     /// Set the value.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn set(&mut self, value: impl AsRef<[u8]>) {
         self.data = value.as_ref().to_vec();
     }

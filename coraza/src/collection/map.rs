@@ -64,10 +64,6 @@ struct KeyValue {
 
 impl KeyValue {
     /// Creates a stored key/value pair.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     fn new(key: &str, value: &[u8]) -> Self {
         Self {
             key: key.to_owned(),
@@ -76,10 +72,6 @@ impl KeyValue {
     }
 
     /// How `value` is stored.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     fn stored(value: &[u8]) -> Vec<u8> {
         value.to_vec()
     }
@@ -95,10 +87,6 @@ impl KeyValue {
     }
 
     /// Replaces the key and value, reusing their buffers.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     fn replace(&mut self, key: &str, value: &[u8]) {
         self.key.clear();
         self.key.push_str(key);
@@ -111,10 +99,6 @@ impl Map {
     /// Create a new map with case-insensitive keys.
     ///
     /// This is the default for collections like `REQUEST_HEADERS`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: false,
@@ -126,10 +110,6 @@ impl Map {
     /// Create a new map with case-sensitive keys.
     ///
     /// This is used for collections like `ARGS`, `ARGS_GET`, and `ARGS_POST`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn new_case_sensitive(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: true,
@@ -203,10 +183,6 @@ impl Map {
     }
 
     /// Appends `value` to the values of `key`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn add(&mut self, key: &str, value: impl AsRef<[u8]>) {
         let lookup = self.lookup_key(key);
         let kv = KeyValue::new(key, value.as_ref());
@@ -219,10 +195,6 @@ impl Map {
     }
 
     /// Replaces the values of `key`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn set<V: AsRef<[u8]>>(&mut self, key: &str, values: impl IntoIterator<Item = V>) {
         let lookup = self.lookup_key(key);
         let key_values: Vec<KeyValue> = values
