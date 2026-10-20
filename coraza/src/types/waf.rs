@@ -107,6 +107,92 @@ impl FromStr for AuditEngineStatus {
     }
 }
 
+/// Format of audit log entries (`SecAuditLogFormat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AuditLogFormat {
+    /// ModSecurity's native, section-per-part format.
+    #[default]
+    Native,
+    /// One JSON document per entry.
+    Json,
+    /// The JSON format of ModSecurity 2.
+    JsonLegacy,
+    /// Open Cybersecurity Schema Framework.
+    Ocsf,
+}
+
+/// Error returned for an invalid audit log format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseAuditLogFormatError {
+    /// Original value that failed to parse.
+    input: String,
+}
+
+impl fmt::Display for ParseAuditLogFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid audit log format: {}", self.input)
+    }
+}
+
+impl std::error::Error for ParseAuditLogFormatError {}
+
+impl FromStr for AuditLogFormat {
+    type Err = ParseAuditLogFormatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "native" => Ok(Self::Native),
+            "json" => Ok(Self::Json),
+            "jsonlegacy" => Ok(Self::JsonLegacy),
+            "ocsf" => Ok(Self::Ocsf),
+            _ => Err(ParseAuditLogFormatError { input: s.to_owned() }),
+        }
+    }
+}
+
+/// Where audit log entries are written (`SecAuditLogType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AuditLogType {
+    /// All entries in one file.
+    #[default]
+    Serial,
+    /// One file per entry.
+    Concurrent,
+    /// Sent to an HTTP endpoint.
+    Https,
+    /// Sent to syslog.
+    Syslog,
+}
+
+/// Error returned for an invalid audit log type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseAuditLogTypeError {
+    /// Original value that failed to parse.
+    input: String,
+}
+
+impl fmt::Display for ParseAuditLogTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid audit log type: {}", self.input)
+    }
+}
+
+impl std::error::Error for ParseAuditLogTypeError {}
+
+impl FromStr for AuditLogType {
+    type Err = ParseAuditLogTypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "serial" => Ok(Self::Serial),
+            "concurrent" => Ok(Self::Concurrent),
+            "https" => Ok(Self::Https),
+            "syslog" => Ok(Self::Syslog),
+            _ => Err(ParseAuditLogTypeError { input: s.to_owned() }),
+        }
+    }
+}
+
 /// Status of the rule processing engine.
 ///
 /// Controls whether rules are processed and whether they can generate disruptive actions.
@@ -523,6 +609,33 @@ mod tests {
         assert_eq!(
             "relevantonly".parse::<AuditEngineStatus>().unwrap(),
             AuditEngineStatus::RelevantOnly
+        );
+    }
+
+    #[test]
+    fn audit_log_format_parsing_is_case_insensitive() {
+        assert_eq!("native".parse::<AuditLogFormat>().unwrap(), AuditLogFormat::Native);
+        assert_eq!("JSON".parse::<AuditLogFormat>().unwrap(), AuditLogFormat::Json);
+        assert_eq!(
+            "jsonlegacy".parse::<AuditLogFormat>().unwrap(),
+            AuditLogFormat::JsonLegacy
+        );
+        assert_eq!("OCSF".parse::<AuditLogFormat>().unwrap(), AuditLogFormat::Ocsf);
+        assert_eq!(
+            "invalid".parse::<AuditLogFormat>().unwrap_err().to_string(),
+            "invalid audit log format: invalid"
+        );
+    }
+
+    #[test]
+    fn audit_log_type_parsing_is_case_insensitive() {
+        assert_eq!("serial".parse::<AuditLogType>().unwrap(), AuditLogType::Serial);
+        assert_eq!("CONCURRENT".parse::<AuditLogType>().unwrap(), AuditLogType::Concurrent);
+        assert_eq!("https".parse::<AuditLogType>().unwrap(), AuditLogType::Https);
+        assert_eq!("Syslog".parse::<AuditLogType>().unwrap(), AuditLogType::Syslog);
+        assert_eq!(
+            "invalid".parse::<AuditLogType>().unwrap_err().to_string(),
+            "invalid audit log type: invalid"
         );
     }
 
