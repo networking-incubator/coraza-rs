@@ -212,7 +212,9 @@ impl Transaction {
         match (self.collection(variable)?, key) {
             (VariableCollection::Single(single), None) => Some(single.get().into_owned()),
             (VariableCollection::Map(map), Some(key)) => map.first(key).map(text_of).map(Cow::into_owned),
-            (VariableCollection::Names(_, map), Some(key)) => map.first(key).map(|_| key.to_owned()),
+            (VariableCollection::Names(_, map), Some(key)) => {
+                map.iter_key(key).next().map(|(stored_key, _)| stored_key.to_owned())
+            },
             _ => None,
         }
     }
@@ -423,7 +425,11 @@ mod tests {
         assert_eq!(
             tx.get_variable(RuleVariable::RequestHeadersNames, Some("x-trace"))
                 .as_deref(),
-            Some("x-trace")
+            Some("X-Trace")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestHeadersNames, Some("missing")),
+            None
         );
         assert_eq!(
             tx.find_matches(&names_spec)
