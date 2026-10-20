@@ -132,15 +132,18 @@ impl WrittenVariable<'_> {
         let variable = RuleVariable::from_str(&name)
             .map_err(|error| CompileError::new(format!("invalid variable name '{name}': {error}")))?;
 
+        if matches!(
+            &self.key,
+            WrittenKey::Text(text) | WrittenKey::Regex(text) if !text.is_empty()
+        ) && !variable.can_be_selected()
+        {
+            return Err(CompileError::new(format!(
+                "attempting to select a value inside a non-selectable collection: {name}"
+            )));
+        }
+
         let (text, key) = match &self.key {
-            WrittenKey::Text(text) => {
-                if !text.is_empty() && !variable.can_be_selected() {
-                    return Err(CompileError::new(format!(
-                        "attempting to select a value inside a non-selectable collection: {name}"
-                    )));
-                }
-                (text.as_slice(), String::from_utf8_lossy(text).into_owned())
-            },
+            WrittenKey::Text(text) => (text.as_slice(), String::from_utf8_lossy(text).into_owned()),
             WrittenKey::Path(path) => (*path, String::from_utf8_lossy(path).into_owned()),
             WrittenKey::Regex(pattern) => (pattern.as_slice(), format!("/{}/", String::from_utf8_lossy(pattern))),
         };
@@ -412,6 +415,10 @@ mod tests {
         assert!(parse_variables("").is_err());
         assert!(parse_variables("INVALID_VAR").is_err());
         assert!(parse_variables("REQUEST_URI:foo").is_err());
+        assert_eq!(
+            parse_variables("REQUEST_URI:/foo/").err(),
+            parse_variables("REQUEST_URI:foo").err()
+        );
         assert!(parse_variables("ARGS|!ARGS").is_err());
         assert!(parse_variables("ARGS:/[/").is_err());
     }

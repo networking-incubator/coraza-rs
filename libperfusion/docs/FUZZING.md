@@ -1,6 +1,6 @@
 # Fuzzing
 
-The isolated `fuzz/` package has three libFuzzer targets:
+The workspace has four libFuzzer targets across its isolated `fuzz/` packages:
 
 - `raw_bytes` exercises full-input detection, SQL visitors, and HTML
   token contexts with arbitrary bytes.
@@ -8,6 +8,7 @@ The isolated `fuzz/` package has three libFuzzer targets:
   encoded fragments.
 - `html_grammar` generates tags, attributes, URLs, comments, CDATA, and
   entities.
+- `coraza_variable_list` exercises Coraza SecLang variable-list parsing.
 
 The libperfusion detector targets check parser progress and token/span bounds.
 Fuzz dependencies stay separate from the published library dependencies.
