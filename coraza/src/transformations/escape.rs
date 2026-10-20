@@ -47,6 +47,7 @@ pub fn escape_seq_decode(input: &[u8]) -> TransformationResult {
                         output.push(decoded);
                         offset += 4;
                     } else {
+                        output.push(escaped);
                         offset += 2;
                     }
                     changed = true;
@@ -59,6 +60,7 @@ pub fn escape_seq_decode(input: &[u8]) -> TransformationResult {
                 } else {
                     output.push(escaped);
                     offset += 2;
+                    changed = true;
                 }
             } else {
                 output.push(byte);
@@ -415,8 +417,8 @@ mod tests {
             ],
             true,
         );
-        assert_result(escape_seq_decode, b"\\8", b"8", false);
-        assert_result(escape_seq_decode, b"\\xag", b"ag", true);
+        assert_result(escape_seq_decode, b"\\8", b"8", true);
+        assert_result(escape_seq_decode, b"\\xag", b"xag", true);
         assert_result(escape_seq_decode, b"\\", b"\\", false);
         assert_result(escape_seq_decode, b"\\xff\xfe", b"\xff\xfe", true);
     }
