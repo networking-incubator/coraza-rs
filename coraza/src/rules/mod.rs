@@ -24,6 +24,4 @@ mod transformation;
 mod variable;
 
 pub use transformation::TransformationChain;
-#[cfg(test)]
-pub(crate) use variable::CollectionView;
-pub(crate) use variable::{VariableKey, VariableSpec};
+pub(crate) use variable::{CollectionView, VariableKey, VariableSpec};

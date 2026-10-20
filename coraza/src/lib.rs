@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Core types, WAF configuration, byte utilities, and transformations for a
-//! separate Rust implementation based on Coraza.
+//! Core types, WAF configuration, transaction variable storage, byte utilities,
+//! and transformations for a separate Rust implementation based on Coraza.
 //!
 //! This crate is not the upstream Go implementation or a complete WAF engine.
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
@@ -27,6 +27,7 @@ mod rules;
     expect(dead_code, reason = "used by rule compilation in a later port slice")
 )]
 mod seclang;
+pub mod transaction;
 pub mod transformations;
 pub mod types;
 pub mod utils;
