@@ -25,14 +25,17 @@
 
 mod complex;
 mod encoding;
+mod escape;
 mod html_entities;
 mod simple;
+mod unicode_bestfit;
 
 pub use complex::{html_entity_decode, normalise_path, normalise_path_win};
 pub use encoding::{
     base64_decode, base64_decode_ext, base64_encode, hex_decode, hex_encode, length, md5_hash, none, remove_nulls,
     replace_nulls, sha1_hash, url_encode,
 };
+pub use escape::{css_decode, escape_seq_decode, js_decode, url_decode_uni, utf8_to_unicode};
 pub use simple::{
     compress_whitespace, lowercase, remove_whitespace, trim, trim_left, trim_right, uppercase, url_decode,
 };

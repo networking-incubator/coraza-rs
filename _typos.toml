@@ -5,6 +5,8 @@ extend-exclude = [
     "libperfusion/tests/corpus/test-*.txt",
     # Exact HTML5 entity names and code-point mappings from Go's html package.
     "coraza/src/transformations/html_entities.rs",
+    # Exact Unicode best-fit mapping data from the Coraza port.
+    "coraza/src/transformations/unicode_bestfit.rs",
 ]
 
 [default]
