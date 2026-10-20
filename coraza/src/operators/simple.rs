@@ -23,17 +23,37 @@
 use super::{Macro, MacroError, Operator, Outputs};
 use crate::transaction::Transaction;
 
+/// Parse a decimal integer, clamping overflow and using zero for invalid input.
+fn parse_int(input: &[u8]) -> i64 {
+    let Ok(text) = std::str::from_utf8(input) else {
+        return 0;
+    };
+    let digits = input
+        .strip_prefix(b"-")
+        .or_else(|| input.strip_prefix(b"+"))
+        .unwrap_or(input);
+    if digits.is_empty() || digits.iter().any(|byte| !byte.is_ascii_digit()) {
+        return 0;
+    }
+
+    match text.parse::<i64>() {
+        Ok(value) => value,
+        Err(error) => match error.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => 0,
+        },
+    }
+}
+
 /// Parse an input integer, using zero when parsing fails.
-fn as_int(input: &[u8]) -> i32 {
-    std::str::from_utf8(input)
-        .ok()
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(0)
+fn as_int(input: &[u8]) -> i64 {
+    parse_int(input)
 }
 
 /// Expand and parse an integer parameter, using zero when parsing fails.
-fn parameter_int(parameter: &Macro, tx: &Transaction) -> i32 {
-    parameter.expand(tx).parse().unwrap_or(0)
+fn parameter_int(parameter: &Macro, tx: &Transaction) -> i64 {
+    parse_int(parameter.expand(tx).as_bytes())
 }
 
 /// Numeric equality. Invalid integers are treated as zero.
@@ -277,6 +297,26 @@ mod tests {
         assert!(matches(&lt("10").unwrap(), b"9", &tx));
         assert!(matches(&le("10").unwrap(), b"10", &tx));
         assert!(!matches(&le("10").unwrap(), b"11", &tx));
+    }
+
+    #[test]
+    fn integer_inputs_clamp_overflow_and_reject_invalid_values() {
+        assert_eq!(super::as_int(b"9223372036854775807"), i64::MAX);
+        assert_eq!(super::as_int(b"-9223372036854775808"), i64::MIN);
+        assert_eq!(super::as_int(b"9223372036854775808"), i64::MAX);
+        assert_eq!(super::as_int(b"-9223372036854775809"), i64::MIN);
+        assert_eq!(super::as_int(b"999999999999999999999x"), 0);
+        assert_eq!(super::as_int(b"\xff"), 0);
+    }
+
+    #[test]
+    fn macro_expanded_integer_parameters_clamp_overflow() {
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("positive", b"9223372036854775808");
+        tx.set_tx_variable("negative", b"-9223372036854775809");
+
+        assert!(matches(&eq("%{TX.positive}").unwrap(), b"9223372036854775807", &tx));
+        assert!(matches(&eq("%{TX.negative}").unwrap(), b"-9223372036854775808", &tx));
     }
 
     #[test]
