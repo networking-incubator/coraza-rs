@@ -781,20 +781,23 @@ impl Transaction {
             return self.interruption.clone();
         }
 
-        if !body.is_empty() && self.response_body_access && self.is_response_body_processable() {
-            let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
-            let mut body = body;
-            if body.len() >= limit {
-                self.outbound_data_error.set("1");
-                if self.config.response_body_limit_action == BodyLimitAction::Reject {
-                    self.interrupt(0, "deny", 500, "");
-                    if self.interruption.is_some() {
-                        return self.interruption.clone();
+        if self.response_body_access && self.is_response_body_processable() {
+            self.response_content_length.set(body.len().to_string());
+            if !body.is_empty() {
+                let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
+                let mut body = body;
+                if body.len() > limit {
+                    self.outbound_data_error.set("1");
+                    if self.config.response_body_limit_action == BodyLimitAction::Reject {
+                        self.interrupt(0, "deny", 500, "");
+                        if self.interruption.is_some() {
+                            return self.interruption.clone();
+                        }
                     }
+                    body = body.get(..limit).unwrap_or_default();
                 }
-                body = body.get(..limit).unwrap_or_default();
+                self.inspect_response_body(body);
             }
-            self.inspect_response_body(body);
         }
 
         self.run_phase(RulePhase::ResponseBody);
@@ -804,7 +807,6 @@ impl Transaction {
     /// Parse or store response body data before phase 4 rules run.
     fn inspect_response_body(&mut self, body: &[u8]) {
         self.response_body.set(body);
-        self.response_content_length.set(body.len().to_string());
         if let Some(BodyProcessor::Json) = self.response_body_processor {
             match parse_json(body, self.config.response_body_json_depth_limit) {
                 Ok(value) => flatten_json_value(&value, &mut String::from("json"), self, true),
@@ -2457,10 +2459,18 @@ payload\r\n\
             ..WafConfig::default()
         };
         let mut tx = Transaction::with_config("response-content-type", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
         tx.add_response_header("Content-Type", "application/json");
         tx.add_response_header("content-type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
 
         assert!(!tx.is_response_body_processable());
+        tx.process_response_body(b"body");
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
+            Some("")
+        );
     }
 
     #[test]
@@ -2488,6 +2498,10 @@ payload\r\n\
             tx.get_variable(RuleVariable::ResponseBody, None).as_deref(),
             Some("att")
         );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
+            Some("6")
+        );
         assert_eq!(tx.would_be_interruption().map(|item| item.status), Some(500));
 
         let config = WafConfig {
@@ -2506,6 +2520,40 @@ payload\r\n\
 
         assert_eq!(tx.process_response_body(b"attack").map(|item| item.status), Some(500));
         assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
+            Some("6")
+        );
+    }
+
+    #[test]
+    fn response_body_equal_to_limit_is_not_rejected() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::Reject,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-limit-equal", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"abc"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseBody, None).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
+            Some("3")
+        );
     }
 
     #[test]
@@ -2529,6 +2577,10 @@ payload\r\n\
             Some("0")
         );
         assert_eq!(tx.would_be_interruption(), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
