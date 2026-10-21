@@ -69,7 +69,7 @@ pub(crate) struct VariableException {
 
 impl VariableException {
     /// Create a literal-key exception.
-    fn new_string(key: &str) -> Self {
+    pub(crate) fn new_string(key: &str) -> Self {
         Self {
             key: Some(key.to_lowercase()),
             regex: None,
@@ -77,7 +77,7 @@ impl VariableException {
     }
 
     /// Create a regex-key exception.
-    fn new_regex(regex: Regex) -> Self {
+    pub(crate) fn new_regex(regex: Regex) -> Self {
         Self {
             key: None,
             regex: Some(regex),
@@ -92,6 +92,12 @@ impl VariableException {
         self.key
             .as_ref()
             .is_some_and(|excluded| excluded.is_empty() || excluded == key_lower)
+    }
+
+    /// Check a key without regard to case, as runtime rule-target exclusions do.
+    pub(crate) fn matches_key(&self, key: &str) -> bool {
+        let key_lower = self.key.as_ref().map(|_| key.to_lowercase());
+        self.matches(key, key_lower.as_deref().unwrap_or(key))
     }
 }
 

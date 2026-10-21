@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! WAF configuration, SecLang rule compilation, request-header and request-body
-//! evaluation, transaction variable storage, operators, and transformations for a
-//! separate Rust implementation based on Coraza.
+//! WAF configuration, SecLang rule compilation, request and response phase evaluation,
+//! transaction variable storage, operators, and transformations for a separate Rust
+//! implementation based on Coraza.
 //!
 //! This crate is not the upstream Go implementation or a complete WAF engine.
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
-//! the OWASP Coraza contributors.
+//! the OWASP Coraza contributors. Phase 5 audit logging and external or persistent
+//! actions remain unimplemented.
 
 mod actions;
 mod body_processors;

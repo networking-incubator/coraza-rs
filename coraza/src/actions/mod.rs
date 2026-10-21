@@ -18,7 +18,7 @@
 // Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SecLang action compilation and request-phase runtime effects.
+//! SecLang action compilation and transaction-phase runtime effects.
 
 use std::fmt;
 
@@ -112,7 +112,8 @@ impl CompiledAction {
             "skipafter" => tx.set_skip_after(&self.argument),
             "setvar" => tx.apply_setvar(&self.argument),
             "ctl" => tx.apply_ctl(&self.argument),
-            // shortcut: logging, environment, and external effects wait for their runtime modules.
+            "setenv" => tx.apply_setenv(&self.argument),
+            // shortcut: logging and external effects wait for their runtime modules.
             _ => {},
         }
     }
@@ -485,7 +486,7 @@ fn validate_ctl(argument: &str) -> Result<(), ActionError> {
         "requestBodyAccess" | "forceRequestBodyVariable" | "responseBodyAccess" | "forceResponseBodyVariable" => {
             is_on_or_off(value)
         },
-        "requestBodyLimit" | "responseBodyLimit" => value.parse::<i64>().is_ok(),
+        "requestBodyLimit" | "responseBodyLimit" => value.parse::<i64>().is_ok_and(|limit| limit >= 0),
         "requestBodyProcessor" | "responseBodyProcessor" => is_body_processor(value),
         "ruleRemoveById" => parse_id_range(value).is_ok(),
         "ruleRemoveByTag" | "ruleRemoveByMsg" | "hashEngine" | "hashEnforcement" => true,
@@ -522,10 +523,13 @@ fn is_body_processor(value: &str) -> bool {
 /// Validates a collection selector used by `ruleRemoveTarget`.
 fn valid_rule_target(target: &str) -> bool {
     let (collection, key) = target.split_once(':').unwrap_or((target, ""));
-    if collection.trim().parse::<crate::types::RuleVariable>().is_err() {
+    let Ok(variable) = collection.trim().parse::<crate::types::RuleVariable>() else {
+        return false;
+    };
+    let key = key.trim();
+    if !key.is_empty() && !variable.can_be_selected() {
         return false;
     }
-    let key = key.trim();
     let Some(pattern) = key.strip_prefix('/').and_then(|key| key.strip_suffix('/')) else {
         return true;
     };
@@ -619,6 +623,7 @@ mod tests {
         let mut metadata = RuleMetadata::new();
         for argument in [
             "requestBodyProcessor=JSON",
+            "responseBodyLimit=0",
             "ruleRemoveTargetById=1-5;ARGS:user",
             "ruleRemoveTargetByTag=attack;REQUEST_HEADERS:/^x-/",
             "ruleRemoveByTag=",
@@ -628,8 +633,11 @@ mod tests {
         }
         for argument in [
             "requestBodyProcessor=YAML",
+            "requestBodyLimit=-1",
+            "responseBodyLimit=-1",
             "ruleRemoveTargetById=bad;ARGS:user",
             "ruleRemoveTargetByTag=attack;NOT_A_COLLECTION:x",
+            "ruleRemoveTargetByTag=attack;REQUEST_URI:key",
             "ruleRemoveTargetByTag=attack;ARGS:/[/",
         ] {
             assert!(compile_action("ctl", argument, &mut metadata).is_err(), "{argument}");
