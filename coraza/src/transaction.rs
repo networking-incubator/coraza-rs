@@ -547,11 +547,17 @@ impl Transaction {
 
     /// Store captures and path arguments produced by an operator.
     pub(crate) fn store_operator_outputs(&mut self, outputs: &mut Outputs) {
-        for index in 0..10 {
-            self.tx.remove(&index.to_string());
-        }
-        for (index, value) in outputs.take_captures() {
-            self.set_tx_variable(&index.to_string(), value);
+        {
+            let mut captures = outputs.take_captures();
+            if let Some((index, value)) = captures.next() {
+                for index in 0..10 {
+                    self.tx.remove(&index.to_string());
+                }
+                self.set_tx_variable(&index.to_string(), value);
+                for (index, value) in captures {
+                    self.set_tx_variable(&index.to_string(), value);
+                }
+            }
         }
         for (key, value) in outputs.take_path_arguments() {
             self.set_path_argument(&key, value.as_bytes());
@@ -930,6 +936,28 @@ mod tests {
 
         assert_eq!(tx.process_request_headers(), None);
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")).as_deref(), Some("attack"));
+    }
+
+    #[test]
+    fn captures_survive_chain_links_without_captures() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@rx (attack)\" \"id:24,phase:1,capture,chain,pass\"\n\\
+                 SecRule ARGS \"@streq attack\" \"setvar:TX.saved=%{TX.1},pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("chain-captures");
+        tx.add_get_argument("q", b"attack");
+
+        tx.process_request_headers();
+
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")).as_deref(), Some("attack"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("saved")).as_deref(),
+            Some("attack")
+        );
     }
 
     #[test]
