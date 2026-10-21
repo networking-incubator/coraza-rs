@@ -27,4 +27,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "seclang_rule_compilation"
+path = "fuzz_targets/seclang_rule_compilation.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

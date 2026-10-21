@@ -20,8 +20,15 @@
 
 //! SecLang parsing helpers.
 
+mod action_parser;
 mod operator_parser;
+mod parser;
+mod rule_compiler;
 mod variable_parser;
+
+pub(crate) use action_parser::parse_actions;
+pub use parser::{ParseError, Parser};
+pub(crate) use variable_parser::parse_variables;
 
 /// Error returned while compiling a SecLang value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,5 +41,19 @@ impl CompileError {
     /// Construct an error with its user-facing message.
     pub(crate) fn new(message: String) -> Self {
         Self { message }
+    }
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+impl From<crate::actions::ActionError> for CompileError {
+    fn from(error: crate::actions::ActionError) -> Self {
+        Self::new(error.to_string())
     }
 }

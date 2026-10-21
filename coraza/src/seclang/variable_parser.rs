@@ -40,10 +40,6 @@ use crate::{
 type ParseResult<T> = Result<T, CompileError>;
 
 /// Parse variable expressions such as `ARGS|ARGS:id|&TX:score`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by SecLang rule compilation in a later port slice")
-)]
 pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
     VariableList::parse(input)?.apply_to(&mut variables);
@@ -51,11 +47,11 @@ pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
 }
 
 /// A variable list, retained so negations can exclude earlier entries.
-struct VariableList(Vec<Element>);
+pub(crate) struct VariableList(Vec<Element>);
 
 impl VariableList {
     /// Parse all expressions in a variable list.
-    fn parse(input: &str) -> ParseResult<Self> {
+    pub(crate) fn parse(input: &str) -> ParseResult<Self> {
         if input.is_empty() {
             return Err(CompileError::new("empty variable specification".to_owned()));
         }
@@ -75,7 +71,7 @@ impl VariableList {
     }
 
     /// Apply entries in order. A negation modifies matching earlier variables.
-    fn apply_to(&self, variables: &mut Vec<VariableSpec>) {
+    pub(crate) fn apply_to(&self, variables: &mut Vec<VariableSpec>) {
         for element in &self.0 {
             match element {
                 Element::Inspect(spec) => variables.push(spec.clone()),

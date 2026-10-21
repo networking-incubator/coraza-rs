@@ -20,10 +20,14 @@
 
 //! Rule helpers used by the Coraza engine.
 
+mod group;
 mod operator;
+mod rule;
 mod transformation;
 mod variable;
 
+pub(crate) use group::RuleGroup;
 pub(crate) use operator::RuleOperator;
+pub(crate) use rule::Rule;
 pub use transformation::TransformationChain;
 pub(crate) use variable::{CollectionView, VariableKey, VariableSpec};
