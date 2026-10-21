@@ -10,7 +10,7 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
-| `coraza/` | Separate Rust Coraza implementation with selected core types, WAF configuration, SecLang rule compilation, request-header and request-body phases, RAW and URLENCODED body processing, transaction storage, operators, and transformations; later phases, other body processors, remaining action effects, and audit logging are not included yet. |
+| `coraza/` | Separate Rust Coraza implementation with selected core types, WAF configuration, SecLang rule compilation, request-header and request-body phases, RAW, URLENCODED, JSON, XML, and multipart body processing, transaction storage, operators, and transformations; later phases, remaining action effects, and audit logging are not included yet. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |

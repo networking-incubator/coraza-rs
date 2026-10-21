@@ -175,13 +175,13 @@ pub enum RuleVariable {
     ResponseXML,
     /// `REQUEST_XML` - Request parsed XML (collection)
     RequestXML,
-    /// `XML` - Pointer to `RESPONSE_XML` (collection)
+    /// `XML` - Pointer to `REQUEST_XML` (collection)
     #[expect(clippy::upper_case_acronyms, reason = "matches the SecLang variable name")]
     XML,
     /// `MULTIPART_PART_HEADERS` - Multipart part headers (collection)
     MultipartPartHeaders,
 
-    // Unsupported variables (kept for compatibility)
+    // Compatibility variables; some remain unsupported by this runtime.
     /// `AUTH_TYPE` - Authentication type (unsupported)
     AuthType,
     /// `FULL_REQUEST` - Full request (unsupported)
@@ -202,7 +202,7 @@ pub enum RuleVariable {
     MultipartInvalidHeaderFolding,
     /// `MULTIPART_INVALID_PART` - Kept for compatibility (unsupported)
     MultipartInvalidPart,
-    /// `MULTIPART_INVALID_QUOTING` - Kept for compatibility (unsupported)
+    /// `MULTIPART_INVALID_QUOTING` - Set when filename* is quoted
     MultipartInvalidQuoting,
     /// `MULTIPART_LF_LINE` - Kept for compatibility (unsupported)
     MultipartLfLine,
@@ -246,9 +246,15 @@ pub enum RuleVariable {
     TimeWday,
     /// `TIME_YEAR` - Current four-digit year
     TimeYear,
-    // Kept last to preserve the existing as_u8 values.
+    // New variables stay after existing entries to preserve their as_u8 values.
     /// `ARGUMENTS_LIMIT_REACHED` - Set to 1 when the argument limit drops a value
     ArgumentsLimitReached,
+    /// `MULTIPART_DUPLICATE_PART_HEADER` - Set when a part repeats a header or parameter
+    MultipartDuplicatePartHeader,
+    /// `MULTIPART_FILENAME_CHARSET` - Charset from the filename* parameter (collection)
+    MultipartFilenameCharset,
+    /// `MULTIPART_FILENAME_LANGUAGE` - Language from the filename* parameter (collection)
+    MultipartFilenameLanguage,
 }
 
 /// Lookup table of variable variants and names in enum order.
@@ -368,6 +374,12 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
     (RuleVariable::TimeWday, "TIME_WDAY"),
     (RuleVariable::TimeYear, "TIME_YEAR"),
     (RuleVariable::ArgumentsLimitReached, "ARGUMENTS_LIMIT_REACHED"),
+    (
+        RuleVariable::MultipartDuplicatePartHeader,
+        "MULTIPART_DUPLICATE_PART_HEADER",
+    ),
+    (RuleVariable::MultipartFilenameCharset, "MULTIPART_FILENAME_CHARSET"),
+    (RuleVariable::MultipartFilenameLanguage, "MULTIPART_FILENAME_LANGUAGE"),
 ];
 
 impl RuleVariable {
@@ -438,6 +450,8 @@ impl RuleVariable {
                 | Self::Env
                 | Self::IP
                 | Self::MultipartPartHeaders
+                | Self::MultipartFilenameCharset
+                | Self::MultipartFilenameLanguage
         )
     }
 
@@ -459,6 +473,8 @@ impl RuleVariable {
                 | Self::MultipartPartHeaders
                 | Self::MultipartName
                 | Self::MultipartFilename
+                | Self::MultipartFilenameCharset
+                | Self::MultipartFilenameLanguage
                 | Self::RequestXML
                 | Self::ResponseArgs
                 | Self::ResponseXML
@@ -635,7 +651,7 @@ mod tests {
         }
 
         assert_eq!(
-            usize::from(RuleVariable::ArgumentsLimitReached.as_u8()) + 1,
+            usize::from(RuleVariable::MultipartFilenameLanguage.as_u8()) + 1,
             VARIABLES.len()
         );
     }

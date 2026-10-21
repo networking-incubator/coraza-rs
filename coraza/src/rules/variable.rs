@@ -162,7 +162,10 @@ impl VariableSpec {
 
     /// Return the matches from the collection associated with this variable.
     pub(crate) fn get_matches(&self, collection: Option<CollectionView<'_>>) -> Vec<MatchData> {
-        let Some(collection) = collection.filter(|view| view.variable() == self.variable) else {
+        let Some(collection) = collection.filter(|view| {
+            view.variable() == self.variable
+                || (self.variable == RuleVariable::XML && view.variable() == RuleVariable::RequestXML)
+        }) else {
             return Vec::new();
         };
 
@@ -190,7 +193,7 @@ impl VariableSpec {
             match (collection, &self.key) {
                 (CollectionView::Map(map), _) => self.select(map, |key, value| {
                     if keep(key) {
-                        record(map.variable(), key, value);
+                        record(self.variable, key, value);
                     }
                 }),
                 (CollectionView::Names(variable, map), _) => self.select(map, |key, _| {
