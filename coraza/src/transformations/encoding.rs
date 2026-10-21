@@ -88,7 +88,7 @@ pub fn hex_decode(input: &[u8]) -> TransformationResult {
     }
 
     let mut transformed = Vec::with_capacity(input.len() / 2);
-    for pair in input.chunks_exact(2) {
+    for pair in input.as_chunks::<2>().0 {
         let Some(decoded) = x2c(pair) else {
             return (Vec::new(), false, Some(TransformationError::new("invalid hex string")));
         };

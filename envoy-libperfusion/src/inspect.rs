@@ -20,11 +20,11 @@
 //! know about, so they are recorded where the dispatch happens.
 //!
 //! - **Injection into a statement, not a statement as a value.** libinjection and therefore libperfusion detect a
-//!   fragment injected into an existing SQL statement. A *complete* statement supplied as a parameter value -- `SELECT
-//!   * FROM users`, `DROP TABLE users`, `DELETE FROM users` -- is not reported, because its shape is not an injection
-//!   shape. This matters in front of GraphQL resolvers, report builders and admin consoles, where a whole statement in
-//!   a parameter is itself the attack. Detecting it needs an opt-in signal with a separate false-positive profile and
-//!   is deliberately not enabled here.
+//!   fragment injected into an existing SQL statement. A *complete* statement supplied as a parameter value is not
+//!   reported, because its shape is not an injection shape. Examples: `SELECT * FROM users`, `DROP TABLE users`,
+//!   `DELETE FROM users`. This matters in front of GraphQL resolvers, report builders and admin consoles, where a whole
+//!   statement in a parameter is itself the attack. Detecting it needs an opt-in signal with a separate false-positive
+//!   profile and is deliberately not enabled here.
 //! - **No XML parsing.** An XML body is scanned raw and marked [`Incomplete::UnsupportedContentType`]; its elements are
 //!   not decoded.
 //! - **No `Content-Encoding` decoding.** A compressed body that reaches the filter is marked
@@ -248,8 +248,8 @@ fn has_xss_in_overlapping_windows(bytes: &[u8]) -> bool {
 ///
 /// Two sweeps, because one cannot do both jobs:
 ///
-/// * A **byte-spaced** sweep across the window. Spacing used to be by token *index* -- one restart every `tokens /
-///   MAX_RESTARTS` -- which let the sender widen the gap at will: 4 `KiB` of short benign tokens puts the restarts ~60
+/// * A **byte-spaced** sweep across the window. Spacing used to be by token *index* -- one restart per
+///   `tokens/MAX_RESTARTS` -- which let the sender widen the gap at will: 4 `KiB` of short benign tokens puts the ~60
 ///   tokens apart, and a fingerprint is taken from the first five *folded* tokens of what the restart hands the
 ///   detector, so a payload that far past one is folded away before the fingerprint forms. Byte spacing makes the gap a
 ///   property of the window length, which `RESTART_MAX_BYTES` bounds, rather than of anything in the window.
