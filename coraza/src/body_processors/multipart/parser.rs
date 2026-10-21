@@ -484,21 +484,16 @@ fn skip_line_ending(data: &[u8], pos: usize) -> usize {
 
 /// Find the next boundary in the data
 ///
-/// Looks for \r\n--boundary or \n--boundary
+/// Looks for a line-feed-prefixed boundary, consuming a preceding carriage return too.
 fn find_next_boundary(data: &[u8], boundary: &[u8]) -> Option<(usize, usize)> {
-    let mut crlf_boundary = b"\r\n".to_vec();
-    crlf_boundary.extend_from_slice(boundary);
     let mut lf_boundary = b"\n".to_vec();
     lf_boundary.extend_from_slice(boundary);
-
-    match (
-        find_valid_boundary(data, &crlf_boundary, 2),
-        find_valid_boundary(data, &lf_boundary, 1),
-    ) {
-        (Some(crlf), Some(lf)) => Some(if crlf.0 <= lf.0 { crlf } else { lf }),
-        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
-        (None, None) => None,
-    }
+    let (line_feed_pos, marker_pos) = find_valid_boundary(data, &lf_boundary, 1)?;
+    let part_end = line_feed_pos
+        .checked_sub(1)
+        .filter(|&carriage_return_pos| data.get(carriage_return_pos) == Some(&b'\r'))
+        .unwrap_or(line_feed_pos);
+    Some((part_end, marker_pos))
 }
 
 /// Find a boundary prefix followed by a line ending or a closing marker.
@@ -566,6 +561,18 @@ file content\r\n\
         assert_eq!(part.filename.as_deref(), Some("test.txt"));
         assert_eq!(header(&part.headers, "Content-Type"), Some("text/plain"));
         assert_eq!(part.data, b"file content");
+    }
+
+    #[test]
+    fn find_next_boundary_preserves_crlf_and_lf_positions() {
+        assert_eq!(
+            find_next_boundary(b"payload\r\n--boundary\r\n", b"--boundary"),
+            Some((7, 9))
+        );
+        assert_eq!(
+            find_next_boundary(b"payload\n--boundary\r\n", b"--boundary"),
+            Some((7, 8))
+        );
     }
 
     #[test]
