@@ -37,7 +37,7 @@ jobs:
           components: rust-src
 
       - name: Install cargo-fuzz
-        run: cargo +1.97.1 install --root "$RUNNER_TEMP/cargo-fuzz" --locked cargo-fuzz --version 0.13.2
+        run: cargo +1.99.1 install --root "$RUNNER_TEMP/cargo-fuzz" --locked cargo-fuzz --version 0.13.2
 
       - name: Run detector and SecLang grammar campaigns
         env:

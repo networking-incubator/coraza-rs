@@ -809,7 +809,7 @@ mod tests {
         let tokens: Vec<_> = Lexer::new(&input, Quote::None, Dialect::Ansi).collect();
 
         assert_eq!(tokens.len(), REPEATS * 2);
-        for (index, pair) in tokens.chunks_exact(2).enumerate() {
+        for (index, pair) in tokens.as_chunks::<2>().0.iter().enumerate() {
             let keyword = &pair[0];
             assert_eq!(keyword.ty, TokenType::LogicOperator);
             assert_eq!(keyword.pos, index * 4);

@@ -130,10 +130,12 @@ fn decode_hex(encoded: &str) -> Option<Vec<u8>> {
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
-            let high = char::from(*pair.first()?).to_digit(16)?;
-            let low = char::from(*pair.get(1)?).to_digit(16)?;
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
             u8::try_from((high << 4) | low).ok()
         })
         .collect()
