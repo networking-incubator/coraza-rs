@@ -44,7 +44,7 @@ pub enum RuleVariable {
     FilesCombinedSize,
     /// `FULL_REQUEST_LENGTH` - Length of the full request
     FullRequestLength,
-    /// `INBOUND_DATA_ERROR` - Set to 1 when request body size exceeds `SecRequestBodyLimit`
+    /// `INBOUND_DATA_ERROR` - Set to 1 when request body size reaches `SecRequestBodyLimit`
     InboundDataError,
     /// `MATCHED_VAR` - Value of the matched variable
     MatchedVar,
@@ -70,11 +70,11 @@ pub enum RuleVariable {
     ReqbodyProcessorError,
     /// `REQBODY_PROCESSOR_ERROR_MSG` - Same as `ReqbodyErrorMsg`
     ReqbodyProcessorErrorMsg,
-    /// `REQBODY_PROCESSOR` - Name of request body processor (URLENCODED, MULTIPART, XML)
+    /// `REQBODY_PROCESSOR` - Name of the selected request body processor (RAW, URLENCODED, etc.)
     ReqbodyProcessor,
     /// `REQUEST_BASENAME` - Name after last slash in request URI
     RequestBasename,
-    /// `REQUEST_BODY` - Full request body (urlencoded only by default)
+    /// `REQUEST_BODY` - Request body bytes when a supported body processor is selected
     RequestBody,
     /// `REQUEST_BODY_LENGTH` - Length of request body in bytes
     RequestBodyLength,

@@ -22,7 +22,7 @@
 //!
 //! This slice includes comparisons, regular expressions, phrase and path
 //! matching, IP, validation, `SQLi`, and XSS operators. Compiled rules use
-//! these operators during request-header evaluation.
+//! these operators during request-phase evaluation.
 
 pub mod detection;
 pub mod ip;
