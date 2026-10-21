@@ -420,8 +420,8 @@ mod tests {
         use crate::{transaction::VariableCollection, types::RuleVariable};
 
         let mut tx = Transaction::new("operator-test");
-        tx.add_get_argument("id", "query-id");
-        tx.add_path_argument("id", "connector-id");
+        tx.add_get_argument("id", "same");
+        tx.add_path_argument("id", "same");
         let operator = OperatorEnum::new("restPath", "/users/{id}/{name}").unwrap();
         let mut out = Outputs::default();
 
@@ -437,13 +437,17 @@ mod tests {
             Some("Alice")
         );
         assert_eq!(
+            tx.get_variable(RuleVariable::Args, Some("name")).as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
             tx.get_variable(RuleVariable::ArgsGet, Some("id")).as_deref(),
-            Some("query-id")
+            Some("same")
         );
         let args = tx.collection(RuleVariable::Args);
         assert!(matches!(&args, Some(VariableCollection::Map(_))), "ARGS is a map");
         if let Some(VariableCollection::Map(args)) = args {
-            assert_eq!(args.values("id").collect::<Vec<_>>(), [b"query-id".as_slice(), b"42"]);
+            assert_eq!(args.values("id").collect::<Vec<_>>(), [b"same".as_slice(), b"42"]);
         }
     }
 }

@@ -140,6 +140,9 @@ impl ValidateByteRange {
                     .trim()
                     .parse::<u8>()
                     .map_err(|error| format!("invalid byte value {end_str:?}: {error}"))?;
+                if start > end {
+                    return Err(format!("invalid byte range {range_spec:?}: start exceeds end"));
+                }
 
                 for byte_val in start..=end {
                     if let Some(allowed) = valid_bytes.get_mut(usize::from(byte_val)) {
@@ -405,6 +408,10 @@ mod tests {
         let bytes = validate_byte_range("32-126").unwrap();
         assert!(!bytes.evaluate(&tx, b"printable", &mut Outputs::default()));
         assert!(bytes.evaluate(&tx, b"bad\x00byte", &mut Outputs::default()));
+        assert_eq!(
+            validate_byte_range("126-32").err().as_deref(),
+            Some("invalid byte range \"126-32\": start exceeds end")
+        );
 
         let url = validate_url_encoding();
         assert!(!url.evaluate(&tx, b"/path%20name", &mut Outputs::default()));

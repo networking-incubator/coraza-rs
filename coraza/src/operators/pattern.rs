@@ -240,7 +240,10 @@ impl Operator for Pm {
             matcher
         } else {
             let patterns = self.macro_param.expand(tx).to_lowercase();
-            let dict: Vec<&str> = patterns.split(' ').collect();
+            let dict: Vec<&str> = patterns.split(' ').filter(|phrase| !phrase.trim().is_empty()).collect();
+            if dict.is_empty() {
+                return false;
+            }
             match AhoCorasick::builder().ascii_case_insensitive(true).build(&dict) {
                 Ok(matcher) => {
                     expanded = matcher;
@@ -273,8 +276,12 @@ pub fn pm(patterns: &str) -> Result<Pm, MacroError> {
         None
     } else {
         let patterns = patterns.to_lowercase();
-        let dict: Vec<&str> = patterns.split(' ').collect();
-        AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
+        let dict: Vec<&str> = patterns.split(' ').filter(|phrase| !phrase.trim().is_empty()).collect();
+        if dict.is_empty() {
+            None
+        } else {
+            AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
+        }
     };
     Ok(Pm {
         macro_param,
@@ -538,6 +545,18 @@ mod tests {
             out.take_captures().collect::<Vec<_>>(),
             [(0, b"ADMIN".to_vec()), (1, b"guest".to_vec())]
         );
+    }
+
+    #[test]
+    fn phrase_operators_ignore_empty_patterns() {
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("empty", b"");
+
+        for patterns in ["", "   ", " \t\n ", "%{TX.empty}"] {
+            let operator = pm(patterns).unwrap();
+            assert!(!operator.evaluate(&tx, b"", &mut Outputs::default()));
+            assert!(!operator.evaluate(&tx, b"anything", &mut Outputs::default()));
+        }
     }
 
     #[test]
