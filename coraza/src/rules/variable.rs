@@ -29,10 +29,6 @@ use crate::{
 
 /// A borrowed collection selected for a rule variable.
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by transaction variable resolution in a later port slice")
-)]
 pub(crate) enum CollectionView<'a> {
     /// A key-value collection such as `ARGS` or `REQUEST_HEADERS`.
     Map(&'a Map),
@@ -165,10 +161,6 @@ impl VariableSpec {
     }
 
     /// Return the matches from the collection associated with this variable.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction variable resolution in a later port slice")
-    )]
     pub(crate) fn get_matches(&self, collection: Option<CollectionView<'_>>) -> Vec<MatchData> {
         let Some(collection) = collection.filter(|view| view.variable() == self.variable) else {
             return Vec::new();

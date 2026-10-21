@@ -34,7 +34,7 @@ pub const DEFAULT_JSON_DEPTH_LIMIT: usize = 1024;
 /// Configuration for a WAF instance.
 ///
 /// A plain set of settings, built with struct-update syntax over [`Default`].
-/// This crate does not yet apply or validate these settings.
+/// A WAF validates these settings at construction and transactions inherit them.
 ///
 /// # Examples
 ///

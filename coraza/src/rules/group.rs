@@ -105,6 +105,11 @@ impl RuleGroup {
         self.rules.iter_mut()
     }
 
+    /// Iterates over top-level rules in directive order.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Rule> {
+        self.rules.iter()
+    }
+
     #[cfg(test)]
     /// Returns the top-level rules for tests.
     fn rules(&self) -> &[Rule] {

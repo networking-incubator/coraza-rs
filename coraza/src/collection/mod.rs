@@ -83,7 +83,6 @@ impl MatchData {
     /// Create an empty `MatchData` instance for operator-less rules.
     ///
     /// Used for rules without operators (`SecAction`, `SecMarker`) that always match.
-    #[expect(dead_code, reason = "used by the rule engine in a later port slice")]
     pub(crate) fn new_empty() -> Self {
         Self::new(RuleVariable::Unknown, String::new(), String::new())
     }

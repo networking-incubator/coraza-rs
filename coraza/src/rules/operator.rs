@@ -27,10 +27,6 @@ use crate::{
 
 /// An operator and whether SecLang negates its result.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by rule evaluation in a later port slice")
-)]
 pub(crate) struct RuleOperator {
     /// The selected operator implementation.
     operator: OperatorEnum,
@@ -45,10 +41,6 @@ impl RuleOperator {
     }
 
     /// Evaluate one value, applying SecLang negation after the operator runs.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by rule evaluation in a later port slice")
-    )]
     pub(crate) fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
         let matched = self.operator.evaluate(tx, input, out);
         if self.negated { !matched } else { matched }

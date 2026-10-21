@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core types, WAF configuration, transaction storage, transformations, and operators for a separate Rust implementation of Coraza"
+description = "SecLang rule compilation and request-header evaluation for a separate Rust implementation of Coraza"
 
 [dependencies]
 aho-corasick = "1.1"

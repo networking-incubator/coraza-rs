@@ -22,10 +22,13 @@
 
 use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
+    collection::MatchData,
+    operators::Outputs,
     rules::{RuleOperator, VariableSpec},
+    transaction::Transaction,
 };
 
-/// A rule compiled from SecLang, before transaction evaluation is wired in.
+/// A rule compiled from SecLang for transaction evaluation.
 #[derive(Debug)]
 pub(crate) struct Rule {
     /// Rule metadata compiled from actions.
@@ -34,7 +37,7 @@ pub(crate) struct Rule {
     variables: Vec<VariableSpec>,
     /// Operator that checks selected variable values.
     operator: Option<RuleOperator>,
-    /// Actions retained for later transaction evaluation.
+    /// Actions retained for transaction evaluation.
     actions: Vec<CompiledAction>,
     /// Following rules in a chain.
     pub(crate) chain: Vec<Rule>,
@@ -92,6 +95,82 @@ impl Rule {
     /// Returns the actions in source order.
     pub(crate) fn actions(&self) -> &[CompiledAction] {
         &self.actions
+    }
+
+    /// Evaluate this rule and its chain against a transaction.
+    pub(crate) fn evaluate(&self, tx: &mut Transaction) {
+        if !self.matches_chain(tx, self.metadata.id) {
+            return;
+        }
+
+        for action in &self.actions {
+            if action.action_type() != ActionType::Nondisruptive {
+                action.evaluate(&self.metadata, tx);
+            }
+        }
+    }
+
+    /// Match this rule and its chain, running nondisruptive actions at each link.
+    fn matches_chain(&self, tx: &mut Transaction, id: i32) -> bool {
+        if self.metadata.sec_mark.is_some() || !self.match_values(tx, id) {
+            return false;
+        }
+
+        for link in &self.chain {
+            if !link.matches_chain(tx, id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Match the values selected by this rule and run per-match actions.
+    fn match_values(&self, tx: &mut Transaction, id: i32) -> bool {
+        let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
+        let log_data = self.metadata.log_data.as_ref().map(|value| value.expand(tx));
+        let severity = self.metadata.severity.map_or("unknown", |value| value.as_str());
+        tx.set_rule_variables(id, message, &self.metadata.rev, log_data, severity);
+
+        let Some(operator) = &self.operator else {
+            if !self.variables.is_empty() || self.metadata.sec_mark.is_some() {
+                return false;
+            }
+            tx.record_matched_variable(&MatchData::new_empty());
+            self.run_nondisruptive_actions(tx);
+            return true;
+        };
+
+        let mut matched = false;
+        for variable in &self.variables {
+            for value in tx.find_matches(variable) {
+                let candidates = if self.metadata.multi_match {
+                    self.metadata.transformations.apply_multimatch(&value.value).0
+                } else {
+                    vec![self.metadata.transformations.apply(&value.value).0]
+                };
+                for candidate in candidates {
+                    let mut outputs = Outputs::new(self.metadata.capture);
+                    let operator_matched = operator.evaluate(tx, &candidate, &mut outputs);
+                    tx.store_operator_outputs(&mut outputs);
+                    if operator_matched {
+                        matched = true;
+                        let matched = MatchData::new(value.variable, value.key.clone(), candidate);
+                        tx.record_matched_variable(&matched);
+                        self.run_nondisruptive_actions(tx);
+                    }
+                }
+            }
+        }
+        matched
+    }
+
+    /// Run actions that apply as each rule in a chain matches.
+    fn run_nondisruptive_actions(&self, tx: &mut Transaction) {
+        for action in &self.actions {
+            if action.action_type() == ActionType::Nondisruptive {
+                action.evaluate(&self.metadata, tx);
+            }
+        }
     }
 
     /// Returns mutable rule variables.
