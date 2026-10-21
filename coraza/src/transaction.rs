@@ -415,9 +415,9 @@ impl Transaction {
             multipart_filename_charset: map(RuleVariable::MultipartFilenameCharset),
             multipart_filename_language: map(RuleVariable::MultipartFilenameLanguage),
             multipart_part_headers: map(RuleVariable::MultipartPartHeaders),
-            multipart_strict_error: Single::new(RuleVariable::MultipartStrictError),
-            multipart_duplicate_part_header: Single::new(RuleVariable::MultipartDuplicatePartHeader),
-            multipart_invalid_quoting: Single::new(RuleVariable::MultipartInvalidQuoting),
+            multipart_strict_error: flag(RuleVariable::MultipartStrictError),
+            multipart_duplicate_part_header: flag(RuleVariable::MultipartDuplicatePartHeader),
+            multipart_invalid_quoting: flag(RuleVariable::MultipartInvalidQuoting),
             args_path: map(RuleVariable::ArgsPath),
             args_path_indices: Vec::new(),
             request_headers: map(RuleVariable::RequestHeaders),
@@ -623,6 +623,10 @@ impl Transaction {
                 .ok_or_else(|| "multipart size overflow".to_owned())?;
 
             if let Some(filename) = &part.filename {
+                if self.uploaded_paths.len() >= self.config.upload_file_limit {
+                    self.multipart_strict_error.set("1");
+                    continue;
+                }
                 let path =
                     save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
                 self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
@@ -1427,7 +1431,16 @@ payload\r\n\
         );
         assert_eq!(
             tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
-            Some("")
+            Some("0")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartDuplicatePartHeader, None)
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartInvalidQuoting, None).as_deref(),
+            Some("0")
         );
 
         let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
@@ -1435,6 +1448,50 @@ payload\r\n\
         assert!(std::path::Path::new(&path).exists());
         drop(tx);
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn multipart_upload_limit_skips_extra_files_and_continues_fields() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let config = WafConfig {
+            request_body_access: true,
+            upload_dir: upload_dir.path().to_string_lossy().into_owned(),
+            upload_file_limit: 1,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("multipart-upload-limit", Arc::new(config));
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"first\"; filename=\"first.txt\"\r\n\
+\r\n\
+first\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"second\"; filename=\"second.txt\"\r\n\
+\r\n\
+second\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"after\"\r\n\
+\r\n\
+field value\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body), None);
+
+        let files = tx.find_matches(&VariableSpec::new_string(RuleVariable::Files, String::new()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files.first().map(|matched| matched.value.as_slice()),
+            Some(&b"first.txt"[..])
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("after")).as_deref(),
+            Some("field value")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
