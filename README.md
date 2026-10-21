@@ -10,7 +10,7 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
-| `coraza/` | Separate Rust Coraza implementation with selected core types, WAF configuration, transaction variable storage, common operators, byte utilities, encoding, HTML entity decoding, and path transformations; not a complete WAF engine. |
+| `coraza/` | Separate Rust Coraza implementation with selected core types, WAF configuration, transaction variable storage, common, phrase, IP, validation, SQLi, and XSS operators, plus byte utilities, encoding, HTML entity decoding, and path transformations; not a complete WAF engine. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |

@@ -20,7 +20,11 @@
 
 //! Regular expression matching with transaction macro expansion.
 
-use super::{Macro, Operator, Outputs};
+use std::path::Path;
+
+use aho_corasick::AhoCorasick;
+
+use super::{Datasets, Macro, MacroError, Operator, Outputs, simple::contains_bytes};
 use crate::{transaction::Transaction, transformations::text_of, utils::strings::x2c};
 
 /// Regular expression operator with Coraza's multiline and dotall defaults.
@@ -220,10 +224,225 @@ pub fn rx(pattern: &str) -> Result<Rx, Box<dyn std::error::Error>> {
     })
 }
 
+/// Case-insensitive matching for any of the space-separated phrases.
+#[derive(Debug, Clone)]
+pub struct Pm {
+    /// Phrases with transaction variable references parsed.
+    macro_param: Macro,
+    /// Matcher cached when the parameter has no variable references.
+    cached_matcher: Option<AhoCorasick>,
+}
+
+impl Operator for Pm {
+    fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        let expanded;
+        let matcher = if let Some(matcher) = &self.cached_matcher {
+            matcher
+        } else {
+            let patterns = self.macro_param.expand(tx).to_lowercase();
+            let dict: Vec<&str> = patterns.split(' ').collect();
+            match AhoCorasick::builder().ascii_case_insensitive(true).build(&dict) {
+                Ok(matcher) => {
+                    expanded = matcher;
+                    &expanded
+                },
+                Err(_) => return false,
+            }
+        };
+
+        if !out.wants_captures() {
+            return matcher.is_match(input);
+        }
+        let mut matched = false;
+        for (index, found) in matcher.find_iter(input).take(10).enumerate() {
+            out.capture(index, input.get(found.range()).unwrap_or_default());
+            matched = true;
+        }
+        matched
+    }
+}
+
+/// Create a case-insensitive phrase matcher from space-separated patterns.
+///
+/// # Errors
+///
+/// Returns an error for malformed macro syntax.
+pub fn pm(patterns: &str) -> Result<Pm, MacroError> {
+    let macro_param = Macro::new(patterns)?;
+    let cached_matcher = if patterns.contains("%{") {
+        None
+    } else {
+        let patterns = patterns.to_lowercase();
+        let dict: Vec<&str> = patterns.split(' ').collect();
+        AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
+    };
+    Ok(Pm {
+        macro_param,
+        cached_matcher,
+    })
+}
+
+/// Case-insensitive phrase matching from a file, with one phrase per line.
+#[derive(Debug, Clone)]
+pub struct PmFromFile {
+    /// Phrase matcher built from the file contents.
+    phrases: Phrases,
+}
+
+/// A fixed phrase matcher shared by file and dataset operators.
+#[derive(Debug, Clone)]
+struct Phrases {
+    /// Case-insensitive multi-pattern matcher.
+    matcher: AhoCorasick,
+}
+
+impl Phrases {
+    /// Build a matcher from phrases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the phrase set cannot be compiled.
+    fn new(patterns: &[String]) -> Result<Self, String> {
+        let matcher = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(patterns)
+            .map_err(|error| format!("failed to build matcher: {error}"))?;
+        Ok(Self { matcher })
+    }
+
+    /// Test the input and record up to ten matches when captures are enabled.
+    fn evaluate(&self, input: &[u8], out: &mut Outputs) -> bool {
+        if !out.wants_captures() {
+            return self.matcher.is_match(input);
+        }
+        let mut matched = false;
+        for (index, found) in self.matcher.find_iter(input).take(10).enumerate() {
+            out.capture(index, input.get(found.range()).unwrap_or_default());
+            matched = true;
+        }
+        matched
+    }
+}
+
+impl PmFromFile {
+    /// Read phrases from `file_path`, ignoring blank lines and comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or no phrases are found.
+    pub fn new(file_path: impl AsRef<Path>) -> Result<Self, String> {
+        let file_path = file_path.as_ref();
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
+        let patterns: Vec<_> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        if patterns.is_empty() {
+            return Err(format!("no valid patterns found in {}", file_path.display()));
+        }
+        Ok(Self {
+            phrases: Phrases::new(&patterns)?,
+        })
+    }
+}
+
+impl Operator for PmFromFile {
+    fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        self.phrases.evaluate(input, out)
+    }
+}
+
+/// Case-insensitive phrase matching from a named dataset.
+#[derive(Debug, Clone)]
+pub struct PmFromDataset {
+    /// Phrase matcher built from the dataset contents.
+    phrases: Phrases,
+}
+
+impl Operator for PmFromDataset {
+    fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        self.phrases.evaluate(input, out)
+    }
+}
+
+/// Create a phrase matcher from dataset `name`.
+///
+/// # Errors
+///
+/// Returns an error if the dataset is missing or cannot be compiled.
+pub fn pm_from_dataset(name: &str, datasets: &Datasets) -> Result<PmFromDataset, String> {
+    let items = datasets
+        .get(name)
+        .ok_or_else(|| format!("dataset \"{name}\" not found"))?;
+    Ok(PmFromDataset {
+        phrases: Phrases::new(items)?,
+    })
+}
+
+/// Create a phrase matcher from a file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or no phrases are found.
+pub fn pm_from_file(file_path: impl AsRef<Path>) -> Result<PmFromFile, String> {
+    PmFromFile::new(file_path)
+}
+
+/// Match when the input occurs within the macro-expanded parameter.
+#[derive(Debug, Clone)]
+pub struct Within {
+    /// Haystack with transaction variable references parsed.
+    macro_param: Macro,
+}
+
+impl Operator for Within {
+    fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+        contains_bytes(self.macro_param.expand(tx).as_bytes(), input)
+    }
+}
+
+/// Create a `within` operator.
+///
+/// # Errors
+///
+/// Returns an error for malformed macro syntax.
+pub fn within(haystack: &str) -> Result<Within, MacroError> {
+    Ok(Within {
+        macro_param: Macro::new(haystack)?,
+    })
+}
+
+/// Case-sensitive substring matching, compatible with `strmatch`.
+#[derive(Debug, Clone)]
+pub struct StrMatch {
+    /// Needle with transaction variable references parsed.
+    macro_param: Macro,
+}
+
+impl Operator for StrMatch {
+    fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+        contains_bytes(input, self.macro_param.expand(tx).as_bytes())
+    }
+}
+
+/// Create a `strmatch` operator.
+///
+/// # Errors
+///
+/// Returns an error for malformed macro syntax.
+pub fn strmatch(pattern: &str) -> Result<StrMatch, MacroError> {
+    Ok(StrMatch {
+        macro_param: Macro::new(pattern)?,
+    })
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "operator tests use fixed valid patterns")]
 mod tests {
-    use super::{Operator as _, Outputs, rx};
+    use super::{Operator as _, Outputs, pm, rx, strmatch, within};
     use crate::transaction::Transaction;
 
     #[test]
@@ -267,6 +486,46 @@ mod tests {
             !rx("%{TX.pattern}")
                 .unwrap()
                 .evaluate(&tx, b"input", &mut Outputs::default())
+        );
+    }
+
+    #[test]
+    fn phrase_operators_match_case_insensitively_and_capture_matches() {
+        let tx = Transaction::new("operator-test");
+        let operator = pm("admin guest").unwrap();
+        let mut out = Outputs::new(true);
+        assert!(operator.evaluate(&tx, b"ADMIN and guest", &mut out));
+        assert_eq!(
+            out.take_captures().collect::<Vec<_>>(),
+            [(0, b"ADMIN".to_vec()), (1, b"guest".to_vec())]
+        );
+    }
+
+    #[test]
+    fn phrase_and_substring_operators_expand_macros() {
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("terms", b"bad request");
+        tx.set_tx_variable("needle", b"needle");
+
+        assert!(
+            pm("%{TX.terms}")
+                .unwrap()
+                .evaluate(&tx, b"BAD request", &mut Outputs::default())
+        );
+        assert!(
+            within("a long parameter")
+                .unwrap()
+                .evaluate(&tx, b"long", &mut Outputs::default())
+        );
+        assert!(
+            strmatch("%{TX.needle}")
+                .unwrap()
+                .evaluate(&tx, b"a needle here", &mut Outputs::default())
+        );
+        assert!(
+            !strmatch("Needle")
+                .unwrap()
+                .evaluate(&tx, b"needle", &mut Outputs::default())
         );
     }
 }

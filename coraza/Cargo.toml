@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Core types, WAF configuration, transaction storage, transformations, and operators for a separate Rust implementation of Coraza"
 
 [dependencies]
+aho-corasick = "1.1"
+ipnet = "2.9"
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = "0.11"
 regex = "1.10"
