@@ -20,4 +20,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "seclang_operator"
+path = "fuzz_targets/seclang_operator.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

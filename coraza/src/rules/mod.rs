@@ -20,8 +20,10 @@
 
 //! Rule helpers used by the Coraza engine.
 
+mod operator;
 mod transformation;
 mod variable;
 
+pub(crate) use operator::RuleOperator;
 pub use transformation::TransformationChain;
 pub(crate) use variable::{CollectionView, VariableKey, VariableSpec};

@@ -20,6 +20,7 @@
 
 //! SecLang parsing helpers.
 
+mod operator_parser;
 mod variable_parser;
 
 /// Error returned while compiling a SecLang value.
