@@ -273,7 +273,7 @@ pub fn ends_with(parameter: &str) -> Result<EndsWith, MacroError> {
 }
 
 /// Whether `needle` occurs in `haystack`, including an empty `needle`.
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+pub(super) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle)
 }
 
