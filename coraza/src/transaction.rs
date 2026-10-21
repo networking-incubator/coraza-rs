@@ -121,6 +121,8 @@ pub struct Transaction {
     args_post: Map,
     /// Path arguments supplied by the connector.
     args_path: Map,
+    /// Indices of path arguments in the combined `ARGS` map, in insertion order.
+    args_path_indices: Vec<(String, usize)>,
     /// Request headers supplied by the connector.
     request_headers: Map,
     /// Request cookies supplied by a connector that parsed them.
@@ -176,6 +178,7 @@ impl Transaction {
             args_get: map(RuleVariable::ArgsGet),
             args_post: map(RuleVariable::ArgsPost),
             args_path: map(RuleVariable::ArgsPath),
+            args_path_indices: Vec::new(),
             request_headers: map(RuleVariable::RequestHeaders),
             request_cookies: map(RuleVariable::RequestCookies),
             response_headers: map(RuleVariable::ResponseHeaders),
@@ -295,8 +298,10 @@ impl Transaction {
     pub fn add_path_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
         let value = value.as_ref();
         if self.within_argument_limit(self.args_path.value_count()) {
+            let args_index = self.args.values(key).count();
             self.args_path.add(key, value);
             self.args.add(key, value);
+            self.args_path_indices.push((key.to_owned(), args_index));
         }
     }
 
@@ -306,6 +311,9 @@ impl Transaction {
         expect(dead_code, reason = "used by rule evaluation in a later port slice")
     )]
     pub(crate) fn store_operator_outputs(&mut self, outputs: &mut Outputs) {
+        for index in 0..10 {
+            self.tx.remove(&index.to_string());
+        }
         for (index, value) in outputs.take_captures() {
             self.set_tx_variable(&index.to_string(), value);
         }
@@ -316,20 +324,17 @@ impl Transaction {
 
     /// Replace the first stored path argument and its corresponding ARGS value.
     fn set_path_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
-        let previous = self.args_path.first(key).map(<[u8]>::to_vec);
-        let Some(previous) = previous else {
+        let args_index = self
+            .args_path_indices
+            .iter()
+            .find(|(path_key, _)| path_key == key)
+            .map(|(_, index)| *index);
+        let Some(args_index) = args_index else {
             self.add_path_argument(key, value);
             return;
         };
         self.args_path.set_index(key, 0, value.as_ref());
-        let index = self
-            .args
-            .values(key)
-            .position(|argument| argument == previous.as_slice());
-        match index {
-            Some(index) => self.args.set_index(key, index, value),
-            None => self.args.add(key, value),
-        }
+        self.args.set_index(key, args_index, value);
     }
 
     /// Store a request header value as supplied by the connector.
@@ -381,7 +386,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{Transaction, VariableCollection};
-    use crate::{config::WafConfig, rules::VariableSpec, types::RuleVariable};
+    use crate::{config::WafConfig, operators::Outputs, rules::VariableSpec, types::RuleVariable};
 
     #[test]
     fn stores_and_matches_byte_arguments() {
@@ -442,6 +447,23 @@ mod tests {
             tx.get_variable(RuleVariable::ArgumentsLimitReached, None).as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn operator_outputs_clear_stale_tx_capture_variables() {
+        let mut tx = Transaction::new("tx-captures");
+        for index in 0..10 {
+            tx.set_tx_variable(&index.to_string(), b"stale");
+        }
+        let mut outputs = Outputs::new(true);
+        outputs.capture(0, b"current");
+
+        tx.store_operator_outputs(&mut outputs);
+
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("0")).as_deref(), Some("current"));
+        for index in 1..10 {
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some(&index.to_string())), None);
+        }
     }
 
     #[test]

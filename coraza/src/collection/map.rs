@@ -226,10 +226,6 @@ impl Map {
     }
 
     /// Removes `key` and all its values.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn remove(&mut self, key: &str) {
         let lookup = self.lookup_key(key);
         self.data.remove(lookup.as_ref());
