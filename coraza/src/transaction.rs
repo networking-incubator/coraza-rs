@@ -23,9 +23,15 @@
 //! This module stores values supplied by a connector and evaluates request-header and
 //! request-body rules. Callers must apply transport limits before passing a body.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
+    body_processors::{multipart, xml},
     collection::{Map, MatchData, Single},
     config::WafConfig,
     operators::{Macro, Outputs},
@@ -84,6 +90,7 @@ macro_rules! variable_storage {
             RuleVariable::ArgsGet => Some(Map($($borrow)+ $tx.args_get)),
             RuleVariable::ArgsPost => Some(Map($($borrow)+ $tx.args_post)),
             RuleVariable::ArgsPath => Some(Map($($borrow)+ $tx.args_path)),
+            RuleVariable::RequestXML | RuleVariable::XML => Some(Map($($borrow)+ $tx.request_xml)),
             RuleVariable::RequestHeaders => Some(Map($($borrow)+ $tx.request_headers)),
             RuleVariable::RequestCookies => Some(Map($($borrow)+ $tx.request_cookies)),
             RuleVariable::ResponseHeaders => Some(Map($($borrow)+ $tx.response_headers)),
@@ -114,7 +121,40 @@ macro_rules! variable_storage {
             RuleVariable::MatchedVar => Some(Single($($borrow)+ $tx.matched_var)),
             RuleVariable::MatchedVarName => Some(Single($($borrow)+ $tx.matched_var_name)),
             RuleVariable::InboundDataError => Some(Single($($borrow)+ $tx.inbound_data_error)),
+            RuleVariable::FilesCombinedSize => Some(Single($($borrow)+ $tx.files_combined_size)),
+            RuleVariable::Files => Some(Map($($borrow)+ $tx.files)),
+            RuleVariable::FilesNames => Some(Map($($borrow)+ $tx.files_names)),
+            RuleVariable::FilesSizes => Some(Map($($borrow)+ $tx.files_sizes)),
+            RuleVariable::FilesTmpNames => Some(Map($($borrow)+ $tx.files_tmp_names)),
+            RuleVariable::MultipartFilename => Some(Map($($borrow)+ $tx.multipart_filename)),
+            RuleVariable::MultipartFilenameCharset => {
+                Some(Map($($borrow)+ $tx.multipart_filename_charset))
+            }
+            RuleVariable::MultipartFilenameLanguage => {
+                Some(Map($($borrow)+ $tx.multipart_filename_language))
+            }
+            RuleVariable::MultipartName => Some(Map($($borrow)+ $tx.multipart_name)),
+            RuleVariable::MultipartPartHeaders => {
+                Some(Map($($borrow)+ $tx.multipart_part_headers))
+            }
+            RuleVariable::MultipartStrictError => {
+                Some(Single($($borrow)+ $tx.multipart_strict_error))
+            }
+            RuleVariable::MultipartDuplicatePartHeader => {
+                Some(Single($($borrow)+ $tx.multipart_duplicate_part_header))
+            }
+            RuleVariable::MultipartInvalidQuoting => {
+                Some(Single($($borrow)+ $tx.multipart_invalid_quoting))
+            }
+            RuleVariable::ReqbodyError => Some(Single($($borrow)+ $tx.reqbody_error)),
+            RuleVariable::ReqbodyErrorMsg => Some(Single($($borrow)+ $tx.reqbody_error_msg)),
             RuleVariable::ReqbodyProcessor => Some(Single($($borrow)+ $tx.reqbody_processor)),
+            RuleVariable::ReqbodyProcessorError => {
+                Some(Single($($borrow)+ $tx.reqbody_processor_error))
+            }
+            RuleVariable::ReqbodyProcessorErrorMsg => {
+                Some(Single($($borrow)+ $tx.reqbody_processor_error_msg))
+            }
             RuleVariable::Rule => Some(Map($($borrow)+ $tx.rule)),
             RuleVariable::UniqueID => Some(Single($($borrow)+ $tx.unique_id)),
             RuleVariable::ArgsCombinedSize => Some(Single($($borrow)+ $tx.args_combined_size_value)),
@@ -141,6 +181,12 @@ enum RequestBodyProcessor {
     Raw,
     /// Parse `application/x-www-form-urlencoded` arguments.
     UrlEncoded,
+    /// Parse `multipart/form-data` fields and file uploads.
+    Multipart,
+    /// Parse JSON bodies into flattened POST arguments.
+    Json,
+    /// Parse XML bodies into `REQUEST_XML`.
+    Xml,
 }
 
 impl RequestBodyProcessor {
@@ -150,18 +196,28 @@ impl RequestBodyProcessor {
             Some(Self::Raw)
         } else if name.eq_ignore_ascii_case("URLENCODED") {
             Some(Self::UrlEncoded)
+        } else if name.eq_ignore_ascii_case("MULTIPART") {
+            Some(Self::Multipart)
+        } else if name.eq_ignore_ascii_case("JSON") {
+            Some(Self::Json)
+        } else if name.eq_ignore_ascii_case("XML") {
+            Some(Self::Xml)
         } else {
             None
         }
     }
 
-    /// Detect URLENCODED from a content type, if present.
+    /// Detect a body processor from a content type, if present.
     fn for_content_type(content_type: &[u8]) -> Option<Self> {
         let content_type = std::str::from_utf8(content_type).ok()?.trim();
-        content_type
-            .get(.."application/x-www-form-urlencoded".len())
-            .is_some_and(|value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
-            .then_some(Self::UrlEncoded)
+        let media_type = content_type.split(';').next()?.trim();
+        if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            Some(Self::UrlEncoded)
+        } else if media_type.eq_ignore_ascii_case("multipart/form-data") {
+            Some(Self::Multipart)
+        } else {
+            None
+        }
     }
 
     /// Return the canonical processor name.
@@ -169,6 +225,9 @@ impl RequestBodyProcessor {
         match self {
             Self::Raw => "RAW",
             Self::UrlEncoded => "URLENCODED",
+            Self::Multipart => "MULTIPART",
+            Self::Json => "JSON",
+            Self::Xml => "XML",
         }
     }
 }
@@ -215,6 +274,36 @@ pub struct Transaction {
     args_get: Map,
     /// Request body arguments supplied by the connector.
     args_post: Map,
+    /// Parsed request XML attributes and text.
+    request_xml: Map,
+    /// Uploaded file names and temporary paths.
+    files: Map,
+    /// Form field names associated with uploaded files.
+    files_names: Map,
+    /// Uploaded file sizes indexed by file name.
+    files_sizes: Map,
+    /// Temporary paths exposed through `FILES_TMPNAMES`.
+    files_tmp_names: Map,
+    /// Native paths for uploads, retained so cleanup also works with non-UTF-8 paths.
+    uploaded_paths: Vec<PathBuf>,
+    /// Combined size of all parsed multipart parts.
+    files_combined_size: Single,
+    /// Multipart metadata indexed by each part name.
+    multipart_name: Map,
+    /// Original and extended filenames from `Content-Disposition`.
+    multipart_filename: Map,
+    /// Charset from the extended filename parameter.
+    multipart_filename_charset: Map,
+    /// Language from the extended filename parameter.
+    multipart_filename_language: Map,
+    /// Canonicalized headers from each multipart part.
+    multipart_part_headers: Map,
+    /// Multipart parser status and diagnostics.
+    multipart_strict_error: Single,
+    /// Whether any part repeated a header or disposition parameter.
+    multipart_duplicate_part_header: Single,
+    /// Whether any part quoted its extended filename parameter.
+    multipart_invalid_quoting: Single,
     /// Path arguments supplied by the connector.
     args_path: Map,
     /// Indices of path arguments in the combined `ARGS` map, in insertion order.
@@ -253,8 +342,16 @@ pub struct Transaction {
     request_body_length: Single,
     /// Whether the request body reached its configured limit.
     inbound_data_error: Single,
+    /// Whether the request body processor reported an error.
+    reqbody_error: Single,
+    /// Error message from the request body processor.
+    reqbody_error_msg: Single,
     /// Name of the selected request body processor.
     reqbody_processor: Single,
+    /// Whether the request body processor reported an error.
+    reqbody_processor_error: Single,
+    /// Processor-specific error message.
+    reqbody_processor_error_msg: Single,
 }
 
 impl Transaction {
@@ -306,6 +403,21 @@ impl Transaction {
             args: map(RuleVariable::Args),
             args_get: map(RuleVariable::ArgsGet),
             args_post: map(RuleVariable::ArgsPost),
+            request_xml: map(RuleVariable::RequestXML),
+            files: map(RuleVariable::Files),
+            files_names: map(RuleVariable::FilesNames),
+            files_sizes: map(RuleVariable::FilesSizes),
+            files_tmp_names: map(RuleVariable::FilesTmpNames),
+            uploaded_paths: Vec::new(),
+            files_combined_size: flag(RuleVariable::FilesCombinedSize),
+            multipart_name: map(RuleVariable::MultipartName),
+            multipart_filename: map(RuleVariable::MultipartFilename),
+            multipart_filename_charset: map(RuleVariable::MultipartFilenameCharset),
+            multipart_filename_language: map(RuleVariable::MultipartFilenameLanguage),
+            multipart_part_headers: map(RuleVariable::MultipartPartHeaders),
+            multipart_strict_error: Single::new(RuleVariable::MultipartStrictError),
+            multipart_duplicate_part_header: Single::new(RuleVariable::MultipartDuplicatePartHeader),
+            multipart_invalid_quoting: Single::new(RuleVariable::MultipartInvalidQuoting),
             args_path: map(RuleVariable::ArgsPath),
             args_path_indices: Vec::new(),
             request_headers: map(RuleVariable::RequestHeaders),
@@ -325,7 +437,11 @@ impl Transaction {
             request_body: Single::new(RuleVariable::RequestBody),
             request_body_length: flag(RuleVariable::RequestBodyLength),
             inbound_data_error: flag(RuleVariable::InboundDataError),
+            reqbody_error: flag(RuleVariable::ReqbodyError),
+            reqbody_error_msg: Single::new(RuleVariable::ReqbodyErrorMsg),
             reqbody_processor: Single::new(RuleVariable::ReqbodyProcessor),
+            reqbody_processor_error: flag(RuleVariable::ReqbodyProcessorError),
+            reqbody_processor_error_msg: Single::new(RuleVariable::ReqbodyProcessorErrorMsg),
         }
     }
 
@@ -351,10 +467,9 @@ impl Transaction {
     /// Process a request body and evaluate phase 2 rules.
     ///
     /// Call this once after [`Transaction::process_request_headers`], including for an
-    /// empty body. This slice supports URLENCODED bodies selected by the first
-    /// `Content-Type` header and RAW bodies selected by `ctl:requestBodyProcessor=RAW`.
-    /// Other body processors are not implemented yet. Phase 2 rules still run when body
-    /// access is disabled or no processor is selected.
+    /// empty body. The first `Content-Type` header selects URLENCODED or MULTIPART;
+    /// `ctl:requestBodyProcessor` selects RAW, JSON, or XML. Phase 2 rules still run when
+    /// body access is disabled or no processor is selected.
     pub fn process_request_body(&mut self, body: &[u8]) -> Option<Interruption> {
         if !self.begin_phase(RulePhase::RequestBody) {
             return self.interruption.clone();
@@ -406,13 +521,126 @@ impl Transaction {
             return;
         };
 
-        self.request_body.set(body);
-        self.request_body_length.set(body.len().to_string());
-        if matches!(processor, RequestBodyProcessor::UrlEncoded) {
-            for (key, value) in parse_urlencoded(body) {
-                self.add_post_argument(&key, value);
+        match processor {
+            RequestBodyProcessor::Raw => {
+                self.request_body.set(body);
+                self.request_body_length.set(body.len().to_string());
+            },
+            RequestBodyProcessor::UrlEncoded => {
+                self.request_body.set(body);
+                self.request_body_length.set(body.len().to_string());
+                for (key, value) in parse_urlencoded(body) {
+                    self.add_post_argument(&key, value);
+                }
+            },
+            RequestBodyProcessor::Multipart => {
+                if let Err(message) = self.process_multipart_body(body) {
+                    self.reqbody_error.set("1");
+                    self.reqbody_error_msg.set(format!("MULTIPART: {message}"));
+                    self.reqbody_processor_error.set("1");
+                    self.reqbody_processor_error_msg.set(message);
+                }
+            },
+            RequestBodyProcessor::Json => {
+                let depth_limit = self.config.request_body_json_depth_limit;
+                match parse_json(body, depth_limit) {
+                    Ok(value) => flatten_json_value(&value, &mut String::from("json"), self),
+                    Err(message) => {
+                        self.reqbody_error.set("1");
+                        self.reqbody_error_msg.set(format!("JSON: {message}"));
+                        self.reqbody_processor_error.set("1");
+                        self.reqbody_processor_error_msg.set(message);
+                    },
+                }
+            },
+            RequestBodyProcessor::Xml => match xml::parse(body) {
+                Ok(document) => {
+                    for value in document.attribute_values {
+                        self.request_xml.add("//@*", value);
+                    }
+                    for value in document.text {
+                        self.request_xml.add("/*", value);
+                    }
+                },
+                Err(message) => {
+                    let error = format!("malformed xml: {message}");
+                    self.reqbody_error.set("1");
+                    self.reqbody_error_msg.set(format!("XML: {error}"));
+                    self.reqbody_processor_error.set("1");
+                    self.reqbody_processor_error_msg.set(error);
+                },
+            },
+        }
+    }
+
+    /// Populate multipart fields, metadata, and temporary upload files.
+    fn process_multipart_body(&mut self, body: &[u8]) -> Result<(), String> {
+        let content_type = self
+            .request_headers
+            .first("content-type")
+            .map(|value| text_of(value).into_owned())
+            .unwrap_or_default();
+        let parts = multipart::parse(&content_type, body).inspect_err(|_| self.multipart_strict_error.set("1"))?;
+        let upload_dir = if self.config.upload_dir.is_empty() {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from(&self.config.upload_dir)
+        };
+        let mut total_size = 0_u64;
+
+        for part in parts {
+            if part.repeats_header {
+                self.multipart_duplicate_part_header.set("1");
+                self.multipart_strict_error.set("1");
+            }
+            if part.invalid_quoting {
+                self.multipart_invalid_quoting.set("1");
+                self.multipart_strict_error.set("1");
+            }
+
+            for (name, value) in &part.headers {
+                self.multipart_part_headers
+                    .add(&part.name, format!("{}: {value}", canonical_header_name(name)));
+            }
+            self.multipart_name.add(&part.name, &part.name);
+            if let Some(filename) = &part.filename {
+                self.multipart_filename.add(&part.name, filename);
+            }
+            if let Some(filename) = &part.alt_filename {
+                self.multipart_filename.add(&part.name, filename);
+            }
+            if let Some(encoding) = &part.filename_encoding {
+                self.multipart_filename_charset.add(&part.name, &encoding.charset);
+                self.multipart_filename_language.add(&part.name, &encoding.language);
+            }
+            if part.malformed_filename {
+                self.multipart_strict_error.set("1");
+            }
+
+            let size = u64::try_from(part.data.len()).map_err(|error| format!("multipart size overflow: {error}"))?;
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| "multipart size overflow".to_owned())?;
+
+            if let Some(filename) = &part.filename {
+                let path =
+                    save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
+                self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
+                self.uploaded_paths.push(path);
+                self.files.add("", filename);
+                self.files_sizes.set_index(filename, 0, size.to_string());
+                if let Some(alt_filename) = &part.alt_filename {
+                    self.files.add("", alt_filename);
+                    self.files_sizes.set_index(alt_filename, 0, size.to_string());
+                }
+                self.files_names.add("", &part.name);
+            } else {
+                self.add_post_argument(&part.name, part.data);
             }
         }
+
+        self.files_combined_size.set(total_size.to_string());
+        Ok(())
     }
 
     /// Return the interruption applied by a matching disruptive action.
@@ -817,6 +1045,48 @@ impl Transaction {
     }
 }
 
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.config.upload_keep_files {
+            return;
+        }
+        for path in &self.uploaded_paths {
+            drop(std::fs::remove_file(path));
+        }
+    }
+}
+
+/// Store an upload in a new private temporary file and return its path.
+fn save_to_temp(upload_dir: &Path, data: &[u8]) -> Result<PathBuf, String> {
+    let mut file = tempfile::Builder::new()
+        .prefix("crzmp")
+        .tempfile_in(upload_dir)
+        .map_err(|error| format!("I/O error: {error}"))?;
+    file.write_all(data).map_err(|error| format!("I/O error: {error}"))?;
+    let (_, path) = file.keep().map_err(|error| format!("I/O error: {}", error.error))?;
+    Ok(path)
+}
+
+/// Format a valid MIME header name as Go's canonical header key.
+fn canonical_header_name(name: &str) -> String {
+    let is_token = |character: char| character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character);
+    if !name.chars().all(is_token) {
+        return name.to_owned();
+    }
+    let mut starts_word = true;
+    name.chars()
+        .map(|character| {
+            let character = if starts_word {
+                character.to_ascii_uppercase()
+            } else {
+                character.to_ascii_lowercase()
+            };
+            starts_word = character == '-';
+            character
+        })
+        .collect()
+}
+
 /// Parses URLENCODED pairs in order, preserving decoded value bytes.
 fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec<u8>)> + '_ {
     body.split(|&byte| byte == b'&')
@@ -833,6 +1103,64 @@ fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec<u8>)> + '_
             let value = url_decode(value).0;
             (key, value)
         })
+}
+
+/// Parse JSON and enforce the configured nesting limit.
+fn parse_json(body: &[u8], depth_limit: usize) -> Result<serde_json::Value, String> {
+    let body = String::from_utf8_lossy(body);
+    // shortcut: serde_json caps nesting at 128; replace it if configured limits above 128 must work.
+    let value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if json_depth(&value) > depth_limit {
+        return Err(format!("nesting deeper than the limit of {depth_limit}"));
+    }
+    Ok(value)
+}
+
+/// Return the deepest object or array nesting, with scalars at depth zero.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Flatten JSON values into the dot-separated `ARGS_POST` names used by Coraza.
+fn flatten_json_value(value: &serde_json::Value, key: &mut String, tx: &mut Transaction) {
+    match value {
+        serde_json::Value::Object(values) => {
+            for (name, value) in values {
+                let previous_len = key.len();
+                key.push('.');
+                key.push_str(name);
+                flatten_json_value(value, key, tx);
+                key.truncate(previous_len);
+            }
+        },
+        serde_json::Value::Array(values) => {
+            if !values.is_empty() {
+                let length = values.len().to_string();
+                tx.add_post_argument(key, length.as_bytes());
+                for (index, value) in values.iter().enumerate() {
+                    let previous_len = key.len();
+                    key.push('.');
+                    key.push_str(&index.to_string());
+                    flatten_json_value(value, key, tx);
+                    key.truncate(previous_len);
+                }
+            }
+        },
+        serde_json::Value::String(value) => tx.add_post_argument(key, value.as_bytes()),
+        serde_json::Value::Number(value) => {
+            let value = value.to_string();
+            tx.add_post_argument(key, value.as_bytes());
+        },
+        serde_json::Value::Bool(value) => {
+            let value = value.to_string();
+            tx.add_post_argument(key, value.as_bytes());
+        },
+        serde_json::Value::Null => tx.add_post_argument(key, b""),
+    }
 }
 
 #[cfg(test)]
@@ -1022,6 +1350,145 @@ mod tests {
     }
 
     #[test]
+    fn multipart_body_populates_fields_metadata_and_temporary_uploads() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let mut parser = crate::seclang::Parser::new();
+        let rules = format!(
+            "SecRequestBodyAccess On\nSecUploadDir {}\nSecRule ARGS_POST \"@contains hello\" \"id:77,phase:2,deny,status:403\"",
+            upload_dir.path().display()
+        );
+        parser.from_string(&rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-body");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"message\"\r\n\
+\r\n\
+hello\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"legacy.txt\"; filename*=UTF-8'en'payload.txt\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+payload\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body).unwrap().rule_id, 77);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("MULTIPART")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("message")).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
+            Some("payload.txt")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesNames, Some("")).as_deref(),
+            Some("upload")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("payload.txt"))
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("legacy.txt")).as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartFilenameCharset, Some("upload"))
+                .as_deref(),
+            Some("UTF-8")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartFilenameLanguage, Some("upload"))
+                .as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartName, Some("message")).as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartPartHeaders, Some("upload"))
+                .as_deref(),
+            Some(
+                "Content-Disposition: form-data; name=\"upload\"; filename=\"legacy.txt\"; filename*=UTF-8'en'payload.txt"
+            )
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesCombinedSize, None).as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+            Some("")
+        );
+
+        let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        assert!(std::path::Path::new(&path).exists());
+        drop(tx);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn malformed_multipart_sets_processor_and_strict_errors() {
+        let config = WafConfig {
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("malformed-multipart", Arc::new(config));
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"field\"\r\n\
+\r\n\
+value";
+        assert_eq!(tx.process_request_body(body), None);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn multipart_upload_keep_files_preserves_files_after_transaction_drop() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let config = WafConfig {
+            request_body_access: true,
+            upload_dir: upload_dir.path().to_string_lossy().into_owned(),
+            upload_keep_files: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("kept-multipart-upload", Arc::new(config));
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"file.txt\"\r\n\
+\r\n\
+payload\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body), None);
+
+        let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
+        drop(tx);
+        assert!(std::path::Path::new(&path).exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn raw_body_is_selected_by_ctl_and_matches_original_bytes() {
         let mut parser = crate::seclang::Parser::new();
         parser
@@ -1194,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn force_body_variable_does_not_override_an_explicit_unsupported_processor() {
+    fn force_body_variable_does_not_override_an_explicit_json_processor() {
         let mut parser = crate::seclang::Parser::new();
         parser
             .from_string(
@@ -1203,16 +1670,225 @@ mod tests {
             )
             .unwrap();
         let waf = parser.into_waf().unwrap();
-        let mut tx = waf.new_transaction_with_id("unsupported-body-processor");
+        let mut tx = waf.new_transaction_with_id("explicit-json-processor");
         tx.process_request_headers();
 
-        assert_eq!(tx.process_request_body(b"q=attack"), None);
+        assert_eq!(tx.process_request_body(br#"{"q":"attack"}"#), None);
         assert_eq!(
             tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
             Some("JSON")
         );
-        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("q")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.q")).as_deref(),
+            Some("attack")
+        );
         assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn json_body_populates_flattened_post_arguments_and_runs_phase_two_rules() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:41,phase:1,ctl:requestBodyProcessor=JSON,pass\"\n\
+                 SecRule ARGS_POST \"@contains admin\" \"id:42,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("json-body");
+        tx.process_request_headers();
+
+        let body = br#"{"user":{"name":"admin","enabled":true},"ids":[10,20],"nothing":null}"#;
+        let interruption = tx.process_request_body(body).unwrap();
+
+        assert_eq!(interruption.rule_id, 42);
+        assert_eq!(interruption.status, 403);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("JSON")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.user.name"))
+                .as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.user.enabled"))
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.ids")).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.ids.0")).as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.nothing")).as_deref(),
+            Some("")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn json_body_errors_are_exposed_and_phase_two_still_runs() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRequestBodyJsonDepthLimit 1\n\
+                 SecAction \"id:43,phase:1,ctl:requestBodyProcessor=JSON,pass\"\n\
+                 SecRule REQBODY_ERROR \"@eq 1\" \"id:44,phase:2,setvar:TX.error_seen=+1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        for (id, body, expected_error) in [
+            ("invalid-json", b"{invalid}".as_slice(), "JSON:"),
+            (
+                "deep-json",
+                br#"{"a":{"b":1}}"#.as_slice(),
+                "JSON: nesting deeper than the limit of 1",
+            ),
+        ] {
+            let mut tx = waf.new_transaction_with_id(id);
+            tx.process_request_headers();
+
+            assert_eq!(tx.process_request_body(body), None);
+            assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+            assert!(
+                tx.get_variable(RuleVariable::ReqbodyErrorMsg, None)
+                    .is_some_and(|message| message.starts_with(expected_error))
+            );
+            assert_eq!(
+                tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
+                Some("1")
+            );
+            assert!(
+                tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
+                    .is_some_and(|message| !message.is_empty())
+            );
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some("error_seen")).as_deref(),
+                Some("1")
+            );
+            assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("json.a")), None);
+        }
+    }
+
+    #[test]
+    fn xml_body_populates_request_xml_and_runs_phase_two_rules() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:45,phase:1,ctl:requestBodyProcessor=XML,pass\"\n\
+                 SecRule XML:/* \"@contains superuser\" \"id:46,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("xml-body");
+        tx.process_request_headers();
+
+        let body = br#"<user name="admin"><role>superuser &amp; guest</role></user>"#;
+        let interruption = tx.process_request_body(body).unwrap();
+
+        assert_eq!(interruption.rule_id, 46);
+        assert_eq!(interruption.status, 403);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("XML")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestXML, Some("//@*")).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::XML, Some("/*")).as_deref(),
+            Some("superuser & guest")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn xml_truncated_body_keeps_values_parsed_before_eof() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:49,phase:1,ctl:requestBodyProcessor=XML,pass\"\n\
+                 SecRule XML:/* \"@contains partial\" \"id:50,phase:2,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("truncated-xml");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"<root><item>partial").unwrap().rule_id, 50);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("0"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::XML, Some("/*")).as_deref(),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn xml_body_errors_are_exposed_and_phase_two_still_runs() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:47,phase:1,ctl:requestBodyProcessor=XML,pass\"\n\
+                 SecRule REQBODY_ERROR \"@eq 1\" \"id:48,phase:2,setvar:TX.xml_error=+1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("invalid-xml");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"<root><1bad>secret</1bad></root>"), None);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+        assert!(
+            tx.get_variable(RuleVariable::ReqbodyErrorMsg, None)
+                .is_some_and(|message| message.starts_with("XML: malformed xml:"))
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
+            Some("1")
+        );
+        assert!(
+            tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
+                .is_some_and(|message| message.starts_with("malformed xml:"))
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("xml_error")).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestXML, Some("/*")), None);
+    }
+
+    #[test]
+    fn xml_content_type_does_not_select_the_processor_automatically() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("xml-content-type");
+        tx.add_request_header("Content-Type", b"application/xml");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"<root>text</root>"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestXML, Some("/*")), None);
     }
 
     #[test]

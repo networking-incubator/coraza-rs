@@ -21,6 +21,7 @@
 //! the OWASP Coraza contributors.
 
 mod actions;
+mod body_processors;
 pub mod collection;
 pub mod config;
 pub mod operators;

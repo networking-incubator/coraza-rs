@@ -7,6 +7,8 @@ extend-exclude = [
     "coraza/src/transformations/html_entities.rs",
     # Exact Unicode best-fit mapping data from the Coraza port.
     "coraza/src/transformations/unicode_bestfit.rs",
+    # Exact HTML entity names and mappings from Go's encoding/xml port.
+    "coraza/src/body_processors/xml/tables.rs",
 ]
 
 [default]

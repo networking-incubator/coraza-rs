@@ -63,6 +63,10 @@ const CORAZA_SOURCE_HEADERS: [&str; 2] = [
 const GO_HTML_SOURCE_HEADER: &str =
     "// Copyright 2010 The Go Authors. All rights reserved.\n// SPDX-License-Identifier: BSD-3-Clause\n";
 
+/// Header for the Go standard library XML decoder retained under BSD-3-Clause.
+const GO_XML_SOURCE_HEADER: &str =
+    "// Copyright 2009 The Go Authors. All rights reserved.\n// SPDX-License-Identifier: BSD-3-Clause\n";
+
 /// Directory names skipped while walking the workspace for `.rs` files.
 const SKIPPED_DIRS: [&str; 3] = ["target", ".git", "coraza-rs"];
 
@@ -163,6 +167,8 @@ fn collect_violations(root: &Path) -> Result<Vec<PathBuf>, LintLicenseError> {
         })?;
         let has_expected_header = if is_go_html_source(&member_dirs, &path) {
             content.starts_with(GO_HTML_SOURCE_HEADER)
+        } else if is_go_xml_source(&member_dirs, &path) {
+            content.starts_with(GO_XML_SOURCE_HEADER)
         } else if is_libinjection_source(&path) {
             content.starts_with(LIBINJECTION_SOURCE_HEADER)
         } else if is_coraza_source(&member_dirs, &path) {
@@ -205,6 +211,15 @@ fn is_go_html_source(member_dirs: &[PathBuf], path: &Path) -> bool {
     member_dirs.iter().any(|member_dir| {
         member_dir.file_name().is_some_and(|name| name == "coraza")
             && path == member_dir.join("src/transformations/html_entities.rs")
+    })
+}
+
+/// Accept the Go XML header only on the imported XML decoder and tables.
+fn is_go_xml_source(member_dirs: &[PathBuf], path: &Path) -> bool {
+    member_dirs.iter().any(|member_dir| {
+        member_dir.file_name().is_some_and(|name| name == "coraza")
+            && (path == member_dir.join("src/body_processors/xml/decoder.rs")
+                || path == member_dir.join("src/body_processors/xml/tables.rs"))
     })
 }
 
@@ -579,6 +594,30 @@ mod tests {
         assert_eq!(
             collect_violations(&root).unwrap(),
             vec![root.join("coraza/src/other.rs")]
+        );
+    }
+
+    #[test]
+    fn go_xml_header_is_scoped_to_the_decoder_and_tables() {
+        let root = write_temp_workspace_at(
+            tempfile_dir().join("coraza").join("project"),
+            &["coraza"],
+            &[
+                ("coraza/src/body_processors/xml/decoder.rs", GO_XML_SOURCE_HEADER),
+                ("coraza/src/body_processors/xml/tables.rs", GO_XML_SOURCE_HEADER),
+                ("coraza/src/body_processors/xml/mod.rs", GO_XML_SOURCE_HEADER),
+                ("coraza/src/other.rs", GO_XML_SOURCE_HEADER),
+            ],
+        );
+
+        let mut violations = collect_violations(&root).unwrap();
+        violations.sort();
+        assert_eq!(
+            violations,
+            vec![
+                root.join("coraza/src/body_processors/xml/mod.rs"),
+                root.join("coraza/src/other.rs")
+            ]
         );
     }
 
