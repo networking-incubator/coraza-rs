@@ -145,6 +145,7 @@ name = "coraza"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "glob",
  "ipnet",
  "libperfusion",
  "md-5",

@@ -9,6 +9,7 @@ description = "Core types, WAF configuration, transaction storage, transformatio
 
 [dependencies]
 aho-corasick = "1.1"
+glob = { workspace = true }
 ipnet = "2.9"
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = "0.11"
