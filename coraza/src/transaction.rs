@@ -781,7 +781,7 @@ impl Transaction {
             return self.interruption.clone();
         }
 
-        if self.response_body_access && self.is_response_body_processable() {
+        if !body.is_empty() && self.response_body_access && self.is_response_body_processable() {
             let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
             let mut body = body;
             if body.len() >= limit {
@@ -2506,6 +2506,29 @@ payload\r\n\
 
         assert_eq!(tx.process_response_body(b"attack").map(|item| item.status), Some(500));
         assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn empty_response_body_bypasses_zero_body_limit() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 0,
+            response_body_limit_action: BodyLimitAction::Reject,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("empty-response-limit", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b""), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.would_be_interruption(), None);
     }
 
     #[test]
