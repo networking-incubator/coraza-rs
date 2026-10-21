@@ -370,13 +370,10 @@ impl Transaction {
             if body.len() >= limit {
                 self.inbound_data_error.set("1");
                 if self.config.request_body_limit_action == BodyLimitAction::Reject {
-                    self.interruption = Some(Interruption {
-                        rule_id: 0,
-                        action: "deny".to_owned(),
-                        status: 413,
-                        data: String::new(),
-                    });
-                    return self.interruption.clone();
+                    self.interrupt(0, "deny", 413, "");
+                    if self.interruption.is_some() {
+                        return self.interruption.clone();
+                    }
                 }
                 body = body.get(..limit).unwrap_or_default();
             }
@@ -1108,6 +1105,39 @@ mod tests {
             tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn detection_only_records_body_limit_rejection_and_processes_partial_body() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine DetectionOnly\n\
+                 SecRequestBodyAccess On\n\
+                 SecRequestBodyLimit 4\n\
+                 SecAction \"id:39,phase:1,ctl:requestBodyProcessor=RAW,pass\"\n\
+                 SecRule REQUEST_BODY \"@contains atta\" \"id:40,phase:2,setvar:TX.body=+1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("detect-only-body-limit");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"attack"), None);
+        assert!(tx.interruption().is_none());
+        let would_be = tx.would_be_interruption().unwrap();
+        assert_eq!(would_be.rule_id, 0);
+        assert_eq!(would_be.action, "deny");
+        assert_eq!(would_be.status, 413);
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("atta")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("4")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("body")).as_deref(), Some("1"));
     }
 
     #[test]
