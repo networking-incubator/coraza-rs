@@ -20,8 +20,8 @@
 
 //! Operators that match transaction values.
 //!
-//! This slice includes comparisons, regular expressions, phrase matching, IP,
-//! validation, `SQLi`, and XSS operators. Rule compilation,
+//! This slice includes comparisons, regular expressions, phrase and path
+//! matching, IP, validation, `SQLi`, and XSS operators. Rule compilation,
 //! actions, and phase evaluation are not included yet.
 
 pub mod detection;
@@ -37,7 +37,8 @@ pub use detection::{DetectSQLi, DetectXSS, detect_sqli, detect_xss};
 pub use ip::{IpMatch, IpMatchFromDataset, IpMatchFromFile, ip_match, ip_match_from_dataset, ip_match_from_file};
 pub use macros::{Macro, MacroError};
 pub use pattern::{
-    Pm, PmFromDataset, PmFromFile, Rx, StrMatch, Within, pm, pm_from_dataset, pm_from_file, rx, strmatch, within,
+    Pm, PmFromDataset, PmFromFile, RestPath, Rx, StrMatch, Within, pm, pm_from_dataset, pm_from_file, rest_path, rx,
+    strmatch, within,
 };
 pub use simple::{
     BeginsWith, Contains, EndsWith, Eq, Ge, Gt, Le, Lt, StrEq, begins_with, contains, ends_with, eq, ge, gt, le, lt,
@@ -85,6 +86,8 @@ pub struct Outputs {
     capturing: bool,
     /// Captured bytes indexed by regex group number.
     captures: Vec<(usize, Vec<u8>)>,
+    /// Path arguments extracted by operators such as `@restpath`.
+    path_arguments: Vec<(String, String)>,
 }
 
 impl Outputs {
@@ -108,6 +111,11 @@ impl Outputs {
         }
     }
 
+    /// Add a path argument extracted from the input.
+    pub fn add_path_argument(&mut self, key: &str, value: &str) {
+        self.path_arguments.push((key.to_owned(), value.to_owned()));
+    }
+
     /// Take the captures in the order they were produced.
     #[cfg_attr(
         not(test),
@@ -116,6 +124,11 @@ impl Outputs {
     pub(crate) fn take_captures(&mut self) -> std::vec::Drain<'_, (usize, Vec<u8>)> {
         self.captures.drain(..)
     }
+
+    /// Take the path arguments in the order they were produced.
+    pub(crate) fn take_path_arguments(&mut self) -> std::vec::Drain<'_, (String, String)> {
+        self.path_arguments.drain(..)
+    }
 }
 
 /// A supported operator selected by its SecLang name.
@@ -123,6 +136,8 @@ impl Outputs {
 pub enum OperatorEnum {
     /// Regular expression matching.
     Rx(Rx),
+    /// Named path segment matching.
+    RestPath(RestPath),
     /// Case-insensitive phrase matching.
     Pm(Pm),
     /// Case-insensitive phrase matching loaded from a file.
@@ -194,6 +209,7 @@ impl OperatorEnum {
     pub fn with_context(name: &str, argument: &str, context: &OperatorContext<'_>) -> Result<Self, String> {
         match name.to_ascii_lowercase().as_str() {
             "rx" => rx(argument).map(Self::Rx).map_err(|error| error.to_string()),
+            "restpath" => rest_path(argument).map(Self::RestPath),
             "pm" => pm(argument).map(Self::Pm).map_err(|error| error.to_string()),
             "pmfromfile" | "pmf" => pm_from_file(context.base_dir.join(argument)).map(Self::PmFromFile),
             "pmfromdataset" => pm_from_dataset(argument, context.datasets).map(Self::PmFromDataset),
@@ -237,6 +253,7 @@ impl OperatorEnum {
     pub fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
         match self {
             Self::Rx(operator) => operator.evaluate(tx, input, out),
+            Self::RestPath(operator) => operator.evaluate(tx, input, out),
             Self::Pm(operator) => operator.evaluate(tx, input, out),
             Self::PmFromFile(operator) => operator.evaluate(tx, input, out),
             Self::PmFromDataset(operator) => operator.evaluate(tx, input, out),
@@ -281,6 +298,7 @@ macro_rules! impl_operator_from {
 
 impl_operator_from! {
     Rx => Rx,
+    RestPath => RestPath,
     Pm => Pm,
     PmFromFile => PmFromFile,
     PmFromDataset => PmFromDataset,
@@ -331,6 +349,10 @@ mod tests {
         assert!(matches!(
             OperatorEnum::new("geoLookup", ""),
             Ok(OperatorEnum::UnconditionalMatch(_))
+        ));
+        assert!(matches!(
+            OperatorEnum::new("RestPath", "/users/{id}"),
+            Ok(OperatorEnum::RestPath(_))
         ));
     }
 
@@ -391,5 +413,37 @@ mod tests {
         assert!(ip.evaluate(&tx, b"203.0.113.7", &mut Outputs::default()));
         std::fs::remove_file(phrase_path).unwrap();
         std::fs::remove_file(ip_path).unwrap();
+    }
+
+    #[test]
+    fn restpath_outputs_update_transaction_path_arguments() {
+        use crate::{transaction::VariableCollection, types::RuleVariable};
+
+        let mut tx = Transaction::new("operator-test");
+        tx.add_get_argument("id", "query-id");
+        tx.add_path_argument("id", "connector-id");
+        let operator = OperatorEnum::new("restPath", "/users/{id}/{name}").unwrap();
+        let mut out = Outputs::default();
+
+        assert!(operator.evaluate(&tx, b"/users/42/Alice?active=1", &mut out));
+        tx.store_operator_outputs(&mut out);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPath, Some("id")).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPath, Some("name")).as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsGet, Some("id")).as_deref(),
+            Some("query-id")
+        );
+        let args = tx.collection(RuleVariable::Args);
+        assert!(matches!(&args, Some(VariableCollection::Map(_))), "ARGS is a map");
+        if let Some(VariableCollection::Map(args)) = args {
+            assert_eq!(args.values("id").collect::<Vec<_>>(), [b"query-id".as_slice(), b"42"]);
+        }
     }
 }

@@ -29,6 +29,7 @@ use std::{borrow::Cow, sync::Arc};
 use crate::{
     collection::{Map, MatchData, Single},
     config::WafConfig,
+    operators::Outputs,
     rules::{CollectionView, VariableSpec},
     transformations::text_of,
     types::RuleVariable,
@@ -296,6 +297,38 @@ impl Transaction {
         if self.within_argument_limit(self.args_path.value_count()) {
             self.args_path.add(key, value);
             self.args.add(key, value);
+        }
+    }
+
+    /// Store captures and path arguments produced by an operator.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by rule evaluation in a later port slice")
+    )]
+    pub(crate) fn store_operator_outputs(&mut self, outputs: &mut Outputs) {
+        for (index, value) in outputs.take_captures() {
+            self.set_tx_variable(&index.to_string(), value);
+        }
+        for (key, value) in outputs.take_path_arguments() {
+            self.set_path_argument(&key, value.as_bytes());
+        }
+    }
+
+    /// Replace the first stored path argument and its corresponding ARGS value.
+    fn set_path_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        let previous = self.args_path.first(key).map(<[u8]>::to_vec);
+        let Some(previous) = previous else {
+            self.add_path_argument(key, value);
+            return;
+        };
+        self.args_path.set_index(key, 0, value.as_ref());
+        let index = self
+            .args
+            .values(key)
+            .position(|argument| argument == previous.as_slice());
+        match index {
+            Some(index) => self.args.set_index(key, index, value),
+            None => self.args.add(key, value),
         }
     }
 
