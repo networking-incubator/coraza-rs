@@ -439,10 +439,49 @@ pub fn strmatch(pattern: &str) -> Result<StrMatch, MacroError> {
     })
 }
 
+/// Match a path template and return the values captured by its named segments.
+///
+/// A segment such as `{id}` matches up to the next slash or query delimiter. The
+/// rest of the template is a regular expression, matched anywhere in the value.
+#[derive(Debug, Clone)]
+pub struct RestPath {
+    /// Compiled template matcher.
+    regex: regex::Regex,
+}
+
+impl Operator for RestPath {
+    fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        let input = text_of(input);
+        let Some(captures) = self.regex.captures(&input) else {
+            return false;
+        };
+        for name in self.regex.capture_names().flatten() {
+            if let Some(segment) = captures.name(name) {
+                out.add_path_argument(name, segment.as_str());
+            }
+        }
+        true
+    }
+}
+
+/// Create a `restpath` operator from a template.
+///
+/// # Errors
+///
+/// Returns an error if a segment name or the resulting regular expression is invalid.
+pub fn rest_path(template: &str) -> Result<RestPath, String> {
+    let segment =
+        regex::Regex::new(r"\{([^}]+)\}").map_err(|error| format!("invalid path segment matcher: {error}"))?;
+    let pattern = segment.replace_all(template, "(?P<$1>[^?/]+)");
+    regex::Regex::new(&pattern)
+        .map(|regex| RestPath { regex })
+        .map_err(|error| format!("invalid @restpath template {template:?}: {error}"))
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "operator tests use fixed valid patterns")]
 mod tests {
-    use super::{Operator as _, Outputs, pm, rx, strmatch, within};
+    use super::{Operator as _, Outputs, pm, rest_path, rx, strmatch, within};
     use crate::transaction::Transaction;
 
     #[test]
@@ -527,5 +566,27 @@ mod tests {
                 .unwrap()
                 .evaluate(&tx, b"needle", &mut Outputs::default())
         );
+    }
+
+    #[test]
+    fn restpath_extracts_segments_before_slashes_and_queries() {
+        let tx = Transaction::new("operator-test");
+        let operator = rest_path("/users/{id}/{name}").unwrap();
+        let mut out = Outputs::default();
+
+        assert!(operator.evaluate(&tx, b"/users/42/Alice?active=1", &mut out));
+        assert_eq!(
+            out.take_path_arguments().collect::<Vec<_>>(),
+            [
+                ("id".to_owned(), "42".to_owned()),
+                ("name".to_owned(), "Alice".to_owned())
+            ]
+        );
+        assert!(!operator.evaluate(&tx, b"/groups/42/Alice", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn restpath_rejects_invalid_segment_names() {
+        assert!(rest_path("/users/{user-id}").is_err());
     }
 }
