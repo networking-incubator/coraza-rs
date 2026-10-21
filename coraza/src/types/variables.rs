@@ -448,6 +448,8 @@ impl RuleVariable {
                 | Self::JSON
                 | Self::XML
                 | Self::Env
+                | Self::ResponseArgs
+                | Self::ResponseXML
                 | Self::IP
                 | Self::MultipartPartHeaders
                 | Self::MultipartFilenameCharset

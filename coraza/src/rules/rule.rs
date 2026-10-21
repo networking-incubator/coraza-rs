@@ -142,7 +142,7 @@ impl Rule {
 
         let mut matched = false;
         for variable in &self.variables {
-            for value in tx.find_matches(variable) {
+            for value in tx.find_matches_for_rule(variable, id) {
                 let candidates = if self.metadata.multi_match {
                     self.metadata.transformations.apply_multimatch(&value.value).0
                 } else {
