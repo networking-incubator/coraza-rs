@@ -20,9 +20,8 @@
 
 //! Transaction variable storage and lookup.
 //!
-//! This module stores values supplied by a connector and evaluates request-header rules.
-//! It does not parse HTTP requests or process bodies.
-//! Callers must apply transport and body size limits before storing values.
+//! This module stores values supplied by a connector and evaluates request-header and
+//! request-body rules. Callers must apply transport limits before passing a body.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -31,8 +30,8 @@ use crate::{
     config::WafConfig,
     operators::{Macro, Outputs},
     rules::{CollectionView, RuleGroup, VariableSpec},
-    transformations::text_of,
-    types::{RuleEngineStatus, RulePhase, RuleVariable},
+    transformations::{text_of, url_decode},
+    types::{BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
 };
 
 /// A disruptive action selected by a matching rule.
@@ -114,6 +113,8 @@ macro_rules! variable_storage {
             }
             RuleVariable::MatchedVar => Some(Single($($borrow)+ $tx.matched_var)),
             RuleVariable::MatchedVarName => Some(Single($($borrow)+ $tx.matched_var_name)),
+            RuleVariable::InboundDataError => Some(Single($($borrow)+ $tx.inbound_data_error)),
+            RuleVariable::ReqbodyProcessor => Some(Single($($borrow)+ $tx.reqbody_processor)),
             RuleVariable::Rule => Some(Map($($borrow)+ $tx.rule)),
             RuleVariable::UniqueID => Some(Single($($borrow)+ $tx.unique_id)),
             RuleVariable::ArgsCombinedSize => Some(Single($($borrow)+ $tx.args_combined_size_value)),
@@ -123,6 +124,8 @@ macro_rules! variable_storage {
             RuleVariable::RequestURI => Some(Single($($borrow)+ $tx.request_uri)),
             RuleVariable::RequestMethod => Some(Single($($borrow)+ $tx.request_method)),
             RuleVariable::RequestProtocol => Some(Single($($borrow)+ $tx.request_protocol)),
+            RuleVariable::RequestBody => Some(Single($($borrow)+ $tx.request_body)),
+            RuleVariable::RequestBodyLength => Some(Single($($borrow)+ $tx.request_body_length)),
             RuleVariable::RemoteAddr => Some(Single($($borrow)+ $tx.remote_addr)),
             RuleVariable::ServerName => Some(Single($($borrow)+ $tx.server_name)),
             RuleVariable::ResponseStatus => Some(Single($($borrow)+ $tx.response_status)),
@@ -131,7 +134,46 @@ macro_rules! variable_storage {
     }};
 }
 
-/// A transaction's input collections, rule state, and request-header evaluation.
+#[derive(Clone, Copy)]
+/// Request body processors implemented by this runtime slice.
+enum RequestBodyProcessor {
+    /// Preserve the body bytes without parsing arguments.
+    Raw,
+    /// Parse `application/x-www-form-urlencoded` arguments.
+    UrlEncoded,
+}
+
+impl RequestBodyProcessor {
+    /// Parse a processor name supported by this runtime slice.
+    fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("RAW") {
+            Some(Self::Raw)
+        } else if name.eq_ignore_ascii_case("URLENCODED") {
+            Some(Self::UrlEncoded)
+        } else {
+            None
+        }
+    }
+
+    /// Detect URLENCODED from a content type, if present.
+    fn for_content_type(content_type: &[u8]) -> Option<Self> {
+        let content_type = std::str::from_utf8(content_type).ok()?.trim();
+        content_type
+            .get(.."application/x-www-form-urlencoded".len())
+            .is_some_and(|value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+            .then_some(Self::UrlEncoded)
+    }
+
+    /// Return the canonical processor name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "RAW",
+            Self::UrlEncoded => "URLENCODED",
+        }
+    }
+}
+
+/// A transaction's input collections, rule state, and request-phase evaluation.
 pub struct Transaction {
     /// The settings used to enforce transaction limits.
     config: Arc<WafConfig>,
@@ -139,6 +181,14 @@ pub struct Transaction {
     rules: Arc<RuleGroup>,
     /// Rule-engine mode, which `ctl` actions may change per transaction.
     rule_engine: RuleEngineStatus,
+    /// Whether this transaction inspects request bodies.
+    request_body_access: bool,
+    /// Maximum body size for this transaction, in bytes.
+    request_body_limit: i64,
+    /// Whether to process a body without a recognized content type.
+    force_request_body_variable: bool,
+    /// Processor chosen by the first content type or a `ctl` action.
+    request_body_processor: Option<RequestBodyProcessor>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
     /// A disruptive action applied while the engine is on.
@@ -197,6 +247,14 @@ pub struct Transaction {
     server_name: Single,
     /// The response status supplied by the connector.
     response_status: Single,
+    /// Request body bytes supplied to phase 2.
+    request_body: Single,
+    /// Length of the body passed to its processor.
+    request_body_length: Single,
+    /// Whether the request body reached its configured limit.
+    inbound_data_error: Single,
+    /// Name of the selected request body processor.
+    reqbody_processor: Single,
 }
 
 impl Transaction {
@@ -229,6 +287,10 @@ impl Transaction {
 
         Self {
             rule_engine: config.rule_engine,
+            request_body_access: config.request_body_access,
+            request_body_limit: config.request_body_limit,
+            force_request_body_variable: false,
+            request_body_processor: None,
             config,
             rules,
             last_phase: None,
@@ -260,6 +322,10 @@ impl Transaction {
             remote_addr: Single::new(RuleVariable::RemoteAddr),
             server_name: Single::new(RuleVariable::ServerName),
             response_status: Single::new(RuleVariable::ResponseStatus),
+            request_body: Single::new(RuleVariable::RequestBody),
+            request_body_length: flag(RuleVariable::RequestBodyLength),
+            inbound_data_error: flag(RuleVariable::InboundDataError),
+            reqbody_processor: Single::new(RuleVariable::ReqbodyProcessor),
         }
     }
 
@@ -274,17 +340,82 @@ impl Transaction {
     }
 
     /// Evaluate request-header rules once using the values already stored on this
-    /// transaction. Returns the disruptive interruption, if the engine is on.
-    ///
-    /// Body and response phases are not evaluated by this method.
+    /// transaction. Returns the disruptive interruption, if any.
     pub fn process_request_headers(&mut self) -> Option<Interruption> {
-        if self.last_phase.is_some() || self.rule_engine == RuleEngineStatus::Off || self.interruption.is_some() {
+        if self.begin_phase(RulePhase::RequestHeaders) {
+            self.run_phase(RulePhase::RequestHeaders);
+        }
+        self.interruption.clone()
+    }
+
+    /// Process a request body and evaluate phase 2 rules.
+    ///
+    /// Call this once after [`Transaction::process_request_headers`], including for an
+    /// empty body. This slice supports URLENCODED bodies selected by the first
+    /// `Content-Type` header and RAW bodies selected by `ctl:requestBodyProcessor=RAW`.
+    /// Other body processors are not implemented yet. Phase 2 rules still run when body
+    /// access is disabled or no processor is selected.
+    pub fn process_request_body(&mut self, body: &[u8]) -> Option<Interruption> {
+        if !self.begin_phase(RulePhase::RequestBody) {
             return self.interruption.clone();
         }
 
-        self.last_phase = Some(RulePhase::RequestHeaders);
-        self.run_phase(RulePhase::RequestHeaders);
+        if self.request_body_access && !body.is_empty() {
+            if self.force_request_body_variable && self.reqbody_processor.get_bytes().is_empty() {
+                self.set_request_body_processor("URLENCODED");
+            }
+
+            let limit = usize::try_from(self.request_body_limit).unwrap_or(0);
+            let mut body = body;
+            if body.len() >= limit {
+                self.inbound_data_error.set("1");
+                if self.config.request_body_limit_action == BodyLimitAction::Reject {
+                    self.interruption = Some(Interruption {
+                        rule_id: 0,
+                        action: "deny".to_owned(),
+                        status: 413,
+                        data: String::new(),
+                    });
+                    return self.interruption.clone();
+                }
+                body = body.get(..limit).unwrap_or_default();
+            }
+
+            self.inspect_request_body(body);
+        }
+
+        self.run_phase(RulePhase::RequestBody);
         self.interruption.clone()
+    }
+
+    /// Begin a phase once and only after its required predecessor.
+    fn begin_phase(&mut self, phase: RulePhase) -> bool {
+        if self.rule_engine == RuleEngineStatus::Off || self.interruption.is_some() {
+            return false;
+        }
+        let in_order = match phase {
+            RulePhase::RequestBody => self.last_phase == Some(RulePhase::RequestHeaders),
+            _ => self.last_phase.is_none_or(|last| last < phase),
+        };
+        if in_order {
+            self.last_phase = Some(phase);
+        }
+        in_order
+    }
+
+    /// Store and parse the body with the selected processor.
+    fn inspect_request_body(&mut self, body: &[u8]) {
+        let Some(processor) = self.request_body_processor else {
+            return;
+        };
+
+        self.request_body.set(body);
+        self.request_body_length.set(body.len().to_string());
+        if matches!(processor, RequestBodyProcessor::UrlEncoded) {
+            for (key, value) in parse_urlencoded(body) {
+                self.add_post_argument(&key, value);
+            }
+        }
     }
 
     /// Return the interruption applied by a matching disruptive action.
@@ -433,12 +564,31 @@ impl Transaction {
         let Some((name, value)) = expression.split_once('=') else {
             return;
         };
-        // shortcut: ruleEngine only, add transaction state before supporting other ctl settings.
-        if name == "ruleEngine"
-            && let Ok(rule_engine) = value.parse::<RuleEngineStatus>()
-        {
-            self.rule_engine = rule_engine;
+        match name {
+            "ruleEngine" => {
+                if let Ok(rule_engine) = value.parse::<RuleEngineStatus>() {
+                    self.rule_engine = rule_engine;
+                }
+            },
+            "requestBodyAccess" => self.request_body_access = value.eq_ignore_ascii_case("on"),
+            "requestBodyLimit" => {
+                if let Ok(limit) = value.parse::<i64>() {
+                    self.request_body_limit = limit;
+                }
+            },
+            "forceRequestBodyVariable" => {
+                self.force_request_body_variable = value.eq_ignore_ascii_case("on");
+            },
+            "requestBodyProcessor" => self.set_request_body_processor(value),
+            _ => {},
         }
+    }
+
+    /// Select a request body processor, retaining its name even when this slice does not
+    /// implement that processor.
+    fn set_request_body_processor(&mut self, name: &str) {
+        self.request_body_processor = RequestBodyProcessor::parse(name);
+        self.reqbody_processor.set(name.to_ascii_uppercase());
     }
 
     /// The collection a rule variable reads, or `None` when this storage layer
@@ -581,7 +731,13 @@ impl Transaction {
 
     /// Store a request header value as supplied by the connector.
     pub fn add_request_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        let value = value.as_ref();
+        let first_content_type =
+            key.eq_ignore_ascii_case("content-type") && self.request_headers.first("content-type").is_none();
         self.request_headers.add(key, value);
+        if first_content_type && let Some(processor) = RequestBodyProcessor::for_content_type(value) {
+            self.set_request_body_processor(processor.name());
+        }
     }
 
     /// Store a request cookie supplied by a connector that already parsed cookies.
@@ -662,6 +818,24 @@ impl Transaction {
             .saturating_add(value.len());
         self.args_combined_size_value.set(self.args_combined_size.to_string());
     }
+}
+
+/// Parses URLENCODED pairs in order, preserving decoded value bytes.
+fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec<u8>)> + '_ {
+    body.split(|&byte| byte == b'&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = match pair.iter().position(|&byte| byte == b'=') {
+                Some(equals) => (
+                    pair.get(..equals).unwrap_or_default(),
+                    pair.get(equals.saturating_add(1)..).unwrap_or_default(),
+                ),
+                None => (pair, &b""[..]),
+            };
+            let key = text_of(&url_decode(key).0).into_owned();
+            let value = url_decode(value).0;
+            (key, value)
+        })
 }
 
 #[cfg(test)]
@@ -785,7 +959,249 @@ mod tests {
             tx.collection(RuleVariable::RequestHeaders),
             Some(VariableCollection::Map(_))
         ));
-        assert!(tx.collection(RuleVariable::RequestBody).is_none());
+        assert!(matches!(
+            tx.collection(RuleVariable::RequestBody),
+            Some(VariableCollection::Single(_))
+        ));
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn urlencoded_body_populates_arguments_and_runs_phase_two_rules() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRule ARGS_POST \"@contains attack\" \"id:30,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("urlencoded-body");
+        tx.add_request_header("Content-Type", b"application/x-www-form-urlencoded; charset=UTF-8");
+        tx.process_request_headers();
+
+        let body = b"name=attack&bin=%FF&bad=%G0&empty";
+        let interruption = tx.process_request_body(body).unwrap();
+
+        assert_eq!(interruption.rule_id, 30);
+        assert_eq!(interruption.status, 403);
+        assert_eq!(tx.last_phase(), Some(RulePhase::RequestBody));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("URLENCODED")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("name=attack&bin=%FF&bad=%G0&empty")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None),
+            Some(body.len().to_string())
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("name")).as_deref(),
+            Some("attack")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("empty")).as_deref(),
+            Some("")
+        );
+
+        let binary = VariableSpec::new_string(RuleVariable::ArgsPost, "bin".to_owned());
+        assert_eq!(
+            tx.find_matches(&binary).first().map(|matched| matched.value.as_slice()),
+            Some(&b"\xff"[..])
+        );
+        let invalid_escape = VariableSpec::new_string(RuleVariable::ArgsPost, "bad".to_owned());
+        assert_eq!(
+            tx.find_matches(&invalid_escape)
+                .first()
+                .map(|matched| matched.value.as_slice()),
+            Some(&b"%G0"[..])
+        );
+    }
+
+    #[test]
+    fn raw_body_is_selected_by_ctl_and_matches_original_bytes() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:31,phase:1,ctl:requestBodyProcessor=RAW,pass\"\n\
+                 SecRule REQUEST_BODY \"@contains attack\" \"id:32,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("raw-body");
+        tx.add_request_header("Content-Type", b"text/plain");
+        tx.process_request_headers();
+
+        let body = b"xx\xffattack";
+        assert_eq!(tx.process_request_body(body).unwrap().rule_id, 32);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("RAW")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            tx.find_matches(&VariableSpec::new(RuleVariable::RequestBody))
+                .first()
+                .map(|matched| matched.value.as_slice()),
+            Some(&body[..])
+        );
+    }
+
+    #[test]
+    fn request_body_limit_rejects_at_the_limit_and_processes_partial_bodies() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:33,phase:1,ctl:requestBodyLimit=4,ctl:requestBodyProcessor=RAW,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("body-limit-reject");
+        tx.process_request_headers();
+
+        let interruption = tx.process_request_body(b"body").unwrap();
+
+        assert_eq!(interruption.rule_id, 0);
+        assert_eq!(interruption.action, "deny");
+        assert_eq!(interruption.status, 413);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRequestBodyLimit 4\n\
+                 SecRequestBodyLimitAction ProcessPartial\n\
+                 SecAction \"id:34,phase:1,ctl:requestBodyProcessor=RAW,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("body-limit-partial");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"attack"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("atta")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn request_body_phase_runs_without_body_access_and_only_once_after_headers() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess Off\n\
+                 SecAction \"id:35,phase:2,setvar:TX.body=+1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("body-phase-order");
+        tx.add_get_argument("q", "attack");
+
+        assert_eq!(tx.process_request_body(b"ignored=value"), None);
+        assert_eq!(tx.last_phase(), None);
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b""), None);
+        assert_eq!(tx.last_phase(), Some(RulePhase::RequestBody));
+        assert_eq!(tx.process_request_body(b"again=value"), None);
+
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("body")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("ignored")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn ctl_can_enable_body_access_and_force_urlencoded_processing() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess Off\n\
+                 SecAction \"id:36,phase:1,ctl:requestBodyAccess=On,ctl:forceRequestBodyVariable=On,pass\"\n\
+                 SecRule ARGS_POST \"@contains attack\" \"id:37,phase:2,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("body-access-ctl");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"q=attack").unwrap().rule_id, 37);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("URLENCODED")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("q")).as_deref(),
+            Some("attack")
+        );
+    }
+
+    #[test]
+    fn force_body_variable_does_not_override_an_explicit_unsupported_processor() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:38,phase:1,ctl:forceRequestBodyVariable=On,ctl:requestBodyProcessor=JSON,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("unsupported-body-processor");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"q=attack"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("JSON")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("q")), None);
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn only_the_first_content_type_selects_a_body_processor() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("first-content-type");
+        tx.add_request_header("Content-Type", b"application/json");
+        tx.add_request_header("content-type", b"application/x-www-form-urlencoded");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"key=value"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("key")), None);
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
     }
 
     #[test]

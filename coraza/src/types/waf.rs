@@ -275,7 +275,7 @@ impl FromStr for RuleEngineStatus {
     }
 }
 
-/// Action to take when body size exceeds configured limits.
+/// Action to take when a body reaches its configured limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BodyLimitAction {

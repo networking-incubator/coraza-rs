@@ -44,8 +44,9 @@ impl std::error::Error for ConfigError {}
 
 /// A thread-safe WAF containing compiled SecLang rules and configuration.
 ///
-/// The current runtime evaluates request-header rules. Body and response phases,
-/// audit logging, and the remaining compiled action effects are not implemented yet.
+/// The current runtime evaluates request-header and request-body rules. Request bodies
+/// support RAW and URLENCODED processing; other body processors and response phases,
+/// audit logging, and remaining compiled action effects are not implemented yet.
 #[derive(Debug)]
 pub struct Waf {
     /// Configuration inherited by each transaction.
