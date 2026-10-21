@@ -18,13 +18,14 @@
 // Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SecLang action compilation.
+//! SecLang action compilation and request-header runtime effects.
 
 use std::fmt;
 
 use crate::{
     operators::{Macro, MacroError},
     rules::TransformationChain,
+    transaction::Transaction,
     transformations,
     types::{RulePhase, RuleSeverity},
 };
@@ -87,6 +88,33 @@ impl CompiledAction {
     /// Returns when the action runs.
     pub(crate) fn action_type(&self) -> ActionType {
         self.action_type
+    }
+
+    /// Apply the runtime effect of a compiled action.
+    pub(crate) fn evaluate(&self, rule: &RuleMetadata, tx: &mut Transaction) {
+        match self.name.as_str() {
+            "deny" => {
+                let status = if rule.status == 0 { 403 } else { rule.status };
+                tx.interrupt(rule.id, "deny", status, "");
+            },
+            "drop" => tx.interrupt(rule.id, "drop", rule.status, ""),
+            "redirect" => {
+                let data = Macro::new(&self.argument).map_or_else(|_| self.argument.clone(), |value| value.expand(tx));
+                let status = if rule.status == 0 { 302 } else { rule.status };
+                tx.interrupt(rule.id, "redirect", status, &data);
+            },
+            "allow" => tx.allow(&self.argument),
+            "skip" => {
+                if let Ok(count) = self.argument.parse::<i32>() {
+                    tx.set_skip(count);
+                }
+            },
+            "skipafter" => tx.set_skip_after(&self.argument),
+            "setvar" => tx.apply_setvar(&self.argument),
+            "ctl" => tx.apply_ctl(&self.argument),
+            // shortcut: logging, environment, and external effects wait for their runtime modules.
+            _ => {},
+        }
     }
 }
 

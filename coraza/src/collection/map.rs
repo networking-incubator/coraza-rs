@@ -205,10 +205,6 @@ impl Map {
     }
 
     /// Replaces the value at `index` of `key`, or appends it if `index` is past the end.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn set_index(&mut self, key: &str, index: usize, value: impl AsRef<[u8]>) {
         let lookup = self.lookup_key(key);
         let value = value.as_ref();
@@ -232,10 +228,6 @@ impl Map {
     }
 
     /// Removes every key.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by transaction storage in a later port slice")
-    )]
     pub(crate) fn reset(&mut self) {
         self.data.clear();
     }

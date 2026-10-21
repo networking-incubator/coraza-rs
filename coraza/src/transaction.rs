@@ -20,8 +20,8 @@
 
 //! Transaction variable storage and lookup.
 //!
-//! This module stores values supplied by a connector. It does not parse HTTP
-//! requests, process bodies, or evaluate rules.
+//! This module stores values supplied by a connector and evaluates request-header rules.
+//! It does not parse HTTP requests or process bodies.
 //! Callers must apply transport and body size limits before storing values.
 
 use std::{borrow::Cow, sync::Arc};
@@ -29,11 +29,37 @@ use std::{borrow::Cow, sync::Arc};
 use crate::{
     collection::{Map, MatchData, Single},
     config::WafConfig,
-    operators::Outputs,
-    rules::{CollectionView, VariableSpec},
+    operators::{Macro, Outputs},
+    rules::{CollectionView, RuleGroup, VariableSpec},
     transformations::text_of,
-    types::RuleVariable,
+    types::{RuleEngineStatus, RulePhase, RuleVariable},
 };
+
+/// A disruptive action selected by a matching rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interruption {
+    /// ID of the rule that interrupted the transaction.
+    pub rule_id: i32,
+    /// Disruptive action name.
+    pub action: String,
+    /// HTTP status associated with the action, or zero for `drop`.
+    pub status: u16,
+    /// Action data, such as a redirect URL.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Scope selected by an `allow` action.
+enum AllowType {
+    /// No allow action ran.
+    Unset,
+    /// Skip all later rules in this and subsequent phases.
+    All,
+    /// Skip later rules in the current phase.
+    Phase,
+    /// Skip later request phases.
+    Request,
+}
 
 /// The data behind one rule variable in a transaction.
 ///
@@ -82,6 +108,13 @@ macro_rules! variable_storage {
                 RuleVariable::ResponseHeadersNames,
                 $($borrow)+ $tx.response_headers,
             )),
+            RuleVariable::MatchedVars => Some(Map($($borrow)+ $tx.matched_vars)),
+            RuleVariable::MatchedVarsNames => {
+                Some(Names(RuleVariable::MatchedVarsNames, $($borrow)+ $tx.matched_vars))
+            }
+            RuleVariable::MatchedVar => Some(Single($($borrow)+ $tx.matched_var)),
+            RuleVariable::MatchedVarName => Some(Single($($borrow)+ $tx.matched_var_name)),
+            RuleVariable::Rule => Some(Map($($borrow)+ $tx.rule)),
             RuleVariable::UniqueID => Some(Single($($borrow)+ $tx.unique_id)),
             RuleVariable::ArgsCombinedSize => Some(Single($($borrow)+ $tx.args_combined_size_value)),
             RuleVariable::ArgumentsLimitReached => {
@@ -98,13 +131,26 @@ macro_rules! variable_storage {
     }};
 }
 
-/// A transaction's core input collections and values.
-///
-/// This type is the storage layer used by rule variable selection. HTTP
-/// parsing, body processing, and rule execution are not included yet.
+/// A transaction's input collections, rule state, and request-header evaluation.
 pub struct Transaction {
     /// The settings used to enforce transaction limits.
     config: Arc<WafConfig>,
+    /// Compiled rules inherited from the WAF, possibly empty.
+    rules: Arc<RuleGroup>,
+    /// Rule-engine mode, which `ctl` actions may change per transaction.
+    rule_engine: RuleEngineStatus,
+    /// The last phase evaluated.
+    last_phase: Option<RulePhase>,
+    /// A disruptive action applied while the engine is on.
+    interruption: Option<Interruption>,
+    /// The first disruptive action that would apply in detection-only mode.
+    would_be_interruption: Option<Interruption>,
+    /// Number of following same-phase rules to skip.
+    skip: i32,
+    /// Marker label to skip through, if any.
+    skip_after: Option<String>,
+    /// Rule allowance scope set by an `allow` action.
+    allow: AllowType,
     /// The unique transaction identifier.
     unique_id: Single,
     /// The accumulated combined key and value size of GET and POST arguments.
@@ -131,6 +177,14 @@ pub struct Transaction {
     response_headers: Map,
     /// Transaction variables set by rule actions or the caller.
     tx: Map,
+    /// Latest matched input value.
+    matched_var: Single,
+    /// Name of the latest matched variable.
+    matched_var_name: Single,
+    /// Values matched by the current rule and its chain.
+    matched_vars: Map,
+    /// Metadata of the rule currently being evaluated.
+    rule: Map,
     /// The request URI supplied by the connector.
     request_uri: Single,
     /// The request method supplied by the connector.
@@ -153,6 +207,11 @@ impl Transaction {
 
     /// Create a transaction with the supplied WAF configuration.
     pub fn with_config(id: impl Into<String>, config: Arc<WafConfig>) -> Self {
+        Self::with_rules(config, Arc::new(RuleGroup::new()), id)
+    }
+
+    /// Create a transaction with shared WAF configuration and compiled rules.
+    pub(crate) fn with_rules(config: Arc<WafConfig>, rules: Arc<RuleGroup>, id: impl Into<String>) -> Self {
         let map = |variable: RuleVariable| {
             if variable.has_case_sensitive_keys() {
                 Map::new_case_sensitive(variable)
@@ -169,7 +228,15 @@ impl Transaction {
         unique_id.set(id.into());
 
         Self {
+            rule_engine: config.rule_engine,
             config,
+            rules,
+            last_phase: None,
+            interruption: None,
+            would_be_interruption: None,
+            skip: 0,
+            skip_after: None,
+            allow: AllowType::Unset,
             unique_id,
             args_combined_size: 0,
             args_combined_size_value: flag(RuleVariable::ArgsCombinedSize),
@@ -183,6 +250,10 @@ impl Transaction {
             request_cookies: map(RuleVariable::RequestCookies),
             response_headers: map(RuleVariable::ResponseHeaders),
             tx: map(RuleVariable::TX),
+            matched_var: Single::new(RuleVariable::MatchedVar),
+            matched_var_name: Single::new(RuleVariable::MatchedVarName),
+            matched_vars: map(RuleVariable::MatchedVars),
+            rule: map(RuleVariable::Rule),
             request_uri: Single::new(RuleVariable::RequestURI),
             request_method: Single::new(RuleVariable::RequestMethod),
             request_protocol: Single::new(RuleVariable::RequestProtocol),
@@ -195,6 +266,179 @@ impl Transaction {
     /// The transaction ID as text.
     pub fn id(&self) -> Cow<'_, str> {
         self.unique_id.get()
+    }
+
+    /// Return the rule-engine mode currently applied to this transaction.
+    pub fn rule_engine(&self) -> RuleEngineStatus {
+        self.rule_engine
+    }
+
+    /// Evaluate request-header rules once using the values already stored on this
+    /// transaction. Returns the disruptive interruption, if the engine is on.
+    ///
+    /// Body and response phases are not evaluated by this method.
+    pub fn process_request_headers(&mut self) -> Option<Interruption> {
+        if self.last_phase.is_some() || self.rule_engine == RuleEngineStatus::Off || self.interruption.is_some() {
+            return self.interruption.clone();
+        }
+
+        self.last_phase = Some(RulePhase::RequestHeaders);
+        self.run_phase(RulePhase::RequestHeaders);
+        self.interruption.clone()
+    }
+
+    /// Return the interruption applied by a matching disruptive action.
+    pub fn interruption(&self) -> Option<&Interruption> {
+        self.interruption.as_ref()
+    }
+
+    /// Return the first interruption that would have applied in detection-only mode.
+    pub fn would_be_interruption(&self) -> Option<&Interruption> {
+        self.would_be_interruption.as_ref()
+    }
+
+    /// Return the last phase evaluated by this transaction.
+    pub fn last_phase(&self) -> Option<RulePhase> {
+        self.last_phase
+    }
+
+    /// Evaluate rules assigned to `phase` in directive order.
+    fn run_phase(&mut self, phase: RulePhase) {
+        let rules = Arc::clone(&self.rules);
+
+        for rule in rules.iter() {
+            if self.interruption.is_some() || self.is_allowed(phase) {
+                break;
+            }
+            if rule.metadata().phase != RulePhase::Unknown && rule.metadata().phase != phase {
+                continue;
+            }
+            if let Some(marker) = &self.skip_after {
+                let reached_marker = rule.metadata().sec_mark.as_deref() == Some(marker);
+                if reached_marker {
+                    self.skip_after = None;
+                }
+                continue;
+            }
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+
+            self.reset_matched_vars();
+            rule.evaluate(self);
+        }
+        self.skip = 0;
+        if self.allow == AllowType::Phase {
+            self.allow = AllowType::Unset;
+        }
+    }
+
+    /// Whether an earlier allow action skips rules in `phase`.
+    fn is_allowed(&self, phase: RulePhase) -> bool {
+        match self.allow {
+            AllowType::Unset => false,
+            AllowType::All | AllowType::Phase => phase != RulePhase::Logging,
+            AllowType::Request => matches!(phase, RulePhase::RequestHeaders | RulePhase::RequestBody),
+        }
+    }
+
+    /// Apply a disruptive action according to the transaction's engine mode.
+    pub(crate) fn interrupt(&mut self, rule_id: i32, action: &str, status: i32, data: &str) {
+        let interruption = Interruption {
+            rule_id,
+            action: action.to_owned(),
+            status: u16::try_from(status).unwrap_or(0),
+            data: data.to_owned(),
+        };
+        match self.rule_engine {
+            RuleEngineStatus::On => self.interruption = Some(interruption),
+            RuleEngineStatus::DetectionOnly => {
+                self.would_be_interruption.get_or_insert(interruption);
+            },
+            RuleEngineStatus::Off => {},
+        }
+    }
+
+    /// Set the rule-skip scope for an `allow` action.
+    pub(crate) fn allow(&mut self, scope: &str) {
+        if self.rule_engine != RuleEngineStatus::On {
+            return;
+        }
+        self.allow = match scope {
+            "phase" => AllowType::Phase,
+            "request" => AllowType::Request,
+            _ => AllowType::All,
+        };
+    }
+
+    /// Skip the next `count` rules in the current phase.
+    pub(crate) fn set_skip(&mut self, count: i32) {
+        self.skip = count;
+    }
+
+    /// Skip rules through the named marker.
+    pub(crate) fn set_skip_after(&mut self, marker: &str) {
+        self.skip_after = Some(marker.to_owned());
+    }
+
+    /// Apply the supported TX collection form of `setvar`.
+    pub(crate) fn apply_setvar(&mut self, expression: &str) {
+        let (remove, expression) = expression
+            .strip_prefix('!')
+            .map_or((false, expression), |rest| (true, rest));
+        let Some((collection, assignment)) = expression.split_once('.') else {
+            return;
+        };
+        if !collection.eq_ignore_ascii_case("TX") {
+            return;
+        }
+        let (key, value) = assignment.split_once('=').unwrap_or((assignment, ""));
+        let Ok(key) = Macro::new(key) else {
+            return;
+        };
+        let key = key.expand(self).to_ascii_lowercase();
+        if remove {
+            self.tx.remove(&key);
+            return;
+        }
+        let Ok(value) = Macro::new(value) else {
+            return;
+        };
+        let value = value.expand(self);
+        let arithmetic = value
+            .strip_prefix('+')
+            .map(|number| (true, number))
+            .or_else(|| value.strip_prefix('-').map(|number| (false, number)));
+        if let Some((add, number)) = arithmetic
+            && let Ok(number) = number.parse::<i64>()
+        {
+            let current = self
+                .get_variable(RuleVariable::TX, Some(&key))
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            let result = if add {
+                current.saturating_add(number)
+            } else {
+                current.saturating_sub(number)
+            };
+            self.set_tx_variable(&key, result.to_string());
+            return;
+        }
+        self.set_tx_variable(&key, value);
+    }
+
+    /// Apply transaction-scoped `ctl` settings supported by this runtime slice.
+    pub(crate) fn apply_ctl(&mut self, expression: &str) {
+        let Some((name, value)) = expression.split_once('=') else {
+            return;
+        };
+        // shortcut: ruleEngine only, add transaction state before supporting other ctl settings.
+        if name == "ruleEngine"
+            && let Ok(rule_engine) = value.parse::<RuleEngineStatus>()
+        {
+            self.rule_engine = rule_engine;
+        }
     }
 
     /// The collection a rule variable reads, or `None` when this storage layer
@@ -224,10 +468,6 @@ impl Transaction {
     }
 
     /// Find the byte-preserving matches selected by a parsed variable spec.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by rule evaluation in a later port slice")
-    )]
     pub(crate) fn find_matches(&self, spec: &VariableSpec) -> Vec<MatchData> {
         let collection = self.collection(spec.variable()).map(|collection| match collection {
             VariableCollection::Single(single) => CollectionView::Single(single),
@@ -306,10 +546,6 @@ impl Transaction {
     }
 
     /// Store captures and path arguments produced by an operator.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by rule evaluation in a later port slice")
-    )]
     pub(crate) fn store_operator_outputs(&mut self, outputs: &mut Outputs) {
         for index in 0..10 {
             self.tx.remove(&index.to_string());
@@ -357,6 +593,47 @@ impl Transaction {
         self.tx.set(key, [value]);
     }
 
+    /// Clear captures and matched values from the rule evaluated previously.
+    fn reset_matched_vars(&mut self) {
+        self.matched_vars.reset();
+        for index in 0..10 {
+            self.tx.remove(&index.to_string());
+        }
+    }
+
+    /// Record the value and variable name matched by an operator.
+    pub(crate) fn record_matched_variable(&mut self, matched: &MatchData) {
+        let name = if matched.key.is_empty() {
+            matched.variable.name().to_owned()
+        } else {
+            format!("{}:{}", matched.variable.name(), matched.key)
+        };
+        self.matched_vars.add(&name, &matched.value);
+        self.matched_var.set(&matched.value);
+        self.matched_var_name.set(name);
+    }
+
+    /// Update `RULE` values before evaluating a compiled rule.
+    #[expect(clippy::too_many_arguments, reason = "fields mirror the RULE collection")]
+    pub(crate) fn set_rule_variables(
+        &mut self,
+        id: i32,
+        message: Option<String>,
+        revision: &str,
+        log_data: Option<String>,
+        severity: &str,
+    ) {
+        self.rule.set_index("id", 0, id.to_string());
+        if let Some(message) = message {
+            self.rule.set_index("msg", 0, message);
+        }
+        self.rule.set_index("rev", 0, revision);
+        if let Some(log_data) = log_data {
+            self.rule.set_index("logdata", 0, log_data);
+        }
+        self.rule.set_index("severity", 0, severity);
+    }
+
     /// Whether an argument was dropped because the configured limit was reached.
     pub fn arguments_limit_reached(&self) -> bool {
         self.arguments_limit_reached.get_bytes() == b"1"
@@ -382,11 +659,17 @@ impl Transaction {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "transaction tests use fixed valid inputs")]
 mod tests {
     use std::sync::Arc;
 
     use super::{Transaction, VariableCollection};
-    use crate::{config::WafConfig, operators::Outputs, rules::VariableSpec, types::RuleVariable};
+    use crate::{
+        config::WafConfig,
+        operators::Outputs,
+        rules::VariableSpec,
+        types::{RulePhase, RuleVariable},
+    };
 
     #[test]
     fn stores_and_matches_byte_arguments() {
@@ -497,5 +780,211 @@ mod tests {
             Some(VariableCollection::Map(_))
         ));
         assert!(tx.collection(RuleVariable::RequestBody).is_none());
+    }
+
+    #[test]
+    fn evaluates_request_header_rules_from_a_compiled_waf() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS \"@contains attack\" \"id:10,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("blocked");
+        tx.add_get_argument("q", b"an attack");
+
+        let interruption = tx.process_request_headers().unwrap();
+
+        assert_eq!(interruption.rule_id, 10);
+        assert_eq!(interruption.action, "deny");
+        assert_eq!(interruption.status, 403);
+        assert_eq!(tx.last_phase(), Some(RulePhase::RequestHeaders));
+        assert_eq!(tx.process_request_headers(), Some(interruption));
+    }
+
+    #[test]
+    fn detection_only_records_a_would_be_interruption() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine DetectionOnly\nSecRule ARGS \"@contains attack\" \"id:11,phase:1,deny\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("detect-only");
+        tx.add_get_argument("q", b"attack");
+
+        assert_eq!(tx.process_request_headers(), None);
+        assert!(tx.interruption().is_none());
+        let would_be = tx.would_be_interruption().unwrap();
+        assert_eq!(would_be.rule_id, 11);
+        assert_eq!(would_be.status, 403);
+    }
+
+    #[test]
+    fn chained_rules_only_apply_disruptive_actions_when_every_link_matches() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains first\" \"id:12,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains second\" \"\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("chain");
+        tx.add_get_argument("q", b"first only");
+
+        assert_eq!(tx.process_request_headers(), None);
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains first\" \"id:13,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains second\" \"\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("chain-match");
+        tx.add_get_argument("q", b"first and second");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 13);
+    }
+
+    #[test]
+    fn setvar_updates_tx_during_rule_evaluation() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecAction \"id:14,phase:1,setvar:TX.score=+5,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("setvar");
+        tx.set_tx_variable("score", b"2");
+
+        tx.process_request_headers();
+
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("score")).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn match_variables_are_available_to_action_macros() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains attack\" \"id:19,phase:1,setvar:TX.value=%{MATCHED_VAR},setvar:TX.name=%{MATCHED_VAR_NAME},deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("matched-vars");
+        tx.add_get_argument("q", b"an attack");
+
+        tx.process_request_headers();
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("value")).as_deref(),
+            Some("an attack")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("name")).as_deref(),
+            Some("ARGS:q")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MatchedVar, None).as_deref(),
+            Some("an attack")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::MatchedVars, Some("ARGS:q")).as_deref(),
+            Some("an attack")
+        );
+    }
+
+    #[test]
+    fn rule_variables_describe_the_rule_being_evaluated() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:21,phase:1,rev:3,severity:WARNING,msg:'blocked',logdata:'data',setvar:TX.rule=%{RULE.id}/%{RULE.msg}/%{RULE.rev}/%{RULE.severity}/%{RULE.logdata},pass\"\n\\
+                 SecAction \"id:22,phase:1,setvar:TX.previous=%{RULE.msg}/%{RULE.logdata},pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("rule-vars");
+
+        tx.process_request_headers();
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("rule")).as_deref(),
+            Some("21/blocked/3/warning/data")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("previous")).as_deref(),
+            Some("blocked/data")
+        );
+    }
+
+    #[test]
+    fn captures_are_stored_even_when_negation_makes_the_rule_miss() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS \"!@rx (attack)\" \"id:20,phase:1,capture,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("negated-capture");
+        tx.add_get_argument("q", b"attack");
+
+        assert_eq!(tx.process_request_headers(), None);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")).as_deref(), Some("attack"));
+    }
+
+    #[test]
+    fn transformations_run_before_operator_matching() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS \"@streq admin\" \"id:15,phase:1,t:lowercase,deny\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("transformed");
+        tx.add_get_argument("user", b"ADMIN");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 15);
+    }
+
+    #[test]
+    fn block_uses_phase_defaults_and_is_inert_without_them() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS \"@contains attack\" \"id:16,phase:1,block\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("block-without-default");
+        tx.add_get_argument("q", b"attack");
+
+        assert_eq!(tx.process_request_headers(), None);
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecDefaultAction \"phase:1,deny\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:17,phase:1,block\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("block-with-default");
+        tx.add_get_argument("q", b"attack");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 17);
+    }
+
+    #[test]
+    fn skip_after_skips_through_and_including_its_marker() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:16,phase:1,skipAfter:END,pass\"\n\
+                 SecAction \"id:17,phase:1,deny\"\n\
+                 SecMarker END\n\
+                 SecAction \"id:18,phase:1,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("skip-after");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 18);
     }
 }

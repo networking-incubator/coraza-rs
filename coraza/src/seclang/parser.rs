@@ -67,6 +67,7 @@ use crate::{
     types::{
         AuditEngineStatus, AuditLogFormat, AuditLogType, BodyLimitAction, RuleEngineStatus, parse_audit_log_parts,
     },
+    waf::{ConfigError, Waf},
 };
 
 /// Maximum include recursion depth to prevent `DoS` attacks.
@@ -243,6 +244,15 @@ impl Parser {
     /// Number of rules compiled so far.
     pub fn rule_count(&self) -> usize {
         self.rules.count()
+    }
+
+    /// Consume the parser and build a WAF from its configuration and compiled rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parsed configuration is invalid for WAF construction.
+    pub fn into_waf(self) -> Result<Waf, ConfigError> {
+        Waf::with_rules(self.waf_config, self.rules)
     }
 
     /// Makes later parsing skip directives that fail, instead of stopping at the first one.

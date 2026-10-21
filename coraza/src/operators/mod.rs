@@ -21,8 +21,8 @@
 //! Operators that match transaction values.
 //!
 //! This slice includes comparisons, regular expressions, phrase and path
-//! matching, IP, validation, `SQLi`, and XSS operators. Rule compilation,
-//! actions, and phase evaluation are not included yet.
+//! matching, IP, validation, `SQLi`, and XSS operators. Compiled rules use
+//! these operators during request-header evaluation.
 
 pub mod detection;
 pub mod ip;
@@ -117,10 +117,6 @@ impl Outputs {
     }
 
     /// Take the captures in the order they were produced.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by rule evaluation in a later port slice")
-    )]
     pub(crate) fn take_captures(&mut self) -> std::vec::Drain<'_, (usize, Vec<u8>)> {
         self.captures.drain(..)
     }
