@@ -327,6 +327,21 @@ impl<'a> RuleArguments<'a> {
     }
 }
 
+/// Whether a `SecRule` or `SecAction` directive declares another chain link.
+pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
+    let line = line.trim_start();
+    let (directive, options) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let actions = if directive.eq_ignore_ascii_case("SecRule") {
+        RuleArguments::parse(options).map_or("", |args| args.actions)
+    } else if directive.eq_ignore_ascii_case("SecAction") {
+        remove_matching_quotes(options.trim())
+    } else {
+        return None;
+    };
+
+    Some(parse_actions(actions).is_ok_and(|actions| actions.iter().any(|action| action.key == "chain")))
+}
+
 /// `"..."`, in which a backslash escapes the character after it; returns what's between
 /// the quotes, escapes kept.
 fn double_quoted<'i>(input: &mut &'i str) -> winnow::Result<&'i str, EmptyError> {

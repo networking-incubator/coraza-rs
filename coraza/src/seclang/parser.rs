@@ -207,6 +207,9 @@ pub struct Parser {
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
+    /// Whether later rule directives belong to a chain whose earlier member failed
+    dropping_chain: bool,
+
     /// Directives skipped because they failed, in parse order
     skipped: Vec<ParseError>,
 }
@@ -222,6 +225,7 @@ impl Parser {
             default_actions: DefaultActions::default(),
             datasets: Datasets::new(),
             skip_failed: false,
+            dropping_chain: false,
             skipped: Vec::new(),
         }
     }
@@ -346,6 +350,9 @@ impl Parser {
                     path.map_err(|error| self.error(format!("failed to expand glob pattern '{pattern}': {error}")))?,
                 );
             }
+            if files.is_empty() {
+                return Err(self.error(format!("glob pattern '{pattern}' matched no files")));
+            }
             files
         } else {
             vec![pattern_path]
@@ -393,9 +400,24 @@ impl Parser {
                 Err(_) => return Err(self.error("backticks left open".to_owned())),
             };
 
+            if self.dropping_chain
+                && let Some(has_chain) = super::rule_compiler::directive_chain_status(&directive)
+            {
+                self.skipped
+                    .push(self.error("skipped because parsing failed while a rule chain was open".to_owned()));
+                self.dropping_chain = has_chain;
+                continue;
+            }
+
             match self.evaluate_line(&directive) {
                 Err(e) if self.skip_failed => {
-                    self.rules.discard_open_chain();
+                    let chain_status = super::rule_compiler::directive_chain_status(&directive);
+                    let discarded_chain = self.rules.discard_open_chain();
+                    if let Some(has_chain) = chain_status {
+                        self.dropping_chain = has_chain;
+                    } else if discarded_chain {
+                        self.dropping_chain = true;
+                    }
                     self.skipped.push(e);
                 },
                 result => result?,
@@ -1862,6 +1884,20 @@ SecWebAppId production
     }
 
     #[test]
+    fn test_include_glob_pattern_with_no_matches() {
+        let glob_pattern = std::env::temp_dir()
+            .join(format!("coraza_glob_no_match_{}", std::process::id()))
+            .join("*.conf")
+            .to_string_lossy()
+            .into_owned();
+        let mut parser = Parser::new();
+
+        let error = parser.from_file(&glob_pattern).unwrap_err();
+
+        assert!(error.message.contains(&glob_pattern));
+    }
+
+    #[test]
     fn test_include_recursion_limit() {
         use std::{fs, io::Write as _};
 
@@ -2042,13 +2078,61 @@ SecWebAppId production
             .from_string(
                 r#"
                 SecRule ARGS "@contains a" "id:1,phase:1,deny,chain"
-                    SecRule ARGS "@nosuchop b" ""
-                SecRule ARGS "@contains c" "id:2,phase:1,deny"
+                    SecRule ARGS "@nosuchop b" "chain"
+                SecRule ARGS "@contains c" ""
+                SecAction "id:2,phase:1,pass"
                 "#,
             )
             .unwrap();
 
         assert!(parser.rules.find_by_id(1).is_none());
-        assert!(parser.rules.find_by_id(2).unwrap().chain.is_empty());
+        assert!(parser.rules.find_by_id(2).is_some());
+        assert_eq!(parser.rule_count(), 1);
+        assert_eq!(parser.skipped().len(), 2);
+    }
+
+    #[test]
+    fn test_skip_failed_chain_parent_and_links() {
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        parser
+            .from_string(
+                "SecRule ARGS \"@nosuchop a\" \"id:1,phase:1,deny,chain\"\n\
+                 SecRuleEngine On\n\
+                 SecRule ARGS \"@contains b\" \"chain\"\n\
+                 SecAction \"id:2,phase:1,pass\"\n\
+                 SecRule ARGS \"@contains c\" \"id:3,phase:1,deny\"",
+            )
+            .unwrap();
+
+        assert_eq!(parser.config().rule_engine, RuleEngineStatus::On);
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(2).is_none());
+        assert!(parser.rules.find_by_id(3).is_some());
+        assert_eq!(parser.rule_count(), 1);
+        assert_eq!(
+            parser.skipped().iter().map(|error| error.line).collect::<Vec<_>>(),
+            [1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn test_skip_failed_directive_discards_open_chain_before_following_rule() {
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,deny,chain\"\n\
+                 SecNoSuchDirective On\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,deny\"\n\
+                 SecAction \"id:3,phase:1,pass\"",
+            )
+            .unwrap();
+
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(2).is_none());
+        assert!(parser.rules.find_by_id(3).is_some());
+        assert_eq!(parser.rule_count(), 1);
+        assert_eq!(parser.skipped().len(), 2);
     }
 }
