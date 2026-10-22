@@ -73,3 +73,89 @@ func TestLifecycleSmoke(t *testing.T) {
 		t.Fatalf("second benign request was interrupted: %+v", again)
 	}
 }
+
+const serverNameDirectives = `
+SecRuleEngine On
+SecRule SERVER_NAME "@streq example.test" "id:900002,phase:1,deny,status:403"
+`
+
+func TestServerNameFromHost(t *testing.T) {
+	engine, err := bench.New(serverNameDirectives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := engine.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	withHost, err := engine.Run(smokeRequest("/anything"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !withHost.Interrupted || withHost.Status != 403 {
+		t.Fatalf("request with Host was not denied: %+v", withHost)
+	}
+
+	withoutHost := smokeRequest("/anything")
+	withoutHost.RequestHeaders = nil
+	allowed, err := engine.Run(withoutHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed.Interrupted {
+		t.Fatalf("request without Host was interrupted: %+v", allowed)
+	}
+}
+
+const loggingDirectives = `
+SecRuleEngine On
+SecRule REQUEST_URI "@contains /deny" "id:900001,phase:1,deny,status:403,log"
+SecRule REQUEST_METHOD "@streq GET" "id:900003,phase:5,pass,nolog"
+`
+
+func TestLoggingPhaseMatchesAreIncluded(t *testing.T) {
+	engine, err := bench.New(loggingDirectives)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := engine.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	allowed, err := engine.Run(smokeRequest("/allow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed.Interrupted {
+		t.Fatalf("benign request was interrupted: %+v", allowed)
+	}
+	if !containsRule(allowed.MatchedRuleIDs, 900003) {
+		t.Fatalf("allowed matched rule ids = %v, want phase-5 rule 900003", allowed.MatchedRuleIDs)
+	}
+
+	denied, err := engine.Run(smokeRequest("/deny"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !denied.Interrupted {
+		t.Fatalf("denied request was not interrupted: %+v", denied)
+	}
+	for _, id := range []int{900001, 900003} {
+		if !containsRule(denied.MatchedRuleIDs, id) {
+			t.Fatalf("denied matched rule ids = %v, want %d", denied.MatchedRuleIDs, id)
+		}
+	}
+}
+
+func containsRule(ids []int, want int) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}

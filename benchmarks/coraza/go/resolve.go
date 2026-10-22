@@ -33,6 +33,7 @@ const (
 var (
 	linkedEngineDir      string
 	linkedEngineRevision string
+	linkedEngineClean    string
 )
 
 // Profile names the module identity a benchmark run uses.
@@ -180,6 +181,7 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 	if err := verifyBuildStamp(buildStamp{
 		Dir:      linkedEngineDir,
 		Revision: linkedEngineRevision,
+		Clean:    linkedEngineClean,
 	}, dir, res.EngineRevision); err != nil {
 		return Resolution{}, err
 	}
@@ -191,16 +193,19 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 type buildStamp struct {
 	Dir      string
 	Revision string
+	Clean    string
 }
 
 // verifyBuildStamp requires the binary to have been built from the checkout
-// validated at run time. A directory replace's path alone does not prove that.
+// validated at run time, including a clean working tree at build time. A
+// directory replace's path alone does not prove that.
 func verifyBuildStamp(stamp buildStamp, dir, revision string) error {
-	if stamp.Dir == "" || stamp.Revision == "" {
+	if stamp.Dir == "" || stamp.Revision == "" || stamp.Clean != "1" {
 		return fmt.Errorf(
-			"local profile requires build-time engine identity; rebuild with -ldflags "+
+			"local profile requires build-time engine identity and a clean checkout; rebuild with -ldflags "+
 				"\"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=%s "+
-				"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=%s\"",
+				"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=%s "+
+				"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineClean=1\"",
 			dir, revision,
 		)
 	}
