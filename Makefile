@@ -81,14 +81,14 @@ audit:
 	cargo audit
 	cargo deny check
 
-# Offline corpus and table refresh tools are not runtime coverage targets.
+# Offline corpus, table and conformance refresh tools are not runtime coverage targets.
 # llvm-cov sees native test profiles; Envoy WASM callbacks are exercised in the integration job.
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
-		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs'
+		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
-		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs'
+		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
 
 fmt:
 	cargo +$(NIGHTLY) fmt --all
