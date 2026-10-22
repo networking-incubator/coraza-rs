@@ -6,12 +6,13 @@ V ?=
 NIGHTLY ?= nightly
 CARGO_TARGET_DIR ?= target
 ENVOY_WASM_IMAGE ?= coraza-rs/envoy-libperfusion:dev
+FTW_MANIFEST ?= target/ftw-smoke-result.json
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -61,6 +62,34 @@ parity-differential:
 	cargo test -p libperfusion --test oracle_differential pinned_c_oracle_matches_corpus_and_binary_cases -- --ignored --nocapture
 	cargo test -p libperfusion --test oracle_differential -- --ignored --nocapture
 	cargo test -p libperfusion --test generated_differential -- --ignored --nocapture
+
+go-harness-check:
+	@files="$$(cd benchmarks/coraza/go && gofmt -l .)"; \
+	if [ -n "$$files" ]; then printf '%s\n' "$$files"; exit 1; fi
+	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go vet ./...
+	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go test ./...
+	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go run ./cmd/checkresolve
+
+ftw-runner-check:
+	@files="$$(cd ftw-runner && gofmt -l .)"; \
+	if [ -n "$$files" ]; then printf '%s\n' "$$files"; exit 1; fi
+	cd ftw-runner && GOWORK=off GOTOOLCHAIN=local go vet ./...
+	cd ftw-runner && GOWORK=off GOTOOLCHAIN=local go test ./...
+
+coraza-example-test:
+	cargo test -p coraza --example ftw_server_async --features async-server $(_NOCAPTURE)
+
+ftw-smoke:
+	cargo build --release -p coraza --example ftw_server_async --features async-server
+	cd ftw-runner && GOWORK=off GOTOOLCHAIN=local go run . \
+		--rules testdata/smoke/rules.conf \
+		--test-dir testdata/smoke \
+		--expected-rules 1 \
+		--expected-files 1 \
+		--expected-tests 1 \
+		--expected-stages 1 \
+		--manifest "$(abspath $(FTW_MANIFEST))"
+	@python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); bad = [k for k in ("failed", "skipped", "ignored", "forced_failed") if m["results"][k]]; assert m["ok"] and not bad, (m["failures"], bad); assert all(m["counts"][k]["selected"] == m["counts"][k]["inventory"] for k in ("files", "tests", "stages"))' "$(abspath $(FTW_MANIFEST))"
 
 # -------------------------------------------------------------------
 # Quality
@@ -140,6 +169,11 @@ help:
 	@echo "  test       verify corpus and run all tests"
 	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
 	@echo "  parity-differential   run pinned C/Go corpus and generated-byte parity gates"
+	@echo "  go-harness-check      gofmt, vet, test and resolution-check the Go benchmark module"
+	@echo "  ftw-runner-check      gofmt, vet and test the FTW runner module"
+	@echo "  coraza-example-test   run the async FTW example server tests"
+	@echo "  ftw-smoke             run strict FTW conformance against the smoke fixtures"
+	@echo "    FTW_MANIFEST=...      result manifest path (default: $(FTW_MANIFEST))"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"

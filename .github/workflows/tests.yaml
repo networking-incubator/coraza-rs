@@ -104,8 +104,11 @@ jobs:
       contents: read
     env:
       TYPOS_VERSION: v1.42.1
+      TYPOS_SHA256: fe1492d6c1079c328ef66de2094b7a3a4569987ec972ab56002c5db4746a8d1b
       TAPLO_VERSION: 0.10.0
+      TAPLO_SHA256: 8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
       ACTIONLINT_VERSION: 1.7.10
+      ACTIONLINT_SHA256: f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,18 +116,25 @@ jobs:
 
       - name: Install lint tools
         run: |
-          mkdir -p "$HOME/.local/bin"
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin" "$RUNNER_TEMP/tools"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          curl -sSL "https://github.com/crate-ci/typos/releases/download/${TYPOS_VERSION}/typos-${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar xz -C "$HOME/.local/bin" ./typos
+          curl -sSL -o "$RUNNER_TEMP/tools/typos.tar.gz" \
+            "https://github.com/crate-ci/typos/releases/download/${TYPOS_VERSION}/typos-${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TYPOS_SHA256}  $RUNNER_TEMP/tools/typos.tar.gz" | sha256sum --check --strict
+          tar xzf "$RUNNER_TEMP/tools/typos.tar.gz" -C "$HOME/.local/bin" ./typos
 
-          curl -sSL "https://github.com/tamasfe/taplo/releases/download/${TAPLO_VERSION}/taplo-linux-x86_64.gz" \
-            | gunzip > "$HOME/.local/bin/taplo"
+          curl -sSL -o "$RUNNER_TEMP/tools/taplo.gz" \
+            "https://github.com/tamasfe/taplo/releases/download/${TAPLO_VERSION}/taplo-linux-x86_64.gz"
+          echo "${TAPLO_SHA256}  $RUNNER_TEMP/tools/taplo.gz" | sha256sum --check --strict
+          gunzip -c "$RUNNER_TEMP/tools/taplo.gz" > "$HOME/.local/bin/taplo"
           chmod +x "$HOME/.local/bin/taplo"
 
-          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            | tar xz -C "$HOME/.local/bin" actionlint
+          curl -sSL -o "$RUNNER_TEMP/tools/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/tools/actionlint.tar.gz" | sha256sum --check --strict
+          tar xzf "$RUNNER_TEMP/tools/actionlint.tar.gz" -C "$HOME/.local/bin" actionlint
 
       - name: Lint extra
         run: make lint-extra
