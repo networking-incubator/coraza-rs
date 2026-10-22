@@ -12,7 +12,7 @@ import (
 )
 
 func TestResolutionReportsEngineIdentity(t *testing.T) {
-	res, err := CheckResolution(context.Background())
+	res, err := checkResolution(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,15 +300,16 @@ func TestModuleRootContainsGoMod(t *testing.T) {
 
 // TestBuildInfoMatchesResolution checks what was linked into this test binary,
 // not just what go.mod declares. An ambient workspace that selected another
-// engine would fail here.
+// engine would fail here. Go 1.26 test binaries omit dependency build info, so
+// on that toolchain the test skips and cmd/checkresolve, a command binary,
+// covers the linked-engine check.
 func TestBuildInfoMatchesResolution(t *testing.T) {
-	res, err := CheckResolution(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		t.Fatal("build info is unavailable")
+	}
+	if len(info.Deps) == 0 {
+		t.Skip("Go 1.26 test binaries omit dependency build info; cmd/checkresolve covers the linked-engine check for this toolchain")
 	}
 	var dep *debug.Module
 	for _, candidate := range info.Deps {
@@ -319,6 +320,11 @@ func TestBuildInfoMatchesResolution(t *testing.T) {
 	}
 	if dep == nil {
 		t.Fatalf("engine %s is missing from build info", EngineModulePath)
+	}
+
+	res, err := checkResolution(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	switch res.Profile {
