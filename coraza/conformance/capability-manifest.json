@@ -27,7 +27,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:BeginsWith::evaluate",
         "go_reference": "internal/operators/begins_with.go",
         "fixtures": [],
         "differences": []
@@ -39,7 +39,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Contains::evaluate",
         "go_reference": "internal/operators/contains.go",
         "fixtures": [],
         "differences": []
@@ -51,7 +51,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/detection.rs:DetectSQLi::evaluate",
         "go_reference": "internal/operators/detect_sqli.go",
         "fixtures": [],
         "differences": [
@@ -65,7 +65,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/detection.rs:DetectXSS::evaluate",
         "go_reference": "internal/operators/detect_xss.go",
         "fixtures": [],
         "differences": [
@@ -79,7 +79,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:EndsWith::evaluate",
         "go_reference": "internal/operators/ends_with.go",
         "fixtures": [],
         "differences": []
@@ -91,7 +91,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Eq::evaluate",
         "go_reference": "internal/operators/eq.go",
         "fixtures": [],
         "differences": []
@@ -103,7 +103,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Ge::evaluate",
         "go_reference": "internal/operators/ge.go",
         "fixtures": [],
         "differences": []
@@ -115,7 +115,7 @@
         "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
         "go_reference": "internal/operators/geo_lookup.go",
         "fixtures": [],
         "differences": [
@@ -129,7 +129,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Gt::evaluate",
         "go_reference": "internal/operators/gt.go",
         "fixtures": [],
         "differences": []
@@ -155,7 +155,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatch::evaluate",
         "go_reference": "internal/operators/ip_match.go",
         "fixtures": [],
         "differences": []
@@ -167,7 +167,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatchFromDataset::evaluate",
         "go_reference": "internal/operators/ip_match_from_dataset.go",
         "fixtures": [],
         "differences": []
@@ -180,7 +180,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatchFromFile::evaluate",
         "go_reference": "internal/operators/ip_match_from_file.go",
         "fixtures": [],
         "differences": []
@@ -192,7 +192,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Le::evaluate",
         "go_reference": "internal/operators/le.go",
         "fixtures": [],
         "differences": []
@@ -204,7 +204,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:Lt::evaluate",
         "go_reference": "internal/operators/lt.go",
         "fixtures": [],
         "differences": []
@@ -216,7 +216,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:NoMatch::evaluate",
         "go_reference": "internal/operators/no_match.go",
         "fixtures": [],
         "differences": []
@@ -228,7 +228,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:Pm::evaluate",
         "go_reference": "internal/operators/pm.go",
         "fixtures": [],
         "differences": []
@@ -240,7 +240,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:PmFromDataset::evaluate",
         "go_reference": "internal/operators/pm_from_dataset.go",
         "fixtures": [],
         "differences": []
@@ -253,7 +253,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:PmFromFile::evaluate",
         "go_reference": "internal/operators/pm_from_file.go",
         "fixtures": [],
         "differences": []
@@ -279,7 +279,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:RestPath::evaluate",
         "go_reference": "internal/operators/restpath.go",
         "fixtures": [],
         "differences": []
@@ -291,7 +291,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:Rx::evaluate",
         "go_reference": "internal/operators/rx.go",
         "fixtures": [],
         "differences": [
@@ -305,7 +305,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/simple.rs:StrEq::evaluate",
         "go_reference": "internal/operators/streq.go",
         "fixtures": [],
         "differences": []
@@ -317,7 +317,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:StrMatch::evaluate",
         "go_reference": "internal/operators/strmatch.go",
         "fixtures": [],
         "differences": []
@@ -329,7 +329,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
         "go_reference": "internal/operators/unconditional_match.go",
         "fixtures": [],
         "differences": []
@@ -341,7 +341,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateByteRange::evaluate",
         "go_reference": "internal/operators/validate_byte_range.go",
         "fixtures": [],
         "differences": []
@@ -353,7 +353,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateNid::evaluate",
         "go_reference": "internal/operators/validate_nid.go",
         "fixtures": [],
         "differences": []
@@ -379,7 +379,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateUrlEncoding::evaluate",
         "go_reference": "internal/operators/validate_url_encoding.go",
         "fixtures": [],
         "differences": []
@@ -391,7 +391,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateUtf8Encoding::evaluate",
         "go_reference": "internal/operators/validate_utf8_encoding.go",
         "fixtures": [],
         "differences": []
@@ -403,7 +403,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
-        "evaluator": "coraza/src/operators/mod.rs:OperatorEnum::evaluate",
+        "evaluator": "coraza/src/operators/pattern.rs:Within::evaluate",
         "go_reference": "internal/operators/within.go",
         "fixtures": [],
         "differences": []
@@ -417,7 +417,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_decode",
         "go_reference": "internal/transformations/base64decode.go",
         "fixtures": [],
         "differences": []
@@ -429,7 +429,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_decode_ext",
         "go_reference": "internal/transformations/base64decodeext.go",
         "fixtures": [],
         "differences": [
@@ -443,7 +443,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_encode",
         "go_reference": "internal/transformations/base64encode.go",
         "fixtures": [],
         "differences": []
@@ -469,7 +469,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:compress_whitespace",
         "go_reference": "internal/transformations/compress_whitespace.go",
         "fixtures": [],
         "differences": [
@@ -483,7 +483,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/escape.rs:css_decode",
         "go_reference": "internal/transformations/css_decode.go",
         "fixtures": [],
         "differences": []
@@ -495,7 +495,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/escape.rs:escape_seq_decode",
         "go_reference": "internal/transformations/escape_seq_decode.go",
         "fixtures": [],
         "differences": []
@@ -507,7 +507,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:hex_decode",
         "go_reference": "internal/transformations/hex_decode.go",
         "fixtures": [],
         "differences": []
@@ -519,7 +519,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:hex_encode",
         "go_reference": "internal/transformations/hex_encode.go",
         "fixtures": [],
         "differences": []
@@ -531,7 +531,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/complex.rs:html_entity_decode",
         "go_reference": "internal/transformations/html_entity_decode.go",
         "fixtures": [],
         "differences": []
@@ -543,7 +543,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/escape.rs:js_decode",
         "go_reference": "internal/transformations/js_decode.go",
         "fixtures": [],
         "differences": [
@@ -557,7 +557,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:length",
         "go_reference": "internal/transformations/length.go",
         "fixtures": [],
         "differences": []
@@ -569,7 +569,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:lowercase",
         "go_reference": "internal/transformations/lowercase.go",
         "fixtures": [],
         "differences": []
@@ -581,7 +581,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:md5_hash",
         "go_reference": "internal/transformations/md5.go",
         "fixtures": [],
         "differences": [
@@ -595,7 +595,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:none",
         "go_reference": "internal/transformations/none.go",
         "fixtures": [],
         "differences": []
@@ -608,7 +608,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/complex.rs:normalise_path",
         "go_reference": "internal/transformations/normalise_path.go",
         "fixtures": [],
         "differences": []
@@ -621,7 +621,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/complex.rs:normalise_path_win",
         "go_reference": "internal/transformations/normalise_path_win.go",
         "fixtures": [],
         "differences": []
@@ -661,7 +661,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:remove_nulls",
         "go_reference": "internal/transformations/remove_nulls.go",
         "fixtures": [],
         "differences": []
@@ -673,7 +673,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:remove_whitespace",
         "go_reference": "internal/transformations/remove_whitespace.go",
         "fixtures": [],
         "differences": []
@@ -699,7 +699,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:replace_nulls",
         "go_reference": "internal/transformations/replace_nulls.go",
         "fixtures": [],
         "differences": []
@@ -711,7 +711,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:sha1_hash",
         "go_reference": "internal/transformations/sha1.go",
         "fixtures": [],
         "differences": [
@@ -725,7 +725,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:trim",
         "go_reference": "internal/transformations/trim.go",
         "fixtures": [],
         "differences": []
@@ -737,7 +737,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:trim_left",
         "go_reference": "internal/transformations/trim_left.go",
         "fixtures": [],
         "differences": []
@@ -749,7 +749,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:trim_right",
         "go_reference": "internal/transformations/trim_right.go",
         "fixtures": [],
         "differences": []
@@ -761,7 +761,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:uppercase",
         "go_reference": "internal/transformations/uppercase.go",
         "fixtures": [],
         "differences": []
@@ -773,7 +773,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/simple.rs:url_decode",
         "go_reference": "internal/transformations/url_decode.go",
         "fixtures": [],
         "differences": []
@@ -785,7 +785,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/escape.rs:url_decode_uni",
         "go_reference": "internal/transformations/url_decode_uni.go",
         "fixtures": [],
         "differences": []
@@ -797,7 +797,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/encoding.rs:url_encode",
         "go_reference": "internal/transformations/url_encode.go",
         "fixtures": [],
         "differences": []
@@ -809,7 +809,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
-        "evaluator": "coraza/src/rules/transformation.rs:TransformationChain::apply",
+        "evaluator": "coraza/src/transformations/escape.rs:utf8_to_unicode",
         "go_reference": "internal/transformations/utf8_to_unicode.go",
         "fixtures": [],
         "differences": []
@@ -835,7 +835,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::allow",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -859,7 +859,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -885,7 +885,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -897,7 +897,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -961,7 +961,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::id",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1023,7 +1023,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::msg",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1121,7 +1121,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_setenv",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1133,7 +1133,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_setvar",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -1159,7 +1159,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_skip",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1171,7 +1171,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_skip_after",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1195,7 +1195,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/actions/mod.rs:transformation_by_name",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1207,7 +1207,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
-        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::tags",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1232,7 +1232,7 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "producer": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
         "go_reference": null,
         "fixtures": [],
@@ -1247,7 +1247,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_action",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1273,7 +1273,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_arguments_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1285,7 +1285,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_engine",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1297,7 +1297,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1309,7 +1309,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_dir_mode",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1321,7 +1321,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_file_mode",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1333,7 +1333,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_format",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1345,7 +1345,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_parts",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1357,7 +1357,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_relevant_status",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1369,7 +1369,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_storage_dir",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1381,7 +1381,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_type",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -1491,7 +1491,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_dataset",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1531,7 +1531,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_default_action",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1641,7 +1641,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_ignore_rule_compilation_errors",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -1655,7 +1655,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_marker",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1695,7 +1695,7 @@
         "state": "rejected",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -1709,7 +1709,7 @@
         "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules_fail_action",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -1723,7 +1723,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_access",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1749,7 +1749,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_json_depth_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1761,7 +1761,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1773,7 +1773,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit_action",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1799,7 +1799,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_access",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1811,7 +1811,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_json_depth_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1823,7 +1823,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1835,7 +1835,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit_action",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1847,7 +1847,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_type",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1859,7 +1859,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_types_clear",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1871,7 +1871,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1883,7 +1883,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_engine",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1909,7 +1909,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_id",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1921,7 +1921,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_msg",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1933,7 +1933,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_tag",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1959,7 +1959,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_action_by_id",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1971,7 +1971,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_id",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1997,7 +1997,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_tag",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -2009,7 +2009,7 @@
         "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rx_pre_filter",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -2079,7 +2079,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_dir",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -2091,7 +2091,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_file_limit",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -2117,7 +2117,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
-        "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_keep_files",
         "go_reference": null,
         "fixtures": [],
         "differences": [
@@ -2146,8 +2146,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2158,8 +2158,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2170,8 +2170,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2182,8 +2182,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2194,8 +2194,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2206,8 +2206,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2218,8 +2218,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2230,8 +2230,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2242,8 +2242,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2282,8 +2282,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2294,8 +2294,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2306,8 +2306,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2318,8 +2318,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2330,8 +2330,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2356,8 +2356,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2410,8 +2410,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2422,8 +2422,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2462,8 +2462,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2474,8 +2474,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2486,8 +2486,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2498,8 +2498,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2580,8 +2580,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2606,8 +2606,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2618,8 +2618,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2630,8 +2630,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2684,8 +2684,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2724,8 +2724,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2736,8 +2736,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2748,8 +2748,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2774,8 +2774,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2814,8 +2814,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2840,8 +2840,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2852,8 +2852,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2864,8 +2864,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2876,8 +2876,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2888,8 +2888,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2900,8 +2900,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2926,8 +2926,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2938,8 +2938,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2950,8 +2950,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2962,8 +2962,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2988,8 +2988,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3000,8 +3000,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3026,8 +3026,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3038,8 +3038,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3050,8 +3050,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3076,8 +3076,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3088,8 +3088,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3100,8 +3100,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3112,8 +3112,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3124,8 +3124,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3136,8 +3136,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3148,8 +3148,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3160,8 +3160,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3172,8 +3172,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3184,8 +3184,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3196,8 +3196,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3208,8 +3208,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3220,8 +3220,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3232,8 +3232,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3244,8 +3244,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3256,8 +3256,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3268,8 +3268,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3280,8 +3280,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3292,8 +3292,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3458,8 +3458,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3470,8 +3470,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3538,8 +3538,8 @@
         ],
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": "coraza/src/types/variables.rs:RuleVariable",
-        "evaluator": "coraza/src/transaction.rs:variable_storage!",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -3737,7 +3737,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_request_body_processor",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -3773,7 +3773,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_response_body_processor",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -3833,7 +3833,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -3845,7 +3845,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -3857,7 +3857,7 @@
         "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []

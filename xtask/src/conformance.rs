@@ -83,6 +83,14 @@ enum Source {
     Variables,
 }
 
+/// Returns true when the group's source names are effective registry entries.
+///
+/// `VARIABLES` also lists names without a storage arm, so an unavailable
+/// variable is not a contradiction; the drift test validates that state.
+fn is_registry(spec: &GroupSpec) -> bool {
+    !matches!(&spec.source, Source::Variables)
+}
+
 /// One capability group and its registry and dispatch symbols.
 struct GroupSpec {
     /// Group key in the manifest.
@@ -381,6 +389,7 @@ fn optional_strings(value: &Value, field: &str, context: &str) -> Result<Vec<Str
 
 /// Builds one group's entries from source names and human overrides.
 fn build_entries(
+    root: &Path,
     spec: &GroupSpec,
     source: &[String],
     overrides: &Value,
@@ -403,6 +412,13 @@ fn build_entries(
         if !STATES.contains(&state) {
             return Err(format!("{context} {name} has unknown state {state}"));
         }
+        let producer_override = optional_str(item, "producer", &context)?;
+        let evaluator_override = optional_str(item, "evaluator", &context)?;
+        if state == "unavailable" && (producer_override.is_some() || evaluator_override.is_some()) {
+            return Err(format!(
+                "{context} {name} is unavailable and must not override producer or evaluator"
+            ));
+        }
         let mut names = vec![name.clone()];
         names.extend(optional_strings(item, "aliases", &context)?);
         let mut present = Vec::with_capacity(names.len());
@@ -420,10 +436,29 @@ fn build_entries(
                 "{context} {name} is marked {state} but is not present in source"
             ));
         }
+        if state == "unavailable" && present.iter().any(|value| *value) && is_registry(spec) {
+            return Err(format!(
+                "{context} {name} is marked unavailable but is present in source"
+            ));
+        }
         let (producer, evaluator) = if state == "unavailable" {
             (None, None)
         } else {
-            (Some(spec.producer.to_owned()), Some(spec.evaluator.to_owned()))
+            let producer = match producer_override {
+                Some(value) => {
+                    verify_symbol(root, &value)?;
+                    value
+                },
+                None => spec.producer.to_owned(),
+            };
+            let evaluator = match evaluator_override {
+                Some(value) => {
+                    verify_symbol(root, &value)?;
+                    value
+                },
+                None => spec.evaluator.to_owned(),
+            };
+            (Some(producer), Some(evaluator))
         };
         entries.push(Entry {
             names,
@@ -490,7 +525,7 @@ fn generate(root: &Path) -> Result<String, String> {
         verify_symbol(root, spec.producer)?;
         verify_symbol(root, spec.evaluator)?;
         let source = source_names(root, spec)?;
-        let entries = build_entries(spec, &source, groups, go_commit)?;
+        let entries = build_entries(root, spec, &source, groups, go_commit)?;
         rendered.push((spec.key, entries));
     }
     render_manifest(reference, &rendered)
@@ -649,6 +684,37 @@ fn render_manifest(reference: &Value, groups: &[(&str, Vec<Entry>)]) -> Result<S
 // Checks
 // -----------------------------------------------------------------------------
 
+/// Returns the affected group and names for entries that still need classification.
+fn review_required(rendered: &str) -> Result<Vec<String>, String> {
+    let manifest: Value =
+        serde_json::from_str(rendered).map_err(|error| format!("generated manifest is not valid JSON: {error}"))?;
+    let groups = manifest
+        .get("capability_groups")
+        .and_then(Value::as_object)
+        .ok_or("generated manifest has no capability_groups object")?;
+    let mut found = Vec::new();
+    for (group, entries) in groups {
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| format!("generated manifest group {group} is not an array"))?;
+        for entry in entries {
+            if entry.get("go_reference").and_then(Value::as_str) != Some(REVIEW_GO_REFERENCE) {
+                continue;
+            }
+            let names = entry
+                .get("names")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("generated manifest {group} entry has no names array"))?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            found.push(format!("{group}: {names}"));
+        }
+    }
+    Ok(found)
+}
+
 fn check(root: &Path) -> Result<(), String> {
     let expected = generate(root)?;
     let path = root.join(MANIFEST);
@@ -656,6 +722,13 @@ fn check(root: &Path) -> Result<(), String> {
     if expected != actual {
         return Err(format!(
             "{MANIFEST} is out of date; run `cargo xtask conformance-refresh`"
+        ));
+    }
+    let unclassified = review_required(&expected)?;
+    if !unclassified.is_empty() {
+        return Err(format!(
+            "unclassified source capabilities with go_reference \"{REVIEW_GO_REFERENCE}\": {}; add an override",
+            unclassified.join("; ")
         ));
     }
     check_ledger(root)?;
@@ -1010,4 +1083,31 @@ fn check_example(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_required_reports_unclassified_group_and_name() {
+        let rendered = r#"{
+            "capability_groups": {
+                "operators": [
+                    {"names": ["newOperator"], "go_reference": "review required"},
+                    {"names": ["eq"], "go_reference": "internal/operators/eq.go"}
+                ]
+            }
+        }"#;
+        assert_eq!(
+            review_required(rendered).unwrap(),
+            vec!["operators: newOperator".to_owned()]
+        );
+    }
+
+    #[test]
+    fn review_required_accepts_classified_entries() {
+        let rendered = r#"{"capability_groups": {"operators": []}}"#;
+        assert!(review_required(rendered).unwrap().is_empty());
+    }
 }
