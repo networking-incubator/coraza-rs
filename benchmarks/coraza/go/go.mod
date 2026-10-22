@@ -2,7 +2,7 @@ module github.com/corazawaf/coraza-rs/benchmarks/coraza/go
 
 go 1.26.0
 
-require github.com/corazawaf/coraza/v3 v3.0.0
+require github.com/corazawaf/coraza/v3 v3.8.1
 
 require (
 	github.com/corazawaf/libinjection-go v0.3.4 // indirect
@@ -24,5 +24,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
-
-replace github.com/corazawaf/coraza/v3 => ../../../../coraza

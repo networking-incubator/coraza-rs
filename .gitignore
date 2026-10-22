@@ -1,6 +1,10 @@
 # Cargo build output
 target
 
+# Generated Go local-profile module files
+benchmarks/coraza/go/local.mod
+benchmarks/coraza/go/local.sum
+
 # Test artifacts
 **/*.db
 

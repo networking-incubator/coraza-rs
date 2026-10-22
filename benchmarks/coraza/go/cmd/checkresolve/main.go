@@ -1,8 +1,8 @@
 // Copyright 2026 Coraza Rust Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Command checkresolve prints the resolved engine source as JSON and exits
-// non-zero when the resolution is not the pinned local checkout.
+// Command checkresolve prints the resolved engine identity as JSON and exits
+// non-zero when the resolution does not match the active profile.
 package main
 
 import (
