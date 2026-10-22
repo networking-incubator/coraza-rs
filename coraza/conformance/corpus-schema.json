@@ -1,6 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/networking-incubator/coraza-rs/coraza/conformance/corpus-schema.json",
+  "schema_version": 1,
+  "$comment": "Hand-maintained contract, not generated. Change it together with example-case.json.",
   "title": "Coraza byte-event conformance case",
   "description": "One ordered byte-event case replayed by the native Go and Rust drivers. Arbitrary bytes are inline base64 or a referenced binary fixture. Arrays of headers preserve order and repeats. fixture_sha256 is the SHA-256 of the primary referenced fixture; for a case with no fixture reference it is the SHA-256 of request.body followed by response.body.",
   "type": "object",
