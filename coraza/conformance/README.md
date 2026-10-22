@@ -13,14 +13,23 @@ source-derived fields are recomputed from the Rust source on every run:
   `VARIABLES` table);
 - `reference_revision` from the pinned Go reference;
 - `producer` and `evaluator`, the group registry and dispatch symbols for
-  implemented capabilities.
+  implemented capabilities, or the entry's override when one is present.
 
 `capability-overrides.json` is hand-maintained. It holds the human decisions
 keyed by group and primary name: `state`, `go_reference`, `fixtures`,
-`differences`, and optional `notes` (review context that is not emitted into
-the manifest). Optional `aliases` groups spellings that share one entry. The
-top-level `reference` block pins the profiles and commits; it is copied into
-the manifest.
+`differences`, optional `producer` and `evaluator`, and optional `notes`
+(review context that is not emitted into the manifest). Optional `aliases`
+groups spellings that share one entry. The top-level `reference` block pins the
+profiles and commits; it is copied into the manifest.
+
+For an entry whose state is not `unavailable`, an optional `producer` or
+`evaluator` overrides the group default for that field. Each override is
+verified against the source the same way the group defaults are; generation
+fails if the symbol does not resolve. Unavailable entries must not have
+`producer` or `evaluator` overrides, and an explicit `unavailable` override for
+a name in a group registry fails generation. The `variables` group is a name
+table rather than a runtime registry, so an unavailable variable there is not a
+contradiction; the drift test validates that state.
 
 `difference-ledger.md` is hand-maintained. It records reviewed differences
 against `libperfusion/tests/parity/mismatch-ledger.md` and any shared-corpus
@@ -62,15 +71,17 @@ indentation. Running the refresh twice must produce no diff.
 ## Adding a capability
 
 1. Add the capability to the Rust source.
-2. Run `cargo xtask conformance-refresh`.
+2. Run `cargo xtask conformance-refresh`. It writes the manifest.
 3. If the name is not covered by an override, the manifest gains an
    `unavailable` entry with `go_reference` set to `review required` and a
-   `differences` note. This keeps the capability visible; it is never dropped
-   silently.
+   `differences` note, and the refresh exits after writing because the
+   subsequent check fails. This keeps the capability visible; it is never
+   dropped silently.
 4. Add an override for the name with the reviewed `state`, `go_reference`,
-   `fixtures`, and `differences`, then refresh again. If the capability is
-   implemented, the source membership check fails until the state is no
-   longer `unavailable`.
+   `fixtures`, and `differences`, then refresh again. `cargo xtask
+   conformance-check` fails while any entry still has `go_reference` set to
+   `review required`, listing the affected group and names, until the override
+   classifies the name.
 
 ## Adding a difference review
 
