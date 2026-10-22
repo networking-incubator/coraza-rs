@@ -10,7 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"runtime/debug"
 	"strings"
 )
 
@@ -125,6 +125,14 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 	res.Profile = profile
 	res.EngineDir = res.Engine.Dir
 
+	linked, err := linkedEngine()
+	if err != nil {
+		return Resolution{}, err
+	}
+	if err := verifyLinkedEngine(profile, res.Engine, linked); err != nil {
+		return Resolution{}, err
+	}
+
 	if profile == ProfileUpstream {
 		return res, nil
 	}
@@ -162,12 +170,69 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 	return res, nil
 }
 
-func moduleRoot() (string, error) {
-	_, file, _, ok := runtime.Caller(0)
+// linkedEngine returns the engine module recorded in this binary's build info.
+func linkedEngine() (debug.Module, error) {
+	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "", fmt.Errorf("locate module root: runtime.Caller failed")
+		return debug.Module{}, fmt.Errorf("build info is unavailable")
 	}
-	return filepath.Dir(file), nil
+	for _, dep := range info.Deps {
+		if dep.Path == EngineModulePath {
+			return *dep, nil
+		}
+	}
+	return debug.Module{}, fmt.Errorf("%s is not linked into this binary", EngineModulePath)
+}
+
+// verifyLinkedEngine checks the engine actually linked into this binary matches
+// the resolved profile, so a different GOFLAGS at run time cannot make the
+// report describe an engine the binary did not use.
+func verifyLinkedEngine(profile Profile, resolved Module, linked debug.Module) error {
+	switch profile {
+	case ProfileUpstream:
+		if linked.Replace != nil {
+			return fmt.Errorf(
+				"linked engine uses replace %q, but the resolved profile is upstream",
+				linked.Replace.Path,
+			)
+		}
+		if linked.Version != resolved.Version {
+			return fmt.Errorf("linked engine version is %q, resolved version is %q", linked.Version, resolved.Version)
+		}
+	case ProfileLocal:
+		if resolved.Replace == nil {
+			return fmt.Errorf("local profile has no resolved replace")
+		}
+		if linked.Replace == nil {
+			return fmt.Errorf("linked engine %s %s is not the local replacement", linked.Path, linked.Version)
+		}
+		if linked.Replace.Path != resolved.Replace.Path {
+			return fmt.Errorf(
+				"linked replace path is %q, resolved replace path is %q",
+				linked.Replace.Path, resolved.Replace.Path,
+			)
+		}
+		if linked.Replace.Version != "" {
+			return fmt.Errorf("linked replace uses module version %q, want a directory replace", linked.Replace.Version)
+		}
+	default:
+		return fmt.Errorf("unknown profile %q", profile)
+	}
+	return nil
+}
+
+// moduleRoot returns the module directory from the runtime working directory.
+// The caller must run from the module directory: runtime.Caller source paths are
+// not filesystem paths under -trimpath.
+func moduleRoot() (string, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		return "", fmt.Errorf("run from the module directory, %s has no go.mod: %w", root, err)
+	}
+	return root, nil
 }
 
 func runGo(ctx context.Context, dir string, args ...string) ([]byte, error) {
