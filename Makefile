@@ -7,12 +7,23 @@ NIGHTLY ?= nightly
 CARGO_TARGET_DIR ?= target
 ENVOY_WASM_IMAGE ?= coraza-rs/envoy-libperfusion:dev
 FTW_MANIFEST ?= target/ftw-smoke-result.json
+CORAZA_WORKLOADS ?= benchmarks/coraza/workloads
+BENCH_OUT ?= target/coraza-bench
+CORAZA_REPETITIONS ?= 3
+CORAZA_ITERATIONS ?= 1000
+CORAZA_GO_PROFILE ?= auto
+CORAZA_CHECKRESOLVE_CMD ?=
+CORAZA_PARITY_CMD ?=
+CORAZA_RUST_BUILD_CMD ?=
+CORAZA_RUST_DRIVER_CMD ?=
+CORAZA_GO_BUILD_CMD ?=
+CORAZA_GO_DRIVER_CMD ?=
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check coraza-coordinator-check coraza-parity coraza-bench ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -69,6 +80,38 @@ go-harness-check:
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go vet ./...
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go test ./...
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go run ./cmd/checkresolve
+
+coraza-coordinator-check:
+	@files="$$(cd benchmarks/coraza/coordinator && gofmt -l .)"; \
+	if [ -n "$$files" ]; then printf '%s\n' "$$files"; exit 1; fi
+	cd benchmarks/coraza/coordinator && GOWORK=off GOTOOLCHAIN=local go vet ./...
+	cd benchmarks/coraza/coordinator && GOWORK=off GOTOOLCHAIN=local go test ./...
+
+coraza-parity:
+	cd benchmarks/coraza/coordinator && \
+		CORAZA_REPO="$(abspath .)" \
+		CORAZA_WORKLOADS="$(abspath $(CORAZA_WORKLOADS))" \
+		BENCH_OUT="$(abspath $(BENCH_OUT))" \
+		CORAZA_GO_PROFILE="$(CORAZA_GO_PROFILE)" \
+		CORAZA_CHECKRESOLVE_CMD="$(CORAZA_CHECKRESOLVE_CMD)" \
+		CORAZA_PARITY_CMD="$(CORAZA_PARITY_CMD)" \
+		GOWORK=off GOTOOLCHAIN=local go run . parity
+
+coraza-bench:
+	cd benchmarks/coraza/coordinator && \
+		CORAZA_REPO="$(abspath .)" \
+		CORAZA_WORKLOADS="$(abspath $(CORAZA_WORKLOADS))" \
+		BENCH_OUT="$(abspath $(BENCH_OUT))" \
+		CORAZA_GO_PROFILE="$(CORAZA_GO_PROFILE)" \
+		CORAZA_CHECKRESOLVE_CMD="$(CORAZA_CHECKRESOLVE_CMD)" \
+		CORAZA_PARITY_CMD="$(CORAZA_PARITY_CMD)" \
+		CORAZA_REPETITIONS="$(CORAZA_REPETITIONS)" \
+		CORAZA_ITERATIONS="$(CORAZA_ITERATIONS)" \
+		CORAZA_RUST_BUILD_CMD="$(CORAZA_RUST_BUILD_CMD)" \
+		CORAZA_RUST_DRIVER_CMD="$(CORAZA_RUST_DRIVER_CMD)" \
+		CORAZA_GO_BUILD_CMD="$(CORAZA_GO_BUILD_CMD)" \
+		CORAZA_GO_DRIVER_CMD="$(CORAZA_GO_DRIVER_CMD)" \
+		GOWORK=off GOTOOLCHAIN=local go run . bench
 
 ftw-runner-check:
 	@files="$$(cd ftw-runner && gofmt -l .)"; \
@@ -171,6 +214,18 @@ help:
 	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
 	@echo "  parity-differential   run pinned C/Go corpus and generated-byte parity gates"
 	@echo "  go-harness-check      gofmt, vet, test and resolution-check the Go benchmark module"
+	@echo "  coraza-coordinator-check  gofmt, vet and test the Coraza benchmark coordinator"
+	@echo "  coraza-parity         validate identities and run the correctness parity gate"
+	@echo "  coraza-bench          run the correctness gate and the paired timing protocol"
+	@echo "    CORAZA_WORKLOADS=...  workload directory (default: $(CORAZA_WORKLOADS))"
+	@echo "    BENCH_OUT=...         artifact root (default: $(BENCH_OUT))"
+	@echo "    CORAZA_REPETITIONS=...  paired repetitions, at least 3 (default: $(CORAZA_REPETITIONS))"
+	@echo "    CORAZA_ITERATIONS=...   driver iterations (default: $(CORAZA_ITERATIONS))"
+	@echo "    CORAZA_GO_PROFILE=...   auto, upstream or local (default: $(CORAZA_GO_PROFILE))"
+	@echo "    CORAZA_CHECKRESOLVE_CMD=...  stamped checkresolve command for the local profile"
+	@echo "    CORAZA_PARITY_CMD=...   parity runner command (default: go run ./cmd/parity)"
+	@echo "    CORAZA_RUST_DRIVER_CMD=... / CORAZA_GO_DRIVER_CMD=...  prebuilt driver commands"
+	@echo "    CORAZA_RUST_BUILD_CMD=... / CORAZA_GO_BUILD_CMD=...    build commands with driver commands"
 	@echo "  ftw-runner-check      gofmt, vet and test the FTW runner module"
 	@echo "  coraza-example-test   run the async FTW example server tests"
 	@echo "  ftw-smoke             run strict FTW conformance against the smoke fixtures"
