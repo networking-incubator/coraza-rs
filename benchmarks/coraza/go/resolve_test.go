@@ -180,6 +180,17 @@ func TestVerifyLinkedEngine(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:     "local version mismatch",
+			profile:  ProfileLocal,
+			resolved: local,
+			linked: debug.Module{
+				Path:    EngineModulePath,
+				Version: "v3.7.0",
+				Replace: &debug.Module{Path: "../coraza"},
+			},
+			wantErr: true,
+		},
+		{
 			name:     "local replacement by version",
 			profile:  ProfileLocal,
 			resolved: local,
@@ -204,6 +215,55 @@ func TestVerifyLinkedEngine(t *testing.T) {
 			err := verifyLinkedEngine(tt.profile, tt.resolved, tt.linked)
 			if tt.wantErr && err == nil {
 				t.Fatal("verifyLinkedEngine() = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestVerifyBuildStamp(t *testing.T) {
+	dir := t.TempDir()
+	other := t.TempDir()
+	const revision = "d9cc9befc2721fd217ce1660a0e91aca1157221d"
+
+	tests := []struct {
+		name    string
+		stamp   buildStamp
+		wantErr bool
+	}{
+		{
+			name:  "matching stamp",
+			stamp: buildStamp{Dir: dir, Revision: revision},
+		},
+		{
+			name:    "missing dir",
+			stamp:   buildStamp{Revision: revision},
+			wantErr: true,
+		},
+		{
+			name:    "missing revision",
+			stamp:   buildStamp{Dir: dir},
+			wantErr: true,
+		},
+		{
+			name:    "different dir",
+			stamp:   buildStamp{Dir: other, Revision: revision},
+			wantErr: true,
+		},
+		{
+			name:    "different revision",
+			stamp:   buildStamp{Dir: dir, Revision: "abc"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyBuildStamp(tt.stamp, dir, revision)
+			if tt.wantErr && err == nil {
+				t.Fatal("verifyBuildStamp() = nil, want error")
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatal(err)

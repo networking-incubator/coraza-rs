@@ -25,6 +25,16 @@ const (
 	PinnedEngineRevision = "d9cc9befc2721fd217ce1660a0e91aca1157221d"
 )
 
+// Build-time identity for the local profile, set with
+// `-ldflags "-X <package>.linkedEngineDir=<dir> -X <package>.linkedEngineRevision=<rev>"`.
+// Go build info records a directory replace's path but not the replaced
+// checkout's revision, so a prebuilt binary cannot otherwise prove it was built
+// from the checkout validated at run time.
+var (
+	linkedEngineDir      string
+	linkedEngineRevision string
+)
+
 // Profile names the module identity a benchmark run uses.
 type Profile string
 
@@ -167,7 +177,47 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 		)
 	}
 
+	if err := verifyBuildStamp(buildStamp{
+		Dir:      linkedEngineDir,
+		Revision: linkedEngineRevision,
+	}, dir, res.EngineRevision); err != nil {
+		return Resolution{}, err
+	}
+
 	return res, nil
+}
+
+// buildStamp is the engine identity recorded in the binary at build time.
+type buildStamp struct {
+	Dir      string
+	Revision string
+}
+
+// verifyBuildStamp requires the binary to have been built from the checkout
+// validated at run time. A directory replace's path alone does not prove that.
+func verifyBuildStamp(stamp buildStamp, dir, revision string) error {
+	if stamp.Dir == "" || stamp.Revision == "" {
+		return fmt.Errorf(
+			"local profile requires build-time engine identity; rebuild with -ldflags "+
+				"\"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=%s "+
+				"-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=%s\"",
+			dir, revision,
+		)
+	}
+	stampDir, err := filepath.EvalSymlinks(stamp.Dir)
+	if err != nil {
+		return fmt.Errorf("build-time engine dir %q: %w", stamp.Dir, err)
+	}
+	if stampDir != dir {
+		return fmt.Errorf("binary was built from engine dir %q, validated checkout is %q", stampDir, dir)
+	}
+	if stamp.Revision != revision {
+		return fmt.Errorf(
+			"binary was built from engine revision %s, validated checkout is %s",
+			stamp.Revision, revision,
+		)
+	}
+	return nil
 }
 
 // linkedEngine returns the engine module recorded in this binary's build info.
@@ -212,8 +262,8 @@ func verifyLinkedEngine(profile Profile, resolved Module, linked debug.Module) e
 				linked.Replace.Path, resolved.Replace.Path,
 			)
 		}
-		if linked.Replace.Version != "" {
-			return fmt.Errorf("linked replace uses module version %q, want a directory replace", linked.Replace.Version)
+		if linked.Version != resolved.Version {
+			return fmt.Errorf("linked engine version is %q, resolved version is %q", linked.Version, resolved.Version)
 		}
 	default:
 		return fmt.Errorf("unknown profile %q", profile)
