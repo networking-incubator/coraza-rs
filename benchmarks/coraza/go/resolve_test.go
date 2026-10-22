@@ -5,6 +5,8 @@ package bench
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"testing"
 )
@@ -108,6 +110,115 @@ func TestClassifyModule(t *testing.T) {
 				t.Fatalf("classifyModule(%+v) = %q, want %q", tt.engine, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestVerifyLinkedEngine(t *testing.T) {
+	upstream := Module{Path: EngineModulePath, Version: ExpectedEngineVersion}
+	local := Module{
+		Path:    EngineModulePath,
+		Version: ExpectedEngineVersion,
+		Replace: &Module{Path: "../coraza", Dir: "/tmp/coraza"},
+	}
+	tests := []struct {
+		name     string
+		profile  Profile
+		resolved Module
+		linked   debug.Module
+		wantErr  bool
+	}{
+		{
+			name:     "upstream match",
+			profile:  ProfileUpstream,
+			resolved: upstream,
+			linked:   debug.Module{Path: EngineModulePath, Version: ExpectedEngineVersion},
+		},
+		{
+			name:     "upstream version mismatch",
+			profile:  ProfileUpstream,
+			resolved: upstream,
+			linked:   debug.Module{Path: EngineModulePath, Version: "v3.7.0"},
+			wantErr:  true,
+		},
+		{
+			name:     "upstream linked replacement",
+			profile:  ProfileUpstream,
+			resolved: upstream,
+			linked: debug.Module{
+				Path:    EngineModulePath,
+				Version: ExpectedEngineVersion,
+				Replace: &debug.Module{Path: "../coraza"},
+			},
+			wantErr: true,
+		},
+		{
+			name:     "local match",
+			profile:  ProfileLocal,
+			resolved: local,
+			linked: debug.Module{
+				Path:    EngineModulePath,
+				Version: ExpectedEngineVersion,
+				Replace: &debug.Module{Path: "../coraza"},
+			},
+		},
+		{
+			name:     "local linked without replacement",
+			profile:  ProfileLocal,
+			resolved: local,
+			linked:   debug.Module{Path: EngineModulePath, Version: ExpectedEngineVersion},
+			wantErr:  true,
+		},
+		{
+			name:     "local replacement mismatch",
+			profile:  ProfileLocal,
+			resolved: local,
+			linked: debug.Module{
+				Path:    EngineModulePath,
+				Version: ExpectedEngineVersion,
+				Replace: &debug.Module{Path: "../other"},
+			},
+			wantErr: true,
+		},
+		{
+			name:     "local replacement by version",
+			profile:  ProfileLocal,
+			resolved: local,
+			linked: debug.Module{
+				Path:    EngineModulePath,
+				Version: ExpectedEngineVersion,
+				Replace: &debug.Module{Path: EngineModulePath, Version: "v3.7.0"},
+			},
+			wantErr: true,
+		},
+		{
+			name:     "unknown profile",
+			profile:  Profile("other"),
+			resolved: upstream,
+			linked:   debug.Module{Path: EngineModulePath, Version: ExpectedEngineVersion},
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyLinkedEngine(tt.profile, tt.resolved, tt.linked)
+			if tt.wantErr && err == nil {
+				t.Fatal("verifyLinkedEngine() = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestModuleRootContainsGoMod(t *testing.T) {
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatalf("module root %q has no go.mod: %v", root, err)
 	}
 }
 

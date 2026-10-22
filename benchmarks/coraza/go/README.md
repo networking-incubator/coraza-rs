@@ -33,7 +33,11 @@ implicitly. An inherited `GOFLAGS` is preserved.
 The resolution report is the source of identity for a run. `cmd/checkresolve`
 prints it as JSON, including the profile, module version, engine directory and,
 for the local profile, the revision and cleanliness, then exits non-zero on
-mismatch. Run it before any measurement.
+mismatch. Run it before any measurement. The check also compares the engine
+recorded in the running binary's build info with the resolved profile, so a
+different `GOFLAGS` cannot make the report describe an engine the binary did not
+link. Run the command from the module directory; the working directory is the
+module root.
 
 To assess a local checkout, a coordinator generates an alternate module file
 with the directory replace and runs with `GOFLAGS=-modfile=local.mod`. The
