@@ -5,9 +5,14 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,10 +82,8 @@ func run() error {
 
 	// Wait for server to be ready
 	fmt.Println("Waiting for server to be ready...")
-	time.Sleep(2 * time.Second)
-
-	if !server.IsHealthy() {
-		return fmt.Errorf("server failed to start properly")
+	if err := server.WaitUntilReady(30 * time.Second); err != nil {
+		return err
 	}
 	fmt.Printf("Server ready on http://localhost:%d\n\n", serverPort)
 
@@ -98,17 +101,27 @@ func run() error {
 
 // Server represents the Rust FTW server process
 type Server struct {
-	cmd       *exec.Cmd
-	port      int
-	logfile   string
-	rulesFile string
+	cmd            *exec.Cmd
+	port           int
+	logfile        string
+	rulesFile      string
+	readinessToken string
+	done           chan struct{}
+	waitErr        error
 }
 
 // Start starts the server process
 func (s *Server) Start() error {
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return fmt.Errorf("failed to generate server readiness token: %w", err)
+	}
+	s.readinessToken = hex.EncodeToString(token)
+
 	args := []string{
 		"--port", fmt.Sprintf("%d", s.port),
 		"--logfile", s.logfile,
+		"--readiness-token", s.readinessToken,
 	}
 
 	if s.rulesFile != "" {
@@ -119,36 +132,88 @@ func (s *Server) Start() error {
 	s.cmd.Stdout = os.Stdout
 	s.cmd.Stderr = os.Stderr
 
-	return s.cmd.Start()
+	if err := s.cmd.Start(); err != nil {
+		return err
+	}
+	s.done = make(chan struct{})
+	go func() {
+		s.waitErr = s.cmd.Wait()
+		close(s.done)
+	}()
+	return nil
 }
 
 // Stop stops the server process
 func (s *Server) Stop() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		fmt.Println("\nStopping server...")
-		if err := s.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			fmt.Fprintf(os.Stderr, "failed to stop FTW server: %v\n", err)
+		select {
+		case <-s.done:
+		default:
+			if err := s.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				fmt.Fprintf(os.Stderr, "failed to stop FTW server: %v\n", err)
+			}
+			<-s.done
 		}
-		_ = s.cmd.Wait()
 		s.cmd = nil
 	}
 }
 
-// IsHealthy checks if server is responding
-func (s *Server) IsHealthy() bool {
-	// Try to connect to server
-	// For a WAF, 403 (blocked) is also a healthy response - it means the server is running
-	cmd := exec.Command("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-		fmt.Sprintf("http://localhost:%d/", s.port))
+// WaitUntilReady polls until this server responds or the process exits.
+func (s *Server) WaitUntilReady(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return s.exitedBeforeReady()
+		default:
+		}
+		if s.IsHealthy(ctx) {
+			select {
+			case <-s.done:
+				return s.exitedBeforeReady()
+			default:
+				return nil
+			}
+		}
+		select {
+		case <-s.done:
+			return s.exitedBeforeReady()
+		case <-ctx.Done():
+			return fmt.Errorf("server did not become ready within %s: %w", timeout, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
 
-	output, err := cmd.Output()
+func (s *Server) exitedBeforeReady() error {
+	if s.waitErr != nil {
+		return fmt.Errorf("server process exited before becoming ready: %w", s.waitErr)
+	}
+	return errors.New("server process exited before becoming ready")
+}
+
+// IsHealthy verifies the response token emitted only by this server process.
+func (s *Server) IsHealthy(ctx context.Context) bool {
+	url := fmt.Sprintf("http://127.0.0.1:%d/.well-known/coraza-ftw-health/%s", s.port, s.readinessToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
+	resp, err := (&http.Client{CheckRedirect: stopRedirects}).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(len(s.readinessToken)+1)))
+	return err == nil && resp.StatusCode == http.StatusOK && string(body) == s.readinessToken
+}
 
-	status := string(output)
-	// Accept 200 (OK) or 403 (Forbidden/blocked) as healthy
-	return status == "200" || status == "403"
+func stopRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // createFTWConfig creates the FTW configuration in memory (no file I/O)
@@ -283,34 +348,44 @@ func runFTW(maxTests int, customTestDir string, failedOut string) error {
 // testServerHealth performs basic server health check
 func testServerHealth() error {
 	fmt.Println("\nRunning basic health checks...")
+	return testServerHealthAt(
+		fmt.Sprintf("http://127.0.0.1:%d", serverPort),
+		&http.Client{Timeout: 5 * time.Second},
+	)
+}
 
+func testServerHealthAt(baseURL string, client *http.Client) error {
+	clientWithoutRedirects := *client
+	clientWithoutRedirects.CheckRedirect = stopRedirects
 	tests := []struct {
-		name   string
 		method string
 		path   string
 	}{
-		{"GET /", "GET", "/"},
-		{"POST /test", "POST", "/test"},
-		{"GET with query", "GET", "/search?q=test"},
+		{"GET", "/"},
+		{"POST", "/test"},
+		{"GET", "/search?q=test"},
 	}
 
 	for _, test := range tests {
 		fmt.Printf("   Testing: %s %s... ", test.method, test.path)
 
-		url := fmt.Sprintf("http://localhost:%d%s", serverPort, test.path)
-		cmd := exec.Command("curl", "-s", "-X", test.method, "-o", "/dev/null", "-w", "%{http_code}", url)
-
-		output, err := cmd.Output()
+		req, err := http.NewRequest(test.method, baseURL+test.path, nil)
+		if err != nil {
+			fmt.Println("FAIL")
+			return fmt.Errorf("request setup failed: %w", err)
+		}
+		resp, err := clientWithoutRedirects.Do(req)
 		if err != nil {
 			fmt.Println("FAIL")
 			return fmt.Errorf("request failed: %w", err)
 		}
-
-		status := string(output)
-		if status == "200" {
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status == http.StatusOK {
 			fmt.Println("PASS")
 		} else {
-			fmt.Printf("Status %s\n", status)
+			fmt.Printf("FAIL (HTTP %d)\n", status)
+			return fmt.Errorf("health check %s %s returned HTTP status %d", test.method, test.path, status)
 		}
 	}
 
