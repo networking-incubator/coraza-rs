@@ -95,13 +95,24 @@ func classifyModule(engine Module) (Profile, error) {
 	return ProfileLocal, nil
 }
 
-// CheckResolution reports the profile and engine identity the build selects.
-// Every go command runs with GOWORK=off so an ambient workspace cannot
-// substitute another engine, and GOTOOLCHAIN=local so nothing is downloaded
-// implicitly. The upstream profile stops after `go list`; the local profile
-// additionally pins the checkout revision and requires it to be clean. The
-// returned error is meant to stop a benchmark run.
+// CheckResolution reports the profile and engine identity the build selects and
+// requires the engine linked into the running binary to match it. Every go
+// command runs with GOWORK=off so an ambient workspace cannot substitute another
+// engine, and GOTOOLCHAIN=local so nothing is downloaded implicitly. The
+// upstream profile stops after `go list`; the local profile additionally pins
+// the checkout revision and requires it to be clean. The returned error is
+// meant to stop a benchmark run.
 func CheckResolution(ctx context.Context) (Resolution, error) {
+	return checkResolution(ctx, true)
+}
+
+// checkResolution reports the resolved profile and, when verifyLinked is set,
+// also verifies the engine linked into this binary. Tests pass false because,
+// on Go 1.26, `go test` binaries omit dependency build info: `go version -m`
+// records only path and mod, so linkedEngine cannot find the engine. Command
+// binaries such as cmd/checkresolve do record dependencies and always verify
+// the linked engine through CheckResolution.
+func checkResolution(ctx context.Context, verifyLinked bool) (Resolution, error) {
 	root, err := moduleRoot()
 	if err != nil {
 		return Resolution{}, err
@@ -136,12 +147,14 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 	res.Profile = profile
 	res.EngineDir = res.Engine.Dir
 
-	linked, err := linkedEngine()
-	if err != nil {
-		return Resolution{}, err
-	}
-	if err := verifyLinkedEngine(profile, res.Engine, linked); err != nil {
-		return Resolution{}, err
+	if verifyLinked {
+		linked, err := linkedEngine()
+		if err != nil {
+			return Resolution{}, err
+		}
+		if err := verifyLinkedEngine(profile, res.Engine, linked); err != nil {
+			return Resolution{}, err
+		}
 	}
 
 	if profile == ProfileUpstream {

@@ -39,6 +39,13 @@ different `GOFLAGS` cannot make the report describe an engine the binary did not
 link. Run the command from the module directory; the working directory is the
 module root.
 
+Go 1.26 test binaries omit dependency build info: `go version -m` records only
+`path` and `mod`, with no `dep` lines, so `debug.ReadBuildInfo` in a `go test`
+binary cannot see the linked engine. Tests therefore check module resolution
+only. `cmd/checkresolve` is a command binary, whose build info does record
+dependencies, and it checks the linked engine. `make go-harness-check` runs both
+checks.
+
 To assess a local checkout, a coordinator generates an alternate module file
 with the directory replace and runs with `GOFLAGS=-modfile=local.mod`. The
 generated `local.mod` and `local.sum` are ignored by git and must never be
@@ -66,7 +73,10 @@ also rejects a checkout with modified tracked files.
 
 `TestBuildInfoMatchesResolution` also inspects `debug.ReadBuildInfo`, so it
 checks the engine actually linked into the test binary rather than only what
-the module file declares.
+the module file declares. When build info has no dependencies, as with Go 1.26
+test binaries, the test skips with a message: module resolution is still
+covered by the other tests, and `cmd/checkresolve` covers the linked-engine
+check for that toolchain.
 
 ## Layout
 
