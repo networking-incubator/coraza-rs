@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "workload_id": "coraza-common-subset-v1",
+  "description": "Validated common subset for the local Go-versus-Rust Coraza comparison. Cases use exact bytes, one shared policy per traffic pair and the full phase-1 to phase-5 lifecycle. The next-wave coordinator compares both engines; this manifest does not claim parity.",
+  "case_schema": "coraza/conformance/corpus-schema.json",
+  "cases": [
+    {
+      "path": "cases/get-benign.json",
+      "sha256": "bc35d7bc8fb7c827e1ab19e4207a538afe766ae05a6433382e4fdca2b63f4a31"
+    },
+    {
+      "path": "cases/get-attack.json",
+      "sha256": "941b6597f55fb090148ca54d5b98192dd5bffb5cefd64c353fc5660d61050efd"
+    },
+    {
+      "path": "cases/form-benign.json",
+      "sha256": "76d7c330f7ab2db3039b4ff3ab27caa0d0839473682e395e58989be24594a144"
+    },
+    {
+      "path": "cases/form-attack.json",
+      "sha256": "8530caed3bbad284609e13c4e13d1216a5961c78997d7f49c4d42ce04a94be5b"
+    },
+    {
+      "path": "cases/json-benign.json",
+      "sha256": "8a81737c26ff62e5ffef3ebbb8508c37923f977c27db3060515d6a9ff0075c3c"
+    },
+    {
+      "path": "cases/json-attack.json",
+      "sha256": "51f31c980c00cb9b4868f514f3423fa04139ef69e41768db1e6aa513460d7faf"
+    }
+  ]
+}

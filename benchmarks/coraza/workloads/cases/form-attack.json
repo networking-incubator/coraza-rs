@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "case_id": "form-attack",
+  "fixture_sha256": "f70c849c647bc058d217eaacb3c2ec7f8fc6b31807289ebb5ea09fe747080e4e",
+  "reference": {
+    "profile": "native-go-default-build",
+    "go_commit": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+    "rust_commit": "e078282328dce075ad8b421bf052aa1f7190c6ec"
+  },
+  "connection": {
+    "remote_addr": "203.0.113.7",
+    "remote_port": 50000,
+    "local_addr": "192.0.2.10",
+    "local_port": 8080,
+    "tls": false,
+    "tls_version": null
+  },
+  "request": {
+    "method": "POST",
+    "uri": {
+      "base64": "L3N1Ym1pdA=="
+    },
+    "protocol": "HTTP/1.1",
+    "headers": [
+      {
+        "name": "Host",
+        "value": {
+          "base64": "ZXhhbXBsZS5pbnZhbGlk"
+        }
+      },
+      {
+        "name": "Content-Type",
+        "value": {
+          "base64": "YXBwbGljYXRpb24veC13d3ctZm9ybS11cmxlbmNvZGVk"
+        }
+      }
+    ],
+    "body": {
+      "base64": "bmFtZT1hdCU3NGFjaw=="
+    },
+    "chunks": [
+      {
+        "offset": 0,
+        "length": 8
+      },
+      {
+        "offset": 8,
+        "length": 5
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "protocol": "HTTP/1.1",
+    "headers": [
+      {
+        "name": "Content-Type",
+        "value": {
+          "base64": "dGV4dC9wbGFpbg=="
+        }
+      }
+    ],
+    "body": {
+      "base64": "b2s="
+    },
+    "chunks": [
+      {
+        "offset": 0,
+        "length": 2
+      }
+    ]
+  },
+  "processor": {
+    "sec_lang": {
+      "utf8": "SecRuleEngine On\nSecRequestBodyAccess On\nSecRule ARGS_POST:name \"@rx attack\" \"id:1002,phase:2,deny,status:403,log,capture\"\n"
+    },
+    "request_body_processor": "auto",
+    "response_body_processor": "auto",
+    "config": {}
+  },
+  "phase_calls": [
+    {
+      "call": "process_connection",
+      "phase": 1
+    },
+    {
+      "call": "process_uri",
+      "phase": 1
+    },
+    {
+      "call": "process_request_headers",
+      "phase": 1
+    },
+    {
+      "call": "append_request_body",
+      "phase": 2,
+      "chunk_index": 0
+    },
+    {
+      "call": "append_request_body",
+      "phase": 2,
+      "chunk_index": 1
+    },
+    {
+      "call": "process_request_body",
+      "phase": 2
+    },
+    {
+      "call": "process_response_headers",
+      "phase": 3
+    },
+    {
+      "call": "append_response_body",
+      "phase": 4,
+      "chunk_index": 0
+    },
+    {
+      "call": "process_response_body",
+      "phase": 4
+    },
+    {
+      "call": "process_logging",
+      "phase": 5
+    }
+  ],
+  "expected": {
+    "matches": [
+      {
+        "rule_id": 1002,
+        "phase": 2,
+        "variable": "ARGS_POST",
+        "key": "name",
+        "value": {
+          "base64": "YXR0YWNr"
+        }
+      }
+    ],
+    "interruptions": [
+      {
+        "rule_id": 1002,
+        "action": "deny",
+        "status": 403,
+        "data": {
+          "base64": ""
+        }
+      }
+    ],
+    "captures": [
+      {
+        "index": 0,
+        "value": {
+          "base64": "YXR0YWNr"
+        }
+      }
+    ],
+    "scores": {},
+    "flags": {
+      "REQBODY_ERROR": "0"
+    },
+    "collections": [
+      {
+        "variable": "REQBODY_PROCESSOR",
+        "key": null,
+        "value": {
+          "base64": "VVJMRU5DT0RFRA=="
+        }
+      }
+    ],
+    "audit": {
+      "required": false,
+      "parts": "",
+      "entries": 0
+    }
+  },
+  "normalize": [
+    "timestamps",
+    "generated_ids",
+    "temporary_paths",
+    "audit_boundaries"
+  ]
+}
