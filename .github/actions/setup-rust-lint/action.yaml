@@ -35,3 +35,4 @@ runs:
       with:
         key: lint-${{ inputs.nightly }}
         cache-bin: false
+        save-if: ${{ github.event_name != 'pull_request' }}
