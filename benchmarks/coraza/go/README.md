@@ -48,7 +48,7 @@ revision:
 
 ```sh
 rev=$(git -C /path/to/coraza rev-parse HEAD)
-GOWORK=off GOTOOLCHAIN=local go run -ldflags \
+GOFLAGS=-modfile=local.mod GOWORK=off GOTOOLCHAIN=local go run -ldflags \
   "-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=/path/to/coraza \
    -X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=$rev" \
   ./cmd/checkresolve

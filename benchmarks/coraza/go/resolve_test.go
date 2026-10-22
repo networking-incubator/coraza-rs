@@ -224,8 +224,14 @@ func TestVerifyLinkedEngine(t *testing.T) {
 }
 
 func TestVerifyBuildStamp(t *testing.T) {
-	dir := t.TempDir()
-	other := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	const revision = "d9cc9befc2721fd217ce1660a0e91aca1157221d"
 
 	tests := []struct {
