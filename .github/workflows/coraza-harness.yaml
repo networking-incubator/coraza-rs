@@ -31,8 +31,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: benchmarks/coraza/go/go.mod
-          cache: true
-          cache-dependency-path: benchmarks/coraza/go/go.sum
+          cache: false
 
       - name: Record Go toolchain
         run: go version
@@ -77,8 +76,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: ftw-runner/go.mod
-          cache: true
-          cache-dependency-path: ftw-runner/go.sum
+          cache: false
 
       - name: Record Go toolchain
         run: go version
