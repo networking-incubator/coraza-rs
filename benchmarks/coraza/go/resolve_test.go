@@ -241,26 +241,36 @@ func TestVerifyBuildStamp(t *testing.T) {
 	}{
 		{
 			name:  "matching stamp",
-			stamp: buildStamp{Dir: dir, Revision: revision},
+			stamp: buildStamp{Dir: dir, Revision: revision, Clean: "1"},
 		},
 		{
 			name:    "missing dir",
-			stamp:   buildStamp{Revision: revision},
+			stamp:   buildStamp{Revision: revision, Clean: "1"},
 			wantErr: true,
 		},
 		{
 			name:    "missing revision",
-			stamp:   buildStamp{Dir: dir},
+			stamp:   buildStamp{Dir: dir, Clean: "1"},
+			wantErr: true,
+		},
+		{
+			name:    "missing clean stamp",
+			stamp:   buildStamp{Dir: dir, Revision: revision},
+			wantErr: true,
+		},
+		{
+			name:    "dirty clean stamp",
+			stamp:   buildStamp{Dir: dir, Revision: revision, Clean: "0"},
 			wantErr: true,
 		},
 		{
 			name:    "different dir",
-			stamp:   buildStamp{Dir: other, Revision: revision},
+			stamp:   buildStamp{Dir: other, Revision: revision, Clean: "1"},
 			wantErr: true,
 		},
 		{
 			name:    "different revision",
-			stamp:   buildStamp{Dir: dir, Revision: "abc"},
+			stamp:   buildStamp{Dir: dir, Revision: "abc", Clean: "1"},
 			wantErr: true,
 		},
 	}

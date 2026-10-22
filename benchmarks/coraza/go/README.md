@@ -44,20 +44,25 @@ with the directory replace and runs with `GOFLAGS=-modfile=local.mod`. The
 generated `local.mod` and `local.sum` are ignored by git and must never be
 committed. The local profile also requires a build-time identity stamp, because
 Go build info records a directory replace's path but not the replaced checkout's
-revision:
+revision or build-time cleanliness:
 
 ```sh
-rev=$(git -C /path/to/coraza rev-parse HEAD)
+dir=/path/to/coraza
+rev=$(git -C "$dir" rev-parse HEAD)
+if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
+  echo "engine checkout is dirty" >&2
+  exit 1
+fi
 GOFLAGS=-modfile=local.mod GOWORK=off GOTOOLCHAIN=local go run -ldflags \
-  "-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=/path/to/coraza \
-   -X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=$rev" \
+  "-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=$dir \
+   -X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=$rev \
+   -X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineClean=1" \
   ./cmd/checkresolve
 ```
 
-A binary without the stamp, or one built from a different directory or
-revision, fails the local profile. Build the stamped binary only from a clean
-checkout; the run-time check also rejects a checkout with modified tracked
-files.
+A binary without the stamps, one built from a different directory or revision,
+or one built from a dirty checkout fails the local profile. The run-time check
+also rejects a checkout with modified tracked files.
 
 `TestBuildInfoMatchesResolution` also inspects `debug.ReadBuildInfo`, so it
 checks the engine actually linked into the test binary rather than only what
