@@ -9,7 +9,12 @@ description = "SecLang rule compilation and request processing for a separate Ru
 
 [dependencies]
 aho-corasick = "1.1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 glob = { workspace = true }
+fastrand = "2"
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 ipnet = "2.9"
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = "0.11"
@@ -18,7 +23,15 @@ regex = "1.10"
 serde_json = "1"
 sha1 = "0.11"
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
 winnow = "1.0.4"
+
+[features]
+async-server = ["dep:base64", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio"]
+
+[[example]]
+name = "ftw_server_async"
+required-features = ["async-server"]
 
 [lints]
 workspace = true

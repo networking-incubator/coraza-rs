@@ -54,6 +54,7 @@ use winnow::{
 };
 
 use crate::{
+    audit_log::{ErrorLog, MatchedRule},
     config::WafConfig,
     operators::{Datasets, OperatorContext},
     rules::{Rule, RuleGroup},
@@ -213,6 +214,9 @@ pub struct Parser {
 
     /// Directives skipped because they failed, in parse order
     skipped: Vec<ParseError>,
+
+    /// Optional callback for rules with the `log` action.
+    error_log: Option<ErrorLog>,
 }
 
 impl Parser {
@@ -228,6 +232,7 @@ impl Parser {
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
+            error_log: None,
         }
     }
 
@@ -252,7 +257,12 @@ impl Parser {
     ///
     /// Returns an error when the parsed configuration is invalid for WAF construction.
     pub fn into_waf(self) -> Result<Waf, ConfigError> {
-        Waf::with_rules(self.waf_config, self.rules)
+        Waf::with_rules(self.waf_config, self.rules, self.error_log)
+    }
+
+    /// Set a callback that receives each rule with the `log` action when it matches.
+    pub fn on_error_log(&mut self, log: impl Fn(&MatchedRule) + Send + Sync + 'static) {
+        self.error_log = Some(ErrorLog::new(log));
     }
 
     /// Makes later parsing skip directives that fail, instead of stopping at the first one.

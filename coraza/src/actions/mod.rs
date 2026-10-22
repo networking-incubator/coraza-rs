@@ -113,7 +113,7 @@ impl CompiledAction {
             "setvar" => tx.apply_setvar(&self.argument),
             "ctl" => tx.apply_ctl(&self.argument),
             "setenv" => tx.apply_setenv(&self.argument),
-            // shortcut: logging and external effects wait for their runtime modules.
+            // shortcut: process execution and persistent collection effects are deferred.
             _ => {},
         }
     }
@@ -125,7 +125,7 @@ impl CompiledAction {
     clippy::struct_excessive_bools,
     reason = "fields mirror independent SecLang rule actions"
 )]
-pub(crate) struct RuleMetadata {
+pub struct RuleMetadata {
     /// Rule id set by the `id` action.
     pub(crate) id: i32,
     /// Message template set by the `msg` action.
