@@ -21,7 +21,7 @@
     reason = "small fixed fixtures and bounded byte scans are checked first"
 )]
 
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use regex::Regex;
 use serde_json::Value;
@@ -502,24 +502,7 @@ fn decoded_len(value: &str) -> usize {
     value.len() / 4 * 3 - padding
 }
 
-fn bytes_length(value: &Value) -> usize {
-    if let Some(encoded) = value.get("base64").and_then(Value::as_str) {
-        assert!(is_base64(encoded), "invalid base64 in corpus case");
-        decoded_len(encoded)
-    } else {
-        let length = value
-            .get("length")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| panic!("fixture reference has no length"));
-        usize::try_from(length).unwrap()
-    }
-}
-
-fn check_bytes(value: &Value, corpus_root: &Path) {
-    if let Some(encoded) = value.get("base64").and_then(Value::as_str) {
-        assert!(is_base64(encoded), "invalid base64 in corpus case: {encoded}");
-        return;
-    }
+fn fixture_range(value: &Value, corpus_root: &Path) -> (std::path::PathBuf, usize, usize) {
     let fixture = value
         .get("fixture")
         .and_then(Value::as_str)
@@ -530,7 +513,42 @@ fn check_bytes(value: &Value, corpus_root: &Path) {
         "fixture hash is malformed"
     );
     let path = corpus_root.join(fixture);
-    assert!(path.is_file(), "referenced fixture does not exist: {path:?}");
+    let file_len = fs::metadata(&path)
+        .unwrap_or_else(|error| panic!("cannot read referenced fixture {path:?}: {error}"))
+        .len();
+    let file_len = usize::try_from(file_len).unwrap();
+    let offset = value
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map_or(0, |offset| usize::try_from(offset).unwrap());
+    assert!(offset <= file_len, "fixture offset is past the end of {path:?}");
+    let length = value
+        .get("length")
+        .and_then(Value::as_u64)
+        .map_or(file_len - offset, |length| usize::try_from(length).unwrap());
+    let end = offset
+        .checked_add(length)
+        .unwrap_or_else(|| panic!("fixture range overflows for {path:?}"));
+    assert!(end <= file_len, "fixture range extends past the end of {path:?}");
+    (path, offset, length)
+}
+
+fn bytes_length(value: &Value, corpus_root: &Path) -> usize {
+    if let Some(encoded) = value.get("base64").and_then(Value::as_str) {
+        assert!(is_base64(encoded), "invalid base64 in corpus case");
+        decoded_len(encoded)
+    } else {
+        let (_, _, length) = fixture_range(value, corpus_root);
+        length
+    }
+}
+
+fn check_bytes(value: &Value, corpus_root: &Path) {
+    if let Some(encoded) = value.get("base64").and_then(Value::as_str) {
+        assert!(is_base64(encoded), "invalid base64 in corpus case: {encoded}");
+        return;
+    }
+    fixture_range(value, corpus_root);
 }
 
 fn check_headers(value: &Value, corpus_root: &Path) {
@@ -542,8 +560,8 @@ fn check_headers(value: &Value, corpus_root: &Path) {
     }
 }
 
-fn check_chunks(value: &Value, body: &Value) {
-    let body_len = bytes_length(body);
+fn check_chunks(value: &Value, body: &Value, corpus_root: &Path) {
+    let body_len = bytes_length(body, corpus_root);
     let chunks = value.get("chunks").and_then(Value::as_array).unwrap();
     let mut next = 0_usize;
     for chunk in chunks {
@@ -675,18 +693,24 @@ fn corpus_schema_matches_example() {
             "case hash and referenced request fixture hash differ"
         );
     }
-    check_chunks(request, request.get("body").unwrap());
-    check_chunks(response, response.get("body").unwrap());
+    check_chunks(request, request.get("body").unwrap(), &corpus_root);
+    check_chunks(response, response.get("body").unwrap(), &corpus_root);
 
     let mut last_phase = 0_u64;
     for call in case.get("phase_calls").and_then(Value::as_array).unwrap() {
         let phase = call.get("phase").and_then(Value::as_u64).unwrap();
         assert!(phase >= last_phase, "phase calls are not ordered");
         last_phase = phase;
-        assert!(
-            call.get("call").and_then(Value::as_str).is_some(),
-            "phase call has no name"
-        );
+        let call_name = call
+            .get("call")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("phase call has no name"));
+        if matches!(call_name, "append_request_body" | "append_response_body") {
+            assert!(
+                call.get("chunk_index").and_then(Value::as_u64).is_some(),
+                "{call_name} requires an integer chunk_index"
+            );
+        }
     }
     let expected = case.get("expected").unwrap();
     for field in [

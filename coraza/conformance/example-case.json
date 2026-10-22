@@ -77,7 +77,7 @@
   },
   "processor": {
     "sec_lang": {
-      "utf8": "SecRuleEngine On\nSecRule ARGS_GET:q \"@contains attack\" \"id:1,phase:2,deny,status:403,log\"\n"
+      "utf8": "SecRuleEngine On\nSecAuditEngine On\nSecAuditLogParts ABZ\nSecRule ARGS_GET:q \"@contains attack\" \"id:1,phase:2,deny,status:403,log\"\n"
     },
     "request_body_processor": "auto",
     "response_body_processor": "auto",
@@ -147,7 +147,7 @@
     ],
     "captures": [],
     "scores": {
-      "anomaly_inbound": 5,
+      "anomaly_inbound": 0,
       "sql_injection": 0,
       "xss": 0
     },
