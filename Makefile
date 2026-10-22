@@ -89,7 +89,8 @@ ftw-smoke:
 		--expected-tests 1 \
 		--expected-stages 1 \
 		--manifest "$(abspath $(FTW_MANIFEST))"
-	@python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); bad = [k for k in ("failed", "skipped", "ignored", "forced_failed") if m["results"][k]]; assert m["ok"] and not bad, (m["failures"], bad); assert all(m["counts"][k]["selected"] == m["counts"][k]["inventory"] for k in ("files", "tests", "stages"))' "$(abspath $(FTW_MANIFEST))"
+	@python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); bad = [k for k in ("failed", "skipped", "ignored", "forced_failed") if m["results"][k]]; (sys.exit("FTW smoke failed: %s %s" % (m["failures"], bad)) if (not m["ok"] or bad) else None)' "$(abspath $(FTW_MANIFEST))"
+	@python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); incomplete = [k for k in ("files", "tests", "stages") if m["counts"][k]["selected"] != m["counts"][k]["inventory"]]; (sys.exit("FTW smoke incomplete counts: %s" % incomplete) if incomplete else None)' "$(abspath $(FTW_MANIFEST))"
 
 # -------------------------------------------------------------------
 # Quality
