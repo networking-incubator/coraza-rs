@@ -30,18 +30,28 @@ use std::{
     ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use regex::RegexBuilder;
 
+pub use crate::{actions::RuleMetadata, audit_log::MatchedRule};
 use crate::{
+    audit_log::{
+        AuditFile, AuditLog, AuditLogger, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse,
+        AuditTransaction, ErrorLog, mime_type_of,
+    },
     body_processors::{multipart, xml},
     collection::{Map, MatchData, Single},
     config::WafConfig,
     operators::{Macro, Outputs},
     rules::{CollectionView, RuleGroup, VariableException, VariableSpec},
     transformations::{text_of, url_decode},
-    types::{BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
+    types::{
+        AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, RuleEngineStatus, RulePhase, RuleSeverity,
+        RuleVariable,
+    },
+    utils::time::UtcTime,
 };
 
 /// A disruptive action selected by a matching rule.
@@ -173,7 +183,11 @@ macro_rules! variable_storage {
             RuleVariable::ResponseBody => Some(Single($($borrow)+ $tx.response_body)),
             RuleVariable::ResponseContentLength => Some(Single($($borrow)+ $tx.response_content_length)),
             RuleVariable::RemoteAddr => Some(Single($($borrow)+ $tx.remote_addr)),
+            RuleVariable::RemotePort => Some(Single($($borrow)+ $tx.remote_port)),
+            RuleVariable::ServerAddr => Some(Single($($borrow)+ $tx.server_addr)),
             RuleVariable::ServerName => Some(Single($($borrow)+ $tx.server_name)),
+            RuleVariable::ServerPort => Some(Single($($borrow)+ $tx.server_port)),
+            RuleVariable::HighestSeverity => Some(Single($($borrow)+ $tx.highest_severity)),
             RuleVariable::ResponseStatus => Some(Single($($borrow)+ $tx.response_status)),
             RuleVariable::ResponseContentType => Some(Single($($borrow)+ $tx.response_content_type)),
             RuleVariable::ResponseProtocol => Some(Single($($borrow)+ $tx.response_protocol)),
@@ -279,6 +293,22 @@ pub struct Transaction {
     force_response_body_variable: bool,
     /// Processor selected by a `ctl` action for the response body.
     response_body_processor: Option<BodyProcessor>,
+    /// Audit mode and parts, which `ctl` actions may change per transaction.
+    audit_engine: AuditEngineStatus,
+    /// Parts selected for this transaction's audit entry.
+    audit_log_parts: AuditLogParts,
+    /// Audit resources inherited from the WAF.
+    audit_logger: Option<Arc<AuditLogger>>,
+    /// Optional connector callback for rules with the `log` action.
+    error_log: Option<ErrorLog>,
+    /// Rules matched by this transaction.
+    matched_rules: Vec<MatchedRule>,
+    /// Transaction start time, used in audit records.
+    started: SystemTime,
+    /// Raw bodies retained only when an enabled audit entry requests them.
+    audit_request_body: Vec<u8>,
+    /// Retained response bytes for selected audit parts.
+    audit_response_body: Vec<u8>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
     /// A disruptive action applied while the engine is on.
@@ -377,6 +407,12 @@ pub struct Transaction {
     request_protocol: Single,
     /// The client address supplied by the connector.
     remote_addr: Single,
+    /// The client port supplied by the connector.
+    remote_port: Single,
+    /// The server address supplied by the connector.
+    server_addr: Single,
+    /// The server port supplied by the connector.
+    server_port: Single,
     /// The server name supplied by the connector.
     server_name: Single,
     /// The response status supplied by the connector.
@@ -417,6 +453,8 @@ pub struct Transaction {
     res_body_processor_error: Single,
     /// Processor-specific response error message.
     res_body_processor_error_msg: Single,
+    /// Highest matched rule severity, or 255 when none matched.
+    highest_severity: Single,
 }
 
 impl Transaction {
@@ -431,6 +469,10 @@ impl Transaction {
     }
 
     /// Create a transaction with shared WAF configuration and compiled rules.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "initializes the transaction's typed variable collections"
+    )]
     pub(crate) fn with_rules(config: Arc<WafConfig>, rules: Arc<RuleGroup>, id: impl Into<String>) -> Self {
         let map = |variable: RuleVariable| {
             if variable.has_case_sensitive_keys() {
@@ -457,6 +499,14 @@ impl Transaction {
             response_body_limit: config.response_body_limit,
             force_response_body_variable: false,
             response_body_processor: None,
+            audit_engine: config.audit_engine,
+            audit_log_parts: config.audit_log_parts.clone(),
+            audit_logger: None,
+            error_log: None,
+            matched_rules: Vec::new(),
+            started: SystemTime::now(),
+            audit_request_body: Vec::new(),
+            audit_response_body: Vec::new(),
             config,
             rules,
             last_phase: None,
@@ -508,6 +558,9 @@ impl Transaction {
             request_method: Single::new(RuleVariable::RequestMethod),
             request_protocol: Single::new(RuleVariable::RequestProtocol),
             remote_addr: Single::new(RuleVariable::RemoteAddr),
+            remote_port: Single::new(RuleVariable::RemotePort),
+            server_addr: Single::new(RuleVariable::ServerAddr),
+            server_port: Single::new(RuleVariable::ServerPort),
             server_name: Single::new(RuleVariable::ServerName),
             response_status: Single::new(RuleVariable::ResponseStatus),
             response_content_type: Single::new(RuleVariable::ResponseContentType),
@@ -528,12 +581,63 @@ impl Transaction {
             res_body_processor: Single::new(RuleVariable::ResBodyProcessor),
             res_body_processor_error: flag(RuleVariable::ResBodyProcessorError),
             res_body_processor_error_msg: Single::new(RuleVariable::ResBodyProcessorErrorMsg),
+            highest_severity: {
+                let mut value = Single::new(RuleVariable::HighestSeverity);
+                value.set("255");
+                value
+            },
         }
     }
 
     /// The transaction ID as text.
     pub fn id(&self) -> Cow<'_, str> {
         self.unique_id.get()
+    }
+
+    /// Attach the WAF's shared audit writer.
+    pub(crate) fn set_audit_logger(&mut self, logger: Arc<AuditLogger>) {
+        self.audit_logger = Some(logger);
+    }
+
+    /// Attach the connector's matched-rule callback.
+    pub(crate) fn set_error_log(&mut self, log: ErrorLog) {
+        self.error_log = Some(log);
+    }
+
+    /// Rules that matched during this transaction, in evaluation order.
+    pub fn matched_rules(&self) -> &[MatchedRule] {
+        &self.matched_rules
+    }
+
+    /// Record a matched rule, notifying the connector and retaining it for audit output.
+    pub(crate) fn record_match(
+        &mut self,
+        rule: RuleMetadata,
+        matches: Vec<MatchData>,
+        disruptive_action: Option<&'static str>,
+    ) {
+        let matched = MatchedRule {
+            rule,
+            matches,
+            disruptive_action,
+            disruptive: disruptive_action.is_some() && self.rule_engine == RuleEngineStatus::On,
+            client_ip: self.remote_addr.get().into_owned(),
+            server_ip: self.server_addr.get().into_owned(),
+            uri: self.request_uri.get().into_owned(),
+            transaction_id: self.unique_id.get().into_owned(),
+        };
+        if let Some(error_log) = self.error_log.as_ref().filter(|_| matched.rule.log) {
+            error_log.write(&matched);
+        }
+        self.matched_rules.push(matched);
+    }
+
+    /// Update the transaction's most severe matched rule.
+    pub(crate) fn raise_highest_severity(&mut self, severity: RuleSeverity) {
+        let highest = self.highest_severity.get().parse::<u8>().unwrap_or(u8::MAX);
+        if severity.as_int() < highest {
+            self.highest_severity.set(severity.as_int().to_string());
+        }
     }
 
     /// Return the rule-engine mode currently applied to this transaction.
@@ -564,6 +668,13 @@ impl Transaction {
     pub fn process_request_body(&mut self, body: &[u8]) -> Option<Interruption> {
         if !self.begin_phase(RulePhase::RequestBody) {
             return self.interruption.clone();
+        }
+
+        if self.audit_engine != AuditEngineStatus::Off && self.audit_log_parts.contains(&AuditLogPart::RequestBody) {
+            let limit = usize::try_from(self.request_body_limit).unwrap_or(0);
+            self.audit_request_body.clear();
+            self.audit_request_body
+                .extend_from_slice(body.get(..body.len().min(limit)).unwrap_or_default());
         }
 
         if self.request_body_access && !body.is_empty() {
@@ -781,6 +892,16 @@ impl Transaction {
             return self.interruption.clone();
         }
 
+        if self.audit_engine != AuditEngineStatus::Off
+            && (self.audit_log_parts.contains(&AuditLogPart::IntermediaryResponseBody)
+                || self.audit_log_parts.contains(&AuditLogPart::ResponseBody))
+        {
+            let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
+            self.audit_response_body.clear();
+            self.audit_response_body
+                .extend_from_slice(body.get(..body.len().min(limit)).unwrap_or_default());
+        }
+
         if self.response_body_access && self.is_response_body_processable() {
             self.response_content_length.set(body.len().to_string());
             if !body.is_empty() {
@@ -804,6 +925,191 @@ impl Transaction {
         self.interruption.clone()
     }
 
+    /// Run logging rules and write this transaction's audit entry once.
+    ///
+    /// Call this after response processing when the caller needs to observe write errors.
+    /// Dropping a transaction also runs the logging phase and ignores any write error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured audit writer fails.
+    pub fn process_logging(&mut self) -> std::io::Result<()> {
+        if self.last_phase == Some(RulePhase::Logging) {
+            return Ok(());
+        }
+        self.last_phase = Some(RulePhase::Logging);
+        if self.rule_engine != RuleEngineStatus::Off {
+            self.run_phase(RulePhase::Logging);
+        }
+
+        let Some(logger) = self.audit_logger.clone() else {
+            return Ok(());
+        };
+        let should_log = match self.audit_engine {
+            AuditEngineStatus::Off => false,
+            AuditEngineStatus::On => true,
+            AuditEngineStatus::RelevantOnly => {
+                let status = self
+                    .interruption
+                    .as_ref()
+                    .or(self.would_be_interruption.as_ref())
+                    .map_or_else(
+                        || self.response_status.get().into_owned(),
+                        |value| value.status.to_string(),
+                    );
+                let audited = self.matched_rules.iter().any(|matched| matched.rule.audit_log);
+                logger.is_relevant(audited, &status)
+            },
+        };
+        if should_log {
+            logger.write(&self.audit_log())?;
+        }
+        Ok(())
+    }
+
+    /// Build this transaction's audit entry using the current audit parts.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds the typed record from all selected transaction fields"
+    )]
+    pub fn audit_log(&self) -> AuditLog {
+        let elapsed = self.started.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let at = UtcTime::from_unix(elapsed.as_secs());
+        let mut transaction = AuditTransaction {
+            timestamp: format!(
+                "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+                at.year, at.month, at.day, at.hour, at.minute, at.second
+            ),
+            unix_timestamp: i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX),
+            id: self.unique_id.get().into_owned(),
+            client_ip: self.remote_addr.get().into_owned(),
+            client_port: self.remote_port.get().parse().unwrap_or(0),
+            host_ip: self.server_addr.get().into_owned(),
+            host_port: self.server_port.get().parse().unwrap_or(0),
+            server_id: self.server_name.get().into_owned(),
+            request: AuditRequest {
+                method: self.request_method.get().into_owned(),
+                protocol: self.request_protocol.get().into_owned(),
+                uri: self.request_uri.get().into_owned(),
+                length: i32::try_from(self.audit_request_body.len()).unwrap_or(i32::MAX),
+                args: self
+                    .args
+                    .iter()
+                    .map(|(key, value)| (key.to_owned(), text_of(value).into_owned()))
+                    .collect(),
+                ..AuditRequest::default()
+            },
+            highest_severity: self.highest_severity.get().into_owned(),
+            is_interrupted: self.interruption.is_some(),
+            ..AuditTransaction::default()
+        };
+
+        let has = |part| self.audit_log_parts.contains(&part);
+        if has(AuditLogPart::RequestHeaders) {
+            transaction.request.headers = Some(self.request_headers.entries());
+        }
+        if has(AuditLogPart::RequestBody) {
+            transaction.request.body = text_of(&self.audit_request_body).into_owned();
+        }
+        if has(AuditLogPart::UploadedFiles) {
+            transaction.request.files = Some(
+                self.files
+                    .iter()
+                    .map(|(_, filename)| {
+                        let name = text_of(filename).into_owned();
+                        AuditFile {
+                            size: self
+                                .files_sizes
+                                .get(&name)
+                                .first()
+                                .and_then(|size| size.parse().ok())
+                                .unwrap_or(0),
+                            mime: mime_type_of(&name).to_owned(),
+                            name,
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        if has(AuditLogPart::IntermediaryResponseBody)
+            || has(AuditLogPart::ResponseBody)
+            || has(AuditLogPart::ResponseHeaders)
+        {
+            let mut response = AuditResponse {
+                protocol: self.response_protocol.get().into_owned(),
+                ..AuditResponse::default()
+            };
+            if has(AuditLogPart::IntermediaryResponseBody) || has(AuditLogPart::ResponseBody) {
+                response.body = text_of(&self.audit_response_body).into_owned();
+            }
+            if has(AuditLogPart::ResponseHeaders) {
+                response.status = self.response_status.get().parse().unwrap_or(0);
+                response.headers = Some(self.response_headers.entries());
+            }
+            transaction.response = Some(response);
+        }
+        let trailer = has(AuditLogPart::Trailer);
+        if trailer {
+            let elapsed_ns = SystemTime::now()
+                .duration_since(self.started)
+                .map_or(0, |duration| duration.as_nanos());
+            transaction.producer = Some(AuditProducer {
+                rule_engine: self.rule_engine.as_str().to_owned(),
+                stopwatch: format!(
+                    "{} {elapsed_ns}; combined=0, p1=0, p2=0, p3=0, p4=0, p5=0",
+                    transaction.unix_timestamp
+                ),
+                rulesets: self.config.component_names.clone(),
+                ..AuditProducer::default()
+            });
+        }
+
+        let audited = self.matched_rules.iter().filter(|matched| matched.rule.audit_log);
+        let messages = if has(AuditLogPart::RulesMatched) {
+            audited
+                .flat_map(|matched| {
+                    matched.matches.iter().map(move |data| {
+                        let rule = &matched.rule;
+                        AuditMessage {
+                            actionset: self.config.component_names.join(" "),
+                            message: data.message.clone(),
+                            error_message: if trailer { matched.error_log() } else { String::new() },
+                            data: AuditMessageData {
+                                file: rule.file.clone(),
+                                line: rule.line,
+                                id: rule.id,
+                                rev: rule.rev.clone(),
+                                msg: data.message.clone(),
+                                data: data.data.clone(),
+                                severity: rule.severity.map_or(-1, |severity| severity.as_int().cast_signed()),
+                                ver: rule.ver.clone(),
+                                maturity: rule.maturity,
+                                accuracy: rule.accuracy,
+                                tags: rule.tags.clone(),
+                                raw: rule.raw.clone(),
+                            },
+                        }
+                    })
+                })
+                .collect()
+        } else if trailer {
+            audited
+                .map(|matched| AuditMessage {
+                    error_message: matched.error_log(),
+                    ..AuditMessage::default()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        AuditLog {
+            parts: self.audit_log_parts.clone(),
+            transaction,
+            messages,
+        }
+    }
+
     /// Parse or store response body data before phase 4 rules run.
     fn inspect_response_body(&mut self, body: &[u8]) {
         self.response_body.set(body);
@@ -825,7 +1131,7 @@ impl Transaction {
         let rules = Arc::clone(&self.rules);
 
         for rule in rules.iter() {
-            if self.interruption.is_some() || self.is_allowed(phase) {
+            if (phase != RulePhase::Logging && self.interruption.is_some()) || self.is_allowed(phase) {
                 break;
             }
             if rule.metadata().phase != RulePhase::Unknown && rule.metadata().phase != phase {
@@ -968,6 +1274,16 @@ impl Transaction {
             return;
         };
         match name {
+            "auditEngine" => {
+                if let Ok(audit_engine) = value.parse::<AuditEngineStatus>() {
+                    self.audit_engine = audit_engine;
+                }
+            },
+            "auditLogParts" => {
+                if let Ok(parts) = crate::types::apply_audit_log_parts(&self.audit_log_parts, value) {
+                    self.audit_log_parts = parts;
+                }
+            },
             "ruleEngine" => {
                 if let Ok(rule_engine) = value.parse::<RuleEngineStatus>() {
                     self.rule_engine = rule_engine;
@@ -1209,6 +1525,21 @@ impl Transaction {
         self.set_single(RuleVariable::RemoteAddr, value);
     }
 
+    /// Set the client port supplied by the connector.
+    pub fn set_remote_port(&mut self, value: u16) {
+        self.set_single(RuleVariable::RemotePort, value.to_string());
+    }
+
+    /// Set the server address supplied by the connector.
+    pub fn set_server_addr(&mut self, value: impl AsRef<[u8]>) {
+        self.set_single(RuleVariable::ServerAddr, value);
+    }
+
+    /// Set the server port supplied by the connector.
+    pub fn set_server_port(&mut self, value: u16) {
+        self.set_single(RuleVariable::ServerPort, value.to_string());
+    }
+
     /// Set the server name supplied by the connector.
     pub fn set_server_name(&mut self, value: impl AsRef<[u8]>) {
         self.set_single(RuleVariable::ServerName, value);
@@ -1217,6 +1548,19 @@ impl Transaction {
     /// Set the response status supplied by the connector.
     pub fn set_response_status(&mut self, status: u16) {
         self.set_single(RuleVariable::ResponseStatus, status.to_string());
+    }
+
+    /// Set the request line fields and populate query arguments from `uri`.
+    pub fn process_uri(&mut self, uri: &str, method: &str, protocol: &str) {
+        let uri = uri.split_once('#').map_or(uri, |(uri, _)| uri);
+        self.set_request_uri(uri);
+        self.set_request_method(method);
+        self.set_request_protocol(protocol);
+        if let Some((_, query)) = uri.split_once('?') {
+            for (key, value) in parse_urlencoded(query.as_bytes()) {
+                self.add_get_argument(&key, value);
+            }
+        }
     }
 
     /// Add a query argument to `ARGS_GET` and `ARGS`.
@@ -1395,6 +1739,9 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            drop(self.process_logging());
+        }
         if self.config.upload_keep_files {
             return;
         }
@@ -2933,5 +3280,153 @@ payload\r\n\
         let mut tx = waf.new_transaction_with_id("skip-after");
 
         assert_eq!(tx.process_request_headers().unwrap().rule_id, 18);
+    }
+
+    #[test]
+    fn audit_logging_records_matches_and_request_response_data_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.json");
+        let callback_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_output = Arc::clone(&callback_lines);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: crate::types::AuditEngineStatus::On,
+            audit_log: path.to_string_lossy().into_owned(),
+            audit_log_format: crate::types::AuditLogFormat::Json,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABCFGHKZ").unwrap(),
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        parser.on_error_log(move |matched| {
+            callback_output.lock().unwrap().push(matched.error_log());
+        });
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains attack\" \"id:71,phase:1,log,msg:'found %{MATCHED_VAR}',logdata:'value %{MATCHED_VAR}',severity:WARNING\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("audit-1");
+        tx.process_uri("/?q=attack#fragment", "GET", "HTTP/1.1");
+        tx.set_remote_addr("192.0.2.1");
+        tx.set_remote_port(1234);
+        assert_eq!(tx.process_request_headers(), None);
+        tx.add_request_header("Content-Type", "text/plain");
+        tx.process_request_body(b"request-body");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.process_response_body(b"response-body");
+        tx.process_logging().unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(
+            entry.pointer("/transaction/id").and_then(serde_json::Value::as_str),
+            Some("audit-1")
+        );
+        assert_eq!(
+            entry
+                .pointer("/transaction/request/uri")
+                .and_then(serde_json::Value::as_str),
+            Some("/?q=attack")
+        );
+        assert_eq!(
+            entry
+                .pointer("/transaction/request/body")
+                .and_then(serde_json::Value::as_str),
+            Some("request-body")
+        );
+        assert_eq!(
+            entry
+                .pointer("/transaction/response/body")
+                .and_then(serde_json::Value::as_str),
+            Some("response-body")
+        );
+        assert_eq!(
+            entry.pointer("/messages/0/data/id").and_then(serde_json::Value::as_i64),
+            Some(71)
+        );
+        assert_eq!(
+            entry.pointer("/messages/0/message").and_then(serde_json::Value::as_str),
+            Some("found attack")
+        );
+        assert_eq!(callback_lines.lock().unwrap().len(), 1);
+
+        drop(tx);
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn relevant_only_audits_matches_when_the_transaction_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: crate::types::AuditEngineStatus::RelevantOnly,
+            audit_log: path.to_string_lossy().into_owned(),
+            audit_log_parts: crate::types::parse_audit_log_parts("ABFHKZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser
+            .from_string("SecRule ARGS:q \"@streq evil\" \"id:81,phase:1,deny,status:403,log,auditlog,msg:'Evil'\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let mut benign = waf.new_transaction_with_id("tx-benign");
+        benign.process_uri("/?q=fine", "GET", "HTTP/1.1");
+        drop(benign.process_request_headers());
+        drop(benign);
+
+        let mut matched = waf.new_transaction_with_id("tx-evil");
+        matched.process_uri("/?q=evil", "GET", "HTTP/1.1");
+        assert_eq!(matched.process_request_headers().map(|item| item.rule_id), Some(81));
+        drop(matched);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("tx-benign"), "{log}");
+        assert!(log.contains("tx-evil"), "{log}");
+        assert!(log.contains("[id \"81\"]"), "{log}");
+    }
+
+    #[test]
+    fn logging_phase_runs_after_a_disruptive_request_match() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains attack\" \"id:72,phase:1,deny\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:73,phase:5,setvar:TX.logged=yes,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("logging-after-deny");
+        tx.add_get_argument("q", "attack");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 72);
+        tx.process_logging().unwrap();
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("logged")).as_deref(),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn process_uri_populates_decoded_query_arguments_without_the_fragment() {
+        let mut tx = Transaction::new("process-uri");
+        tx.process_uri("/search?q=hello+world&encoded=%ff#section", "GET", "HTTP/1.1");
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestURI, None).as_deref(),
+            Some("/search?q=hello+world&encoded=%ff")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsGet, Some("q")).as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsGet, Some("encoded")).as_deref(),
+            Some("\u{fffd}")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RemotePort, None), Some(String::new()));
     }
 }

@@ -10,7 +10,8 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
-| `coraza/` | Separate Rust Coraza implementation with SecLang rule compilation, request and response header/body phases, transaction storage, operators, and transformations. Request bodies support RAW, URLENCODED, JSON, XML, and multipart processing; response bodies support raw storage and JSON arguments. Phase 5 audit logging and the deferred `exec`, `initcol`, and `expirevar` effects are not implemented. |
+| `coraza/` | Separate Rust Coraza implementation with SecLang rule compilation, request and response header/body phases, transaction storage, operators, transformations, and audit logging. Request bodies support RAW, URLENCODED, JSON, XML, and multipart processing; response bodies support raw storage and JSON arguments. The `exec`, `initcol`, and `expirevar` effects remain unimplemented. |
+| `ftw-runner/` | Optional Go FTW integration harness for the Coraza crate. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
@@ -133,3 +134,9 @@ The [library README](libperfusion/README.md) has crate-specific compatibility,
 corpus, and development details. The
 [Envoy example guide](examples/envoy-libperfusion/README.md) explains how to
 build and run the optional filter.
+
+The [Coraza crate guide](coraza/README.md) describes SecLang processing and
+audit logging.
+
+The [FTW runner guide](ftw-runner/README.md) explains how to build the Coraza
+test server and run go-ftw tests against a CRS checkout.

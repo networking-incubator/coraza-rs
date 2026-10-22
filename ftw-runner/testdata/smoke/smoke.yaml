@@ -1,0 +1,20 @@
+meta:
+  author: "Coraza RS"
+  description: "Audit and FTW integration smoke test"
+  name: "smoke.yaml"
+rule_id: 1001
+tests:
+  - test_id: 1
+    desc: "Block an attack and emit the matching rule ID"
+    stages:
+      - input:
+          dest_addr: "127.0.0.1"
+          port: 8080
+          headers:
+            Host: "localhost"
+          uri: "/?q=attack"
+          method: "GET"
+        output:
+          status: 403
+          log:
+            expect_ids: [1001]

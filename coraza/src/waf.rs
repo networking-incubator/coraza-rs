@@ -25,7 +25,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::{config::WafConfig, rules::RuleGroup, transaction::Transaction};
+use crate::{
+    audit_log::{AuditLogger, ErrorLog},
+    config::WafConfig,
+    rules::RuleGroup,
+    transaction::Transaction,
+};
 
 /// Next process-unique transaction identifier suffix.
 static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -47,13 +52,18 @@ impl std::error::Error for ConfigError {}
 /// The runtime evaluates request and response header/body rules. Request bodies support
 /// RAW, URLENCODED, JSON, XML, and multipart/form-data processing, including temporary
 /// upload files. Response bodies support raw storage and JSON argument parsing. Audit
-/// logging and the deferred `exec`, `initcol`, and `expirevar` effects are not implemented.
+/// logging is available through the configured writer. The deferred `exec`,
+/// `initcol`, and `expirevar` effects are not implemented.
 #[derive(Debug)]
 pub struct Waf {
     /// Configuration inherited by each transaction.
     config: Arc<WafConfig>,
     /// Compiled rules shared by each transaction.
     rules: Arc<RuleGroup>,
+    /// Writer shared by transactions created by this WAF.
+    audit_logger: Arc<AuditLogger>,
+    /// Optional connector callback for rules with the `log` action.
+    error_log: Option<ErrorLog>,
 }
 
 impl Waf {
@@ -61,17 +71,25 @@ impl Waf {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid limits or incompatible upload settings.
+    /// Returns an error for invalid limits, incompatible upload settings, or audit
+    /// logging configuration and writer errors.
     pub fn new(config: WafConfig) -> Result<Self, ConfigError> {
-        Self::with_rules(config, RuleGroup::new())
+        Self::with_rules(config, RuleGroup::new(), None)
     }
 
     /// Create a WAF from configuration and compiled rules.
-    pub(crate) fn with_rules(config: WafConfig, rules: RuleGroup) -> Result<Self, ConfigError> {
+    pub(crate) fn with_rules(
+        config: WafConfig,
+        rules: RuleGroup,
+        error_log: Option<ErrorLog>,
+    ) -> Result<Self, ConfigError> {
         validate_config(&config)?;
+        let audit_logger = AuditLogger::open(&config).map_err(ConfigError)?;
         Ok(Self {
             config: Arc::new(config),
             rules: Arc::new(rules),
+            audit_logger: Arc::new(audit_logger),
+            error_log,
         })
     }
 
@@ -83,7 +101,12 @@ impl Waf {
 
     /// Create a transaction with a caller-supplied identifier.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
-        Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id)
+        let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
+        transaction.set_audit_logger(Arc::clone(&self.audit_logger));
+        if let Some(error_log) = &self.error_log {
+            transaction.set_error_log(error_log.clone());
+        }
+        transaction
     }
 
     /// Return the WAF configuration.
@@ -99,9 +122,12 @@ impl Waf {
 
 impl Default for Waf {
     fn default() -> Self {
+        let config = Arc::new(WafConfig::default());
         Self {
-            config: Arc::new(WafConfig::default()),
+            config,
             rules: Arc::new(RuleGroup::new()),
+            audit_logger: Arc::new(AuditLogger::discard()),
+            error_log: None,
         }
     }
 }

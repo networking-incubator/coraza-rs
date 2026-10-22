@@ -13,15 +13,15 @@
 // limitations under the License.
 
 //! WAF configuration, SecLang rule compilation, request and response phase evaluation,
-//! transaction variable storage, operators, and transformations for a separate Rust
-//! implementation based on Coraza.
+//! transaction variable storage, audit logging, operators, and transformations for a
+//! separate Rust implementation based on Coraza.
 //!
 //! This crate is not the upstream Go implementation or a complete WAF engine.
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
-//! the OWASP Coraza contributors. Phase 5 audit logging and external or persistent
-//! actions remain unimplemented.
+//! the OWASP Coraza contributors. External or persistent actions remain unimplemented.
 
 mod actions;
+pub mod audit_log;
 mod body_processors;
 pub mod collection;
 pub mod config;
@@ -34,6 +34,9 @@ pub mod types;
 pub mod utils;
 pub mod waf;
 
+pub use audit_log::{
+    AuditFile, AuditLog, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse, AuditTransaction,
+};
 pub use rules::TransformationChain;
 pub use types::{
     AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, RuleEngineStatus, RulePhase, RuleSeverity,

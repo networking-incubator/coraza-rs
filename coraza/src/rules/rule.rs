@@ -99,8 +99,34 @@ impl Rule {
 
     /// Evaluate this rule and its chain against a transaction.
     pub(crate) fn evaluate(&self, tx: &mut Transaction) {
-        if !self.matches_chain(tx, self.metadata.id) {
+        let matched_values = self.matches_chain(tx, self.metadata.id);
+        if matched_values.is_empty() {
             return;
+        }
+
+        if self.metadata.id != 0 {
+            let mut rule = self.metadata.clone();
+            for link in &self.chain {
+                rule.raw.push_str(" \n");
+                rule.raw.push_str(&link.metadata.raw);
+            }
+            let disruptive_action = self
+                .actions
+                .iter()
+                .find(|action| action.action_type() == ActionType::Disruptive)
+                .map(|action| match action.name.as_str() {
+                    "allow" => "allow",
+                    "deny" => "deny",
+                    "drop" => "drop",
+                    "pass" => "pass",
+                    "redirect" => "redirect",
+                    "block" => "block",
+                    _ => "custom",
+                });
+            tx.record_match(rule, matched_values, disruptive_action);
+            if let Some(severity) = self.metadata.severity {
+                tx.raise_highest_severity(severity);
+            }
         }
 
         for action in &self.actions {
@@ -111,36 +137,54 @@ impl Rule {
     }
 
     /// Match this rule and its chain, running nondisruptive actions at each link.
-    fn matches_chain(&self, tx: &mut Transaction, id: i32) -> bool {
-        if self.metadata.sec_mark.is_some() || !self.match_values(tx, id) {
-            return false;
+    fn matches_chain(&self, tx: &mut Transaction, id: i32) -> Vec<MatchData> {
+        if self.metadata.sec_mark.is_some() {
+            return Vec::new();
         }
+        let mut matched_values = self.match_values(tx, id);
+        if matched_values.is_empty() {
+            return matched_values;
+        }
+        let own_matches = matched_values.len();
 
         for link in &self.chain {
-            if !link.matches_chain(tx, id) {
-                return false;
+            let link_matches = link.matches_chain(tx, id);
+            if link_matches.is_empty() {
+                return Vec::new();
+            }
+            matched_values.extend(link_matches);
+        }
+        if !self.chain.is_empty() {
+            let (message, data) = self.describe_match(tx);
+            for matched in matched_values.iter_mut().take(own_matches) {
+                matched.message.clone_from(&message);
+                matched.data.clone_from(&data);
             }
         }
-        true
+        matched_values
     }
 
     /// Match the values selected by this rule and run per-match actions.
-    fn match_values(&self, tx: &mut Transaction, id: i32) -> bool {
+    fn match_values(&self, tx: &mut Transaction, id: i32) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
         let log_data = self.metadata.log_data.as_ref().map(|value| value.expand(tx));
         let severity = self.metadata.severity.map_or("unknown", |value| value.as_str());
-        tx.set_rule_variables(id, message, &self.metadata.rev, log_data, severity);
+        tx.set_rule_variables(id, message.clone(), &self.metadata.rev, log_data.clone(), severity);
 
         let Some(operator) = &self.operator else {
             if !self.variables.is_empty() || self.metadata.sec_mark.is_some() {
-                return false;
+                return Vec::new();
             }
-            tx.record_matched_variable(&MatchData::new_empty());
+            let mut matched = MatchData::new_empty();
+            tx.record_matched_variable(&matched);
             self.run_nondisruptive_actions(tx);
-            return true;
+            if self.chain.is_empty() {
+                (matched.message, matched.data) = self.describe_match(tx);
+            }
+            return vec![matched];
         };
 
-        let mut matched = false;
+        let mut matched_values = Vec::new();
         for variable in &self.variables {
             for value in tx.find_matches_for_rule(variable, id) {
                 let candidates = if self.metadata.multi_match {
@@ -153,15 +197,25 @@ impl Rule {
                     let operator_matched = operator.evaluate(tx, &candidate, &mut outputs);
                     tx.store_operator_outputs(&mut outputs);
                     if operator_matched {
-                        matched = true;
-                        let matched = MatchData::new(value.variable, value.key.clone(), candidate);
+                        let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
                         tx.record_matched_variable(&matched);
                         self.run_nondisruptive_actions(tx);
+                        if self.chain.is_empty() {
+                            (matched.message, matched.data) = self.describe_match(tx);
+                        }
+                        matched_values.push(matched);
                     }
                 }
             }
         }
-        matched
+        matched_values
+    }
+
+    /// Expand this rule's `msg` and `logdata` against the current matched variables.
+    fn describe_match(&self, tx: &Transaction) -> (String, String) {
+        let expand =
+            |value: &Option<crate::operators::Macro>| value.as_ref().map(|value| value.expand(tx)).unwrap_or_default();
+        (expand(&self.metadata.msg), expand(&self.metadata.log_data))
     }
 
     /// Run actions that apply as each rule in a chain matches.
