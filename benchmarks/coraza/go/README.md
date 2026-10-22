@@ -42,7 +42,22 @@ module root.
 To assess a local checkout, a coordinator generates an alternate module file
 with the directory replace and runs with `GOFLAGS=-modfile=local.mod`. The
 generated `local.mod` and `local.sum` are ignored by git and must never be
-committed.
+committed. The local profile also requires a build-time identity stamp, because
+Go build info records a directory replace's path but not the replaced checkout's
+revision:
+
+```sh
+rev=$(git -C /path/to/coraza rev-parse HEAD)
+GOWORK=off GOTOOLCHAIN=local go run -ldflags \
+  "-X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineDir=/path/to/coraza \
+   -X github.com/corazawaf/coraza-rs/benchmarks/coraza/go.linkedEngineRevision=$rev" \
+  ./cmd/checkresolve
+```
+
+A binary without the stamp, or one built from a different directory or
+revision, fails the local profile. Build the stamped binary only from a clean
+checkout; the run-time check also rejects a checkout with modified tracked
+files.
 
 `TestBuildInfoMatchesResolution` also inspects `debug.ReadBuildInfo`, so it
 checks the engine actually linked into the test binary rather than only what
