@@ -14,12 +14,12 @@ timing code, workload matrix, fixture format or result collection.
 | Engine module | `github.com/corazawaf/coraza/v3` |
 | Required version | `v3.0.0` |
 | Declared replace | `../../../../coraza` (relative to this directory) |
-| Resolved source | `/home/rpchevuz/codes/work/waf/coraza` |
+| Resolved source | the pinned checkout at `../../../../coraza` |
 | Engine revision | `d9cc9befc2721fd217ce1660a0e91aca1157221d` |
 | Engine checkout | clean at the time of writing |
 | Module go directive | `1.26.0` |
-| Go binary | `/usr/lib/golang/bin/go` (`/usr/bin/go` symlink) |
-| Go version | `go version go1.27.2-X:nodwarf5 linux/amd64` |
+| Go binary | `go` resolved from `PATH` |
+| Go version | `go1.27.2 linux/amd64`, local toolchain |
 | Workspace mode | `GOWORK=off` |
 | Toolchain mode | `GOTOOLCHAIN=local` |
 
