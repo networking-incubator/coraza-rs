@@ -64,6 +64,151 @@ type Logfile = Arc<Mutex<std::fs::File>>;
 /// Read deadline, kept below FTW's 30-second client timeout.
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Server startup options, parsed from the command line.
+struct Options {
+    /// Port to listen on.
+    port: u16,
+    /// Audit log file the FTW runner reads.
+    logfile: String,
+    /// Optional SecLang rules file.
+    rules_file: Option<String>,
+    /// Readiness token echoed by the health endpoint.
+    readiness_token: Option<String>,
+    /// Reject unsupported rules and require a rules file.
+    strict: bool,
+    /// Expected loaded rule count in strict mode.
+    expected_rules: Option<usize>,
+    /// Optional path for the machine-readable startup inventory.
+    inventory_file: Option<String>,
+}
+
+impl Options {
+    /// Parse options, rejecting combinations that would hide missing rules.
+    fn parse(args: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
+        let port = get_arg(args, "--port")
+            .unwrap_or_else(|| "8080".to_owned())
+            .parse::<u16>()?;
+        let logfile = get_arg(args, "--logfile").unwrap_or_else(|| "/tmp/coraza-ftw-audit.log".to_owned());
+        let rules_file = get_arg(args, "--rules");
+        let readiness_token = get_arg(args, "--readiness-token");
+        let strict = args.iter().any(|argument| argument == "--strict");
+        let expected_rules = match get_arg(args, "--expected-rules") {
+            Some(value) => Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --expected-rules {value:?}: {error}"))?,
+            ),
+            None => None,
+        };
+        let inventory_file = get_arg(args, "--inventory-file");
+
+        if strict && rules_file.is_none() {
+            return Err("--strict requires --rules".into());
+        }
+        if !strict && expected_rules.is_some() {
+            return Err("--expected-rules requires --strict".into());
+        }
+
+        Ok(Self {
+            port,
+            logfile,
+            rules_file,
+            readiness_token,
+            strict,
+            expected_rules,
+            inventory_file,
+        })
+    }
+}
+
+/// Startup facts the Go runner checks before trusting a result.
+struct Inventory {
+    /// "strict" or "legacy".
+    mode: &'static str,
+    /// Number of compiled rules.
+    rules_loaded: usize,
+    /// Directives the parser skipped (always empty in strict mode).
+    skipped_directives: Vec<String>,
+    /// Rule count the caller required, if any.
+    expected_rules: Option<usize>,
+}
+
+impl Inventory {
+    /// Machine-readable form written for the Go runner.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mode": self.mode,
+            "rules_loaded": self.rules_loaded,
+            "skipped_directives": self.skipped_directives,
+            "expected_rules": self.expected_rules,
+        })
+    }
+}
+
+/// Builds a WAF from the options and reports what was actually loaded.
+#[expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "The standalone FTW server reports rule loading to its console."
+)]
+fn load_policy(options: &Options, logfile: &Logfile) -> Result<(Waf, Inventory), Box<dyn std::error::Error>> {
+    // Base configuration; directives in the rules file override it
+    let mut parser = Parser::new();
+    *parser.config_mut() = WafConfig {
+        rule_engine: RuleEngineStatus::On,
+        request_body_access: true,
+        response_body_access: true,
+        request_body_limit: 1_048_576, // 1MB
+        web_app_id: "ftw-test".to_owned(),
+        ..WafConfig::default()
+    };
+    // Legacy mode keeps loading past directives this engine doesn't support yet, so a full
+    // CRS still loads. Strict mode must not hide unsupported rules.
+    if !options.strict {
+        parser.skip_failed_directives();
+    }
+    log_errors_to(&mut parser, logfile);
+
+    if let Some(rules_path) = &options.rules_file {
+        println!("Loading rules from {rules_path}...");
+        parser.from_file(rules_path)?;
+        for e in parser.skipped() {
+            eprintln!("Warning: skipped {e}");
+        }
+    } else {
+        // Options::parse requires --rules in strict mode.
+        println!("No rules file specified, WAF running without rules");
+    }
+
+    let skipped_directives: Vec<String> = parser.skipped().iter().map(ToString::to_string).collect();
+    if options.strict && !skipped_directives.is_empty() {
+        return Err(format!("strict mode: {} directive(s) were skipped", skipped_directives.len()).into());
+    }
+
+    let waf = parser.into_waf()?;
+    let rules_loaded = waf.rule_count();
+    if let Some(expected) = options.expected_rules
+        && expected != rules_loaded
+    {
+        return Err(format!("strict mode: expected {expected} rule(s), loaded {rules_loaded}").into());
+    }
+
+    let inventory = Inventory {
+        mode: if options.strict { "strict" } else { "legacy" },
+        rules_loaded,
+        skipped_directives,
+        expected_rules: options.expected_rules,
+    };
+    Ok((waf, inventory))
+}
+
+/// Write the startup inventory after the policy loaded successfully.
+fn write_inventory(inventory: &Inventory, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let data = serde_json::to_vec_pretty(&inventory.to_json())?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
 #[expect(
     clippy::print_stdout,
     clippy::print_stderr,
@@ -75,58 +220,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    let port = get_arg(&args, "--port")
-        .unwrap_or_else(|| "8080".to_owned())
-        .parse::<u16>()?;
-    let logfile = get_arg(&args, "--logfile").unwrap_or_else(|| "/tmp/coraza-ftw-audit.log".to_owned());
-    let rules_file = get_arg(&args, "--rules");
-    let readiness_token = get_arg(&args, "--readiness-token");
+    let options = Options::parse(&args)?;
 
     println!("Configuration:");
-    println!("   Port: {port}");
-    println!("   Logfile: {logfile}");
-    if let Some(rules) = &rules_file {
+    println!("   Port: {}", options.port);
+    println!("   Logfile: {}", options.logfile);
+    if let Some(rules) = &options.rules_file {
         println!("   Rules: {rules}");
+    }
+    if options.strict {
+        println!("   Mode: strict");
     }
     println!();
 
-    let logfile: Logfile = Arc::new(Mutex::new(OpenOptions::new().create(true).append(true).open(&logfile)?));
-
-    // Base configuration; directives in the rules file override it
-    let mut parser = Parser::new();
-    *parser.config_mut() = WafConfig {
-        rule_engine: RuleEngineStatus::On,
-        request_body_access: true,
-        response_body_access: true,
-        request_body_limit: 1_048_576, // 1MB
-        web_app_id: "ftw-test".to_owned(),
-        ..WafConfig::default()
-    };
-    // Keep loading past directives this engine doesn't support yet, so a full CRS still loads
-    parser.skip_failed_directives();
-    log_errors_to(&mut parser, &logfile);
-
-    // Load rules if specified
-    if let Some(rules_path) = &rules_file {
-        println!("Loading rules from {rules_path}...");
-        parser.from_file(rules_path)?;
-        for e in parser.skipped() {
-            eprintln!("Warning: skipped {e}");
-        }
-    } else {
-        println!("No rules file specified, WAF running without rules");
+    let logfile: Logfile = Arc::new(Mutex::new(
+        OpenOptions::new().create(true).append(true).open(&options.logfile)?,
+    ));
+    let (waf, inventory) = load_policy(&options, &logfile)?;
+    if let Some(path) = &options.inventory_file {
+        write_inventory(&inventory, path)?;
     }
-
-    let waf = parser.into_waf()?;
-    if rules_file.is_some() {
-        println!("Loaded {} rules", waf.rule_count());
+    if options.rules_file.is_some() {
+        println!("Loaded {} rules", inventory.rules_loaded);
     }
 
     // Create shared state
     let waf = Arc::new(waf);
 
     // Bind to address
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], options.port));
 
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -140,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let waf = Arc::clone(&waf);
         let logfile = Arc::clone(&logfile);
-        let readiness_token = readiness_token.clone();
+        let readiness_token = options.readiness_token.clone();
 
         // Spawn a task to handle the connection
         tokio::task::spawn(async move {
@@ -503,9 +625,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         convert::Infallible,
+        fs::OpenOptions,
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -518,10 +641,123 @@ mod tests {
         body::{Bytes, Frame},
         header::HeaderValue,
     };
+    use tempfile::{TempDir, tempdir};
 
     use super::{
-        BackendResponse, add_request_headers, collect_body_prefix, create_blocking_response, has_content_type, response,
+        BackendResponse, Logfile, Options, add_request_headers, collect_body_prefix, create_blocking_response,
+        has_content_type, load_policy, response, write_inventory,
     };
+
+    fn test_args(extra: &[&str]) -> Vec<String> {
+        let mut args = vec!["ftw_server_async".to_owned()];
+        args.extend(extra.iter().map(|value| (*value).to_owned()));
+        args
+    }
+
+    fn rules_path(dir: &TempDir) -> String {
+        dir.path().join("rules.conf").to_string_lossy().into_owned()
+    }
+
+    fn test_logfile(dir: &TempDir) -> Logfile {
+        Arc::new(Mutex::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.path().join("audit.log"))
+                .unwrap(),
+        ))
+    }
+
+    fn write_rules(dir: &TempDir, content: &str) -> String {
+        let path = rules_path(dir);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn strict_mode_requires_a_rules_file() {
+        let error = Options::parse(&test_args(&["--strict"])).err().unwrap();
+        assert!(error.to_string().contains("--strict requires --rules"));
+    }
+
+    #[test]
+    fn expected_rule_count_requires_strict_mode() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(&dir, "SecRuleEngine On\n");
+        let error = Options::parse(&test_args(&["--rules", &path, "--expected-rules", "1"]))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("--expected-rules requires --strict"));
+    }
+
+    #[test]
+    fn strict_mode_rejects_an_unsupported_directive() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(&dir, "SecRuleEngine On\nSecBogusDirective value\n");
+        let options = Options::parse(&test_args(&["--strict", "--rules", &path])).unwrap();
+
+        let error = load_policy(&options, &test_logfile(&dir)).err().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("unknown directive"), "unexpected error: {message}");
+        assert!(message.contains("SecBogusDirective"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn legacy_mode_skips_an_unsupported_directive() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(&dir, "SecRuleEngine On\nSecBogusDirective value\n");
+        let options = Options::parse(&test_args(&["--rules", &path])).unwrap();
+
+        let (_waf, inventory) = load_policy(&options, &test_logfile(&dir)).unwrap();
+
+        assert_eq!(inventory.mode, "legacy");
+        assert_eq!(inventory.skipped_directives.len(), 1);
+        assert!(inventory.skipped_directives[0].contains("SecBogusDirective"));
+    }
+
+    #[test]
+    fn strict_mode_checks_the_expected_rule_count() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(
+            &dir,
+            "SecRule ARGS \"@contains x\" \"id:998101,phase:1,deny,status:403\"\n",
+        );
+        let options = Options::parse(&test_args(&["--strict", "--rules", &path, "--expected-rules", "2"])).unwrap();
+
+        let error = load_policy(&options, &test_logfile(&dir)).err().unwrap();
+        assert!(
+            error.to_string().contains("expected 2 rule(s), loaded 1"),
+            "unexpected error: {error}"
+        );
+
+        let options = Options::parse(&test_args(&["--strict", "--rules", &path, "--expected-rules", "1"])).unwrap();
+        let (_waf, inventory) = load_policy(&options, &test_logfile(&dir)).unwrap();
+        assert_eq!(inventory.rules_loaded, 1);
+        assert_eq!(inventory.expected_rules, Some(1));
+    }
+
+    #[test]
+    fn strict_inventory_is_machine_readable() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(
+            &dir,
+            "SecRule ARGS \"@contains x\" \"id:998102,phase:1,deny,status:403\"\n",
+        );
+        let options = Options::parse(&test_args(&["--strict", "--rules", &path])).unwrap();
+        let (_waf, inventory) = load_policy(&options, &test_logfile(&dir)).unwrap();
+
+        let value = inventory.to_json();
+        assert_eq!(value["mode"], "strict");
+        assert_eq!(value["rules_loaded"], 1);
+        assert_eq!(value["skipped_directives"].as_array().unwrap().len(), 0);
+        assert!(value["expected_rules"].is_null());
+
+        let inventory_path = dir.path().join("inventory.json");
+        write_inventory(&inventory, inventory_path.to_str().unwrap()).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&inventory_path).unwrap()).unwrap();
+        assert_eq!(written["mode"], "strict");
+        assert_eq!(written["rules_loaded"], 1);
+    }
 
     #[test]
     fn response_uses_backend_content_type_without_adding_a_default() {

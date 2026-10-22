@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +33,59 @@ const (
 	serverBinaryPath = "../target/release/examples/ftw_server_async"
 )
 
+type runMode string
+
+const (
+	// modeConformance requires a complete, strict FTW inventory and run.
+	modeConformance runMode = "conformance"
+	// modeHealthOnly only checks that the server answers basic requests.
+	modeHealthOnly runMode = "health-only"
+)
+
 var serverLogfile string
+
+func parseMode(value string) (runMode, error) {
+	switch mode := runMode(value); mode {
+	case modeConformance, modeHealthOnly:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown --mode %q (want %q or %q)", value, modeConformance, modeHealthOnly)
+	}
+}
+
+// options holds the runner configuration after command-line validation.
+type options struct {
+	mode           runMode
+	rulesFile      string
+	testDir        string
+	maxTests       int
+	failedOut      string
+	manifestPath   string
+	expectedRules  int
+	expectedFiles  int
+	expectedTests  int
+	expectedStages int
+}
+
+// validate rejects combinations that could hide missing coverage.
+func (o options) validate() error {
+	if o.mode == modeConformance {
+		if o.testDir == "" {
+			return errors.New("--test-dir is required in conformance mode")
+		}
+		if o.rulesFile == "" {
+			return errors.New("--rules is required in conformance mode")
+		}
+		if o.manifestPath == "" {
+			return errors.New("--manifest is required in conformance mode")
+		}
+		return nil
+	}
+	if o.expectedRules >= 0 || o.expectedFiles >= 0 || o.expectedTests >= 0 || o.expectedStages >= 0 {
+		return errors.New("--expected-* counts are only valid in conformance mode")
+	}
+	return nil
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -43,60 +97,103 @@ func main() {
 func run() error {
 	// Parse command-line flags
 	rulesFile := flag.String("rules", "", "Path to CRS rules file (e.g., crs-test.conf)")
-	maxTests := flag.Int("max-tests", 0, "Maximum number of tests to run (0 = all tests)")
-	testDir := flag.String("test-dir", "", "Path to test directory (default: ../../coraza-coreruleset/tests)")
+	modeFlag := flag.String("mode", string(modeConformance), "Run mode: conformance or health-only")
+	maxTests := flag.Int("max-tests", 0, "Maximum number of test files to run (0 = all files)")
+	testDir := flag.String("test-dir", "", "Directory searched recursively for FTW tests (required in conformance mode)")
 	failedOut := flag.String("failed-out", "", "File to write the IDs of the failed tests to, one per line")
+	manifestPath := flag.String("manifest", "ftw-result.json", "Path for the machine-readable conformance result manifest")
+	expectedRules := flag.Int("expected-rules", -1, "Expected number of loaded WAF rules (-1 = not checked)")
+	expectedFiles := flag.Int("expected-files", -1, "Expected number of FTW test files (-1 = not checked)")
+	expectedTests := flag.Int("expected-tests", -1, "Expected number of FTW test cases (-1 = not checked)")
+	expectedStages := flag.Int("expected-stages", -1, "Expected number of FTW stages (-1 = not checked)")
 	flag.Parse()
+
+	mode, err := parseMode(*modeFlag)
+	if err != nil {
+		return err
+	}
+	opts := options{
+		mode:           mode,
+		rulesFile:      *rulesFile,
+		testDir:        *testDir,
+		maxTests:       *maxTests,
+		failedOut:      *failedOut,
+		manifestPath:   *manifestPath,
+		expectedRules:  *expectedRules,
+		expectedFiles:  *expectedFiles,
+		expectedTests:  *expectedTests,
+		expectedStages: *expectedStages,
+	}
+	if err := opts.validate(); err != nil {
+		return err
+	}
 
 	fmt.Println("Coraza-RS FTW test runner")
 
-	// Verify server binary exists
+	if opts.mode == modeHealthOnly {
+		return runHealthOnly(opts)
+	}
+	return runConformance(opts)
+}
+
+// runHealthOnly performs only the explicitly requested basic health checks.
+func runHealthOnly(opts options) error {
+	server, cleanup, err := startServer(opts)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	fmt.Printf("Server ready on http://localhost:%d\n\n", server.port)
+	fmt.Println("Running in explicitly selected health-only mode; no FTW coverage is asserted")
+	return testServerHealth()
+}
+
+// startServer builds and starts the Rust server, preserving token-based readiness.
+func startServer(opts options) (*Server, func(), error) {
 	if _, err := os.Stat(serverBinaryPath); err != nil {
-		return fmt.Errorf("server binary not found at %s; build it with cargo build --release -p coraza --example ftw_server_async --features async-server: %w", serverBinaryPath, err)
+		return nil, nil, fmt.Errorf("server binary not found at %s; build it with cargo build --release -p coraza --example ftw_server_async --features async-server: %w", serverBinaryPath, err)
 	}
 	fmt.Printf("Found server binary: %s\n", serverBinaryPath)
 
 	auditDir, err := os.MkdirTemp("", "coraza-ftw-audit-")
 	if err != nil {
-		return fmt.Errorf("failed to create audit directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to create audit directory: %w", err)
 	}
 	serverLogfile = filepath.Join(auditDir, "audit.log")
-	defer func() {
+	cleanupDir := func() {
 		if err := os.RemoveAll(auditDir); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to remove audit directory %s: %v\n", auditDir, err)
 		}
-	}()
+	}
 
-	// Start server
 	fmt.Println("Starting FTW server...")
 	server := &Server{
-		port:      serverPort,
-		logfile:   serverLogfile,
-		rulesFile: *rulesFile,
+		port:          serverPort,
+		logfile:       serverLogfile,
+		rulesFile:     opts.rulesFile,
+		strict:        opts.mode == modeConformance,
+		expectedRules: opts.expectedRules,
+	}
+	if opts.mode == modeConformance {
+		server.inventoryPath = filepath.Join(auditDir, "server-inventory.json")
 	}
 
 	if err := server.Start(); err != nil {
-		return fmt.Errorf("failed to start server: %w", err)
+		cleanupDir()
+		return nil, nil, fmt.Errorf("failed to start server: %w", err)
 	}
-	defer server.Stop()
 
-	// Wait for server to be ready
 	fmt.Println("Waiting for server to be ready...")
 	if err := server.WaitUntilReady(30 * time.Second); err != nil {
-		return err
+		server.Stop()
+		cleanupDir()
+		return nil, nil, err
 	}
-	fmt.Printf("Server ready on http://localhost:%d\n\n", serverPort)
-
-	// Run FTW tests
-	fmt.Println("Running FTW tests...")
-	fmt.Println(strings.Repeat("=", 61))
-	if err := runFTW(*maxTests, *testDir, *failedOut); err != nil {
-		return fmt.Errorf("FTW run failed: %w", err)
-	}
-
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("All tests complete!")
-	return nil
+	return server, func() {
+		server.Stop()
+		cleanupDir()
+	}, nil
 }
 
 // Server represents the Rust FTW server process
@@ -106,6 +203,9 @@ type Server struct {
 	logfile        string
 	rulesFile      string
 	readinessToken string
+	strict         bool
+	expectedRules  int
+	inventoryPath  string
 	done           chan struct{}
 	waitErr        error
 }
@@ -126,6 +226,15 @@ func (s *Server) Start() error {
 
 	if s.rulesFile != "" {
 		args = append(args, "--rules", s.rulesFile)
+	}
+	if s.strict {
+		args = append(args, "--strict")
+	}
+	if s.expectedRules >= 0 {
+		args = append(args, "--expected-rules", strconv.Itoa(s.expectedRules))
+	}
+	if s.inventoryPath != "" {
+		args = append(args, "--inventory-file", s.inventoryPath)
 	}
 
 	s.cmd = exec.Command(serverBinaryPath, args...)
@@ -156,6 +265,22 @@ func (s *Server) Stop() {
 			<-s.done
 		}
 		s.cmd = nil
+	}
+}
+
+// CheckAlive reports an early process exit after readiness was observed.
+func (s *Server) CheckAlive() error {
+	if s.done == nil {
+		return nil
+	}
+	select {
+	case <-s.done:
+		if s.waitErr != nil {
+			return fmt.Errorf("server process exited during the test run: %w", s.waitErr)
+		}
+		return errors.New("server process exited during the test run")
+	default:
+		return nil
 	}
 }
 
@@ -229,78 +354,216 @@ mode: "default"
 `, serverLogfile, serverPort)
 }
 
-// runFTW executes go-ftw tests using the library directly
-func runFTW(maxTests int, customTestDir string, failedOut string) error {
+// inventory is the complete set of FTW files below the configured directory.
+type inventory struct {
+	Files     int
+	Tests     int
+	Stages    int
+	TestFiles []*test.FTWTest
+}
+
+// selectFiles applies --max-tests to files and recomputes the selected counts.
+func (inv inventory) selectFiles(maxFiles int) inventory {
+	if maxFiles <= 0 || maxFiles >= len(inv.TestFiles) {
+		return inv
+	}
+	selected := inv
+	selected.TestFiles = inv.TestFiles[:maxFiles]
+	selected.Files = len(selected.TestFiles)
+	selected.Tests = 0
+	selected.Stages = 0
+	for _, ftwTest := range selected.TestFiles {
+		selected.Tests += len(ftwTest.Tests)
+		for _, testCase := range ftwTest.Tests {
+			selected.Stages += len(testCase.Stages)
+		}
+	}
+	return selected
+}
+
+func isYAMLTest(path string) bool {
+	return strings.HasSuffix(path, ".yaml") || strings.HasSuffix(path, ".yml")
+}
+
+// loadInventory rejects unreadable or malformed files instead of skipping them.
+func loadInventory(testDir string) (inventory, error) {
+	if testDir == "" {
+		return inventory{}, errors.New("test directory is required")
+	}
+	info, err := os.Stat(testDir)
+	if err != nil {
+		return inventory{}, fmt.Errorf("test directory %q: %w", testDir, err)
+	}
+	if !info.IsDir() {
+		return inventory{}, fmt.Errorf("test directory %q is not a directory", testDir)
+	}
+
+	var testFiles []*test.FTWTest
+	err = filepath.Walk(testDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() || !isYAMLTest(path) {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read test file %s: %w", path, err)
+		}
+		ftwTest, err := test.GetTestFromYaml(data, path)
+		if err != nil {
+			return fmt.Errorf("parse test file %s: %w", path, err)
+		}
+		testFiles = append(testFiles, ftwTest)
+		return nil
+	})
+	if err != nil {
+		return inventory{}, err
+	}
+	if len(testFiles) == 0 {
+		return inventory{}, fmt.Errorf("test directory %q contains no FTW YAML tests", testDir)
+	}
+
+	inv := inventory{Files: len(testFiles), TestFiles: testFiles}
+	for _, ftwTest := range testFiles {
+		inv.Tests += len(ftwTest.Tests)
+		for _, testCase := range ftwTest.Tests {
+			inv.Stages += len(testCase.Stages)
+		}
+	}
+	return inv, nil
+}
+
+// runConformance executes the strict run and always writes a result manifest.
+func runConformance(opts options) error {
+	manifest := newResultManifest(opts)
+	runErr := startAndRunConformance(opts, &manifest)
+	if runErr != nil {
+		manifest.OK = false
+		manifest.Failures = append(manifest.Failures, runErr.Error())
+	}
+	if err := writeManifest(opts.manifestPath, manifest); err != nil {
+		if runErr != nil {
+			return fmt.Errorf("%w; also failed to write manifest: %v", runErr, err)
+		}
+		return err
+	}
+	return runErr
+}
+
+func startAndRunConformance(opts options, manifest *resultManifest) error {
+	server, cleanup, err := startServer(opts)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	fmt.Printf("Server ready on http://localhost:%d\n\n", server.port)
+	fmt.Println("Running FTW conformance tests...")
+	fmt.Println(strings.Repeat("=", 61))
+	return executeConformance(opts, server, manifest)
+}
+
+// executeConformance checks the inventory and server state, runs FTW, and fills the manifest.
+func executeConformance(opts options, server *Server, manifest *resultManifest) error {
+	inv, err := loadInventory(opts.testDir)
+	if err != nil {
+		return fmt.Errorf("test inventory: %w", err)
+	}
+	manifest.Counts.Files.Inventory = inv.Files
+	manifest.Counts.Tests.Inventory = inv.Tests
+	manifest.Counts.Stages.Inventory = inv.Stages
+
+	if err := checkCount("file", opts.expectedFiles, inv.Files); err != nil {
+		return err
+	}
+	if err := checkCount("test case", opts.expectedTests, inv.Tests); err != nil {
+		return err
+	}
+	if err := checkCount("stage", opts.expectedStages, inv.Stages); err != nil {
+		return err
+	}
+
+	selected := inv.selectFiles(opts.maxTests)
+	manifest.Counts.Files.Selected = selected.Files
+	manifest.Counts.Tests.Selected = selected.Tests
+	manifest.Counts.Stages.Selected = selected.Stages
+
+	fmt.Printf("Test inventory: %d file(s), %d test case(s), %d stage(s)\n", inv.Files, inv.Tests, inv.Stages)
+	fmt.Printf("Selected files: %d file(s), %d test case(s), %d stage(s) (--max-tests limits files)\n", selected.Files, selected.Tests, selected.Stages)
+
+	serverInventory, err := readServerInventory(server.inventoryPath)
+	if err != nil {
+		return fmt.Errorf("server inventory: %w", err)
+	}
+	if serverInventory.Mode != "strict" {
+		return fmt.Errorf("server inventory reports mode %q, want \"strict\"", serverInventory.Mode)
+	}
+	manifest.Counts.Rules.Loaded = serverInventory.RulesLoaded
+	if err := checkCount("rule", opts.expectedRules, serverInventory.RulesLoaded); err != nil {
+		return err
+	}
+	fmt.Printf("Server rules loaded: %d\n", serverInventory.RulesLoaded)
+
+	out := output.NewOutput("normal", os.Stdout)
+	res, err := runFTWTests(selected.TestFiles, out)
+	if err != nil {
+		return err
+	}
+	if err := server.CheckAlive(); err != nil {
+		return err
+	}
+
+	totalFailed := res.Stats.TotalFailed()
+	manifest.Results = runResults{
+		Run:          res.Stats.Run,
+		Passed:       len(res.Stats.Success),
+		Failed:       res.Stats.Failed,
+		Skipped:      res.Stats.Skipped,
+		Ignored:      res.Stats.Ignored,
+		ForcedFailed: res.Stats.ForcedFail,
+	}
+
+	// Report results
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("Test results:")
+	fmt.Printf("   Run:     %d\n", res.Stats.Run)
+	fmt.Printf("   Passed:  %d\n", len(res.Stats.Success))
+	fmt.Printf("   Failed:  %d\n", totalFailed)
+	fmt.Printf("   Skipped: %d\n", len(res.Stats.Skipped))
+	fmt.Printf("   Ignored: %d\n", len(res.Stats.Ignored))
+	fmt.Println(strings.Repeat("=", 60))
+
+	if opts.failedOut != "" {
+		failed := strings.Join(append(res.Stats.Failed, res.Stats.ForcedFail...), "\n")
+		if totalFailed > 0 {
+			failed += "\n"
+		}
+		if err := os.WriteFile(opts.failedOut, []byte(failed), 0o644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", opts.failedOut, err)
+		}
+	}
+
+	if err := checkRunComplete(selected.Tests, res.Stats.Run); err != nil {
+		return err
+	}
+	if totalFailed > 0 {
+		return fmt.Errorf("%d test(s) failed", totalFailed)
+	}
+
+	manifest.OK = true
+	return nil
+}
+
+// runFTWTests executes the selected files using go-ftw.
+func runFTWTests(tests []*test.FTWTest, out *output.Output) (*runner.TestRunContext, error) {
 	// Set up logging
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
 	// Create configuration in memory (no file I/O)
-	configYaml := createFTWConfig()
-	cfg, err := config.NewConfigFromString(configYaml)
+	cfg, err := config.NewConfigFromString(createFTWConfig())
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Determine test directory
-	testDir := customTestDir
-	if testDir == "" {
-		testDir = filepath.Join("..", "..", "coraza-coreruleset", "tests")
-	}
-
-	if _, err := os.Stat(testDir); os.IsNotExist(err) {
-		fmt.Printf("Test directory not found: %s\n", testDir)
-		fmt.Println("   Running server health checks only")
-		return testServerHealth()
-	}
-
-	// Get test files recursively from all subdirectories
-	var tests []*test.FTWTest
-	err = filepath.Walk(testDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories and non-YAML files
-		if info.IsDir() || (!strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml")) {
-			return nil
-		}
-
-		// Skip non-test files (tests.go, etc.)
-		if strings.HasSuffix(path, ".go") {
-			return nil
-		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Printf("Skipping %s: %v\n", path, err)
-			return nil
-		}
-
-		ftwTest, err := test.GetTestFromYaml(data, path)
-		if err != nil {
-			fmt.Printf("Skipping %s: %v\n", path, err)
-			return nil
-		}
-
-		tests = append(tests, ftwTest)
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to walk test directory: %w", err)
-	}
-
-	if len(tests) == 0 {
-		return fmt.Errorf("test directory %q contains no valid FTW tests", testDir)
-	}
-
-	// Limit number of tests if requested
-	totalTests := len(tests)
-	if maxTests > 0 && maxTests < len(tests) {
-		tests = tests[:maxTests]
-		fmt.Printf("Loaded %d test file(s) from CRS test suite (limited to first %d)\n\n", totalTests, maxTests)
-	} else {
-		fmt.Printf("Loaded %d test file(s) from CRS test suite\n\n", len(tests))
+		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
 	// Run tests with increased timeouts for sync server
@@ -315,33 +578,139 @@ func runFTW(maxTests int, customTestDir string, failedOut string) error {
 	fmt.Printf("   Read Timeout: %v\n", runnerConfig.ReadTimeout)
 	fmt.Printf("   Rate Limit: %v (sequential execution)\n\n", runnerConfig.RateLimit)
 
-	out := output.NewOutput("normal", os.Stdout)
 	res, err := runner.Run(runnerConfig, tests, out)
 	if err != nil {
-		return fmt.Errorf("test execution failed: %w", err)
+		return nil, fmt.Errorf("test execution failed: %w", err)
 	}
+	return res, nil
+}
 
-	// Report results
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Printf("Test results:\n")
-	fmt.Printf("   Run:     %d\n", res.Stats.Run)
-	fmt.Printf("   Passed:  %d\n", res.Stats.Run-len(res.Stats.Failed))
-	fmt.Printf("   Failed:  %d\n", len(res.Stats.Failed))
-	fmt.Printf("   Ignored: %d\n", len(res.Stats.Ignored))
-	fmt.Println(strings.Repeat("=", 60))
-
-	if failedOut != "" {
-		failed := strings.Join(res.Stats.Failed, "\n") + "\n"
-		if err := os.WriteFile(failedOut, []byte(failed), 0o644); err != nil {
-			return fmt.Errorf("failed to write %s: %w", failedOut, err)
-		}
+// checkCount compares an optional expected count with the observed value.
+func checkCount(name string, want, got int) error {
+	if want < 0 {
+		return nil
 	}
-
-	if len(res.Stats.Failed) > 0 {
-		return fmt.Errorf("%d test(s) failed", len(res.Stats.Failed))
+	if want != got {
+		return fmt.Errorf("expected %d %s(s), found %d", want, name, got)
 	}
-
 	return nil
+}
+
+// checkRunComplete rejects runs that report fewer tests than the inventory selected.
+func checkRunComplete(expected, run int) error {
+	if run != expected {
+		return fmt.Errorf("incomplete test output: expected %d test case(s), go-ftw reported %d run", expected, run)
+	}
+	return nil
+}
+
+// resultManifest is the machine-readable conformance result.
+type resultManifest struct {
+	Mode     string           `json:"mode"`
+	OK       bool             `json:"ok"`
+	Strict   bool             `json:"strict"`
+	TestDir  string           `json:"test_dir"`
+	Expected expectedManifest `json:"expected"`
+	Counts   countsManifest   `json:"counts"`
+	Results  runResults       `json:"results"`
+	Failures []string         `json:"failures"`
+}
+
+type expectedManifest struct {
+	Rules  *int `json:"rules"`
+	Files  *int `json:"files"`
+	Tests  *int `json:"tests"`
+	Stages *int `json:"stages"`
+}
+
+type countsManifest struct {
+	Files  countValue `json:"files"`
+	Tests  countValue `json:"tests"`
+	Stages countValue `json:"stages"`
+	Rules  ruleCount  `json:"rules"`
+}
+
+type countValue struct {
+	Inventory int `json:"inventory"`
+	Selected  int `json:"selected"`
+}
+
+type ruleCount struct {
+	Loaded int `json:"loaded"`
+}
+
+type runResults struct {
+	Run          int      `json:"run"`
+	Passed       int      `json:"passed"`
+	Failed       []string `json:"failed"`
+	Skipped      []string `json:"skipped"`
+	Ignored      []string `json:"ignored"`
+	ForcedFailed []string `json:"forced_failed"`
+}
+
+func newResultManifest(opts options) resultManifest {
+	return resultManifest{
+		Mode:    string(opts.mode),
+		Strict:  true,
+		TestDir: opts.testDir,
+		Expected: expectedManifest{
+			Rules:  optionalCount(opts.expectedRules),
+			Files:  optionalCount(opts.expectedFiles),
+			Tests:  optionalCount(opts.expectedTests),
+			Stages: optionalCount(opts.expectedStages),
+		},
+		Results: runResults{
+			Failed:       []string{},
+			Skipped:      []string{},
+			Ignored:      []string{},
+			ForcedFailed: []string{},
+		},
+		Failures: []string{},
+	}
+}
+
+func optionalCount(value int) *int {
+	if value < 0 {
+		return nil
+	}
+	return &value
+}
+
+func writeManifest(path string, manifest resultManifest) error {
+	if path == "" {
+		return errors.New("manifest path is empty")
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode manifest: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write manifest %s: %w", path, err)
+	}
+	return nil
+}
+
+// serverInventory is the startup inventory written by the Rust server in strict mode.
+type serverInventory struct {
+	Mode              string   `json:"mode"`
+	RulesLoaded       int      `json:"rules_loaded"`
+	SkippedDirectives []string `json:"skipped_directives"`
+	ExpectedRules     *int     `json:"expected_rules"`
+}
+
+func readServerInventory(path string) (serverInventory, error) {
+	if path == "" {
+		return serverInventory{}, errors.New("inventory path is empty")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return serverInventory{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var inventory serverInventory
+	if err := json.Unmarshal(data, &inventory); err != nil {
+		return serverInventory{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return inventory, nil
 }
 
 // testServerHealth performs basic server health check
