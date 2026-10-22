@@ -1112,6 +1112,8 @@ impl AuditLogger {
 struct Syslog {
     /// Connected socket.
     socket: SyslogSocket,
+    /// Original target, used if the socket needs to reconnect.
+    target: String,
     /// Whether it is the local syslog, which takes a shorter header
     local: bool,
 }
@@ -1130,6 +1132,20 @@ enum SyslogSocket {
     UnixDatagram(std::os::unix::net::UnixDatagram),
 }
 
+impl SyslogSocket {
+    /// Write one already-framed syslog message to this socket.
+    fn write_frame(&mut self, framed: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Udp(socket) => socket.send(framed).map(|_| ()),
+            Self::Tcp(stream) => stream.write_all(framed),
+            #[cfg(unix)]
+            Self::UnixStream(stream) => stream.write_all(framed),
+            #[cfg(unix)]
+            Self::UnixDatagram(socket) => socket.send(framed).map(|_| ()),
+        }
+    }
+}
+
 impl Syslog {
     /// Connects to `target` as Go Coraza reads it: `scheme://address`, where the scheme
     /// is `udp`, `tcp`, `unix` or `unixgram`; an address alone, over TCP; or, empty, the
@@ -1143,7 +1159,7 @@ impl Syslog {
         };
         let socket = match (network, address) {
             #[cfg(unix)]
-            (_, "") => return Self::connect_local(),
+            (_, "") => return Self::connect_local(target),
             ("udp" | "udp4" | "udp6", address) => {
                 let socket = std::net::UdpSocket::bind(if address.starts_with('[') {
                     "[::]:0"
@@ -1164,12 +1180,16 @@ impl Syslog {
             },
             (network, _) => return Err(unsupported(network)),
         };
-        Ok(Self { socket, local: false })
+        Ok(Self {
+            socket,
+            target: target.to_owned(),
+            local: false,
+        })
     }
 
     /// The local syslog, at the first of Go's known socket paths that answers.
     #[cfg(unix)]
-    fn connect_local() -> io::Result<Self> {
+    fn connect_local(target: &str) -> io::Result<Self> {
         let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no local syslog");
         for path in ["/dev/log", "/var/run/syslog", "/var/run/log"] {
             let datagram =
@@ -1184,7 +1204,11 @@ impl Syslog {
                     },
                 },
             };
-            return Ok(Self { socket, local: true });
+            return Ok(Self {
+                socket,
+                target: target.to_owned(),
+                local: true,
+            });
         }
         Err(last_error)
     }
@@ -1226,14 +1250,12 @@ impl Syslog {
                 hostname()
             )
         };
-        match &mut self.socket {
-            SyslogSocket::Udp(socket) => socket.send(framed.as_bytes()).map(|_| ()),
-            SyslogSocket::Tcp(stream) => stream.write_all(framed.as_bytes()),
-            #[cfg(unix)]
-            SyslogSocket::UnixStream(stream) => stream.write_all(framed.as_bytes()),
-            #[cfg(unix)]
-            SyslogSocket::UnixDatagram(socket) => socket.send(framed.as_bytes()).map(|_| ()),
+        if self.socket.write_frame(framed.as_bytes()).is_err() {
+            let target = self.target.clone();
+            *self = Self::connect(&target)?;
+            self.socket.write_frame(framed.as_bytes())?;
         }
+        Ok(())
     }
 }
 
@@ -1317,7 +1339,7 @@ fn index_field(value: &str) -> String {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "audit log tests use fixed temporary paths")]
 mod tests {
-    use super::{AuditLog, AuditLogger, AuditTransaction, index_field, safe_file_component, write_new};
+    use super::{AuditLog, AuditLogger, AuditTransaction, Syslog, index_field, safe_file_component, write_new};
     use crate::{
         actions::RuleMetadata,
         collection::MatchData,
@@ -1453,5 +1475,64 @@ mod tests {
 
         assert!(write_new(&link, b"replace", 0o600).is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn syslog_reconnects_to_its_original_target_after_a_write_failure() {
+        use std::{
+            io::{self, Read as _},
+            os::unix::net::UnixListener,
+            sync::mpsc,
+            thread,
+            time::Duration,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syslog.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let target = format!("unix://{}", path.display());
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> io::Result<Vec<u8>> {
+            let (connection, _) = listener.accept()?;
+            drop(connection);
+            closed_tx
+                .send(())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut retry, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(error) => return Err(error),
+                }
+            };
+            let mut message = Vec::new();
+            let mut byte = [0; 1];
+            loop {
+                if retry.read(&mut byte)? == 0 {
+                    break;
+                }
+                let Some(value) = byte.first().copied() else {
+                    break;
+                };
+                message.push(value);
+                if value == b'\n' {
+                    break;
+                }
+            }
+            Ok(message)
+        });
+
+        let mut syslog = Syslog::connect(&target).unwrap();
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        syslog.send("reconnected", false).unwrap();
+
+        let message = server.join().unwrap().unwrap();
+        assert!(message.ends_with(b"reconnected\n"));
     }
 }

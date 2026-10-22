@@ -30,22 +30,23 @@
 //! - Supports concurrent requests via tokio
 //!
 //! Usage:
-//!   cargo run --example ftw_server_async --features async-server -- \
+//!   cargo run --example `ftw_server_async` --features async-server -- \
 //!     --port 8080 \
 //!     --logfile /tmp/coraza-audit.log \
 //!     --rules crs-setup.conf
 
 use std::{
     convert::Infallible,
+    fmt::Write as _,
     fs::OpenOptions,
-    io::Write as IoWrite,
+    io::Write as _,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use coraza::{config::WafConfig, seclang::Parser, types::RuleEngineStatus, waf::Waf};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
@@ -59,6 +60,11 @@ use tokio::net::TcpListener;
 /// The log FTW reads: request markers and Go Coraza's error log lines.
 type Logfile = Arc<Mutex<std::fs::File>>;
 
+#[expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "The standalone FTW server reports startup and connection status to its console."
+)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Coraza FTW test server (async)");
@@ -70,12 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<u16>()?;
     let logfile = get_arg(&args, "--logfile").unwrap_or_else(|| "/tmp/coraza-ftw-audit.log".to_owned());
     let rules_file = get_arg(&args, "--rules");
+    let readiness_token = get_arg(&args, "--readiness-token");
 
     println!("Configuration:");
-    println!("   Port: {}", port);
-    println!("   Logfile: {}", logfile);
-    if let Some(ref rules) = rules_file {
-        println!("   Rules: {}", rules);
+    println!("   Port: {port}");
+    println!("   Logfile: {logfile}");
+    if let Some(rules) = &rules_file {
+        println!("   Rules: {rules}");
     }
     println!();
 
@@ -87,8 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rule_engine: RuleEngineStatus::On,
         request_body_access: true,
         response_body_access: true,
-        request_body_limit: 1048576, // 1MB
-        web_app_id: "ftw-test".to_string(),
+        request_body_limit: 1_048_576, // 1MB
+        web_app_id: "ftw-test".to_owned(),
         ..WafConfig::default()
     };
     // Keep loading past directives this engine doesn't support yet, so a full CRS still loads
@@ -129,52 +136,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let waf = Arc::clone(&waf);
         let logfile = Arc::clone(&logfile);
+        let readiness_token = readiness_token.clone();
 
         // Spawn a task to handle the connection
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
-                handle_request(req, Arc::clone(&waf), Arc::clone(&logfile), peer_addr, local_addr)
+                handle_request(
+                    req,
+                    Arc::clone(&waf),
+                    Arc::clone(&logfile),
+                    readiness_token.clone(),
+                    peer_addr,
+                    local_addr,
+                )
             });
 
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                eprintln!("Error serving connection: {:?}", err);
+                eprintln!("Error serving connection: {err:?}");
             }
         });
     }
 }
 
 /// Handle a single HTTP request through the WAF
+#[expect(
+    clippy::too_many_arguments,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "The request needs its connection context and the FTW server logs each request."
+)]
 async fn handle_request(
     req: Request<Incoming>,
     waf: Arc<Waf>,
     logfile: Logfile,
+    readiness_token: Option<String>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let method = req.method().as_str().to_string();
+    let method = req.method().as_str().to_owned();
 
     // CONNECT requests use authority (host:port) instead of path
     let full_uri = if req.method() == Method::CONNECT {
         req.uri()
             .authority()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| req.uri().path().to_string())
+            .map_or_else(|| req.uri().path().to_owned(), ToString::to_string)
     } else {
         match req.uri().query() {
-            Some(query) => format!("{}?{}", req.uri().path(), query),
-            None => req.uri().path().to_string(),
+            Some(query) => format!("{}?{query}", req.uri().path()),
+            None => req.uri().path().to_owned(),
         }
     };
-    let path = req.uri().path().to_string();
+    let path = req.uri().path().to_owned();
     let protocol = format!("{:?}", req.version());
 
     println!("{method} {full_uri} {protocol}");
+
+    if let Some(token) = readiness_token
+        && req.method() == Method::GET
+        && path.strip_prefix("/.well-known/coraza-ftw-health/") == Some(token.as_str())
+    {
+        return Ok(response(200, &[], token.into_bytes()));
+    }
 
     let marker_header = req
         .headers()
         .get("X-CRS-Test")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .map(str::to_owned);
     // Before the request's own error log lines, which FTW looks for after it
     if let Some(marker) = &marker_header {
         write_marker(&logfile, marker);
@@ -199,7 +227,7 @@ async fn handle_request(
     let body = match req.collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
         Err(e) => {
-            eprintln!("Error reading body: {}", e);
+            eprintln!("Error reading body: {e}");
             return Ok(create_error_response(500, "Internal Server Error"));
         },
     };
@@ -229,7 +257,9 @@ fn run_transaction(tx: &mut coraza::transaction::Transaction, path: &str, body: 
     let backend = BackendResponse::for_request(path, body);
 
     // Go Coraza's CRS test harness sets this on every response
-    tx.add_response_header("Content-Type", "text/plain");
+    if !has_content_type(&backend.headers) {
+        tx.add_response_header("Content-Type", "text/plain");
+    }
     for (name, value) in &backend.headers {
         tx.add_response_header(name, value);
     }
@@ -245,8 +275,11 @@ fn run_transaction(tx: &mut coraza::transaction::Transaction, path: &str, body: 
 
 /// What the backend behind the WAF answers.
 struct BackendResponse {
+    /// HTTP status returned by the backend.
     status: u16,
+    /// Headers returned by the backend.
     headers: Vec<(String, String)>,
+    /// Response body returned by the backend.
     body: Vec<u8>,
 }
 
@@ -265,20 +298,25 @@ impl BackendResponse {
         let Ok(spec) = serde_json::from_slice::<serde_json::Value>(body) else {
             return ok;
         };
-        let body = match (spec["body"].as_str(), spec["encodedBody"].as_str()) {
+        let body = match (
+            spec.get("body").and_then(serde_json::Value::as_str),
+            spec.get("encodedBody").and_then(serde_json::Value::as_str),
+        ) {
             (Some(body), _) => body.as_bytes().to_vec(),
             (None, Some(encoded)) => STANDARD.decode(encoded).unwrap_or_default(),
             (None, None) => Vec::new(),
         };
-        let headers = spec["headers"]
-            .as_object()
+        let headers = spec
+            .get("headers")
+            .and_then(serde_json::Value::as_object)
             .into_iter()
             .flatten()
-            .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+            .filter_map(|(name, value)| value.as_str().map(|value| (name.clone(), value.to_owned())))
             .collect();
         Self {
-            status: spec["status"]
-                .as_u64()
+            status: spec
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
                 .and_then(|status| u16::try_from(status).ok())
                 .unwrap_or(200),
             headers,
@@ -289,6 +327,10 @@ impl BackendResponse {
 
 /// Has the WAF write Go Coraza's error log line to `logfile` for each matched rule with
 /// `log`, as its CRS test harness reads it.
+#[expect(
+    clippy::print_stderr,
+    reason = "The standalone FTW server reports audit log write failures to its console."
+)]
 fn log_errors_to(parser: &mut Parser, logfile: &Logfile) {
     let logfile = Arc::clone(logfile);
     parser.on_error_log(move |matched| {
@@ -301,14 +343,26 @@ fn log_errors_to(parser: &mut Parser, logfile: &Logfile) {
 }
 
 /// Writes the FTW marker of a request, by which FTW finds the request's lines.
+#[expect(
+    clippy::print_stderr,
+    reason = "The standalone FTW server reports marker write failures to its console."
+)]
 fn write_marker(logfile: &Logfile, marker: &str) {
+    let escaped = match log_field(marker) {
+        Ok(escaped) => escaped,
+        Err(error) => {
+            eprintln!("failed to escape the FTW request marker: {error}");
+            return;
+        },
+    };
     let mut file = logfile.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(error) = writeln!(file, "[X-CRS-Test \"{}\"]", log_field(marker)) {
+    if let Err(error) = writeln!(file, "[X-CRS-Test \"{escaped}\"]") {
         eprintln!("failed to write the FTW request marker: {error}");
     }
 }
 
-fn log_field(value: &str) -> String {
+/// Escape a request marker field so it stays on one log line.
+fn log_field(value: &str) -> Result<String, std::fmt::Error> {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -317,20 +371,23 @@ fn log_field(value: &str) -> String {
             '\r' => escaped.push_str("\\r"),
             '\n' => escaped.push_str("\\n"),
             character if character.is_control() => {
-                escaped.push_str(&format!("\\u{{{:x}}}", character as u32));
+                write!(escaped, "\\u{{{:x}}}", character as u32)?;
             },
             character => escaped.push(character),
         }
     }
-    escaped
+    Ok(escaped)
 }
 
+/// Build an HTTP response, adding a default content type when needed.
 fn response(status: u16, headers: &[(String, String)], body: Vec<u8>) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    response
-        .headers_mut()
-        .insert("content-type", HeaderValue::from_static("text/plain"));
+    if !has_content_type(headers) {
+        response
+            .headers_mut()
+            .insert("content-type", HeaderValue::from_static("text/plain"));
+    }
     for (name, value) in headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
@@ -342,12 +399,23 @@ fn response(status: u16, headers: &[(String, String)], body: Vec<u8>) -> Respons
     response
 }
 
+/// Return whether backend headers contain a content type.
+fn has_content_type(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+}
+
 /// Create an error HTTP response.
 fn create_error_response(status: u16, body: &str) -> Response<Full<Bytes>> {
     response(status, &[], body.as_bytes().to_vec())
 }
 
 /// Create a blocking response when the WAF interrupts.
+#[expect(
+    clippy::print_stdout,
+    reason = "The standalone FTW server reports blocking decisions to its console."
+)]
 fn create_blocking_response(interruption: &coraza::transaction::Interruption) -> Response<Full<Bytes>> {
     println!("Blocked by rule {}: {}", interruption.rule_id, interruption.action);
     response(interruption.status, &[], b"Blocked by WAF".to_vec())
@@ -376,4 +444,27 @@ fn get_arg(args: &[String], name: &str) -> Option<String> {
         .position(|arg| arg == name)
         .and_then(|pos| args.get(pos + 1))
         .cloned()
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "FTW response tests assert fixed headers")]
+mod tests {
+    use super::{has_content_type, response};
+
+    #[test]
+    fn response_uses_backend_content_type_without_adding_a_default() {
+        let headers = [("Content-Type".to_owned(), "application/json".to_owned())];
+        let response = response(200, &headers, Vec::new());
+
+        assert_eq!(response.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(response.headers().get_all("content-type").iter().count(), 1);
+    }
+
+    #[test]
+    fn response_defaults_content_type_when_backend_omits_it() {
+        let response = response(200, &[], Vec::new());
+
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/plain");
+        assert!(!has_content_type(&[]));
+    }
 }
