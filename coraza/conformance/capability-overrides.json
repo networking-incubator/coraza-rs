@@ -1,0 +1,2061 @@
+{
+  "reference": {
+    "profile": "native-go-default-build",
+    "go_coraza": {
+      "repository": "https://github.com/corazawaf/coraza",
+      "commit": "d9cc9befc2721fd217ce1660a0e91aca1157221d"
+    },
+    "rust": {
+      "repository": "https://github.com/networking-incubator/coraza-rs",
+      "commit": "45f8785f8b17fb1f4df56f87bf87155cc986b916"
+    }
+  },
+  "groups": {
+    "operators": {
+      "beginsWith": {
+        "state": "implemented",
+        "go_reference": "internal/operators/begins_with.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "contains": {
+        "state": "implemented",
+        "go_reference": "internal/operators/contains.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "detectSQLi": {
+        "state": "implemented",
+        "go_reference": "internal/operators/detect_sqli.go",
+        "fixtures": [],
+        "differences": [
+          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+        ]
+      },
+      "detectXSS": {
+        "state": "implemented",
+        "go_reference": "internal/operators/detect_xss.go",
+        "fixtures": [],
+        "differences": [
+          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+        ]
+      },
+      "endsWith": {
+        "state": "implemented",
+        "go_reference": "internal/operators/ends_with.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "eq": {
+        "state": "implemented",
+        "go_reference": "internal/operators/eq.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ge": {
+        "state": "implemented",
+        "go_reference": "internal/operators/ge.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "geoLookup": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/operators/geo_lookup.go",
+        "fixtures": [],
+        "differences": [
+          "Mapped to the unconditional-match operator. Go's built-in geo lookup is also a stub."
+        ]
+      },
+      "gt": {
+        "state": "implemented",
+        "go_reference": "internal/operators/gt.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "inspectFile": {
+        "state": "unavailable",
+        "go_reference": "internal/operators/inspect_file.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host command capability and deadline before it is added."
+        ]
+      },
+      "ipMatch": {
+        "state": "implemented",
+        "go_reference": "internal/operators/ip_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ipMatchFromDataset": {
+        "state": "implemented",
+        "go_reference": "internal/operators/ip_match_from_dataset.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ipMatchFromFile": {
+        "state": "implemented",
+        "go_reference": "internal/operators/ip_match_from_file.go",
+        "fixtures": [],
+        "differences": [],
+        "aliases": [
+          "ipMatchF"
+        ]
+      },
+      "le": {
+        "state": "implemented",
+        "go_reference": "internal/operators/le.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "lt": {
+        "state": "implemented",
+        "go_reference": "internal/operators/lt.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "noMatch": {
+        "state": "implemented",
+        "go_reference": "internal/operators/no_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "pm": {
+        "state": "implemented",
+        "go_reference": "internal/operators/pm.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "pmFromDataset": {
+        "state": "implemented",
+        "go_reference": "internal/operators/pm_from_dataset.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "pmFromFile": {
+        "state": "implemented",
+        "go_reference": "internal/operators/pm_from_file.go",
+        "fixtures": [],
+        "differences": [],
+        "aliases": [
+          "pmf"
+        ]
+      },
+      "rbl": {
+        "state": "unavailable",
+        "go_reference": "internal/operators/rbl.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host DNS capability and deadline before it is added."
+        ]
+      },
+      "restPath": {
+        "state": "implemented",
+        "go_reference": "internal/operators/restpath.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "rx": {
+        "state": "implemented",
+        "go_reference": "internal/operators/rx.go",
+        "fixtures": [],
+        "differences": [
+          "Go regexp and byte-regexp profiles have no exact Rust equivalent; syntax, Unicode folding and malformed-byte captures need shared fixtures."
+        ]
+      },
+      "streq": {
+        "state": "implemented",
+        "go_reference": "internal/operators/streq.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "strmatch": {
+        "state": "implemented",
+        "go_reference": "internal/operators/strmatch.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "unconditionalMatch": {
+        "state": "implemented",
+        "go_reference": "internal/operators/unconditional_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "validateByteRange": {
+        "state": "implemented",
+        "go_reference": "internal/operators/validate_byte_range.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "validateNid": {
+        "state": "implemented",
+        "go_reference": "internal/operators/validate_nid.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "validateSchema": {
+        "state": "unavailable",
+        "go_reference": "internal/operators/validate_schema.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory."
+        ]
+      },
+      "validateUrlEncoding": {
+        "state": "implemented",
+        "go_reference": "internal/operators/validate_url_encoding.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "validateUtf8Encoding": {
+        "state": "implemented",
+        "go_reference": "internal/operators/validate_utf8_encoding.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "within": {
+        "state": "implemented",
+        "go_reference": "internal/operators/within.go",
+        "fixtures": [],
+        "differences": []
+      }
+    },
+    "transformations": {
+      "base64Decode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/base64decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "base64DecodeExt": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/base64decodeext.go",
+        "fixtures": [],
+        "differences": [
+          "Rust stops at invalid bytes; current Go skips invalid extended input and accepts the URL-safe alphabet (F13)."
+        ]
+      },
+      "base64Encode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/base64encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "cmdLine": {
+        "state": "unavailable",
+        "go_reference": "internal/transformations/cmd_line.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:34 but absent from the Rust transformation factory."
+        ]
+      },
+      "compressWhitespace": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/compress_whitespace.go",
+        "fixtures": [],
+        "differences": [
+          "Rust uses full Unicode whitespace; Go intentionally uses an ASCII/Latin-1 set and preserves malformed bytes (F13)."
+        ]
+      },
+      "cssDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/css_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "escapeSeqDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/escape_seq_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "hexDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/hex_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "hexEncode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/hex_encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "htmlEntityDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/html_entity_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "jsDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/js_decode.go",
+        "fixtures": [],
+        "differences": [
+          "Rust handles classic four-digit Unicode escapes; current Go also handles ES2015 braced escapes (F13)."
+        ]
+      },
+      "length": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/length.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "lowercase": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/lowercase.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "md5": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/md5.go",
+        "fixtures": [],
+        "differences": [
+          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+        ]
+      },
+      "none": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/none.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "normalisePath": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/normalise_path.go",
+        "fixtures": [],
+        "differences": [],
+        "aliases": [
+          "normalizePath"
+        ]
+      },
+      "normalisePathWin": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/normalise_path_win.go",
+        "fixtures": [],
+        "differences": [],
+        "aliases": [
+          "normalizePathWin"
+        ]
+      },
+      "removeComments": {
+        "state": "unavailable",
+        "go_reference": "internal/transformations/remove_comments.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:50 but absent from the Rust transformation factory."
+        ]
+      },
+      "removeCommentsChar": {
+        "state": "unavailable",
+        "go_reference": "internal/transformations/remove_comments_char.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:51 but absent from the Rust transformation factory."
+        ]
+      },
+      "removeNulls": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/remove_nulls.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "removeWhitespace": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/remove_whitespace.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "replaceComments": {
+        "state": "unavailable",
+        "go_reference": "internal/transformations/replace_comments.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:54 but absent from the Rust transformation factory."
+        ]
+      },
+      "replaceNulls": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/replace_nulls.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "sha1": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/sha1.go",
+        "fixtures": [],
+        "differences": [
+          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+        ]
+      },
+      "trim": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/trim.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "trimLeft": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/trim_left.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "trimRight": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/trim_right.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "uppercase": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/uppercase.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "urlDecode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/url_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "urlDecodeUni": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/url_decode_uni.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "urlEncode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/url_encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "utf8toUnicode": {
+        "state": "implemented",
+        "go_reference": "internal/transformations/utf8_to_unicode.go",
+        "fixtures": [],
+        "differences": []
+      }
+    },
+    "actions": {
+      "accuracy": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "allow": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "auditlog": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "block": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "A placeholder resolved against SecDefaultAction, as in Go; with no default the action has no effect."
+        ]
+      },
+      "capture": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "chain": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ctl": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "deny": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "drop": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "exec": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/actions/exec.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Native Go exec Evaluate is also empty; Go rejects a non-empty argument while Rust requires one."
+        ]
+      },
+      "expirevar": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/actions/expirevar.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Go emits an unsupported warning; Go accepts more input than Rust's variable=integer validator."
+        ]
+      },
+      "id": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "initcol": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/actions/initcol.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Go's persistence is also commented out."
+        ]
+      },
+      "log": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "logdata": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "maturity": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "msg": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "multiMatch": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "noauditlog": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "nolog": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "pass": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "The default non-disruptive outcome; the action has no separate runtime arm."
+        ]
+      },
+      "phase": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "redirect": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "rev": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "setenv": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "setvar": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "TX-only, as in Go; persistent IP/SESSION storage is separate work."
+        ]
+      },
+      "severity": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "skip": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "skipAfter": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "status": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "t": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "tag": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ver": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      }
+    },
+    "directives": {
+      "Include": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Handled by the parser rather than directive_handler, with a recursion limit."
+        ]
+      },
+      "SecAction": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecArgumentSeparator": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecArgumentsLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditEngine": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLog": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogDirMode": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogFileMode": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogFormat": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogParts": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogRelevantStatus": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogStorageDir": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecAuditLogType": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Serial, Concurrent and Syslog writers are implemented. HTTPS is recognized but rejected when the WAF is built; audit timestamps are UTC rather than process-local."
+        ]
+      },
+      "SecCollectionTimeout": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated and stored, but persistent collections are inactive. Go's collection timeout is also inactive."
+        ]
+      },
+      "SecComponentSignature": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecConnEngine": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecConnReadStateLimit": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecConnWriteStateLimit": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecCookieFormat": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecDataDir": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored only; no runtime path resolves data files through it."
+        ]
+      },
+      "SecDataset": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecDebugLog": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; the library writes no debug log."
+        ]
+      },
+      "SecDebugLogLevel": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated and stored, but the debug logger is not driven by the library. Go applies the level."
+        ]
+      },
+      "SecDefaultAction": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecGsbLookupDb": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHashEngine": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHashKey": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHashMethodPm": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHashMethodRx": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHashParam": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecHttpBlKey": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecIgnoreRuleCompilationErrors": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Rust skips failed later directives when enabled. Go records the setting but does not act on it."
+        ]
+      },
+      "SecMarker": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecPcreMatchLimit": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecPcreMatchLimitRecursion": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecRemoteRules": {
+        "state": "rejected",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Deliberately unsupported and rejected, as in Go. Loading rules over the network is left to the embedder."
+        ]
+      },
+      "SecRemoteRulesFailAction": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; SecRemoteRules is unsupported in both engines."
+        ]
+      },
+      "SecRequestBodyAccess": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRequestBodyInMemoryLimit": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but ingestion accepts an already allocated body and never spills to disk (F03)."
+        ]
+      },
+      "SecRequestBodyJsonDepthLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRequestBodyLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRequestBodyLimitAction": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRequestBodyNoFilesLimit": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but unused. Go explicitly leaves the feature unimplemented."
+        ]
+      },
+      "SecResponseBodyAccess": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecResponseBodyJsonDepthLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecResponseBodyLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecResponseBodyLimitAction": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecResponseBodyMimeType": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecResponseBodyMimeTypesClear": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRule": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleEngine": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRulePerfTime": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecRuleRemoveById": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleRemoveByMsg": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleRemoveByTag": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleScript": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecRuleUpdateActionById": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleUpdateTargetById": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRuleUpdateTargetByMsg": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecRuleUpdateTargetByTag": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecRxPreFilter": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only. Go enables a regex prefilter; the Rust regex engine does this internally, so the setting has no separate effect."
+        ]
+      },
+      "SecSensorID": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; no runtime producer or audit field uses it."
+        ]
+      },
+      "SecServerSignature": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; the library does not mutate the Server response header."
+        ]
+      },
+      "SecTmpDir": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecUnicodeMap": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      "SecUploadDir": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecUploadFileLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "SecUploadFileMode": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but upload storage uses private generated tempfile paths and does not apply the mode."
+        ]
+      },
+      "SecUploadKeepFiles": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Boolean only; Go's RelevantOnly retention mode is not implemented in either engine."
+        ]
+      },
+      "SecWebAppId": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored only. Persistent IP/SESSION collections that would use it are not implemented in either engine."
+        ]
+      }
+    },
+    "variables": {
+      "ARGS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_COMBINED_SIZE": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_GET": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_GET_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_PATH": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_POST": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGS_POST_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "ARGUMENTS_LIMIT_REACHED": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "AUTH_TYPE": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "DURATION": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/waf.go:283",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:283 and no producer updating it was established."
+        ]
+      },
+      "ENV": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FILES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FILES_COMBINED_SIZE": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FILES_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FILES_SIZES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FILES_TMP_CONTENT": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage; meaningful automatic population was not established."
+        ]
+      },
+      "FILES_TMPNAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "FULL_REQUEST": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "FULL_REQUEST_LENGTH": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/waf.go:275",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:275 and no producer updating it was established."
+        ]
+      },
+      "GEO": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go's built-in geo lookup is a stub."
+        ]
+      },
+      "HIGHEST_SEVERITY": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "INBOUND_DATA_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "IP": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "JSON": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go's JSON collection is explicitly nil."
+        ]
+      },
+      "MATCHED_VAR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MATCHED_VAR_NAME": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MATCHED_VARS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MATCHED_VARS_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_BOUNDARY_QUOTED": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_BOUNDARY_WHITESPACE": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_CRLF_LF_LINES": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_DATA_AFTER": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go initializes the collection as a compatibility placeholder; no producer was established."
+        ]
+      },
+      "MULTIPART_DATA_BEFORE": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_DUPLICATE_PART_HEADER": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_FILE_LIMIT_EXCEEDED": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_FILENAME": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_FILENAME_CHARSET": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_FILENAME_LANGUAGE": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_HEADER_FOLDING": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_INVALID_HEADER_FOLDING": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_INVALID_PART": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_INVALID_QUOTING": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_LF_LINE": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_MISSING_SEMICOLON": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "MULTIPART_NAME": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_PART_HEADERS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_STRICT_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "MULTIPART_UNMATCHED_BOUNDARY": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      "OUTBOUND_DATA_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "PATH_INFO": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "QUERY_STRING": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (QUERY_STRING)"
+        ]
+      },
+      "REMOTE_ADDR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REMOTE_HOST": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage but no automatic producer was established."
+        ]
+      },
+      "REMOTE_PORT": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQBODY_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQBODY_ERROR_MSG": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQBODY_PROCESSOR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQBODY_PROCESSOR_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQBODY_PROCESSOR_ERROR_MSG": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_BASENAME": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_BASENAME)"
+        ]
+      },
+      "REQUEST_BODY": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_BODY_LENGTH": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_COOKIES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_COOKIES_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_FILENAME": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_FILENAME)"
+        ]
+      },
+      "REQUEST_HEADERS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_HEADERS_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_LINE": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_LINE)"
+        ]
+      },
+      "REQUEST_METHOD": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_PROTOCOL": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_URI": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "REQUEST_URI_RAW": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_URI_RAW)"
+        ]
+      },
+      "REQUEST_XML": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RES_BODY_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RES_BODY_ERROR_MSG": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RES_BODY_PROCESSOR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RES_BODY_PROCESSOR_ERROR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RES_BODY_PROCESSOR_ERROR_MSG": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_ARGS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_BODY": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_CONTENT_LENGTH": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_CONTENT_TYPE": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_HEADERS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_HEADERS_NAMES": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_PROTOCOL": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_STATUS": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RESPONSE_XML": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "RULE": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "SERVER_ADDR": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "SERVER_NAME": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "SERVER_PORT": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "SESSIONID": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "STATUS_LINE": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage but no automatic producer was established."
+        ]
+      },
+      "TIME": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME)"
+        ]
+      },
+      "TIME_DAY": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_DAY)"
+        ]
+      },
+      "TIME_EPOCH": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_EPOCH)"
+        ]
+      },
+      "TIME_HOUR": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_HOUR)"
+        ]
+      },
+      "TIME_MIN": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MIN)"
+        ]
+      },
+      "TIME_MON": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MON)"
+        ]
+      },
+      "TIME_SEC": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_SEC)"
+        ]
+      },
+      "TIME_WDAY": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_WDAY)"
+        ]
+      },
+      "TIME_YEAR": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_YEAR)"
+        ]
+      },
+      "TX": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "UNIQUE_ID": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      "UNKNOWN": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Error placeholder only; it is never a real input collection."
+        ]
+      },
+      "URI_PARSE_ERROR": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/transaction.go:885",
+        "fixtures": [],
+        "differences": [
+          "Absent from RuleVariable and query recovery; current Go exposes it at internal/variables/variables.go:750. Rules naming it fail compilation in this build."
+        ]
+      },
+      "URLENCODED_ERROR": {
+        "state": "unavailable",
+        "go_reference": "internal/corazawaf/waf.go:272",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:272; Rust has no value at all."
+        ]
+      },
+      "USERID": {
+        "state": "accepted_without_effect",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      "XML": {
+        "state": "implemented",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      }
+    },
+    "body_processors": {
+      "JSON": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "DOM-based flattening drops duplicate members and does not populate TX.json_request_body/TX.json_response_body; numeric tokens and collision behavior differ from Go (F04)."
+        ]
+      },
+      "MULTIPART": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Initial delimiter search, per-part metadata retention and partial-body EOF handling differ from Go (F07)."
+        ]
+      },
+      "RAW": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "URLENCODED": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Decoded argument names lose byte identity: invalid UTF-8 names become the same replacement-character String, unlike Go's byte-preserving keys (F01). Values remain byte-preserving."
+        ]
+      },
+      "XML": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "REQUEST_XML:/* is rejected because the alias is not marked selectable (F05)."
+        ]
+      }
+    },
+    "runtime_controls": {
+      "auditEngine": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "auditLogParts": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "debugLogLevel": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; Go applies the debug log level."
+        ]
+      },
+      "forceRequestBodyVariable": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "forceResponseBodyVariable": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "hashEnforcement": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; no hash enforcement is applied."
+        ]
+      },
+      "hashEngine": {
+        "state": "accepted_without_effect",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; no hashing engine is configured or applied."
+        ]
+      },
+      "requestBodyAccess": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "requestBodyLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "requestBodyProcessor": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "responseBodyAccess": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "responseBodyLimit": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "responseBodyProcessor": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleEngine": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveById": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveByMsg": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveByTag": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveTargetById": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveTargetByMsg": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "ruleRemoveTargetByTag": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      }
+    }
+  }
+}

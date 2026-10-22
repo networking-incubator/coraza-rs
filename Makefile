@@ -11,7 +11,7 @@ ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -42,8 +42,15 @@ clean:
 test:
 	cargo xtask corpus-check
 	cargo xtask tables-check
+	cargo xtask conformance-check
 	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
+
+conformance-check:
+	cargo xtask conformance-check
+
+conformance-refresh:
+	cargo xtask conformance-refresh
 
 parity-manifest-check:
 	python3 libperfusion/tools/parity/check_manifest.py

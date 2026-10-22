@@ -24,6 +24,7 @@
     reason = "development tooling"
 )]
 
+mod conformance;
 mod corpus;
 mod lint_license;
 mod tables;
@@ -57,6 +58,10 @@ enum Command {
     TablesCheck,
     /// Refresh libperfusion's local tables from a libinjection C checkout.
     TablesRefresh(tables::RefreshArgs),
+    /// Verify the conformance manifest, ledger and example case.
+    ConformanceCheck,
+    /// Regenerate the conformance capability manifest from source and overrides.
+    ConformanceRefresh,
 }
 
 // -----------------------------------------------------------------------------
@@ -72,5 +77,7 @@ fn main() {
         Command::CorpusRefresh => corpus::refresh_or_exit(),
         Command::TablesCheck => tables::check_or_exit(),
         Command::TablesRefresh(args) => tables::refresh_or_exit(&args),
+        Command::ConformanceCheck => conformance::check_or_exit(),
+        Command::ConformanceRefresh => conformance::refresh_or_exit(),
     }
 }
