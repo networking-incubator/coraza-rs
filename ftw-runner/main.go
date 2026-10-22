@@ -291,8 +291,7 @@ func runFTW(maxTests int, customTestDir string, failedOut string) error {
 	}
 
 	if len(tests) == 0 {
-		fmt.Println("No valid test files found, running health checks only")
-		return testServerHealth()
+		return fmt.Errorf("test directory %q contains no valid FTW tests", testDir)
 	}
 
 	// Limit number of tests if requested

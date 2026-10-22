@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,18 @@ func TestHealthCheckPassesOn200(t *testing.T) {
 	server := newIPv4TestServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	if err := testServerHealthAt(server.url, server.client); err != nil {
 		t.Fatalf("testServerHealthAt() error = %v", err)
+	}
+}
+
+func TestRunFTWErrorsWhenExistingDirectoryHasNoValidTests(t *testing.T) {
+	testDir := t.TempDir()
+	previousLogfile := serverLogfile
+	serverLogfile = filepath.Join(testDir, "audit.log")
+	t.Cleanup(func() { serverLogfile = previousLogfile })
+
+	err := runFTW(0, testDir, "")
+	if err == nil || !strings.Contains(err.Error(), "contains no valid FTW tests") {
+		t.Fatalf("runFTW() error = %v, want an empty-directory error", err)
 	}
 }
 

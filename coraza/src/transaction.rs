@@ -650,6 +650,11 @@ impl Transaction {
         self.response_body_access
     }
 
+    /// Return the request body limit currently applied to this transaction.
+    pub fn request_body_limit(&self) -> i64 {
+        self.request_body_limit
+    }
+
     /// Evaluate request-header rules once using the values already stored on this
     /// transaction. Returns the disruptive interruption, if any.
     pub fn process_request_headers(&mut self) -> Option<Interruption> {
@@ -2315,6 +2320,7 @@ payload\r\n\
         let waf = parser.into_waf().unwrap();
         let mut tx = waf.new_transaction_with_id("body-limit-reject");
         tx.process_request_headers();
+        assert_eq!(tx.request_body_limit(), 4);
 
         let interruption = tx.process_request_body(b"body").unwrap();
 

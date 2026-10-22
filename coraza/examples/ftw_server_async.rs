@@ -42,6 +42,7 @@ use std::{
     io::Write as _,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -50,7 +51,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
-    header::{HeaderName, HeaderValue},
+    header::{HeaderMap, HeaderName, HeaderValue},
     server::conn::http1,
     service::service_fn,
 };
@@ -59,6 +60,9 @@ use tokio::net::TcpListener;
 
 /// The log FTW reads: request markers and Go Coraza's error log lines.
 type Logfile = Arc<Mutex<std::fs::File>>;
+
+/// Read deadline, kept below FTW's 30-second client timeout.
+const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[expect(
     clippy::print_stdout,
@@ -217,22 +221,31 @@ async fn handle_request(
     if let Some(host) = req.headers().get("host").and_then(|value| value.to_str().ok()) {
         tx.set_server_name(host);
     }
-    // As Go's net/http hands them to Go Coraza: hyper lowercases names, and a value
-    // needn't be ASCII
-    for (name, value) in req.headers() {
-        let value = String::from_utf8_lossy(value.as_bytes());
-        tx.add_request_header(&canonical_header_name(name.as_str()), value.as_bytes());
-    }
+    add_request_headers(&mut tx, req.headers());
 
-    let body = match req.collect().await {
-        Ok(collected) => collected.to_bytes().to_vec(),
-        Err(e) => {
-            eprintln!("Error reading body: {e}");
-            return Ok(create_error_response(500, "Internal Server Error"));
-        },
+    let response = if let Some(interruption) = tx.process_request_headers() {
+        create_blocking_response(&interruption)
+    } else {
+        let max_body_bytes = usize::try_from(tx.request_body_limit())
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        match tokio::time::timeout(
+            REQUEST_BODY_READ_TIMEOUT,
+            collect_body_prefix(req.into_body(), max_body_bytes),
+        )
+        .await
+        {
+            Ok(Ok(body)) => run_transaction(&mut tx, &path, &body),
+            Ok(Err(error)) => {
+                eprintln!("Error reading body: {error}");
+                create_error_response(500, "Internal Server Error")
+            },
+            Err(_) => {
+                eprintln!("Timed out reading request body");
+                create_error_response(408, "Request Timeout")
+            },
+        }
     };
-
-    let response = run_transaction(&mut tx, &path, &body);
 
     // As Go Coraza's HTTP middleware does, whether or not the transaction was interrupted
     if let Err(e) = tx.process_logging() {
@@ -242,14 +255,40 @@ async fn handle_request(
     Ok(response)
 }
 
-/// Runs the request and response phases of `tx`, the backend answering in between (as
-/// CRS's albedo test backend does for `/reflect`); returns the backend's response, or
-/// the interruption's.
-fn run_transaction(tx: &mut coraza::transaction::Transaction, path: &str, body: &[u8]) -> Response<Full<Bytes>> {
-    if let Some(interruption) = tx.process_request_headers() {
-        return create_blocking_response(&interruption);
+/// Collect at most `max_bytes` of request data while draining the body stream to EOF.
+///
+/// # Errors
+///
+/// Returns the body error if reading a frame fails.
+async fn collect_body_prefix<B>(mut body: B, max_bytes: usize) -> Result<Vec<u8>, B::Error>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let mut collected = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if collected.len() >= max_bytes {
+            continue;
+        }
+        if let Ok(data) = frame.into_data() {
+            let count = (max_bytes - collected.len()).min(data.len());
+            collected.extend_from_slice(data.get(..count).unwrap_or_default());
+        }
     }
+    Ok(collected)
+}
 
+/// Copy request header names and original values into the transaction.
+fn add_request_headers(tx: &mut coraza::transaction::Transaction, headers: &HeaderMap) {
+    // Hyper lowercases names, and a header value need not be ASCII.
+    for (name, value) in headers {
+        tx.add_request_header(&canonical_header_name(name.as_str()), value.as_bytes());
+    }
+}
+
+/// Runs the request body and response phases after request headers were processed.
+/// The backend answers between them, as CRS's albedo test backend does for `/reflect`.
+fn run_transaction(tx: &mut coraza::transaction::Transaction, path: &str, body: &[u8]) -> Response<Full<Bytes>> {
     if let Some(interruption) = tx.process_request_body(body) {
         return create_blocking_response(&interruption);
     }
@@ -293,7 +332,7 @@ impl BackendResponse {
             body: b"OK".to_vec(),
         };
         if path != "/reflect" {
-            return ok;
+            return Self { body: Vec::new(), ..ok };
         }
         let Ok(spec) = serde_json::from_slice::<serde_json::Value>(body) else {
             return ok;
@@ -418,7 +457,19 @@ fn create_error_response(status: u16, body: &str) -> Response<Full<Bytes>> {
 )]
 fn create_blocking_response(interruption: &coraza::transaction::Interruption) -> Response<Full<Bytes>> {
     println!("Blocked by rule {}: {}", interruption.rule_id, interruption.action);
-    response(interruption.status, &[], b"Blocked by WAF".to_vec())
+    let status = if interruption.status == 0 {
+        StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+    } else {
+        interruption.status
+    };
+    let mut response = response(status, &[], b"Blocked by WAF".to_vec());
+    if (300..400).contains(&status)
+        && !interruption.data.is_empty()
+        && let Ok(location) = HeaderValue::from_bytes(interruption.data.as_bytes())
+    {
+        response.headers_mut().insert("location", location);
+    }
+    response
 }
 
 /// `name` as Go's net/http writes a header name: each letter that starts it or follows
@@ -447,9 +498,30 @@ fn get_arg(args: &[String], name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "FTW response tests assert fixed headers")]
+#[expect(clippy::unwrap_used, reason = "FTW adapter tests use fixed valid inputs")]
 mod tests {
-    use super::{has_content_type, response};
+    use std::{
+        collections::VecDeque,
+        convert::Infallible,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use coraza::{seclang::Parser, transaction::Interruption};
+    use http_body_util::Full;
+    use hyper::{
+        StatusCode,
+        body::{Bytes, Frame},
+        header::HeaderValue,
+    };
+
+    use super::{
+        BackendResponse, add_request_headers, collect_body_prefix, create_blocking_response, has_content_type, response,
+    };
 
     #[test]
     fn response_uses_backend_content_type_without_adding_a_default() {
@@ -466,5 +538,104 @@ mod tests {
 
         assert_eq!(response.headers().get("content-type").unwrap(), "text/plain");
         assert!(!has_content_type(&[]));
+    }
+
+    #[test]
+    fn blocking_responses_handle_zero_status_and_redirect_data() {
+        let no_status = create_blocking_response(&Interruption {
+            rule_id: 1,
+            action: "drop".to_owned(),
+            status: 0,
+            data: String::new(),
+        });
+        assert_eq!(no_status.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let redirect = create_blocking_response(&Interruption {
+            rule_id: 2,
+            action: "redirect".to_owned(),
+            status: 302,
+            data: "https://example.test/blocked".to_owned(),
+        });
+        assert_eq!(redirect.status(), StatusCode::FOUND);
+        assert_eq!(
+            redirect.headers().get("location").unwrap(),
+            "https://example.test/blocked"
+        );
+
+        let denied = create_blocking_response(&Interruption {
+            rule_id: 3,
+            action: "deny".to_owned(),
+            status: 403,
+            data: "ignored".to_owned(),
+        });
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(denied.headers().get("location").is_none());
+        assert_eq!(denied.headers().get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn unmatched_backend_paths_return_an_empty_body() {
+        assert!(BackendResponse::for_request("/other", b"").body.is_empty());
+        assert_eq!(BackendResponse::for_request("/reflect", b"invalid JSON").body, b"OK");
+    }
+
+    #[test]
+    fn request_header_import_preserves_non_utf8_bytes() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(r#"SecRule REQUEST_HEADERS:X-Trace "@rx \xff" "id:998001,phase:1,deny,status:403""#)
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("X-Trace", HeaderValue::from_bytes(b"\xff").unwrap());
+
+        add_request_headers(&mut tx, &headers);
+
+        assert_eq!(tx.process_request_headers().unwrap().status, 403);
+    }
+
+    #[tokio::test]
+    async fn body_collection_keeps_only_the_configured_prefix() {
+        let body = Full::new(Bytes::from_static(b"oversized body"));
+        let collected = collect_body_prefix(body, 5).await.unwrap();
+
+        assert_eq!(collected, b"overs");
+    }
+
+    struct ChunkedBody {
+        frames: VecDeque<Bytes>,
+        poll_count: Arc<AtomicUsize>,
+    }
+
+    impl hyper::body::Body for ChunkedBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.poll_count.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(self.frames.pop_front().map(|data| Ok(Frame::data(data))))
+        }
+    }
+
+    #[tokio::test]
+    async fn body_collection_drains_frames_after_the_prefix_limit() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let body = ChunkedBody {
+            frames: VecDeque::from([
+                Bytes::from_static(b"over"),
+                Bytes::from_static(b"sized"),
+                Bytes::from_static(b" body"),
+            ]),
+            poll_count: Arc::clone(&poll_count),
+        };
+
+        let collected = collect_body_prefix(body, 5).await.unwrap();
+
+        assert_eq!(collected, b"overs");
+        assert_eq!(poll_count.load(Ordering::Relaxed), 4);
     }
 }
