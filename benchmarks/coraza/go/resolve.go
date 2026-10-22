@@ -17,13 +17,22 @@ import (
 const (
 	// EngineModulePath is the Go module under comparison.
 	EngineModulePath = "github.com/corazawaf/coraza/v3"
-	// PinnedEngineRevision is the inspected Coraza checkout this harness builds
-	// against. Update it together with the local replace and the README.
+	// ExpectedEngineVersion is the upstream release the harness requires when
+	// no replace directive is present.
+	ExpectedEngineVersion = "v3.8.1"
+	// PinnedEngineRevision is the local checkout revision the local profile
+	// requires. Update it when the assessed checkout moves.
 	PinnedEngineRevision = "d9cc9befc2721fd217ce1660a0e91aca1157221d"
-	// DeclaredEngineReplace must match the replace directive in go.mod. Build
-	// info records this literal path, so checking it also detects a workspace
-	// replace that was active at compile time.
-	DeclaredEngineReplace = "../../../../coraza"
+)
+
+// Profile names the module identity a benchmark run uses.
+type Profile string
+
+const (
+	// ProfileUpstream resolves the published module at ExpectedEngineVersion.
+	ProfileUpstream Profile = "upstream"
+	// ProfileLocal resolves an explicit directory replace.
+	ProfileLocal Profile = "local"
 )
 
 // Module is the subset of `go list -m -json` used by the resolution report.
@@ -36,22 +45,51 @@ type Module struct {
 }
 
 // Resolution records what the build actually selects. It is intentionally
-// small so a future coordinator can consume it as JSON.
+// small so a coordinator can consume it as JSON.
 type Resolution struct {
-	GoBinary       string `json:"go_binary"`
-	GoVersion      string `json:"go_version"`
-	GOWORK         string `json:"gowork"`
-	GOToolchain    string `json:"gotoolchain"`
-	Engine         Module `json:"engine"`
-	EngineDir      string `json:"engine_dir"`
-	EngineRevision string `json:"engine_revision"`
-	EngineDirty    bool   `json:"engine_dirty"`
+	Profile        Profile `json:"profile"`
+	GoBinary       string  `json:"go_binary"`
+	GoVersion      string  `json:"go_version"`
+	GOWORK         string  `json:"gowork"`
+	GOToolchain    string  `json:"gotoolchain"`
+	Engine         Module  `json:"engine"`
+	EngineDir      string  `json:"engine_dir"`
+	EngineRevision string  `json:"engine_revision"`
+	EngineDirty    bool    `json:"engine_dirty"`
 }
 
-// CheckResolution verifies that the engine resolves to the declared local
-// replacement and that the checkout is exactly the pinned revision. Every go
-// command here runs with GOWORK=off so an ambient workspace cannot substitute
-// another engine. The returned error is meant to stop a benchmark run.
+// classifyModule derives the profile from structured `go list -m -json` output
+// so neither path nor version text has to be parsed. The upstream profile is
+// the expected version without a replace; the local profile is a replace
+// through a directory, which carries no replacement version.
+func classifyModule(engine Module) (Profile, error) {
+	if engine.Path != EngineModulePath {
+		return "", fmt.Errorf("resolved module %q, want %q", engine.Path, EngineModulePath)
+	}
+	if engine.Replace == nil {
+		if engine.Version != ExpectedEngineVersion {
+			return "", fmt.Errorf("engine version is %q, want %q", engine.Version, ExpectedEngineVersion)
+		}
+		return ProfileUpstream, nil
+	}
+	if engine.Replace.Version != "" {
+		return "", fmt.Errorf(
+			"engine is replaced by module version %q; the local profile needs a directory replace",
+			engine.Replace.Version,
+		)
+	}
+	if engine.Replace.Dir == "" {
+		return "", fmt.Errorf("engine replace %q did not resolve to a directory", engine.Replace.Path)
+	}
+	return ProfileLocal, nil
+}
+
+// CheckResolution reports the profile and engine identity the build selects.
+// Every go command runs with GOWORK=off so an ambient workspace cannot
+// substitute another engine, and GOTOOLCHAIN=local so nothing is downloaded
+// implicitly. The upstream profile stops after `go list`; the local profile
+// additionally pins the checkout revision and requires it to be clean. The
+// returned error is meant to stop a benchmark run.
 func CheckResolution(ctx context.Context) (Resolution, error) {
 	root, err := moduleRoot()
 	if err != nil {
@@ -80,20 +118,15 @@ func CheckResolution(ctx context.Context) (Resolution, error) {
 	if err := json.Unmarshal(out, &res.Engine); err != nil {
 		return Resolution{}, fmt.Errorf("decode go list output: %w", err)
 	}
-	if res.Engine.Path != EngineModulePath {
-		return Resolution{}, fmt.Errorf("resolved module %q, want %q", res.Engine.Path, EngineModulePath)
+	profile, err := classifyModule(res.Engine)
+	if err != nil {
+		return Resolution{}, err
 	}
-	if res.Engine.Replace == nil || res.Engine.Replace.Dir == "" {
-		return Resolution{}, fmt.Errorf(
-			"engine %s is not resolved through a local directory replace; refusing to benchmark a downloaded module",
-			EngineModulePath,
-		)
-	}
-	if res.Engine.Replace.Path != DeclaredEngineReplace {
-		return Resolution{}, fmt.Errorf(
-			"engine replace path is %q, expected the declared %q",
-			res.Engine.Replace.Path, DeclaredEngineReplace,
-		)
+	res.Profile = profile
+	res.EngineDir = res.Engine.Dir
+
+	if profile == ProfileUpstream {
+		return res, nil
 	}
 
 	dir, err := filepath.EvalSymlinks(res.Engine.Replace.Dir)
