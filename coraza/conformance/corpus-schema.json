@@ -1,0 +1,590 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/networking-incubator/coraza-rs/coraza/conformance/corpus-schema.json",
+  "title": "Coraza byte-event conformance case",
+  "description": "One ordered byte-event case replayed by the native Go and Rust drivers. Arbitrary bytes are inline base64 or a referenced binary fixture. Arrays of headers preserve order and repeats. fixture_sha256 is the SHA-256 of the primary referenced fixture; for a case with no fixture reference it is the SHA-256 of request.body followed by response.body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "fixture_sha256",
+    "reference",
+    "connection",
+    "request",
+    "response",
+    "processor",
+    "phase_calls",
+    "expected",
+    "normalize"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fixture_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "reference": {
+      "$ref": "#/$defs/reference"
+    },
+    "connection": {
+      "$ref": "#/$defs/connection"
+    },
+    "request": {
+      "$ref": "#/$defs/request"
+    },
+    "response": {
+      "$ref": "#/$defs/response"
+    },
+    "processor": {
+      "$ref": "#/$defs/processor"
+    },
+    "phase_calls": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/phase_call"
+      }
+    },
+    "expected": {
+      "$ref": "#/$defs/expected"
+    },
+    "normalize": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "timestamps",
+          "generated_ids",
+          "temporary_paths",
+          "audit_boundaries",
+          "header_order"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "go_commit",
+        "rust_commit"
+      ],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "go_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "rust_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "bytes": {
+      "description": "Inline base64 or a path relative to the corpus root plus its SHA-256.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "base64"
+          ],
+          "properties": {
+            "base64": {
+              "type": "string",
+              "contentEncoding": "base64"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fixture",
+            "sha256"
+          ],
+          "properties": {
+            "fixture": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "text": {
+      "description": "Inline UTF-8 or a path relative to the corpus root plus its SHA-256.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "utf8"
+          ],
+          "properties": {
+            "utf8": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fixture",
+            "sha256"
+          ],
+          "properties": {
+            "fixture": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "remote_addr",
+        "remote_port",
+        "local_addr",
+        "local_port",
+        "tls"
+      ],
+      "properties": {
+        "remote_addr": {
+          "type": "string"
+        },
+        "remote_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "local_addr": {
+          "type": "string"
+        },
+        "local_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "tls": {
+          "type": "boolean"
+        },
+        "tls_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "header": {
+      "description": "One header occurrence. The array order and duplicate names are significant.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "$ref": "#/$defs/bytes"
+        }
+      }
+    },
+    "chunk": {
+      "description": "A supplied chunk boundary. Chunks may be empty and must cover the body exactly when the driver replays them.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offset",
+        "length"
+      ],
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "uri",
+        "protocol",
+        "headers",
+        "body",
+        "chunks"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uri": {
+          "description": "The original request target bytes, before any normalization.",
+          "$ref": "#/$defs/bytes"
+        },
+        "protocol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/header"
+          }
+        },
+        "body": {
+          "$ref": "#/$defs/bytes"
+        },
+        "chunks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/chunk"
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "protocol",
+        "headers",
+        "body",
+        "chunks"
+      ],
+      "properties": {
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 999
+        },
+        "protocol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/header"
+          }
+        },
+        "body": {
+          "$ref": "#/$defs/bytes"
+        },
+        "chunks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/chunk"
+          }
+        }
+      }
+    },
+    "processor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sec_lang",
+        "request_body_processor",
+        "response_body_processor",
+        "config"
+      ],
+      "properties": {
+        "sec_lang": {
+          "$ref": "#/$defs/text"
+        },
+        "request_body_processor": {
+          "enum": [
+            "auto",
+            "raw",
+            "urlencoded",
+            "multipart",
+            "json",
+            "xml"
+          ]
+        },
+        "response_body_processor": {
+          "enum": [
+            "auto",
+            "raw",
+            "json",
+            "xml"
+          ]
+        },
+        "config": {
+          "description": "Typed host settings applied before SecLang, keyed by WafConfig field name.",
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "integer",
+              "boolean"
+            ]
+          }
+        }
+      }
+    },
+    "phase_call": {
+      "description": "One ordered driver call. Append calls carry the chunk index.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "call",
+        "phase"
+      ],
+      "properties": {
+        "call": {
+          "enum": [
+            "process_connection",
+            "process_uri",
+            "process_request_headers",
+            "append_request_body",
+            "process_request_body",
+            "process_response_headers",
+            "append_response_body",
+            "process_response_body",
+            "process_logging"
+          ]
+        },
+        "phase": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "chunk_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "phase",
+        "variable",
+        "key",
+        "value"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "integer"
+        },
+        "phase": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "variable": {
+          "type": "string"
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/bytes"
+        }
+      }
+    },
+    "interruption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "action",
+        "status",
+        "data"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "integer"
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "integer"
+        },
+        "data": {
+          "$ref": "#/$defs/bytes"
+        }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "value"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "$ref": "#/$defs/bytes"
+        }
+      }
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variable",
+        "key",
+        "value"
+      ],
+      "properties": {
+        "variable": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/bytes"
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "matches",
+        "interruptions",
+        "captures",
+        "scores",
+        "flags",
+        "collections",
+        "audit"
+      ],
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/match"
+          }
+        },
+        "interruptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/interruption"
+          }
+        },
+        "captures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/capture"
+          }
+        },
+        "scores": {
+          "description": "Named anomaly, SQLi and XSS score values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          }
+        },
+        "flags": {
+          "description": "Named engine flags such as REQBODY_ERROR, mapped to their exact string value.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "collections": {
+          "description": "Relevant TX, ENV or other collection values. Order is preserved when it is observable.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/collection"
+          }
+        },
+        "audit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required",
+            "parts",
+            "entries"
+          ],
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "parts": {
+              "type": "string"
+            },
+            "entries": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

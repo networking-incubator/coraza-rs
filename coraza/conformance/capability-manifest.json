@@ -1,0 +1,3867 @@
+{
+  "schema_version": 1,
+  "description": "Capability inventory derived from the Rust factories and variable storage. States: implemented (registered and effective), rejected (known name refused at compile time), accepted_without_effect (compiled but no runtime effect), unavailable (not present in this build).",
+  "reference": {
+    "profile": "native-go-default-build",
+    "go_coraza": {
+      "repository": "https://github.com/corazawaf/coraza",
+      "commit": "d9cc9befc2721fd217ce1660a0e91aca1157221d"
+    },
+    "rust": {
+      "repository": "https://github.com/networking-incubator/coraza-rs",
+      "commit": "45f8785f8b17fb1f4df56f87bf87155cc986b916"
+    }
+  },
+  "states": [
+    "implemented",
+    "rejected",
+    "accepted_without_effect",
+    "unavailable"
+  ],
+  "capability_groups": {
+    "operators": [
+      {
+        "names": [
+          "rx"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:Rx::evaluate",
+        "go_reference": "internal/operators/rx.go",
+        "fixtures": [],
+        "differences": [
+          "Go regexp and byte-regexp profiles have no exact Rust equivalent; syntax, Unicode folding and malformed-byte captures need shared fixtures."
+        ]
+      },
+      {
+        "names": [
+          "restPath"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:RestPath::evaluate",
+        "go_reference": "internal/operators/restpath.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "pm"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:Pm::evaluate",
+        "go_reference": "internal/operators/pm.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "pmFromFile",
+          "pmf"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:PmFromFile::evaluate",
+        "go_reference": "internal/operators/pm_from_file.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "pmFromDataset"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:PmFromDataset::evaluate",
+        "go_reference": "internal/operators/pm_from_dataset.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "strmatch"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:StrMatch::evaluate",
+        "go_reference": "internal/operators/strmatch.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "within"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/pattern.rs:Within::evaluate",
+        "go_reference": "internal/operators/within.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "eq"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Eq::evaluate",
+        "go_reference": "internal/operators/eq.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "lt"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Lt::evaluate",
+        "go_reference": "internal/operators/lt.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "le"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Le::evaluate",
+        "go_reference": "internal/operators/le.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "gt"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Gt::evaluate",
+        "go_reference": "internal/operators/gt.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ge"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Ge::evaluate",
+        "go_reference": "internal/operators/ge.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "streq"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:StrEq::evaluate",
+        "go_reference": "internal/operators/streq.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "contains"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:Contains::evaluate",
+        "go_reference": "internal/operators/contains.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "beginsWith"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:BeginsWith::evaluate",
+        "go_reference": "internal/operators/begins_with.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "endsWith"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/simple.rs:EndsWith::evaluate",
+        "go_reference": "internal/operators/ends_with.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "detectSQLi"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/detection.rs:DetectSQLi::evaluate",
+        "go_reference": "internal/operators/detect_sqli.go",
+        "fixtures": [],
+        "differences": [
+          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+        ]
+      },
+      {
+        "names": [
+          "detectXSS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/detection.rs:DetectXSS::evaluate",
+        "go_reference": "internal/operators/detect_xss.go",
+        "fixtures": [],
+        "differences": [
+          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+        ]
+      },
+      {
+        "names": [
+          "ipMatch"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatch::evaluate",
+        "go_reference": "internal/operators/ip_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ipMatchFromFile",
+          "ipMatchF"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatchFromFile::evaluate",
+        "go_reference": "internal/operators/ip_match_from_file.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ipMatchFromDataset"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/ip.rs:IpMatchFromDataset::evaluate",
+        "go_reference": "internal/operators/ip_match_from_dataset.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "validateByteRange"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateByteRange::evaluate",
+        "go_reference": "internal/operators/validate_byte_range.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "validateUrlEncoding"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateUrlEncoding::evaluate",
+        "go_reference": "internal/operators/validate_url_encoding.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "validateUtf8Encoding"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateUtf8Encoding::evaluate",
+        "go_reference": "internal/operators/validate_utf8_encoding.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "validateNid"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:ValidateNid::evaluate",
+        "go_reference": "internal/operators/validate_nid.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "unconditionalMatch"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
+        "go_reference": "internal/operators/unconditional_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "geoLookup"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
+        "go_reference": "internal/operators/geo_lookup.go",
+        "fixtures": [],
+        "differences": [
+          "Mapped to the unconditional-match operator. Go's built-in geo lookup is also a stub."
+        ]
+      },
+      {
+        "names": [
+          "noMatch"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
+        "evaluator": "coraza/src/operators/validation.rs:NoMatch::evaluate",
+        "go_reference": "internal/operators/no_match.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "inspectFile"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/operators/inspect_file.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host command capability and deadline before it is added."
+        ]
+      },
+      {
+        "names": [
+          "rbl"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/operators/rbl.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host DNS capability and deadline before it is added."
+        ]
+      },
+      {
+        "names": [
+          "validateSchema"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/operators/validate_schema.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by native Go builds but absent from the Rust operator factory."
+        ]
+      }
+    ],
+    "transformations": [
+      {
+        "names": [
+          "base64Decode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_decode",
+        "go_reference": "internal/transformations/base64decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "base64DecodeExt"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_decode_ext",
+        "go_reference": "internal/transformations/base64decodeext.go",
+        "fixtures": [],
+        "differences": [
+          "Rust stops at invalid bytes; current Go skips invalid extended input and accepts the URL-safe alphabet (F13)."
+        ]
+      },
+      {
+        "names": [
+          "base64Encode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:base64_encode",
+        "go_reference": "internal/transformations/base64encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "compressWhitespace"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:compress_whitespace",
+        "go_reference": "internal/transformations/compress_whitespace.go",
+        "fixtures": [],
+        "differences": [
+          "Rust uses full Unicode whitespace; Go intentionally uses an ASCII/Latin-1 set and preserves malformed bytes (F13)."
+        ]
+      },
+      {
+        "names": [
+          "cssDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/escape.rs:css_decode",
+        "go_reference": "internal/transformations/css_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "escapeSeqDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/escape.rs:escape_seq_decode",
+        "go_reference": "internal/transformations/escape_seq_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "hexDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:hex_decode",
+        "go_reference": "internal/transformations/hex_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "hexEncode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:hex_encode",
+        "go_reference": "internal/transformations/hex_encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "htmlEntityDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/complex.rs:html_entity_decode",
+        "go_reference": "internal/transformations/html_entity_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "jsDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/escape.rs:js_decode",
+        "go_reference": "internal/transformations/js_decode.go",
+        "fixtures": [],
+        "differences": [
+          "Rust handles classic four-digit Unicode escapes; current Go also handles ES2015 braced escapes (F13)."
+        ]
+      },
+      {
+        "names": [
+          "length"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:length",
+        "go_reference": "internal/transformations/length.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "lowercase"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:lowercase",
+        "go_reference": "internal/transformations/lowercase.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "md5"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:md5_hash",
+        "go_reference": "internal/transformations/md5.go",
+        "fixtures": [],
+        "differences": [
+          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+        ]
+      },
+      {
+        "names": [
+          "none"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:none",
+        "go_reference": "internal/transformations/none.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "normalisePath",
+          "normalizePath"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/complex.rs:normalise_path",
+        "go_reference": "internal/transformations/normalise_path.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "normalisePathWin",
+          "normalizePathWin"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/complex.rs:normalise_path_win",
+        "go_reference": "internal/transformations/normalise_path_win.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "removeNulls"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:remove_nulls",
+        "go_reference": "internal/transformations/remove_nulls.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "removeWhitespace"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:remove_whitespace",
+        "go_reference": "internal/transformations/remove_whitespace.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "replaceNulls"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:replace_nulls",
+        "go_reference": "internal/transformations/replace_nulls.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "sha1"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:sha1_hash",
+        "go_reference": "internal/transformations/sha1.go",
+        "fixtures": [],
+        "differences": [
+          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+        ]
+      },
+      {
+        "names": [
+          "trim"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:trim",
+        "go_reference": "internal/transformations/trim.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "trimLeft"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:trim_left",
+        "go_reference": "internal/transformations/trim_left.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "trimRight"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:trim_right",
+        "go_reference": "internal/transformations/trim_right.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "uppercase"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:uppercase",
+        "go_reference": "internal/transformations/uppercase.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "urlDecode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:url_decode",
+        "go_reference": "internal/transformations/url_decode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "urlDecodeUni"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/escape.rs:url_decode_uni",
+        "go_reference": "internal/transformations/url_decode_uni.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "urlEncode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/encoding.rs:url_encode",
+        "go_reference": "internal/transformations/url_encode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "utf8toUnicode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/escape.rs:utf8_to_unicode",
+        "go_reference": "internal/transformations/utf8_to_unicode.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "cmdLine"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/transformations/cmd_line.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:34 but absent from the Rust transformation factory."
+        ]
+      },
+      {
+        "names": [
+          "removeComments"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/transformations/remove_comments.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:50 but absent from the Rust transformation factory."
+        ]
+      },
+      {
+        "names": [
+          "removeCommentsChar"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/transformations/remove_comments_char.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:51 but absent from the Rust transformation factory."
+        ]
+      },
+      {
+        "names": [
+          "replaceComments"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/transformations/replace_comments.go",
+        "fixtures": [],
+        "differences": [
+          "Registered by Go at internal/transformations/transformations.go:54 but absent from the Rust transformation factory."
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "names": [
+          "accuracy"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::accuracy",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "allow"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::allow",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "auditlog"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::audit_log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "block"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "A placeholder resolved against SecDefaultAction, as in Go; with no default the action has no effect."
+        ]
+      },
+      {
+        "names": [
+          "capture"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::capture",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "chain"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ctl"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "deny"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "drop"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "exec"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": "internal/actions/exec.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Native Go exec Evaluate is also empty; Go rejects a non-empty argument while Rust requires one."
+        ]
+      },
+      {
+        "names": [
+          "expirevar"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": "internal/actions/expirevar.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Go emits an unsupported warning; Go accepts more input than Rust's variable=integer validator."
+        ]
+      },
+      {
+        "names": [
+          "id"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "initcol"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": "internal/actions/initcol.go",
+        "fixtures": [],
+        "differences": [
+          "Compiled and validated, but no runtime effect. Go's persistence is also commented out."
+        ]
+      },
+      {
+        "names": [
+          "log"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "logdata"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::log_data",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "maturity"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::maturity",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "msg"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::msg",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "multiMatch"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::multi_match",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "nolog"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "noauditlog"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::audit_log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "pass"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "The default non-disruptive outcome; the action has no separate runtime arm."
+        ]
+      },
+      {
+        "names": [
+          "phase"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::phase",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "redirect"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "rev"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::rev",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "setenv"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_setenv",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "setvar"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_setvar",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "TX-only, as in Go; persistent IP/SESSION storage is separate work."
+        ]
+      },
+      {
+        "names": [
+          "severity"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::severity",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "skip"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_skip",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "skipAfter"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_skip_after",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "status"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::status",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "t"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:transformation_by_name",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "tag"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::tags",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ver"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:compile_action",
+        "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::ver",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      }
+    ],
+    "directives": [
+      {
+        "names": [
+          "SecRule"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAction"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_action",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecMarker"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_marker",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecDefaultAction"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_default_action",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecDataset"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_dataset",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleRemoveById"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleRemoveByMsg"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_msg",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleRemoveByTag"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_tag",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleUpdateActionById"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_action_by_id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleUpdateTargetById"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleUpdateTargetByTag"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_tag",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRuleEngine"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_engine",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRequestBodyAccess"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_access",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecResponseBodyAccess"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_access",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRequestBodyLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRequestBodyLimitAction"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit_action",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecDebugLogLevel"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::debug_log_level",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated and stored, but the debug logger is not driven by the library. Go applies the level."
+        ]
+      },
+      {
+        "names": [
+          "SecWebAppId"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::web_app_id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored only. Persistent IP/SESSION collections that would use it are not implemented in either engine."
+        ]
+      },
+      {
+        "names": [
+          "SecComponentSignature"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/audit_log.rs:component_names",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecServerSignature"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::server_signature",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; the library does not mutate the Server response header."
+        ]
+      },
+      {
+        "names": [
+          "SecSensorID"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::sensor_id",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; no runtime producer or audit field uses it."
+        ]
+      },
+      {
+        "names": [
+          "SecResponseBodyLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecResponseBodyLimitAction"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit_action",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRequestBodyInMemoryLimit"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::request_body_in_memory_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but ingestion accepts an already allocated body and never spills to disk (F03)."
+        ]
+      },
+      {
+        "names": [
+          "SecRequestBodyNoFilesLimit"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::request_body_no_files_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but unused. Go explicitly leaves the feature unimplemented."
+        ]
+      },
+      {
+        "names": [
+          "SecArgumentsLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_arguments_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecUploadDir"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_dir",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecUploadFileLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_file_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecUploadFileMode"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::upload_file_mode",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Parsed and validated, but upload storage uses private generated tempfile paths and does not apply the mode."
+        ]
+      },
+      {
+        "names": [
+          "SecUploadKeepFiles"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_keep_files",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Boolean only; Go's RelevantOnly retention mode is not implemented in either engine."
+        ]
+      },
+      {
+        "names": [
+          "SecAuditEngine"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_engine",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLog"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLogFormat"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_format",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLogParts"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_parts",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLogType"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_type",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Serial, Concurrent and Syslog writers are implemented. HTTPS is recognized but rejected when the WAF is built; audit timestamps are UTC rather than process-local."
+        ]
+      },
+      {
+        "names": [
+          "SecAuditLogRelevantStatus"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_relevant_status",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRxPreFilter"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rx_pre_filter",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only. Go enables a regex prefilter; the Rust regex engine does this internally, so the setting has no separate effect."
+        ]
+      },
+      {
+        "names": [
+          "SecRequestBodyJsonDepthLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_json_depth_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecResponseBodyJsonDepthLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_json_depth_limit",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecResponseBodyMimeType"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_type",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecDataDir"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::data_dir",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored only; no runtime path resolves data files through it."
+        ]
+      },
+      {
+        "names": [
+          "SecCollectionTimeout"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::collection_timeout",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated and stored, but persistent collections are inactive. Go's collection timeout is also inactive."
+        ]
+      },
+      {
+        "names": [
+          "SecDebugLog"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/config.rs:WafConfig::debug_log",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Stored for the embedder; the library writes no debug log."
+        ]
+      },
+      {
+        "names": [
+          "SecAuditLogDirMode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_dir_mode",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLogFileMode"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_file_mode",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecAuditLogStorageDir"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_storage_dir",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecIgnoreRuleCompilationErrors"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_ignore_rule_compilation_errors",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Rust skips failed later directives when enabled. Go records the setting but does not act on it."
+        ]
+      },
+      {
+        "names": [
+          "SecRemoteRulesFailAction"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules_fail_action",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; SecRemoteRules is unsupported in both engines."
+        ]
+      },
+      {
+        "names": [
+          "SecResponseBodyMimeTypesClear"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_types_clear",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SecRemoteRules"
+        ],
+        "state": "rejected",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Deliberately unsupported and rejected, as in Go. Loading rules over the network is left to the embedder."
+        ]
+      },
+      {
+        "names": [
+          "Include"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
+        "evaluator": "coraza/src/seclang/parser.rs:Parser::include",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Handled by the parser rather than directive_handler, with a recursion limit."
+        ]
+      },
+      {
+        "names": [
+          "SecArgumentSeparator"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecConnEngine"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecConnReadStateLimit"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecConnWriteStateLimit"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecCookieFormat"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecGsbLookupDb"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHashEngine"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHashKey"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHashMethodPm"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHashMethodRx"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHashParam"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecHttpBlKey"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecPcreMatchLimit"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecPcreMatchLimitRecursion"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecRulePerfTime"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecRuleScript"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecRuleUpdateTargetByMsg"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecTmpDir"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      },
+      {
+        "names": [
+          "SecUnicodeMap"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/seclang/parser.rs:directive_handler",
+        "evaluator": "coraza/src/seclang/parser.rs:Ignored",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Registered as an ignored directive. The inspected Go handler is also inactive or an explicit compatibility no-op."
+        ]
+      }
+    ],
+    "variables": [
+      {
+        "names": [
+          "UNKNOWN"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Error placeholder only; it is never a real input collection."
+        ]
+      },
+      {
+        "names": [
+          "RESPONSE_CONTENT_TYPE"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "UNIQUE_ID"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_COMBINED_SIZE"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES_COMBINED_SIZE"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FULL_REQUEST_LENGTH"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/waf.go:275",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:275 and no producer updating it was established."
+        ]
+      },
+      {
+        "names": [
+          "INBOUND_DATA_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MATCHED_VAR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MATCHED_VAR_NAME"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_DATA_AFTER"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go initializes the collection as a compatibility placeholder; no producer was established."
+        ]
+      },
+      {
+        "names": [
+          "OUTBOUND_DATA_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "QUERY_STRING"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (QUERY_STRING)"
+        ]
+      },
+      {
+        "names": [
+          "REMOTE_ADDR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REMOTE_HOST"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage but no automatic producer was established."
+        ]
+      },
+      {
+        "names": [
+          "REMOTE_PORT"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQBODY_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQBODY_ERROR_MSG"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQBODY_PROCESSOR_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQBODY_PROCESSOR_ERROR_MSG"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQBODY_PROCESSOR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_BASENAME"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_BASENAME)"
+        ]
+      },
+      {
+        "names": [
+          "REQUEST_BODY"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_BODY_LENGTH"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_FILENAME"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_FILENAME)"
+        ]
+      },
+      {
+        "names": [
+          "REQUEST_LINE"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_LINE)"
+        ]
+      },
+      {
+        "names": [
+          "REQUEST_METHOD"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_PROTOCOL"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_URI"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_URI_RAW"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_URI_RAW)"
+        ]
+      },
+      {
+        "names": [
+          "RESPONSE_BODY"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RESPONSE_CONTENT_LENGTH"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RESPONSE_PROTOCOL"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RESPONSE_STATUS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SERVER_ADDR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SERVER_NAME"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "SERVER_PORT"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "HIGHEST_SEVERITY"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "STATUS_LINE"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage but no automatic producer was established."
+        ]
+      },
+      {
+        "names": [
+          "DURATION"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/waf.go:283",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:283 and no producer updating it was established."
+        ]
+      },
+      {
+        "names": [
+          "RESPONSE_HEADERS_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_HEADERS_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_GET"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_POST"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_PATH"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES_SIZES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES_TMP_CONTENT"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go allocates storage; meaningful automatic population was not established."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_FILENAME"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_NAME"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MATCHED_VARS_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MATCHED_VARS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_COOKIES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_HEADERS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RESPONSE_HEADERS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RES_BODY_PROCESSOR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "GEO"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go's built-in geo lookup is a stub."
+        ]
+      },
+      {
+        "names": [
+          "REQUEST_COOKIES_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "FILES_TMPNAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_GET_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ARGS_POST_NAMES"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "TX"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RULE"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "JSON"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust. Go's JSON collection is explicitly nil."
+        ]
+      },
+      {
+        "names": [
+          "ENV"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "URLENCODED_ERROR"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/waf.go:272",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:272; Rust has no value at all."
+        ]
+      },
+      {
+        "names": [
+          "RESPONSE_ARGS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RESPONSE_XML"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "REQUEST_XML"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "XML"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_PART_HEADERS"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "AUTH_TYPE"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "FULL_REQUEST"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_BOUNDARY_QUOTED"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_BOUNDARY_WHITESPACE"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_CRLF_LF_LINES"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_DATA_BEFORE"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_FILE_LIMIT_EXCEEDED"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_HEADER_FOLDING"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_INVALID_HEADER_FOLDING"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_INVALID_PART"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_INVALID_QUOTING"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_LF_LINE"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_MISSING_SEMICOLON"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART_STRICT_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_UNMATCHED_BOUNDARY"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "Kept for compatibility in Go and absent from Rust storage."
+        ]
+      },
+      {
+        "names": [
+          "PATH_INFO"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "SESSIONID"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "USERID"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "IP"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction.rs:variable_storage! (no arm)",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": [
+          "No storage in Rust or Go."
+        ]
+      },
+      {
+        "names": [
+          "RES_BODY_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RES_BODY_ERROR_MSG"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RES_BODY_PROCESSOR_ERROR"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "RES_BODY_PROCESSOR_ERROR_MSG"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "TIME"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_DAY"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_DAY)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_EPOCH"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_EPOCH)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_HOUR"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_HOUR)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_MIN"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MIN)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_MON"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MON)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_SEC"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_SEC)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_WDAY"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_WDAY)"
+        ]
+      },
+      {
+        "names": [
+          "TIME_YEAR"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go",
+        "fixtures": [],
+        "differences": [
+          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_YEAR)"
+        ]
+      },
+      {
+        "names": [
+          "ARGUMENTS_LIMIT_REACHED"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_DUPLICATE_PART_HEADER"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_FILENAME_CHARSET"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "MULTIPART_FILENAME_LANGUAGE"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "go_reference": "internal/variables/variables.go",
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "URI_PARSE_ERROR"
+        ],
+        "state": "unavailable",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": null,
+        "evaluator": null,
+        "go_reference": "internal/corazawaf/transaction.go:885",
+        "fixtures": [],
+        "differences": [
+          "Absent from RuleVariable and query recovery; current Go exposes it at internal/variables/variables.go:750. Rules naming it fail compilation in this build."
+        ]
+      }
+    ],
+    "body_processors": [
+      {
+        "names": [
+          "RAW"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:BodyProcessor::parse",
+        "evaluator": "coraza/src/transaction.rs:process_request_body",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "URLENCODED"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:BodyProcessor::parse",
+        "evaluator": "coraza/src/transaction.rs:process_request_body",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Decoded argument names lose byte identity: invalid UTF-8 names become the same replacement-character String, unlike Go's byte-preserving keys (F01). Values remain byte-preserving."
+        ]
+      },
+      {
+        "names": [
+          "MULTIPART"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:BodyProcessor::parse",
+        "evaluator": "coraza/src/transaction.rs:process_request_body",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Initial delimiter search, per-part metadata retention and partial-body EOF handling differ from Go (F07)."
+        ]
+      },
+      {
+        "names": [
+          "JSON"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:BodyProcessor::parse",
+        "evaluator": "coraza/src/transaction.rs:process_request_body",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "DOM-based flattening drops duplicate members and does not populate TX.json_request_body/TX.json_response_body; numeric tokens and collision behavior differ from Go (F04)."
+        ]
+      },
+      {
+        "names": [
+          "XML"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/transaction.rs:BodyProcessor::parse",
+        "evaluator": "coraza/src/transaction.rs:body_processors/xml/",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "REQUEST_XML:/* is rejected because the alias is not marked selectable (F05)."
+        ]
+      }
+    ],
+    "runtime_controls": [
+      {
+        "names": [
+          "ruleEngine"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "requestBodyAccess"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "forceRequestBodyVariable"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "responseBodyAccess"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "forceResponseBodyVariable"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "requestBodyLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "responseBodyLimit"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "requestBodyProcessor"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_request_body_processor",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "responseBodyProcessor"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::set_response_body_processor",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveById"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveByTag"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveByMsg"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveTargetById"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveTargetByTag"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "ruleRemoveTargetByMsg"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "auditEngine"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "auditLogParts"
+        ],
+        "state": "implemented",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "hashEngine"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl (no arm)",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; no hashing engine is configured or applied."
+        ]
+      },
+      {
+        "names": [
+          "hashEnforcement"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl (no arm)",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; no hash enforcement is applied."
+        ]
+      },
+      {
+        "names": [
+          "debugLogLevel"
+        ],
+        "state": "accepted_without_effect",
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/actions/mod.rs:validate_ctl",
+        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl (no arm)",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": [
+          "Validated only; Go applies the debug log level."
+        ]
+      }
+    ]
+  }
+}
