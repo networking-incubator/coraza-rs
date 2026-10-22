@@ -312,25 +312,392 @@ fn source_names(root: &Path, spec: &GroupSpec) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// Returns true for a Rust identifier character.
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Returns true when no identifier character precedes `index`.
+fn has_boundary_before(text: &str, index: usize) -> bool {
+    text.get(..index)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_none_or(|ch| !is_identifier_char(ch))
+}
+
+/// Returns true when no identifier character starts at `index`.
+fn has_boundary_after(text: &str, index: usize) -> bool {
+    text.get(index..)
+        .and_then(|rest| rest.chars().next())
+        .is_none_or(|ch| !is_identifier_char(ch))
+}
+
+/// Appends one masked character, keeping line breaks so the text stays line-shaped.
+fn push_masked(out: &mut String, ch: char) {
+    out.push(if ch == '\n' { '\n' } else { ' ' });
+}
+
+/// Returns the number of `#` characters in a raw string prefix at `index`.
+fn raw_string_hashes(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'r') {
+        return None;
+    }
+    if index > 0 {
+        let previous = chars.get(index.checked_sub(1)?)?;
+        let prefixed = if *previous == 'b' {
+            index < 2 || chars.get(index - 2).is_none_or(|ch| !is_identifier_char(*ch))
+        } else {
+            !is_identifier_char(*previous)
+        };
+        if !prefixed {
+            return None;
+        }
+    }
+    let mut cursor = index.saturating_add(1);
+    let mut hashes = 0_usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes = hashes.saturating_add(1);
+        cursor = cursor.saturating_add(1);
+    }
+    (chars.get(cursor) == Some(&'"')).then_some(hashes)
+}
+
+/// Masks a string literal starting at the opening quote and returns the index after it.
+fn mask_string(chars: &[char], mut index: usize, out: &mut String) -> usize {
+    push_masked(out, '"');
+    index = index.saturating_add(1);
+    while let Some(&ch) = chars.get(index) {
+        push_masked(out, ch);
+        index = index.saturating_add(1);
+        if ch == '\\' {
+            if let Some(&next) = chars.get(index) {
+                push_masked(out, next);
+                index = index.saturating_add(1);
+            }
+        } else if ch == '"' {
+            break;
+        }
+    }
+    index
+}
+
+/// Masks a raw string body starting at the opening quote and returns the index after it.
+fn mask_raw_string(chars: &[char], mut index: usize, hashes: usize, out: &mut String) -> usize {
+    push_masked(out, '"');
+    index = index.saturating_add(1);
+    while let Some(&ch) = chars.get(index) {
+        push_masked(out, ch);
+        index = index.saturating_add(1);
+        if ch != '"' {
+            continue;
+        }
+        let mut seen = 0;
+        while seen < hashes {
+            let Some(&next) = chars.get(index) else {
+                break;
+            };
+            if next != '#' {
+                break;
+            }
+            push_masked(out, next);
+            index = index.saturating_add(1);
+            seen = seen.saturating_add(1);
+        }
+        if seen == hashes {
+            break;
+        }
+    }
+    index
+}
+
+/// Returns the index of the closing quote when a character literal starts at `index`.
+fn char_literal_end(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'\'') {
+        return None;
+    }
+    let mut cursor = index.checked_add(1)?;
+    if chars.get(cursor) == Some(&'\\') {
+        cursor = cursor.checked_add(1)?;
+        match chars.get(cursor) {
+            Some(&'x') => cursor = cursor.checked_add(3)?,
+            Some(&'u') => {
+                cursor = cursor.checked_add(1)?;
+                while chars.get(cursor).is_some_and(|ch| *ch != '}') {
+                    cursor = cursor.checked_add(1)?;
+                }
+                cursor = cursor.checked_add(1)?;
+            },
+            Some(_) => cursor = cursor.checked_add(1)?,
+            None => return None,
+        }
+    } else {
+        cursor = cursor.checked_add(1)?;
+    }
+    (chars.get(cursor) == Some(&'\'')).then_some(cursor)
+}
+
+/// Returns a copy of `source` with comments and literals replaced by spaces.
+fn mask_non_code(source: &str) -> String {
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while let Some(&ch) = chars.get(index) {
+        if ch == '/' && chars.get(index.saturating_add(1)) == Some(&'/') {
+            while let Some(&current) = chars.get(index) {
+                if current == '\n' {
+                    break;
+                }
+                push_masked(&mut out, current);
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(index.saturating_add(1)) == Some(&'*') {
+            let mut depth = 0_usize;
+            while let Some(&current) = chars.get(index) {
+                if current == '/' && chars.get(index.saturating_add(1)) == Some(&'*') {
+                    depth = depth.saturating_add(1);
+                    push_masked(&mut out, '/');
+                    push_masked(&mut out, '*');
+                    index = index.saturating_add(2);
+                } else if current == '*' && chars.get(index.saturating_add(1)) == Some(&'/') {
+                    depth = depth.saturating_sub(1);
+                    push_masked(&mut out, '*');
+                    push_masked(&mut out, '/');
+                    index = index.saturating_add(2);
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    push_masked(&mut out, current);
+                    index = index.saturating_add(1);
+                }
+            }
+            continue;
+        }
+        if ch == 'r'
+            && let Some(hashes) = raw_string_hashes(&chars, index)
+        {
+            push_masked(&mut out, 'r');
+            index = index.saturating_add(1);
+            for _ in 0..hashes {
+                push_masked(&mut out, '#');
+                index = index.saturating_add(1);
+            }
+            index = mask_raw_string(&chars, index, hashes, &mut out);
+            continue;
+        }
+        if ch == '"' {
+            index = mask_string(&chars, index, &mut out);
+            continue;
+        }
+        if ch == '\''
+            && let Some(end) = char_literal_end(&chars, index)
+        {
+            while index <= end {
+                if let Some(&current) = chars.get(index) {
+                    push_masked(&mut out, current);
+                }
+                index = index.saturating_add(1);
+            }
+            continue;
+        }
+        out.push(ch);
+        index = index.saturating_add(1);
+    }
+    out
+}
+
+/// Keywords that introduce a named item in Rust source.
+const DEFINITION_KEYWORDS: [&str; 8] = ["fn", "struct", "enum", "trait", "type", "const", "static", "mod"];
+
+/// Returns true when `code` contains `keyword name` with identifier boundaries.
+fn has_definition(code: &str, keyword: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = code.get(from..).and_then(|rest| rest.find(keyword)) {
+        let start = from.saturating_add(offset);
+        let after_keyword = start.saturating_add(keyword.len());
+        let boundary =
+            has_boundary_before(code, start) && (keyword.ends_with('!') || has_boundary_after(code, after_keyword));
+        if boundary {
+            let rest = code.get(after_keyword..).unwrap_or_default();
+            let trimmed = rest.trim_start();
+            if trimmed.starts_with(name) {
+                let skipped = rest.len().saturating_sub(trimmed.len());
+                let end = after_keyword.saturating_add(skipped).saturating_add(name.len());
+                if has_boundary_after(code, end) {
+                    return true;
+                }
+            }
+        }
+        from = after_keyword;
+    }
+    false
+}
+
+/// Returns the index just after a leading generic parameter list.
+fn skip_generics(text: &str) -> usize {
+    let mut depth = 0_i32;
+    let mut previous = None;
+    for (index, ch) in text.char_indices() {
+        if ch == '<' {
+            depth = depth.saturating_add(1);
+        } else if ch == '>' && previous != Some('-') {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return index.saturating_add(1);
+            }
+        }
+        previous = Some(ch);
+    }
+    text.len()
+}
+
+/// Returns the byte offset of the last top-level `keyword` in `text`.
+fn find_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut previous = None;
+    let mut found = None;
+    for (index, ch) in text.char_indices() {
+        if ch == '<' {
+            depth = depth.saturating_add(1);
+        } else if ch == '>' && depth > 0 && previous != Some('-') {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0
+            && text.get(index..).is_some_and(|rest| rest.starts_with(keyword))
+            && has_boundary_before(text, index)
+            && has_boundary_after(text, index.saturating_add(keyword.len()))
+        {
+            found = Some(index);
+        }
+        previous = Some(ch);
+    }
+    found
+}
+
+/// Removes generic argument lists from a type expression.
+fn strip_generic_groups(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0_i32;
+    let mut previous = None;
+    for ch in text.chars() {
+        if ch == '<' {
+            depth = depth.saturating_add(1);
+        } else if ch == '>' && depth > 0 && previous != Some('-') {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 {
+            out.push(ch);
+        }
+        previous = Some(ch);
+    }
+    out
+}
+
+/// Returns the last identifier-like run in `text`.
+fn last_identifier(text: &str) -> &str {
+    text.rsplit(|ch: char| !is_identifier_char(ch))
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default()
+}
+
+/// Returns true when a stripped impl type expression names `qualifier`.
+fn impl_type_matches(type_text: &str, qualifier: &str) -> bool {
+    let compact = type_text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    if compact == qualifier {
+        return true;
+    }
+    if qualifier.contains("::") {
+        return compact
+            .strip_suffix(qualifier)
+            .is_some_and(|prefix| prefix.ends_with("::"));
+    }
+    last_identifier(compact.rsplit("::").next().unwrap_or_default()) == qualifier
+}
+
+/// Returns true when an impl header names `qualifier`.
+fn impl_header_names(header: &str, qualifier: &str) -> bool {
+    let header = header.trim_start();
+    let rest = if header.starts_with('<') {
+        header.get(skip_generics(header)..).unwrap_or_default()
+    } else {
+        header
+    };
+    let rest = match find_top_level_keyword(rest, "where") {
+        Some(index) => rest.get(..index).unwrap_or_default(),
+        None => rest,
+    };
+    let type_text = match find_top_level_keyword(rest, "for") {
+        Some(index) => rest.get(index.saturating_add(3)..).unwrap_or_default(),
+        None => rest,
+    };
+    impl_type_matches(&strip_generic_groups(type_text), qualifier)
+}
+
+/// Returns the byte index of the `}` matching the `{` at `open`.
+fn matching_brace(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (offset, ch) in code.get(open..)?.char_indices() {
+        if ch == '{' {
+            depth = depth.saturating_add(1);
+        } else if ch == '}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return open.checked_add(offset);
+            }
+        }
+    }
+    None
+}
+
+/// Returns true when a matching impl block contains `fn method`.
+fn has_impl_method(code: &str, qualifier: &str, method: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = code.get(from..).and_then(|rest| rest.find("impl")) {
+        let start = from.saturating_add(offset);
+        from = start.saturating_add(4);
+        if !has_boundary_before(code, start) || !has_boundary_after(code, from) {
+            continue;
+        }
+        let Some(open_offset) = code.get(from..).and_then(|rest| rest.find('{')) else {
+            break;
+        };
+        let open = from.saturating_add(open_offset);
+        let header = code.get(from..open).unwrap_or_default();
+        if !impl_header_names(header, qualifier) {
+            continue;
+        }
+        let Some(close) = matching_brace(code, open) else {
+            break;
+        };
+        let block = code.get(open..close).unwrap_or_default();
+        if has_definition(block, "fn", method) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when `symbol` resolves to a definition in `source`.
+fn symbol_defined(source: &str, symbol: &str) -> bool {
+    let code = mask_non_code(source);
+    if let Some(macro_symbol) = symbol.strip_suffix('!') {
+        let name = macro_symbol.rsplit("::").next().unwrap_or(macro_symbol);
+        return has_definition(&code, "macro_rules!", name);
+    }
+    if let Some((qualifier, method)) = symbol.rsplit_once("::") {
+        return has_impl_method(&code, qualifier, method);
+    }
+    DEFINITION_KEYWORDS
+        .iter()
+        .any(|keyword| has_definition(&code, keyword, symbol))
+}
+
 /// Verifies that a `file:symbol` reference exists in source.
 fn verify_symbol(root: &Path, reference: &str) -> Result<(), String> {
     let (file, symbol) = reference
         .split_once(':')
         .ok_or_else(|| format!("symbol reference has no file: {reference}"))?;
     let source = read_source(root, file)?;
-    let leaf = symbol.rsplit("::").next().unwrap_or(symbol);
-    let markers = leaf.strip_suffix('!').map_or_else(
-        || {
-            vec![
-                format!("fn {leaf}"),
-                format!("enum {leaf}"),
-                format!("struct {leaf}"),
-                format!("type {leaf}"),
-            ]
-        },
-        |name| vec![format!("macro_rules! {name}")],
-    );
-    if !markers.iter().any(|marker| source.contains(marker)) {
+    if !symbol_defined(&source, symbol) {
         return Err(format!("{reference} does not match a source symbol"));
     }
     Ok(())
@@ -1109,5 +1476,118 @@ mod tests {
     fn review_required_accepts_classified_entries() {
         let rendered = r#"{"capability_groups": {"operators": []}}"#;
         assert!(review_required(rendered).unwrap().is_empty());
+    }
+
+    #[test]
+    fn symbol_defined_matches_method_in_named_impl() {
+        let source = "
+            impl Rx {
+                fn evaluate(&self) -> bool { true }
+            }
+            impl Other {
+                fn evaluate(&self) -> bool { false }
+            }
+        ";
+        assert!(
+            symbol_defined(source, "Rx::evaluate"),
+            "method inside its own impl block"
+        );
+    }
+
+    #[test]
+    fn symbol_defined_rejects_method_from_other_impl() {
+        let source = "
+            impl Foo {
+                fn evaluate(&self) {}
+            }
+            impl Bar {
+                fn collect(&self) {}
+            }
+        ";
+        assert!(!symbol_defined(source, "Bar::evaluate"), "evaluate belongs to Foo");
+    }
+
+    #[test]
+    fn symbol_defined_matches_generic_and_trait_impls() {
+        let source = "
+            impl<T> Holder<T> {
+                fn evaluate(&self, value: T) {}
+            }
+            impl std::fmt::Display for Shown {
+                fn fmt(&self) {}
+            }
+            impl crate::ops::PathType {
+                fn run(&self) {}
+            }
+        ";
+        assert!(symbol_defined(source, "Holder::evaluate"), "generic impl");
+        assert!(symbol_defined(source, "Shown::fmt"), "trait impl");
+        assert!(symbol_defined(source, "PathType::run"), "path-qualified impl type");
+    }
+
+    #[test]
+    fn symbol_defined_requires_identifier_boundaries() {
+        let source = "
+            impl Rx {
+                fn evaluate_extra(&self) {}
+            }
+            impl RxExtra {
+                fn evaluate(&self) {}
+                fn collect(&self) {}
+            }
+        ";
+        assert!(!symbol_defined(source, "Rx::evaluate"), "suffix method is not evaluate");
+        assert!(!symbol_defined(source, "Rx::collect"), "suffix type is not Rx");
+        assert!(symbol_defined(source, "RxExtra::evaluate"), "exact type and method");
+    }
+
+    #[test]
+    fn symbol_defined_handles_macros() {
+        let source = "macro_rules! storage { () => {}; }";
+        assert!(symbol_defined(source, "storage!"), "macro definition");
+        let source = "macro_rules! storage_extra { () => {}; }";
+        assert!(!symbol_defined(source, "storage!"), "macro name boundary");
+    }
+
+    #[test]
+    fn symbol_defined_matches_bare_definitions() {
+        let source = r#"
+            fn helper() { let _ = "ok"; }
+            pub(crate) enum Kind { A }
+            struct Thing;
+            type Alias = u8;
+            trait Marker {}
+            const LIMIT: usize = 1;
+            static GLOBAL: u8 = 0;
+            mod inner {}
+            macro_rules! local { () => {}; }
+        "#;
+        for reference in [
+            "helper", "Kind", "Thing", "Alias", "Marker", "LIMIT", "GLOBAL", "inner", "local!",
+        ] {
+            assert!(symbol_defined(source, reference), "{reference} should resolve");
+        }
+    }
+
+    #[test]
+    fn symbol_defined_ignores_comments_and_literals() {
+        let source = r#"
+            // fn hidden() {}
+            /* struct Hidden; */
+            impl Balanced {
+                fn evaluate(&self) {
+                    let _brace = '}';
+                    let _text = "{";
+                    let _raw = r"fn quoted() {}";
+                }
+            }
+        "#;
+        assert!(
+            symbol_defined(source, "Balanced::evaluate"),
+            "real method still resolves"
+        );
+        assert!(!symbol_defined(source, "hidden"), "line comment");
+        assert!(!symbol_defined(source, "Hidden"), "block comment");
+        assert!(!symbol_defined(source, "quoted"), "raw string literal");
     }
 }
