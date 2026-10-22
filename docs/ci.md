@@ -35,6 +35,23 @@ the [parity protocol](../libperfusion/tools/parity/PROTOCOL.md).
 See the [fuzzing guide](../libperfusion/docs/FUZZING.md) for local runs and
 regression promotion.
 
+### `Coraza harness`
+
+- `go-harness`: checks the isolated Go benchmark module in
+  `benchmarks/coraza/go` with `gofmt -l`, `go vet`, `go test` and
+  `go run ./cmd/checkresolve`. The Go toolchain comes from that module's
+  `go.mod`, and commands run with `GOWORK=off GOTOOLCHAIN=local` so an ambient
+  workspace or implicit toolchain download cannot change the resolved engine.
+- `coraza-examples`: runs the async FTW example server tests.
+- `ftw-smoke`: runs the FTW runner in strict conformance mode against the
+  checked-in smoke rules and test directory. Exact rule, file, test case and
+  stage counts are required, and the manifest must contain no failed, skipped,
+  ignored or forced-fail results. The result manifest is uploaded. It needs no
+  CRS checkout.
+
+The FTW runner and benchmark module have separate `go.mod` files; neither is
+part of the Cargo workspace.
+
 ### `supply-chain`
 
 - `cargo audit`
@@ -60,6 +77,10 @@ regression promotion.
 make lint
 make lint-extra
 make test
+make go-harness-check
+make ftw-runner-check
+make coraza-example-test
+make ftw-smoke
 make audit
 make coverage-check
 ```
