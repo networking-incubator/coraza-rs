@@ -20,6 +20,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write as _,
     path::{Component, Path, PathBuf},
 };
 
@@ -29,7 +30,7 @@ use coraza::{
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 /// Case schema version understood by this driver.
@@ -37,18 +38,6 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 
 /// Highest TX index a Coraza capture can occupy.
 const MAX_CAPTURE_INDEX: usize = 9;
-
-/// Engine flags included in every observed outcome.
-const OBSERVED_FLAGS: [&str; 8] = [
-    "REQBODY_ERROR",
-    "REQBODY_PROCESSOR_ERROR",
-    "INBOUND_DATA_ERROR",
-    "OUTBOUND_DATA_ERROR",
-    "RESBODY_ERROR",
-    "RESBODY_PROCESSOR_ERROR",
-    "MULTIPART_STRICT_ERROR",
-    "ARGUMENTS_LIMIT_REACHED",
-];
 
 /// Normalization names permitted by the case schema.
 const NORMALIZATIONS: [&str; 5] = [
@@ -1424,7 +1413,7 @@ pub(crate) fn run_case(prepared: &PreparedCase) -> Result<Outcome, DriverError> 
         matches,
         captures: read_captures(&transaction),
         scores,
-        flags: read_flags(&transaction),
+        flags: read_flags(&transaction, &case.expected.flags),
         collections,
     })
 }
@@ -1513,14 +1502,15 @@ fn read_captures(transaction: &Transaction) -> Vec<OutcomeCapture> {
     captures
 }
 
-/// Reads the fixed set of engine flags.
-fn read_flags(transaction: &Transaction) -> BTreeMap<String, String> {
+/// Reads the engine flags named by the case. Names the public API does not
+/// expose are omitted, so the existing comparison reports them as unobservable.
+fn read_flags(transaction: &Transaction, expected: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut flags = BTreeMap::new();
-    for name in OBSERVED_FLAGS {
+    for name in expected.keys() {
         if let Ok(variable) = name.parse::<RuleVariable>()
             && let Some(value) = transaction.get_variable(variable, None)
         {
-            flags.insert(name.to_owned(), value);
+            flags.insert(name.clone(), value);
         }
     }
     flags
@@ -1741,4 +1731,89 @@ fn compare_collections(case: &Case, outcome: &Outcome) -> Result<(), DriverError
         }
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Language-neutral outcome document
+// -----------------------------------------------------------------------------
+
+/// Builds the NDJSON outcome object shared with the Go driver.
+///
+/// Byte values are standard base64 so arbitrary bytes survive JSON. Rule
+/// matches stay in evaluation order, captures in index order and collections
+/// in the order the case declares them. The per-match phase is omitted because
+/// the Go public API does not expose it.
+pub(crate) fn outcome_document(case: &Case, outcome: &Outcome) -> Value {
+    let interruption = outcome.interruption.as_ref().map(|interruption| {
+        json!({
+            "rule_id": interruption.rule_id,
+            "action": interruption.action,
+            "status": interruption.status,
+            "data": STANDARD.encode(interruption.data.as_bytes()),
+        })
+    });
+    let matches = outcome
+        .matches
+        .iter()
+        .map(|matched| {
+            json!({
+                "rule_id": matched.rule_id,
+                "variable": matched.variable,
+                "key": matched.key,
+                "value": STANDARD.encode(&matched.value),
+            })
+        })
+        .collect::<Vec<_>>();
+    // The Go transaction seeds TX 0..10 with empty strings and cannot tell an
+    // empty slot from an explicitly cleared capture, so empty captures are
+    // omitted from the shared document on both sides.
+    let captures = outcome
+        .captures
+        .iter()
+        .filter(|capture| !capture.value.is_empty())
+        .map(|capture| {
+            json!({
+                "index": capture.index,
+                "value": STANDARD.encode(&capture.value),
+            })
+        })
+        .collect::<Vec<_>>();
+    let collections = outcome
+        .collections
+        .iter()
+        .map(|collection| {
+            json!({
+                "variable": collection.variable,
+                "key": collection.key,
+                "value": collection.value.as_ref().map(|value| STANDARD.encode(value)),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "case_id": case.case_id,
+        "interruption": interruption,
+        "matches": matches,
+        "captures": captures,
+        "scores": &outcome.scores,
+        "flags": &outcome.flags,
+        "collections": collections,
+    })
+}
+
+/// Writes outcome documents as NDJSON, one object per line.
+pub(crate) fn write_outcomes(path: &Path, documents: &[Value]) -> Result<(), DriverError> {
+    let file = fs::File::create(path)
+        .map_err(|error| DriverError::Load(format!("cannot create outcome file {}: {error}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    for document in documents {
+        let line = serde_json::to_vec(document)
+            .map_err(|error| DriverError::Load(format!("cannot encode outcome document: {error}")))?;
+        writer
+            .write_all(&line)
+            .and_then(|()| writer.write_all(b"\n"))
+            .map_err(|error| DriverError::Load(format!("cannot write {}: {error}", path.display())))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| DriverError::Load(format!("cannot flush {}: {error}", path.display())))
 }

@@ -1,9 +1,10 @@
 # Coraza Go-versus-Rust workload
 
-Shared workload layer and Rust driver for the local Go-versus-Rust Coraza
-comparison. This wave provides fixtures, case validation and the Rust
-lifecycle. It has no timing code, statistics, coordinator, baseline report or
-CI job; the coordinator in the next wave compares the two engines.
+Shared workload layer, Rust and Go drivers, and a correctness-first parity
+runner for the local Go-versus-Rust Coraza comparison. This wave provides
+fixtures, case validation, both lifecycles and cross-engine outcome comparison.
+It has no timing code, statistics, baseline report or speed claim; those remain
+a later wave and start only after correctness parity passes.
 
 The existing conformance case schema at
 [`coraza/conformance/corpus-schema.json`](../../coraza/conformance/corpus-schema.json)
@@ -15,10 +16,14 @@ subset of that schema the drivers support.
 | Path | Role |
 | --- | --- |
 | `go/` | Isolated Go module with engine resolution checks and the Go lifecycle. See [`go/README.md`](go/README.md). |
+| `go/workload.go` | Go loader and validator mirroring the Rust invariants. |
+| `go/outcome.go` | Shared outcome types, Go observation, comparison and NDJSON I/O. |
+| `go/cmd/workload` | Go workload driver: validates, runs and emits outcomes. |
+| `go/cmd/parity` | Correctness parity runner over both drivers. |
 | `workloads/manifest.json` | Frozen list of case paths and SHA-256 hashes. |
 | `workloads/cases/*.json` | One conformance case per file, schema version 1. |
 | `coraza/benches/coraza_workload.rs` | Rust driver entry point. |
-| `coraza/benches/coraza_workload/driver.rs` | Loader, validator, Rust lifecycle and outcome comparison. |
+| `coraza/benches/coraza_workload/driver.rs` | Loader, validator, Rust lifecycle, outcome comparison and document emission. |
 | `coraza/tests/coraza_workload.rs` | Focused tests for the loader, hashes, ranges and the full subset. |
 
 ## Workload contract
@@ -104,7 +109,11 @@ Run it:
 ```sh
 cargo bench -p coraza --bench coraza_workload
 cargo bench -p coraza --bench coraza_workload -- --workloads /path/to/workloads
+cargo bench -p coraza --bench coraza_workload -- --workloads /path/to/workloads --outcome /tmp/rust.ndjson
 ```
+
+The `--outcome` flag keeps every existing validation step and additionally
+writes the language-neutral NDJSON outcome document described below.
 
 Run the focused tests:
 
@@ -122,8 +131,8 @@ and compares the observed outcome with `expected`.
 Validated per case: matched rule IDs, phases, variables, keys and exact value
 bytes; the effective interruption's rule, action, status and data; TX captures
 0 through 9; named TX scores; named engine flags; and named collection values.
-A mismatch or any malformed case fails the driver with a non-zero exit code
-before any future timing section starts.
+A mismatch or any malformed case fails the driver with a non-zero exit code;
+the outcome document is written only after every case validates.
 
 Not compared by this driver, and therefore rejected or documented:
 
@@ -134,34 +143,165 @@ Not compared by this driver, and therefore rejected or documented:
   would diverge from the `SecLang` directives in the case.
 - Request targets that are not UTF-8: the Rust public URI API takes text.
 - DetectionOnly would-be interruptions: the subset uses `SecRuleEngine On`.
-- Per-match phase: the Rust public API does not expose it, so the driver
-  derives it from the lifecycle call after which the match first appeared.
+- Per-match phase in the shared document: the Rust driver derives it from the
+  lifecycle call after which the match first appeared for expected validation,
+  but the Go public API cannot expose it, so the field is absent from the
+  cross-engine outcome document.
 
-The six cases are `get-benign`, `get-attack`, `form-benign`, `form-attack`,
-`json-benign` and `json-attack`. Each pair shares one policy and differs only
-in exact input bytes. The expected blocks were validated against the Rust
-driver only. This is not a parity claim; the coordinator compares both engines.
+## Go driver
 
-## What the Go driver must implement
+The Go driver reuses the existing lifecycle in `go/lifecycle.go`: `New`
+compiles the policy once, `drive` supplies the same bytes, headers and
+connection metadata, an interruption stops later calls and `ProcessLogging`
+always runs. Like the Rust driver, it supplies the validated body once through
+`ReadRequestBodyFrom`; the chunk boundaries are validated metadata so both
+engines see the same call boundaries. The workload loader validates the same
+invariants as the Rust loader.
 
-The existing Go lifecycle in `go/lifecycle.go` already compiles a policy once
-and drives phases 1 to 5. The next wave must add a loader that:
+Run it from the Go module directory:
 
-1. Reads `manifest.json` with the same validation rules and verifies each case
-   file hash, fixture hash and fixture range.
-2. Parses the schema version 1 case shape, including base64 bytes and ordered
-   repeated headers.
-3. Replays `phase_calls` in order, applies connection metadata, promotes the
-   first `Host` header to `SERVER_NAME`, supplies identical bytes, uses the
-   case's policy text unchanged, stops later calls on interruption and calls
-   `ProcessLogging` once.
-4. Compares the same observable outcomes: interruption rule/action/status/data,
-   matched rule IDs and match details, TX captures 0 through 9, named scores,
-   named flags and named collection values.
-5. Loads, validates and compiles everything outside any timed unit. No `go
-   run`, JSON IPC, file discovery or fixture generation may occur per timed
-   transaction.
+```sh
+cd benchmarks/coraza/go
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/workload
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/workload --workloads /path/to/workloads --outcome /tmp/go.ndjson
+```
 
-The coordinator must reject a run when either driver cannot load the complete
-workload, when any case hash differs, or when an observed outcome differs from
-the case. Only cases both engines reproduce are eligible for a speed ratio.
+Without `--workloads` the driver resolves `../workloads` from the Go module
+directory, which is the same directory as the Rust driver's default. Without
+`--outcome` it writes the NDJSON document to standard output; pass and error
+messages always go to standard error.
+
+The loader mirrors the Rust checks: manifest presence and shape, schema
+version, unknown fields, duplicate case paths, absolute and parent-traversal
+paths, exact case-file SHA-256, zero cases, base64 validity, fixture hashes and
+ranges, contiguous chunks that cover the body exactly, the case-level
+`fixture_sha256`, the canonical lifecycle and the expected block. File reads
+are bounded at 64 MiB. The case policy text, body bytes, header bytes and
+protocol text are passed through unchanged.
+
+Observables read from the Go engine:
+
+- Effective interruption: rule ID, action, status and data.
+- Matched rules in evaluation order: rule ID, variable name, collection key and
+  matched value, from `MatchedRules`.
+- TX captures 0 through 9, named TX scores, and the named collection values
+  declared by the case.
+- The engine flags declared by the case that v3.8.1 exposes:
+  `REQBODY_ERROR`, `REQBODY_PROCESSOR_ERROR`, `INBOUND_DATA_ERROR`,
+  `OUTBOUND_DATA_ERROR`, `MULTIPART_STRICT_ERROR` and
+  `ARGUMENTS_LIMIT_REACHED`.
+
+The Go side reads variables through the exported `Variables()` and
+`Collection()` methods implemented by the transaction returned from
+`WAF.NewTransaction()`. Those methods back the plugin API in
+`experimental/plugins/plugintypes`; they are exported but are not part of the
+`types.Transaction` interface, so a future engine upgrade must recheck them.
+
+Observables the Go public API does not expose, and which are therefore not
+fabricated or compared:
+
+- Per-match phase. `MatchedRule` and `MatchData` carry no phase; the Rust
+  document omits the field as well.
+- `RES_BODY_ERROR` and `RES_BODY_PROCESSOR_ERROR`. v3.8.1 has neither a
+  plugin-interface accessor nor a `Collection` mapping for them.
+- Audit entries, for the same subset reason as the Rust driver.
+- Non-`auto` body processors and non-empty `processor.config`, which the common
+  subset rejects.
+
+Go pre-seeds TX keys 0 through 10 with empty strings and leaves several
+untouched flags as empty strings rather than `"0"`. Captures and scores treat
+an empty seeded TX value as unset, matching the Rust driver's absent-key
+behavior, and the document carries only the flags a case declares, so
+initialization differences outside the declared contract are not masked into
+comparisons.
+
+## Outcome document
+
+Both drivers emit one JSON object per line (NDJSON), one line per case in
+workload order. Byte values are standard base64; strings and numbers are
+otherwise plain JSON. `null` means the value is absent.
+
+```json
+{
+  "case_id": "get-attack",
+  "interruption": {"rule_id": 1001, "action": "deny", "status": 403, "data": ""},
+  "matches": [{"rule_id": 1001, "variable": "ARGS_GET", "key": "q", "value": "YXR0YWNr"}],
+  "captures": [{"index": 0, "value": "YXR0YWNr"}],
+  "scores": {"inbound_anomaly_score": 5},
+  "flags": {"REQBODY_ERROR": "0"},
+  "collections": [{"variable": "REQBODY_PROCESSOR", "key": null, "value": "VVJMRU5DT0RFRA=="}]
+}
+```
+
+Field rules:
+
+- `case_id`: the manifest case ID.
+- `interruption`: `null` or an object with `rule_id`, `action`, `status` and
+  base64 `data`.
+- `matches`: one entry per matched value, in evaluation order. `variable` is
+  the engine variable name, `key` is `null` for keyless variables and `value`
+  is base64. The per-match phase is omitted.
+- `captures`: TX indices 0 through 9 with base64 values, in index order. An
+  empty capture slot is unset and omitted. A case that expects an empty
+  capture value is outside the common subset because Go cannot tell it from an
+  unset slot.
+- `scores`: the named TX scores declared by the case. A missing score is `0`,
+  matching both drivers.
+- `flags`: the engine flags declared by the case, using the exact string the
+  engine exposes. A flag neither driver can observe is absent, and the Go
+  expected comparison reports it instead of inventing a value.
+- `collections`: the collection values declared by the case, in declaration
+  order. `value` is base64 or `null` when the collection or key is absent.
+
+Maps (`scores`, `flags`) have no observable order and are compared by key.
+Every array has a defined order: matches are in evaluation order, captures in
+index order and collections in case declaration order. No field is compared as
+a multiset because no public API in this subset exposes an unordered array.
+
+## Correctness parity runner
+
+`go/cmd/parity` builds the Go driver, runs it and the Rust driver over the same
+workload, parses both NDJSON documents and fails on any divergence:
+
+```sh
+cd benchmarks/coraza/go
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/parity
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/parity --workloads /path/to/workloads
+```
+
+The runner compiles each driver once per invocation, writes both documents to a
+temporary directory and removes it afterwards. It fails closed on a non-zero
+driver exit, a missing or unreadable document, invalid JSON or base64, an
+incomplete case object, duplicate case IDs, a missing or extra case, or any
+differing field. Divergences are printed one per line and name the case and
+field, for example:
+
+```text
+case get-attack: matches[0].value: rust "YXR0YWNr", go "c2FmZQ=="
+```
+
+A run succeeds only when both drivers load and validate the complete workload
+and every emitted field agrees. Pass or fail messages from the drivers go to
+standard error and do not affect the outcome comparison.
+
+## Running correctness parity locally
+
+```sh
+cargo test -p coraza --test coraza_workload
+cd benchmarks/coraza/go
+gofmt -l .
+GOWORK=off GOTOOLCHAIN=local go vet ./...
+GOWORK=off GOTOOLCHAIN=local go test ./...
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/parity
+```
+
+The Go tests cover the loader negatives (tampered hashes, traversal, invalid
+base64, chunk gaps, wrong schema version, fixture ranges), the six shipped
+cases through the Go lifecycle, the NDJSON round trip and a negative comparator
+test built from synthetic outcome documents.
+
+The six shipped cases are `get-benign`, `get-attack`, `form-benign`,
+`form-attack`, `json-benign` and `json-attack`. Each pair shares one policy and
+differs only in exact input bytes. Both drivers validate the expected block and
+the parity runner compares the two engines. Only cases that pass correctness
+parity are eligible for a later speed ratio; this wave makes no speed claim.

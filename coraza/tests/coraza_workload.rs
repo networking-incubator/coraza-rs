@@ -30,7 +30,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use driver::{compare_expected, load_workload, parse_case_bytes, run_case, sha256_hex};
+use driver::{
+    compare_expected, load_workload, outcome_document, parse_case_bytes, run_case, sha256_hex, write_outcomes,
+};
 use serde_json::{Value, json};
 
 /// Directory holding the shared workload.
@@ -135,6 +137,36 @@ fn driver_matches_every_expected_outcome() {
         let outcome = run_case(prepared).expect("case must run");
         compare_expected(&prepared.case, &outcome)
             .unwrap_or_else(|error| panic!("case {}: {error}", prepared.case.case_id));
+    }
+}
+
+#[test]
+fn outcome_documents_are_emitted_as_ndjson() {
+    let cases = load_workload(&workload_root()).expect("shipped workload must load");
+    let mut documents = Vec::new();
+    for prepared in &cases {
+        let outcome = run_case(prepared).expect("case must run");
+        documents.push(outcome_document(&prepared.case, &outcome));
+    }
+    let temporary = tempfile::tempdir().expect("create temporary directory");
+    let path = temporary.path().join("outcomes.ndjson");
+    write_outcomes(&path, &documents).expect("write outcomes");
+    let text = fs::read_to_string(&path).expect("read outcomes");
+
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), cases.len(), "one outcome line per case");
+    for (line, prepared) in lines.iter().zip(&cases) {
+        let document: Value = serde_json::from_str(line).expect("each line is JSON");
+        assert_eq!(document["case_id"], prepared.case.case_id);
+        assert!(document["matches"].is_array(), "matches is an array");
+        assert!(document["captures"].is_array(), "captures is an array");
+        assert!(document["collections"].is_array(), "collections is an array");
+        assert!(document.get("scores").is_some(), "scores is present");
+        assert!(document.get("flags").is_some(), "flags is present");
+        assert!(
+            document.get("interruption").is_some(),
+            "interruption is present, null when absent"
+        );
     }
 }
 

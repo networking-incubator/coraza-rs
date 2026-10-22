@@ -4,8 +4,9 @@ Isolated Go side of the local Go-versus-Rust Coraza comparison. This is a
 self-contained Go module with its own `go.mod` and `go.sum`, separate from
 `ftw-runner` and from the Cargo workspace.
 
-This wave provides resolution checks and the lifecycle scaffold only. It has no
-timing code, workload matrix, fixture format or result collection.
+This wave provides resolution checks, the lifecycle, the shared workload
+consumer and the correctness parity runner. It has no timing code or speed
+claim; that remains a later wave.
 
 ## Inputs
 
@@ -80,14 +81,21 @@ check for that toolchain.
 
 ## Layout
 
-- `lifecycle.go`: `Engine` and `Run`, the single lifecycle used by future
-  validation and measurement modes.
+- `lifecycle.go`: `Engine` and `Run`, the single lifecycle used by validation
+  and future measurement modes.
+- `workload.go`: shared workload loader and validator.
+- `outcome.go`: outcome document types, observation, comparison and NDJSON I/O.
 - `resolve.go`: profile detection, pinned revision for the local profile,
   resolution check and JSON report.
 - `cmd/checkresolve`: prints the resolution report and exits non-zero on
   mismatch. Run it before any measurement.
+- `cmd/workload`: validates the shared workload and emits NDJSON outcomes.
+- `cmd/parity`: runs both drivers and compares outcomes field by field.
 - `lifecycle_test.go`: smoke test that compiles one simple policy and runs
   allowed and denied transactions through phases 1 to 5.
+- `workload_test.go`: loader negatives, the shipped cases and the canonical
+  lifecycle.
+- `outcome_test.go`: NDJSON round trip and comparator divergence tests.
 - `resolve_test.go`: profile classification, resolved identity and linked-build
   checks.
 
@@ -99,9 +107,11 @@ order as Coraza's HTTP middleware, calls `ProcessLogging`, and closes the
 transaction. An interruption ends that unit of work, matching server behavior.
 `(*Engine).Close` releases cached compiled patterns.
 
-The future driver must not invoke `go run`, JSON IPC, file discovery or fixture
-generation per transaction. `cmd/checkresolve` is a pre-run gate, not part of a
-timed unit.
+A future timing driver must not invoke `go run`, JSON IPC, file discovery or
+fixture generation per transaction. `cmd/checkresolve` is a pre-run gate, not
+part of a timed unit. The workload and outcome document format, including the
+exact command lines, are documented in
+[`../README.md`](../README.md#outcome-document).
 
 ## Commands
 
@@ -109,4 +119,6 @@ timed unit.
 cd benchmarks/coraza/go
 GOWORK=off GOTOOLCHAIN=local go test ./...
 GOWORK=off GOTOOLCHAIN=local go run ./cmd/checkresolve
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/workload --outcome /tmp/go.ndjson
+GOWORK=off GOTOOLCHAIN=local go run ./cmd/parity
 ```
