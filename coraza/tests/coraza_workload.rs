@@ -213,6 +213,37 @@ fn case_path_traversal_is_rejected() {
 }
 
 #[test]
+fn duplicate_case_ids_are_rejected() {
+    let temporary = tempfile::tempdir().expect("create temporary directory");
+    let first = minimal_case();
+    let mut second = minimal_case();
+    second["connection"]["remote_port"] = json!(50001);
+    let first_bytes = first.to_string();
+    let second_bytes = second.to_string();
+    fs::write(temporary.path().join("first.json"), &first_bytes).expect("write first case");
+    fs::write(temporary.path().join("second.json"), &second_bytes).expect("write second case");
+    let manifest = json!({
+        "schema_version": 1,
+        "workload_id": "duplicate-ids",
+        "description": "duplicate case id manifest",
+        "case_schema": "coraza/conformance/corpus-schema.json",
+        "cases": [
+            {"path": "first.json", "sha256": sha256_hex(first_bytes.as_bytes())},
+            {"path": "second.json", "sha256": sha256_hex(second_bytes.as_bytes())}
+        ]
+    });
+    fs::write(temporary.path().join("manifest.json"), manifest.to_string()).expect("write manifest");
+    let error = load_workload(temporary.path()).expect_err("a duplicate case id must fail");
+    let text = error.to_string();
+    assert!(
+        text.contains("duplicate case id \"minimal\""),
+        "error must name the duplicate case id: {text}"
+    );
+    assert!(text.contains("first.json"), "error must name the first path: {text}");
+    assert!(text.contains("second.json"), "error must name the second path: {text}");
+}
+
+#[test]
 fn invalid_base64_is_rejected() {
     let mut case = minimal_case();
     case["request"]["body"] = json!({"base64": "not base64!"});

@@ -1351,6 +1351,7 @@ pub(crate) fn load_workload(root: &Path) -> Result<Workload, DriverError> {
         return Err(DriverError::Load("manifest has no cases".to_owned()));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut seen_ids = BTreeMap::new();
     let mut prepared = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let entry_context = format!("manifest case {index}");
@@ -1381,6 +1382,14 @@ pub(crate) fn load_workload(root: &Path) -> Result<Workload, DriverError> {
             )));
         }
         let case = parse_case_bytes(&source, root)?;
+        if let Some(first) = seen_ids.insert(case.case_id.clone(), path.clone()) {
+            return Err(DriverError::Load(format!(
+                "duplicate case id {:?} in {} and {}",
+                case.case_id,
+                first.display(),
+                path.display()
+            )));
+        }
         let waf = compile_policy(&case.sec_lang, &case.case_id)?;
         prepared.push(PreparedCase { case, waf });
     }
