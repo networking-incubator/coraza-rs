@@ -165,17 +165,32 @@ func (p *PreparedCase) Close() error {
 	return p.engine.Close()
 }
 
+// WorkloadInfo identifies a loaded workload. ManifestSHA256 is the lower-case
+// SHA-256 of the exact manifest file bytes.
+type WorkloadInfo struct {
+	ID             string
+	ManifestSHA256 string
+}
+
 // LoadWorkload reads the manifest, verifies every case and fixture hash and
 // compiles every policy once.
 func LoadWorkload(root string) ([]*PreparedCase, error) {
+	cases, _, err := LoadWorkloadWithInfo(root)
+	return cases, err
+}
+
+// LoadWorkloadWithInfo is LoadWorkload plus the manifest identity the timing
+// document records. The manifest and every case are still read and validated
+// once.
+func LoadWorkloadWithInfo(root string) ([]*PreparedCase, WorkloadInfo, error) {
 	manifestPath := filepath.Join(root, "manifest.json")
 	manifestBytes, err := readFileBounded(manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w", manifestPath, err)
+		return nil, WorkloadInfo{}, fmt.Errorf("cannot read %s: %w", manifestPath, err)
 	}
 	raw, err := parseJSONDocument(manifestBytes, "manifest")
 	if err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	object, err := asObject(
 		raw,
@@ -184,30 +199,30 @@ func LoadWorkload(root string) ([]*PreparedCase, error) {
 		nil,
 	)
 	if err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	if err := checkSchemaVersion(object["schema_version"], "manifest"); err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	workloadID, err := stringField(object["workload_id"], "manifest workload_id")
 	if err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	if workloadID == "" {
-		return nil, fmt.Errorf("manifest workload_id is empty")
+		return nil, WorkloadInfo{}, fmt.Errorf("manifest workload_id is empty")
 	}
 	if _, err := stringField(object["description"], "manifest description"); err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	if _, err := stringField(object["case_schema"], "manifest case_schema"); err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	entries, err := asArray(object["cases"], "manifest cases")
 	if err != nil {
-		return nil, err
+		return nil, WorkloadInfo{}, err
 	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("manifest has no cases")
+		return nil, WorkloadInfo{}, fmt.Errorf("manifest has no cases")
 	}
 
 	seen := make(map[string]struct{}, len(entries))
@@ -216,41 +231,41 @@ func LoadWorkload(root string) ([]*PreparedCase, error) {
 		entryContext := fmt.Sprintf("manifest case %d", index)
 		entry, err := asObject(entry, entryContext, []string{"path", "sha256"}, nil)
 		if err != nil {
-			return nil, err
+			return nil, WorkloadInfo{}, err
 		}
 		path, err := stringField(entry["path"], entryContext+" path")
 		if err != nil {
-			return nil, err
+			return nil, WorkloadInfo{}, err
 		}
 		if _, err := relativePath(path, entryContext+" path"); err != nil {
-			return nil, err
+			return nil, WorkloadInfo{}, err
 		}
 		if _, duplicate := seen[path]; duplicate {
-			return nil, fmt.Errorf("%s repeats case path %s", entryContext, path)
+			return nil, WorkloadInfo{}, fmt.Errorf("%s repeats case path %s", entryContext, path)
 		}
 		seen[path] = struct{}{}
 		declared, err := stringField(entry["sha256"], entryContext+" sha256")
 		if err != nil {
-			return nil, err
+			return nil, WorkloadInfo{}, err
 		}
 		if !isSHA256(declared) {
-			return nil, fmt.Errorf("%s sha256 is malformed", entryContext)
+			return nil, WorkloadInfo{}, fmt.Errorf("%s sha256 is malformed", entryContext)
 		}
 		casePath := filepath.Join(root, filepath.FromSlash(path))
 		source, err := readFileBounded(casePath)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read %s: %w", casePath, err)
+			return nil, WorkloadInfo{}, fmt.Errorf("cannot read %s: %w", casePath, err)
 		}
 		if actual := sha256Hex(source); actual != declared {
-			return nil, fmt.Errorf("case %s has SHA-256 %s, not %s", casePath, actual, declared)
+			return nil, WorkloadInfo{}, fmt.Errorf("case %s has SHA-256 %s, not %s", casePath, actual, declared)
 		}
 		parsed, err := parseCaseBytes(source, root)
 		if err != nil {
-			return nil, err
+			return nil, WorkloadInfo{}, err
 		}
 		engine, err := New(parsed.secLang)
 		if err != nil {
-			return nil, fmt.Errorf("case %s: %w", parsed.id, err)
+			return nil, WorkloadInfo{}, fmt.Errorf("case %s: %w", parsed.id, err)
 		}
 		prepared = append(prepared, &PreparedCase{
 			ID:       parsed.id,
@@ -259,7 +274,7 @@ func LoadWorkload(root string) ([]*PreparedCase, error) {
 			engine:   engine,
 		})
 	}
-	return prepared, nil
+	return prepared, WorkloadInfo{ID: workloadID, ManifestSHA256: sha256Hex(manifestBytes)}, nil
 }
 
 // requestInput maps a validated case onto the lifecycle request without
