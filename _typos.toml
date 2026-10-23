@@ -28,6 +28,10 @@ UNIONb = "UNIONb"
 # "SELEC" is the truncated keyword libperfusion/src/sqli/keywords.rs looks up
 # to assert that a prefix of a keyword does not match one.
 SELEC = "SELEC"
+# "MatchedDatas" is the pinned Go Coraza v3.8.1 API method
+# (corazarules.MatchedRule.MatchedDatas), called in
+# benchmarks/coraza/go/outcome.go to read each matched rule's match data.
+MatchedDatas = "MatchedDatas"
 
 [default.extend-words]
 # Libinjection fingerprint marker and browser event name.
