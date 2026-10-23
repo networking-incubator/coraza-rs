@@ -180,13 +180,18 @@ impl<'a> MultipartParser<'a> {
         let after_boundary = first_boundary
             .checked_add(boundary_marker.len())
             .ok_or_else(|| ParseError::Parse("boundary position overflow".to_owned()))?;
-        // Skip line ending after first boundary
-        let mut pos = skip_line_ending(self.data, after_boundary);
+        // Skip the linear whitespace Go allows between a boundary and its
+        // line ending, then look for a closing marker before the line ending.
+        let mut pos = skip_lwsp(self.data, after_boundary);
 
         let mut closed = self
             .data
             .get(pos..)
             .is_some_and(|remaining| remaining.starts_with(b"--"));
+        if !closed {
+            // Skip line ending after first boundary
+            pos = skip_line_ending(self.data, pos);
+        }
         let mut total_header_bytes = 0_usize;
 
         // Parse each part
@@ -218,10 +223,12 @@ impl<'a> MultipartParser<'a> {
             let part = parse_part(part_data, &mut total_header_bytes)?;
             parts.push(part);
 
-            // Move past the boundary
+            // Move past the boundary and the linear whitespace that may
+            // separate it from the line ending or a closing marker.
             pos = boundary_marker_pos
                 .checked_add(boundary_marker.len())
                 .ok_or_else(|| ParseError::Parse("boundary position overflow".to_owned()))?;
+            pos = skip_lwsp(self.data, pos);
 
             // Check if this is the final boundary (ends with --)
             if self
@@ -541,6 +548,18 @@ fn find_header_end(data: &[u8]) -> Option<(usize, usize)> {
         .or_else(|| find_subsequence(data, b"\n\n").map(|pos| (pos, 2)))
 }
 
+/// Skip linear whitespace (spaces and tabs) at the given position.
+///
+/// Go's `mime/multipart` accepts optional linear whitespace after a boundary
+/// marker and after a closing marker's dashes (`skipLWSPChar`).
+fn skip_lwsp(data: &[u8], pos: usize) -> usize {
+    let mut end = pos;
+    while data.get(end).is_some_and(|byte| matches!(*byte, b' ' | b'\t')) {
+        end = end.saturating_add(1);
+    }
+    end
+}
+
 /// Skip a line ending (CRLF or LF) at the given position
 ///
 /// Returns the position after the line ending
@@ -597,11 +616,29 @@ fn find_next_boundary(data: &[u8], marker: &[u8], table: &[usize]) -> Option<(us
     Some((part_end, marker_pos))
 }
 
-/// Whether the bytes after a boundary marker start a delimiter line ending or
-/// a closing marker.
+/// Whether the bytes after a boundary marker form a delimiter suffix:
+/// optional linear whitespace and a line ending, or a closing `--` marker with
+/// optional whitespace and a line ending (or end of input).
 fn boundary_suffix_is_valid(data: &[u8], marker_end: usize) -> bool {
-    data.get(marker_end..)
-        .is_some_and(|suffix| suffix.starts_with(b"--") || suffix.starts_with(b"\r\n") || suffix.starts_with(b"\n"))
+    let Some(suffix) = data.get(marker_end..) else {
+        return false;
+    };
+    // Go's isFinalBoundary requires the closing dashes immediately after the
+    // boundary; whitespace before them makes this an ordinary delimiter, not a
+    // closing one.
+    let is_final = suffix.starts_with(b"--");
+    let rest_start = if is_final {
+        marker_end.saturating_add(2)
+    } else {
+        marker_end
+    };
+    let rest = data.get(skip_lwsp(data, rest_start)..).unwrap_or(&[]);
+    let has_line_ending = rest.starts_with(b"\r\n") || rest.starts_with(b"\n");
+    if is_final {
+        rest.is_empty() || has_line_ending
+    } else {
+        has_line_ending
+    }
 }
 
 /// Find a subsequence in a byte slice
@@ -974,6 +1011,119 @@ attack\r\n\
         let parts = MultipartParser::new("b", body).parse().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts.first().unwrap().data, b"attack");
+    }
+
+    #[test]
+    fn first_boundary_with_trailing_space_and_crlf_is_accepted() {
+        let body = b"--b \r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v");
+    }
+
+    #[test]
+    fn first_boundary_with_trailing_tab_and_lf_is_accepted() {
+        let body = b"--b\t\n\
+Content-Disposition: form-data; name=\"q\"\n\
+\n\
+v\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v");
+    }
+
+    #[test]
+    fn later_boundary_with_trailing_spaces_and_crlf_is_accepted() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"a\"\r\n\
+\r\n\
+one\r\n\
+--b  \r\n\
+Content-Disposition: form-data; name=\"b\"\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.first().unwrap().data, b"one");
+        assert_eq!(parts.get(1).unwrap().data, b"two");
+    }
+
+    #[test]
+    fn closing_boundary_with_trailing_space_and_crlf_is_accepted() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b-- \r\n";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v");
+    }
+
+    #[test]
+    fn closing_boundary_with_trailing_tab_at_end_of_input_is_accepted() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b--\t";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v");
+    }
+
+    #[test]
+    fn space_before_the_closing_dashes_is_not_a_final_boundary() {
+        // Go requires the two closing dashes immediately after the boundary.
+        let body = b"--b --\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v";
+        let error = MultipartParser::new("b", body).parse().unwrap_err();
+        assert!(matches!(error, ParseError::Parse(message) if message == "no boundary found"));
+
+        // The line is preamble, not a delimiter: the later final boundary is
+        // the first delimiter, as in Go.
+        let body = b"--b --\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn ordinary_delimiter_with_trailing_whitespace_without_line_ending_is_rejected() {
+        assert!(MultipartParser::new("b", b"--b ").parse().is_err());
+
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b ";
+        let error = MultipartParser::new("b", body).parse().unwrap_err();
+        assert!(matches!(error, ParseError::Parse(message) if message == "missing final boundary"));
+    }
+
+    #[test]
+    fn boundary_like_payload_with_trailing_space_is_not_a_delimiter() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+v\r\n\
+--b x\r\n\
+more\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v\r\n--b x\r\nmore");
     }
 
     #[test]
