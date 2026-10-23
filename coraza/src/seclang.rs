@@ -28,7 +28,7 @@ mod variable_parser;
 
 pub(crate) use action_parser::parse_actions;
 pub use parser::{ParseError, Parser};
-pub(crate) use variable_parser::parse_variables;
+pub(crate) use variable_parser::parse_variables_in;
 
 /// Error returned while compiling a SecLang value.
 #[derive(Debug, Clone, PartialEq, Eq)]

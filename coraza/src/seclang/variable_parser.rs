@@ -39,10 +39,19 @@ use crate::{
 /// The result of parsing a variable expression.
 type ParseResult<T> = Result<T, CompileError>;
 
-/// Parse variable expressions such as `ARGS|ARGS:id|&TX:score`.
+/// Parse variable expressions such as `ARGS|ARGS:id|&TX:score` in the default key mode.
+#[cfg(test)]
 pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
+    parse_variables_in(input, false)
+}
+
+/// Parse variable expressions, compiling key regexes for the given argument key mode.
+///
+/// `case_sensitive_args_keys` mirrors [`crate::config::WafConfig::case_sensitive_args_keys`],
+/// so regex selectors and maps agree on whether argument keys fold case.
+pub(crate) fn parse_variables_in(input: &str, case_sensitive_args_keys: bool) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
-    VariableList::parse(input)?.apply_to(&mut variables);
+    VariableList::parse(input, case_sensitive_args_keys)?.apply_to(&mut variables);
     Ok(variables)
 }
 
@@ -51,7 +60,7 @@ pub(crate) struct VariableList(Vec<Element>);
 
 impl VariableList {
     /// Parse all expressions in a variable list.
-    pub(crate) fn parse(input: &str) -> ParseResult<Self> {
+    pub(crate) fn parse(input: &str, case_sensitive_args_keys: bool) -> ParseResult<Self> {
         if input.is_empty() {
             return Err(CompileError::new("empty variable specification".to_owned()));
         }
@@ -65,7 +74,7 @@ impl VariableList {
             .collect::<ParseResult<Vec<_>>>()?;
         parsed
             .into_iter()
-            .map(|variable| build_element(&variable))
+            .map(|variable| build_element(&variable, case_sensitive_args_keys))
             .collect::<ParseResult<Vec<_>>>()
             .map(Self)
     }
@@ -264,11 +273,11 @@ enum Element {
 }
 
 /// Build a selector or exclusion from one parsed expression.
-fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
+fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> ParseResult<Element> {
     let key = variable
         .key
         .as_deref()
-        .map(|key| parse_key(variable.variable, key))
+        .map(|key| parse_key(variable.variable, key, case_sensitive_args_keys))
         .transpose()?;
 
     if variable.markers.is_negation {
@@ -287,10 +296,14 @@ fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
 }
 
 /// Parse a slash-delimited key as a regex, using the variable's key sensitivity.
-fn parse_key(variable: RuleVariable, key: &str) -> ParseResult<VariableKey> {
+///
+/// Key regexes run against lookup keys, which fold case in a case-insensitive map, so the
+/// regex must fold too unless the variable's map is actually case-sensitive.
+fn parse_key(variable: RuleVariable, key: &str, case_sensitive_args_keys: bool) -> ParseResult<VariableKey> {
+    let case_sensitive = case_sensitive_args_keys && variable.has_case_sensitive_keys();
     match key.strip_prefix('/').and_then(|key| key.strip_suffix('/')) {
         Some(pattern) if !pattern.is_empty() => RegexBuilder::new(pattern)
-            .case_insensitive(!variable.has_case_sensitive_keys())
+            .case_insensitive(!case_sensitive)
             .build()
             .map(VariableKey::Regex)
             .map_err(|error| CompileError::new(format!("invalid regex pattern '{pattern}': {error}"))),
@@ -309,7 +322,12 @@ mod tests {
     }
 
     fn matches(input: &str, variable: RuleVariable, map: &Map) -> Vec<String> {
-        parsed(input)
+        matches_in(input, variable, map, false)
+    }
+
+    fn matches_in(input: &str, variable: RuleVariable, map: &Map, case_sensitive_args_keys: bool) -> Vec<String> {
+        parse_variables_in(input, case_sensitive_args_keys)
+            .expect("test variable expression is valid")
             .iter()
             .filter(|spec| spec.variable() == variable)
             .flat_map(|spec| spec.get_matches(Some(CollectionView::Map(map))))
@@ -334,7 +352,7 @@ mod tests {
         let mut headers = Map::new(RuleVariable::RequestHeaders);
         headers.add("X-Forwarded-For", b"1.2.3.4");
         headers.add("Host", b"localhost");
-        let mut args = Map::new_case_sensitive(RuleVariable::Args);
+        let mut args = Map::new(RuleVariable::Args);
         args.add("Foo", b"1");
         args.add("foo", b"2");
 
@@ -342,19 +360,75 @@ mod tests {
             matches("REQUEST_HEADERS:/^x-forwarded/", RuleVariable::RequestHeaders, &headers),
             ["1.2.3.4"]
         );
-        assert_eq!(matches("ARGS:/^Foo$/", RuleVariable::Args, &args), ["1"]);
-        assert_eq!(matches("ARGS:/^foo$/", RuleVariable::Args, &args), ["2"]);
-        assert!(matches("ARGS:/^FOO$/", RuleVariable::Args, &args).is_empty());
+        // The default mode folds argument key regexes like the argument maps fold lookups.
+        assert_eq!(matches("ARGS:/^Foo$/", RuleVariable::Args, &args), ["1", "2"]);
+        assert_eq!(matches_in("ARGS:/^foo$/", RuleVariable::Args, &args, false), ["1", "2"]);
+
+        let mut strict = Map::new_case_sensitive(RuleVariable::Args);
+        strict.add("Foo", b"1");
+        strict.add("foo", b"2");
+        assert_eq!(matches_in("ARGS:/^Foo$/", RuleVariable::Args, &strict, true), ["1"]);
+        assert_eq!(matches_in("ARGS:/^foo$/", RuleVariable::Args, &strict, true), ["2"]);
+        assert!(matches_in("ARGS:/^FOO$/", RuleVariable::Args, &strict, true).is_empty());
+    }
+
+    #[test]
+    fn regex_key_escapes_are_not_lowercased() {
+        let mut args = Map::new(RuleVariable::Args);
+        args.add("USERID", b"value");
+
+        // Lowercasing the pattern source would turn `\S` into `\s`, which cannot match.
+        assert_eq!(
+            matches_in("ARGS:/^user\\Sd$/", RuleVariable::Args, &args, false),
+            ["value"]
+        );
+    }
+
+    #[test]
+    fn non_argument_regex_keys_stay_case_insensitive_in_both_modes() {
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("X-Trace", b"value");
+
+        assert_eq!(
+            matches_in(
+                "REQUEST_HEADERS:/^X-TRACE$/",
+                RuleVariable::RequestHeaders,
+                &headers,
+                false
+            ),
+            ["value"]
+        );
+        assert_eq!(
+            matches_in(
+                "REQUEST_HEADERS:/^X-TRACE$/",
+                RuleVariable::RequestHeaders,
+                &headers,
+                true
+            ),
+            ["value"]
+        );
     }
 
     #[test]
     fn regex_exclusions_follow_regex_case_rules() {
-        let mut args = Map::new_case_sensitive(RuleVariable::Args);
+        let mut args = Map::new(RuleVariable::Args);
         args.add("Foo", b"1");
         args.add("foo", b"2");
 
-        assert_eq!(matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &args), ["2"]);
-        assert_eq!(matches("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &args), ["1"]);
+        // Default mode folds the exception regex, so it excludes every spelling.
+        assert!(matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &args).is_empty());
+
+        let mut strict = Map::new_case_sensitive(RuleVariable::Args);
+        strict.add("Foo", b"1");
+        strict.add("foo", b"2");
+        assert_eq!(
+            matches_in("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &strict, true),
+            ["2"]
+        );
+        assert_eq!(
+            matches_in("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict, true),
+            ["1"]
+        );
     }
 
     #[test]
