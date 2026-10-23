@@ -78,12 +78,27 @@ impl Waf {
     }
 
     /// Create a WAF from configuration and compiled rules.
+    ///
+    /// `RuleGroup` is crate-private, so this is the only place a compiled rule set is
+    /// paired with a configuration; embedders cannot bypass it. Rules compiled by the
+    /// SecLang parser carry the `case_sensitive_args_keys` mode their key selectors were
+    /// compiled under, and a configuration with a different mode is rejected so compiled
+    /// selectors and transaction maps cannot disagree.
     pub(crate) fn with_rules(
         config: WafConfig,
         rules: RuleGroup,
         error_log: Option<ErrorLog>,
     ) -> Result<Self, ConfigError> {
         validate_config(&config)?;
+        if let Some(compiled) = rules.compiled_case_sensitive_args_keys()
+            && compiled != config.case_sensitive_args_keys
+        {
+            return Err(ConfigError(format!(
+                "case_sensitive_args_keys was {compiled} when the rules were compiled but is {} in the \
+                 configuration",
+                config.case_sensitive_args_keys
+            )));
+        }
         let audit_logger = AuditLogger::open(&config).map_err(ConfigError)?;
         Ok(Self {
             config: Arc::new(config),

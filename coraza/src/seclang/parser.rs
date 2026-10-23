@@ -678,11 +678,15 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
         base_dir: options.config_dir,
         datasets: options.datasets,
     };
+    let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
+    options
+        .rules
+        .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
     let rule = compile_sec_rule_in(
         &options.opts,
         &context,
         options.default_actions,
-        options.waf_config.case_sensitive_args_keys,
+        case_sensitive_args_keys,
     );
     add_rule(options, rule)
 }
@@ -800,6 +804,9 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
     let (ids, variables) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateTargetById ID \"VARIABLES\"")?;
     let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
+    options
+        .rules
+        .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
     let variables = VariableList::parse(variables, case_sensitive_args_keys).map_err(|e| e.message)?;
 
     for spec in ids.split_whitespace() {
@@ -827,8 +834,11 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
 fn directive_sec_rule_update_target_by_tag(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     let (tag, variables) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateTargetByTag TAG \"VARIABLES\"")?;
-    let variables =
-        VariableList::parse(variables, options.waf_config.case_sensitive_args_keys).map_err(|e| e.message)?;
+    let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
+    options
+        .rules
+        .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
+    let variables = VariableList::parse(variables, case_sensitive_args_keys).map_err(|e| e.message)?;
 
     options
         .rules
@@ -1304,6 +1314,79 @@ mod tests {
     fn test_parse_empty_string() {
         let mut parser = Parser::new();
         assert!(parser.from_string("").is_ok());
+    }
+
+    #[test]
+    fn into_waf_accepts_each_case_sensitive_args_keys_mode() {
+        for case_sensitive_args_keys in [false, true] {
+            let mut parser = Parser::new();
+            parser.config_mut().case_sensitive_args_keys = case_sensitive_args_keys;
+            parser
+                .from_string("SecRule ARGS:/^userId$/ \"@contains secret\" \"id:1,phase:1,deny\"")
+                .unwrap();
+            assert!(parser.into_waf().is_ok(), "{case_sensitive_args_keys}");
+        }
+    }
+
+    #[test]
+    fn changing_case_sensitive_args_keys_after_rules_fails_into_waf() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:password \"@contains secret\" \"id:1,phase:1,deny\"")
+            .unwrap();
+        parser.config_mut().case_sensitive_args_keys = true;
+
+        let error = parser.into_waf().unwrap_err();
+
+        assert!(error.to_string().contains("case_sensitive_args_keys"));
+    }
+
+    #[test]
+    fn changing_case_sensitive_args_keys_between_rules_is_rejected() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:password \"@contains secret\" \"id:1,phase:1,deny\"")
+            .unwrap();
+        parser.config_mut().case_sensitive_args_keys = true;
+
+        let error = parser
+            .from_string("SecRule ARGS:token \"@contains secret\" \"id:2,phase:1,deny\"")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("case_sensitive_args_keys"));
+        assert_eq!(parser.rule_count(), 1);
+        assert!(parser.into_waf().is_err());
+    }
+
+    #[test]
+    fn changing_case_sensitive_args_keys_before_target_update_is_rejected() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:password \"@contains secret\" \"id:1,phase:1,deny\"")
+            .unwrap();
+        parser.config_mut().case_sensitive_args_keys = true;
+
+        let error = parser
+            .from_string("SecRuleUpdateTargetById 1 \"ARGS:/^token/\"")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("case_sensitive_args_keys"));
+    }
+
+    #[test]
+    fn waf_with_rules_rejects_a_different_key_mode() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:password \"@contains secret\" \"id:1,phase:1,deny\"")
+            .unwrap();
+        let config = WafConfig {
+            case_sensitive_args_keys: true,
+            ..parser.config().clone()
+        };
+
+        let error = Waf::with_rules(config, parser.rules, None).unwrap_err();
+
+        assert!(error.to_string().contains("case_sensitive_args_keys"));
     }
 
     #[test]
