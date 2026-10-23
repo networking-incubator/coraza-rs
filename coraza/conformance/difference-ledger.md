@@ -58,6 +58,33 @@ adding them requires a shared-corpus fixture first.
 - Twelve URL-bearing attributes and the `MATH` tag added. Cases are pinned in
   `libperfusion/tests/regressions.rs` and the two XSS corpus rows above.
 
+## Rust-only multipart parser hardening budgets
+
+The multipart parser fails closed with `ParseError::Limit` when a body exceeds
+a budget the pinned Go reference does not enforce. Go Coraza v3.8.1's
+`internal/bodyprocessors/multipart.go` reads parts with Go's
+`mime/multipart.Reader.NextPart` loop. The caller reports a limit as
+`malformed multipart: limit exceeded: ...` and sets `MULTIPART_STRICT_ERROR`,
+so rule 200003 interrupts a body Go would process. These are hardening limits,
+not parity claims; no shared-corpus case IDs exist yet.
+
+- Boundary length: 1024 bytes. Go has no boundary-length check in
+  `mime.ParseMediaType` or `mime/multipart`; its 4096-byte read buffer makes a
+  delimiter line longer than about 4090 bytes fail instead. Rust rejects a
+  longer boundary before parsing. RFC 2046 limits boundaries to 70 characters.
+- Part count: 1000. Go Coraza calls `mime/multipart.Reader.NextPart`
+  (`internal/bodyprocessors/multipart.go`), which has no part limit; the Go
+  standard library's `Reader.ReadForm` caps a form at 1000 parts
+  (`mime/multipart/formdata.go`), and Rust adopts that constant.
+- Per-part header block: 10 MiB of raw header bytes and 10000 header lines.
+  The constants come from Go's `maxMIMEHeaderSize` and the default
+  `multipartmaxheaders` value (`mime/multipart/multipart.go`, Go 1.27.3). Go
+  charges the 10 MiB as key bytes plus value bytes plus 200 bytes per distinct
+  header; Rust caps raw header bytes with the same constant.
+- Total header metadata: 10 MiB of raw header bytes summed across every part.
+  Rust-only: Go Coraza accumulates all parts' headers in
+  `MULTIPART_PART_HEADERS` without a whole-body budget.
+
 ## Row format
 
 Every row has exactly five columns:
