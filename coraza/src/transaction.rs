@@ -1618,7 +1618,10 @@ impl Drop for Transaction {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BodyIngestionStats, Transaction, VariableCollection};
+    use super::{
+        BodyIngestionStats, Transaction, VariableCollection,
+        body_buffer::{BufferFailure, inject_failure},
+    };
     use crate::{
         config::WafConfig,
         operators::Outputs,
@@ -4462,5 +4465,84 @@ payload\r\n\
             Some("1")
         );
         assert_eq!(tx.get_variable(RuleVariable::ResponseArgs, Some("json.5")), None);
+    }
+
+    #[test]
+    fn request_body_phase_runs_after_ingest_failure_in_detection_only() {
+        for failure in [BufferFailure::Accept, BufferFailure::Replay] {
+            for (engine, detection_only) in [("On", false), ("DetectionOnly", true)] {
+                let mut parser = crate::seclang::Parser::new();
+                parser
+                    .from_string(&format!(
+                        "SecRuleEngine {engine}\n\
+                         SecRequestBodyAccess On\n\
+                         SecAction \"id:150,phase:1,ctl:requestBodyProcessor=JSON,pass\"\n\
+                         SecAction \"id:151,phase:2,deny,status:403\""
+                    ))
+                    .unwrap();
+                let waf = parser.into_waf().unwrap();
+                let mut tx = waf.new_transaction_with_id(format!("ingest-{engine}-{failure:?}"));
+                tx.process_request_headers();
+                inject_failure(failure);
+
+                let interruption = tx.process_request_body(br#"{"a":1}"#);
+                assert_eq!(
+                    tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+                    Some("1")
+                );
+                let phase_ran = tx.matched_rules().iter().any(|matched| matched.rule.id == 151);
+                if detection_only {
+                    assert_eq!(interruption, None);
+                    assert_eq!(tx.interruption(), None);
+                    assert!(tx.would_be_interruption().is_some());
+                    assert!(phase_ran);
+                    assert_eq!(tx.last_phase(), Some(RulePhase::RequestBody));
+                } else {
+                    assert_eq!(interruption.map(|value| value.status), Some(500));
+                    assert!(!phase_ran);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn response_body_phase_runs_after_ingest_failure_in_detection_only() {
+        for failure in [BufferFailure::Accept, BufferFailure::Replay] {
+            for (engine, detection_only) in [("On", false), ("DetectionOnly", true)] {
+                let mut parser = crate::seclang::Parser::new();
+                parser
+                    .from_string(&format!(
+                        "SecRuleEngine {engine}\n\
+                         SecResponseBodyAccess On\n\
+                         SecResponseBodyMimeType text/plain\n\
+                         SecAction \"id:152,phase:4,deny,status:403\""
+                    ))
+                    .unwrap();
+                let waf = parser.into_waf().unwrap();
+                let mut tx = waf.new_transaction_with_id(format!("res-ingest-{engine}-{failure:?}"));
+                tx.process_request_headers();
+                tx.process_request_body(b"");
+                tx.add_response_header("Content-Type", "text/plain");
+                tx.process_response_headers(200, "HTTP/1.1");
+                inject_failure(failure);
+
+                let interruption = tx.process_response_body(b"response");
+                assert_eq!(
+                    tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+                    Some("1")
+                );
+                let phase_ran = tx.matched_rules().iter().any(|matched| matched.rule.id == 152);
+                if detection_only {
+                    assert_eq!(interruption, None);
+                    assert_eq!(tx.interruption(), None);
+                    assert!(tx.would_be_interruption().is_some());
+                    assert!(phase_ran);
+                    assert_eq!(tx.last_phase(), Some(RulePhase::ResponseBody));
+                } else {
+                    assert_eq!(interruption.map(|value| value.status), Some(500));
+                    assert!(!phase_ran);
+                }
+            }
+        }
     }
 }

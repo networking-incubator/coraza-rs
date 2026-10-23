@@ -98,10 +98,12 @@ impl Transaction {
         if ingest_error {
             self.inbound_data_error.set("1");
             self.interrupt(0, "deny", 500, "");
-            return self.interruption.clone();
-        }
-
-        if self.request_body_access && !self.request_body_buffer.is_empty() {
+            // Detection-only records a would-be interruption; the body phase
+            // must still evaluate its rules rather than being skipped.
+            if self.interruption.is_some() {
+                return self.interruption.clone();
+            }
+        } else if self.request_body_access && !self.request_body_buffer.is_empty() {
             if self.force_request_body_variable && self.reqbody_processor.get_bytes().is_empty() {
                 self.set_request_body_processor("URLENCODED");
             }
@@ -121,7 +123,9 @@ impl Transaction {
                 } else {
                     self.inbound_data_error.set("1");
                     self.interrupt(0, "deny", 500, "");
-                    return self.interruption.clone();
+                    if self.interruption.is_some() {
+                        return self.interruption.clone();
+                    }
                 }
             }
         }
@@ -352,18 +356,90 @@ enum JsonFlattenError {
 
 /// A JSON body flattened the way Go Coraza's `readJSON` does.
 pub(super) struct JsonBody {
-    /// Dot-separated paths, in discovery order per path, with raw value bytes.
-    pub(super) arguments: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Dot-separated paths, in first-discovery order.
+    pub(super) arguments: JsonArguments,
     /// Whether the argument or array-length cap stopped the walk.
     pub(super) truncated: bool,
     /// The parser error message, after any best-effort arguments were collected.
     pub(super) error: Option<String>,
 }
 
+/// Flattened arguments in first-discovery order.
+///
+/// Hash-map iteration order depends on `RandomState`, so publishing straight
+/// from one would make the insertion order of distinct keys in `ARGS_POST`,
+/// `ARGS` and `RESPONSE_ARGS` change between runs, and with it first-match
+/// results and audit argument order. Entries are kept in a vector instead;
+/// the map only indexes a path to its row.
+pub(super) struct JsonArguments {
+    /// Paths in first-discovery order, with each path's values in discovery order.
+    entries: Vec<JsonArgument>,
+    /// Row of each path in `entries`.
+    rows: HashMap<Vec<u8>, usize>,
+}
+
+/// One flattened path with its values, in discovery order.
+type JsonArgument = (Vec<u8>, Vec<Vec<u8>>);
+
+impl JsonArguments {
+    /// Create an empty set of arguments.
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            rows: HashMap::new(),
+        }
+    }
+
+    /// Append `value` under `key`, creating the row on first discovery.
+    fn push(&mut self, key: &[u8], value: Vec<u8>) {
+        if let Some(row) = self.rows.get(key).copied()
+            && let Some((_, values)) = self.entries.get_mut(row)
+        {
+            values.push(value);
+            return;
+        }
+        let row = self.entries.len();
+        let key = key.to_vec();
+        self.rows.insert(key.clone(), row);
+        self.entries.push((key, vec![value]));
+    }
+
+    /// Values stored under `key`, in discovery order.
+    #[cfg(test)]
+    pub(super) fn get(&self, key: &[u8]) -> Option<&[Vec<u8>]> {
+        let row = self.rows.get(key).copied()?;
+        self.entries.get(row).map(|(_, values)| values.as_slice())
+    }
+
+    /// Paths and values in first-discovery order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&[u8], &[Vec<u8>])> + '_ {
+        self.entries
+            .iter()
+            .map(|(key, values)| (key.as_slice(), values.as_slice()))
+    }
+
+    /// Whether no argument was flattened.
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of distinct paths.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// A JSON value as gjson sees it while flattening.
 enum JsonValue<'a> {
-    /// An object or array, holding the raw text it was read from.
-    Json(&'a [u8]),
+    /// An object or array.
+    Json {
+        /// Raw text of the container.
+        raw: &'a [u8],
+        /// Offset of `raw[0]` in the body.
+        base: usize,
+    },
     /// A string, holding its unescaped content.
     String(Cow<'a, [u8]>),
     /// A null, which Go Coraza flattens to an empty string.
@@ -388,6 +464,8 @@ enum JsonKey<'a> {
 struct JsonChildScanner<'a> {
     /// The container text, when the value is an object or array.
     raw: Option<&'a [u8]>,
+    /// Offset of `raw[0]` in the body, for absolute container lookup.
+    base: usize,
     /// Byte offset of the next candidate child.
     offset: usize,
     /// Whether `raw` holds an object rather than an array.
@@ -402,9 +480,10 @@ impl<'a> JsonChildScanner<'a> {
     /// Build a scanner for a parsed value.
     fn new(value: Option<JsonValue<'a>>) -> Self {
         match value {
-            Some(JsonValue::Json(raw)) => Self::container(raw),
+            Some(JsonValue::Json { raw, base }) => Self::container(raw, base),
             Some(other) => Self {
                 raw: None,
+                base: 0,
                 offset: 0,
                 object: false,
                 index: 0,
@@ -418,6 +497,7 @@ impl<'a> JsonChildScanner<'a> {
     fn empty() -> Self {
         Self {
             raw: None,
+            base: 0,
             offset: 0,
             object: false,
             index: 0,
@@ -425,8 +505,8 @@ impl<'a> JsonChildScanner<'a> {
         }
     }
 
-    /// Build a scanner over container text.
-    fn container(raw: &'a [u8]) -> Self {
+    /// Build a scanner over container text starting at `base` in the body.
+    fn container(raw: &'a [u8], base: usize) -> Self {
         let mut offset = 0_usize;
         let mut object = true;
         loop {
@@ -450,6 +530,7 @@ impl<'a> JsonChildScanner<'a> {
         }
         Self {
             raw: Some(raw),
+            base,
             offset,
             object,
             index: 0,
@@ -458,7 +539,7 @@ impl<'a> JsonChildScanner<'a> {
     }
 
     /// The next child, with its key, in document order.
-    fn next(&mut self) -> Option<(JsonKey<'a>, JsonValue<'a>)> {
+    fn next(&mut self, containers: &ContainerIndex) -> Option<(JsonKey<'a>, JsonValue<'a>)> {
         if let Some(single) = self.single.take() {
             return Some((JsonKey::Index(0), single));
         }
@@ -483,7 +564,7 @@ impl<'a> JsonChildScanner<'a> {
                 };
                 self.offset = end;
                 self.skip_separators(raw);
-                let (end, value) = parse_any_value(raw, self.offset)?;
+                let (end, value) = parse_any_value(raw, self.offset, self.base, containers)?;
                 // gjson's ForEach advances one more byte after each pair.
                 self.offset = end.saturating_add(1);
                 return Some((JsonKey::Name(name), value));
@@ -492,7 +573,7 @@ impl<'a> JsonChildScanner<'a> {
         self.skip_separators(raw);
         let index = self.index;
         self.index += 1;
-        let (end, value) = parse_any_value(raw, self.offset)?;
+        let (end, value) = parse_any_value(raw, self.offset, self.base, containers)?;
         // gjson's ForEach advances one more byte after each element.
         self.offset = end.saturating_add(1);
         Some((JsonKey::Index(index), value))
@@ -526,7 +607,7 @@ struct JsonFrame<'a> {
 /// The state of one gjson-compatible flattening walk.
 struct JsonFlattener {
     /// Flattened paths and their values, in discovery order.
-    values: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    values: JsonArguments,
     /// Bytes retained in `values` so far.
     used_bytes: usize,
     /// Values counted against the argument limit.
@@ -543,7 +624,7 @@ impl JsonFlattener {
     /// Start a walk with the given caps.
     fn new(argument_limit: usize, byte_budget: usize) -> Self {
         Self {
-            values: HashMap::new(),
+            values: JsonArguments::new(),
             used_bytes: 0,
             argument_count: 0,
             length_count: 0,
@@ -553,7 +634,12 @@ impl JsonFlattener {
     }
 
     /// Flatten `root`, returning whether the argument or length cap was hit.
-    fn flatten<'a>(&mut self, root: Option<JsonValue<'a>>, max_recursion: usize) -> Result<bool, JsonFlattenError> {
+    fn flatten<'a>(
+        &mut self,
+        root: Option<JsonValue<'a>>,
+        max_recursion: usize,
+        containers: &ContainerIndex,
+    ) -> Result<bool, JsonFlattenError> {
         if max_recursion == 0 {
             return Err(JsonFlattenError::Recursion);
         }
@@ -568,7 +654,7 @@ impl JsonFlattener {
         let mut truncated = false;
         loop {
             let next = match frames.last_mut() {
-                Some(frame) => frame.scanner.next(),
+                Some(frame) => frame.scanner.next(containers),
                 None => return Ok(truncated),
             };
             match next {
@@ -632,13 +718,13 @@ impl JsonFlattener {
             },
         }
         let value: Cow<'_, [u8]> = match value {
-            JsonValue::Json(raw) => {
+            JsonValue::Json { raw, base } => {
                 let depth = depth_remaining.saturating_sub(1);
                 if depth == 0 {
                     return Err(JsonFlattenError::Recursion);
                 }
                 frames.push(JsonFrame {
-                    scanner: JsonChildScanner::container(raw),
+                    scanner: JsonChildScanner::container(raw, base),
                     base_len: path.len(),
                     restore_len: previous_len,
                     depth_remaining: depth,
@@ -663,7 +749,7 @@ impl JsonFlattener {
             return Err(JsonFlattenError::Budget);
         }
         self.used_bytes = used;
-        self.values.entry(key.to_vec()).or_default().push(value.to_vec());
+        self.values.push(key, value.to_vec());
         Ok(())
     }
 }
@@ -746,8 +832,123 @@ fn skip_squashed_string(input: &[u8], quote: usize) -> usize {
     index
 }
 
+/// Container end offsets computed in one pass before flattening.
+///
+/// `squash_json_value` would otherwise rescan every nested container once per
+/// enclosing container, so a body nested `d` deep costs `d` times its size to
+/// flatten. Only containers that themselves hold another container are stored:
+/// their end lets an enclosing scan skip a subtree it already covered, while a
+/// leaf container's scan is its own size and happens once.
+struct ContainerIndex {
+    /// Absolute start offsets, in increasing order.
+    starts: Vec<usize>,
+    /// End offsets, one past the closing byte, parallel to `starts`.
+    ends: Vec<usize>,
+}
+
+impl ContainerIndex {
+    /// Build an index from `input`, capturing containers up to `max_recursion + 1`.
+    fn build(input: &[u8], max_recursion: usize) -> Self {
+        /// One container still open while the index is built.
+        struct Open {
+            /// Absolute offset of the opening bracket.
+            start: usize,
+            /// Row in the index, allocated when a nested container appears.
+            row: Option<usize>,
+        }
+
+        // A container one level past the configured depth is still squashed
+        // before the walk reports the recursion error, so its end is useful.
+        let capture_depth = max_recursion.saturating_add(1);
+        let mut index = Self {
+            starts: Vec::new(),
+            ends: Vec::new(),
+        };
+        let mut open: Vec<Open> = Vec::new();
+        // Opens past `capture_depth`; their closes are absorbed here so the
+        // captured stack stays bounded however deep the input nests.
+        let mut deeper = 0_usize;
+        let mut position = 0_usize;
+        while let Some(&byte) = input.get(position) {
+            match byte {
+                b'"' => position = skip_squashed_string(input, position),
+                b'{' | b'(' | b'[' => {
+                    if let Some(top) = open.last_mut()
+                        && top.row.is_none()
+                    {
+                        top.row = Some(index.starts.len());
+                        index.starts.push(top.start);
+                        index.ends.push(0);
+                    }
+                    if deeper > 0 {
+                        deeper += 1;
+                    } else if open.len() == capture_depth {
+                        deeper = 1;
+                    } else {
+                        open.push(Open {
+                            start: position,
+                            row: None,
+                        });
+                    }
+                    position += 1;
+                },
+                b'}' | b')' | b']' => {
+                    if deeper > 0 {
+                        deeper -= 1;
+                    } else if let Some(container) = open.pop()
+                        && let Some(row) = container.row
+                        && let Some(end) = index.ends.get_mut(row)
+                    {
+                        *end = position.saturating_add(1);
+                    }
+                    position += 1;
+                },
+                _ => position += 1,
+            }
+        }
+        for container in open {
+            if let Some(row) = container.row
+                && let Some(end) = index.ends.get_mut(row)
+            {
+                *end = input.len();
+            }
+        }
+        index
+    }
+
+    /// An index with no entries.
+    fn empty() -> Self {
+        Self {
+            starts: Vec::new(),
+            ends: Vec::new(),
+        }
+    }
+
+    /// The end offset of the container starting at `start`, if captured.
+    fn end(&self, start: usize) -> Option<usize> {
+        let row = self.starts.binary_search(&start).ok()?;
+        let end = self.ends.get(row).copied()?;
+        (end > start).then_some(end)
+    }
+}
+
 /// Finds the end of an object or array token, as gjson's `parseSquash` does.
-fn squash_json_value(input: &[u8], start: usize) -> (usize, &[u8]) {
+///
+/// `base` is the body offset of `input[0]`, so the lookup shares coordinates
+/// with [`ContainerIndex`].
+fn squash_json_value<'a>(input: &'a [u8], start: usize, base: usize, containers: &ContainerIndex) -> (usize, &'a [u8]) {
+    let absolute = base.saturating_add(start);
+    if let Some(end) = containers.end(absolute) {
+        let end = end.saturating_sub(base);
+        if end > start && end <= input.len() {
+            return (end, input.get(start..end).unwrap_or_default());
+        }
+    }
+    squash_json_value_scanning(input, start)
+}
+
+/// Scans an object or array token not covered by [`ContainerIndex`].
+fn squash_json_value_scanning(input: &[u8], start: usize) -> (usize, &[u8]) {
     let mut index = start + 1;
     let mut depth = 1_usize;
     while let Some(&byte) = input.get(index) {
@@ -809,12 +1010,23 @@ fn scan_root_number(input: &[u8], start: usize) -> (usize, &[u8]) {
 }
 
 /// Parses the next value gjson's `parseAny` would read at `start`.
-fn parse_any_value(input: &[u8], start: usize) -> Option<(usize, JsonValue<'_>)> {
+fn parse_any_value<'a>(
+    input: &'a [u8],
+    start: usize,
+    base: usize,
+    containers: &ContainerIndex,
+) -> Option<(usize, JsonValue<'a>)> {
     let mut index = start;
     while let Some(&byte) = input.get(index) {
         if byte == b'{' || byte == b'[' {
-            let (end, raw) = squash_json_value(input, index);
-            return Some((end, JsonValue::Json(raw)));
+            let (end, raw) = squash_json_value(input, index, base, containers);
+            return Some((
+                end,
+                JsonValue::Json {
+                    raw,
+                    base: base.saturating_add(index),
+                },
+            ));
         }
         if byte <= b' ' {
             index += 1;
@@ -862,7 +1074,12 @@ fn parse_json_root(input: &[u8]) -> Option<JsonValue<'_>> {
     let mut index = 0_usize;
     while let Some(&byte) = input.get(index) {
         match byte {
-            b'{' | b'[' => return Some(JsonValue::Json(input.get(index..).unwrap_or_default())),
+            b'{' | b'[' => {
+                return Some(JsonValue::Json {
+                    raw: input.get(index..).unwrap_or_default(),
+                    base: index,
+                });
+            },
             _ if byte <= b' ' => index += 1,
             b'+' | b'-' | b'0'..=b'9' | b'i' | b'I' | b'N' => {
                 let (_, raw) = scan_root_number(input, index);
@@ -1223,9 +1440,24 @@ fn scan_valid_literal(input: &[u8], index: usize, literal: &[u8]) -> Option<usiz
 /// The walk runs before validation so a valid prefix still populates arguments
 /// on a best-effort basis (`internal/bodyprocessors/json.go:141-179`).
 pub(super) fn read_json_body(body: &[u8], max_recursion: usize, argument_limit: usize) -> JsonBody {
+    let containers = if max_recursion == 0 {
+        ContainerIndex::empty()
+    } else {
+        ContainerIndex::build(body, max_recursion)
+    };
+    read_json_with_index(body, max_recursion, argument_limit, &containers)
+}
+
+/// Flatten with the given container index; an empty index scans every container.
+fn read_json_with_index(
+    body: &[u8],
+    max_recursion: usize,
+    argument_limit: usize,
+    containers: &ContainerIndex,
+) -> JsonBody {
     let byte_budget = body.len().saturating_mul(FLATTEN_BYTES_FACTOR).max(FLATTEN_BYTES_FLOOR);
     let mut flattener = JsonFlattener::new(argument_limit, byte_budget);
-    let (truncated, error) = match flattener.flatten(parse_json_root(body), max_recursion) {
+    let (truncated, error) = match flattener.flatten(parse_json_root(body), max_recursion, containers) {
         Ok(truncated) => (truncated, json_error_after_walk(body, max_recursion)),
         Err(JsonFlattenError::Recursion) => (
             false,
@@ -1257,29 +1489,44 @@ fn json_error_after_walk(body: &[u8], max_recursion: usize) -> Option<String> {
     }
 }
 
+/// Visit flattened arguments in first-discovery order.
+///
+/// This is the publication order for both request and response arguments.
+fn for_each_argument(arguments: &JsonArguments, mut visit: impl FnMut(&[u8], &[u8])) {
+    for (key, values) in arguments.iter() {
+        for value in values {
+            visit(key, value);
+        }
+    }
+}
+
 /// Publish flattened JSON arguments to the request or response collection.
 ///
 /// Keys with invalid UTF-8 become U+FFFD because collection keys are `String`s;
 /// values stay byte-exact. See the difference ledger.
-pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &HashMap<Vec<u8>, Vec<Vec<u8>>>, response: bool) {
-    for (key, values) in arguments {
+pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &JsonArguments, response: bool) {
+    for_each_argument(arguments, |key, value| {
         let key = text_of(key);
-        for value in values {
-            if response {
-                tx.response_args.add(&key, value);
-            } else {
-                tx.args_post.add(&key, value);
-                tx.args.add(&key, value);
-                tx.update_args_combined_size(&key, value);
-            }
+        if response {
+            tx.response_args.add(&key, value);
+        } else {
+            tx.args_post.add(&key, value);
+            tx.args.add(&key, value);
+            tx.update_args_combined_size(&key, value);
         }
-    }
+    });
 }
 
 
 #[cfg(test)]
 mod json_tests {
-    use super::{JsonBody, json_nesting_exceeds_limit, read_json_body};
+    use super::{ContainerIndex, JsonBody, json_nesting_exceeds_limit, read_json_body, read_json_with_index};
+
+    /// Tokens for the deterministic malformed-document generator.
+    const TOKENS: [&[u8]; 16] = [
+        b"{", b"}", b"[", b"]", b",", b":", b"\"a\"", b"\"[{\"", b"\"x\"", b"1", b"-2", b"null", b"true", b" ", b"\\",
+        b"\"",
+    ];
 
     /// Flatten with Go Coraza's test limits: no argument cap, generous depth.
     fn flatten(body: &[u8]) -> JsonBody {
@@ -1288,7 +1535,11 @@ mod json_tests {
 
     /// Values stored under `key`, in discovery order.
     fn values(parsed: &JsonBody, key: &str) -> Vec<Vec<u8>> {
-        parsed.arguments.get(key.as_bytes()).cloned().unwrap_or_default()
+        parsed
+            .arguments
+            .get(key.as_bytes())
+            .map(<[Vec<u8>]>::to_vec)
+            .unwrap_or_default()
     }
 
     /// Text form of [`values`], for readable assertions.
@@ -1301,7 +1552,31 @@ mod json_tests {
 
     /// Total flattened values, counting collisions separately.
     fn total_values(parsed: &JsonBody) -> usize {
-        parsed.arguments.values().map(Vec::len).sum()
+        parsed.arguments.iter().map(|(_, values)| values.len()).sum()
+    }
+
+    /// Ordered paths and values, for equivalence comparisons.
+    type Snapshot = Vec<(Vec<u8>, Vec<Vec<u8>>)>;
+
+    /// Ordered paths and values, for equivalence comparisons.
+    fn snapshot(parsed: &JsonBody) -> Snapshot {
+        parsed
+            .arguments
+            .iter()
+            .map(|(key, values)| (key.to_vec(), values.to_vec()))
+            .collect()
+    }
+
+    /// Paths in publication order.
+    fn published_keys(parsed: &JsonBody) -> Vec<String> {
+        let mut keys = Vec::new();
+        super::for_each_argument(&parsed.arguments, |key, _| {
+            let key = String::from_utf8_lossy(key).into_owned();
+            if keys.last() != Some(&key) {
+                keys.push(key);
+            }
+        });
+        keys
     }
 
     fn nested_objects(depth: usize) -> Vec<u8> {
@@ -1325,6 +1600,69 @@ mod json_tests {
 
         let parsed = flatten(br#"{"a":1,"a":2,"a":3}"#);
         assert_eq!(text(&parsed, "json.a"), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn argument_publication_order_is_first_discovery_order() {
+        let body = br#"{"b":1,"a":2,"c":{"d":3},"b":4,"c":{"d":5}}"#;
+        let parsed = flatten(body);
+        assert_eq!(published_keys(&parsed), ["json.b", "json.a", "json.c.d"]);
+        assert_eq!(text(&parsed, "json.b"), ["1", "4"]);
+        assert_eq!(text(&parsed, "json.c.d"), ["3", "5"]);
+
+        // Publication order must not depend on map iteration order.
+        let again = flatten(body);
+        assert_eq!(published_keys(&again), published_keys(&parsed));
+    }
+
+    #[test]
+    fn container_index_matches_scanning_squash() {
+        let mut bodies: Vec<Vec<u8>> = vec![
+            br#"{"a":1,"b":[2,3],"c":{"d":"e"}}"#.to_vec(),
+            br#"[[{"a":[1,2]}],{"b":{}}]"#.to_vec(),
+            br#"{"a":"[[[[]]]]","b":"{\"x\":[}"}"#.to_vec(),
+            br#"{"a":[1,2,3}"#.to_vec(),
+            b"[{]}]]".to_vec(),
+            b"}[[[]]]{".to_vec(),
+            br#"{"a":{"b":{"c":[1,{"d":[]}]}}}"#.to_vec(),
+            br#"{"account":{"role":"x"},"account.role":"y","account":{"role":"z"}}"#.to_vec(),
+            b"[]".repeat(64),
+            b"{}[[".repeat(32),
+        ];
+        let mut deep = vec![b'['; 1023];
+        deep.push(b'1');
+        deep.extend(std::iter::repeat_n(b']', 1023));
+        bodies.push(deep);
+
+        // Token soup exercises unbalanced, mismatched and string-embedded brackets.
+        let mut state = 0x1234_5678_9ABC_DEF0_u64;
+        for _ in 0..300 {
+            let mut body = Vec::new();
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let count = usize::try_from(state >> 60).unwrap_or(0) + 1;
+            for _ in 0..count {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let token = usize::try_from(state >> 40).unwrap_or(0) % TOKENS.len();
+                if let Some(bytes) = TOKENS.get(token) {
+                    body.extend_from_slice(bytes);
+                }
+            }
+            bodies.push(body);
+        }
+
+        for body in bodies {
+            for (depth, limit) in [(1024, 1000), (3, 5), (0, 0)] {
+                let indexed = read_json_body(&body, depth, limit);
+                let scanned = read_json_with_index(&body, depth, limit, &ContainerIndex::empty());
+                assert_eq!(snapshot(&indexed), snapshot(&scanned));
+                assert_eq!(indexed.truncated, scanned.truncated);
+                assert_eq!(indexed.error, scanned.error);
+            }
+        }
     }
 
     #[test]
@@ -1489,7 +1827,7 @@ mod json_tests {
         assert_eq!(parsed.error, None);
         assert_eq!(
             parsed.arguments.get(b"json.k\xff".as_slice()),
-            Some(&vec![b"v\xfe".to_vec()])
+            Some([b"v\xfe".to_vec()].as_slice())
         );
     }
 

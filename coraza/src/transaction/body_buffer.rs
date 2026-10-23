@@ -24,12 +24,46 @@
 //! above it, mirroring Go Coraza's `BodyBuffer`. The temporary file is created with
 //! `tempfile` and removed when the buffer is dropped, including after a failed write.
 
-#[cfg(test)]
-use std::path::Path;
 use std::{
     borrow::Cow,
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
 };
+#[cfg(test)]
+use std::{cell::Cell, path::Path};
+
+/// A body-buffer operation a test can force to fail.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BufferFailure {
+    /// Fail the next `accept`.
+    Accept,
+    /// Fail the next `contiguous`.
+    Replay,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Failure injection for ingestion tests, scoped to the calling thread.
+    static INJECTED_FAILURE: Cell<Option<BufferFailure>> = const { Cell::new(None) };
+}
+
+/// Force the next matching body-buffer operation on this thread to fail.
+#[cfg(test)]
+pub(super) fn inject_failure(failure: BufferFailure) {
+    INJECTED_FAILURE.with(|slot| slot.set(Some(failure)));
+}
+
+/// Consume a pending failure injection for `failure`, if it matches.
+#[cfg(test)]
+fn take_injected_failure(failure: BufferFailure) -> bool {
+    INJECTED_FAILURE.with(|slot| {
+        if slot.get() != Some(failure) {
+            return false;
+        }
+        slot.set(None);
+        true
+    })
+}
 
 /// Counters describing the bytes offered to a transaction and what the engine did with them.
 ///
@@ -123,6 +157,10 @@ impl BodyBuffer {
     ///
     /// Returns an error when the body cannot be retained in memory or spilled to disk.
     pub(super) fn accept(&mut self, data: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if take_injected_failure(BufferFailure::Accept) {
+            return Err(io::Error::other("injected body buffer failure"));
+        }
         self.supplied = self
             .supplied
             .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
@@ -192,6 +230,9 @@ impl BodyBuffer {
     pub(super) fn contiguous(&mut self) -> io::Result<Cow<'_, [u8]>> {
         #[cfg(test)]
         {
+            if take_injected_failure(BufferFailure::Replay) {
+                return Err(io::Error::other("injected body buffer failure"));
+            }
             self.replays = self.replays.saturating_add(1);
         }
         let Some(file) = self.spill.as_mut() else {

@@ -93,12 +93,14 @@ impl Transaction {
         if ingest_error {
             self.outbound_data_error.set("1");
             self.interrupt(0, "deny", 500, "");
-            return self.interruption.clone();
-        }
-
-        // Go runs the selected processor even for an empty response body
-        // (`internal/corazawaf/transaction.go:1389-1423`).
-        if processable {
+            // Detection-only records a would-be interruption; the body phase
+            // must still evaluate its rules rather than being skipped.
+            if self.interruption.is_some() {
+                return self.interruption.clone();
+            }
+        } else if processable {
+            // Go runs the selected processor even for an empty response body
+            // (`internal/corazawaf/transaction.go:1389-1423`).
             let mut buffer = std::mem::take(&mut self.response_body_buffer);
             let inspected = buffer.contiguous().map(|body| {
                 let length = body.len();
@@ -111,7 +113,9 @@ impl Transaction {
             } else {
                 self.outbound_data_error.set("1");
                 self.interrupt(0, "deny", 500, "");
-                return self.interruption.clone();
+                if self.interruption.is_some() {
+                    return self.interruption.clone();
+                }
             }
         }
 
