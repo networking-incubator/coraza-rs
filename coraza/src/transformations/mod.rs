@@ -37,7 +37,8 @@ pub use encoding::{
 };
 pub use escape::{css_decode, escape_seq_decode, js_decode, url_decode_uni, utf8_to_unicode};
 pub use simple::{
-    compress_whitespace, lowercase, remove_whitespace, trim, trim_left, trim_right, uppercase, url_decode,
+    cmd_line, compress_whitespace, lowercase, remove_comments, remove_comments_char, remove_whitespace,
+    replace_comments, trim, trim_left, trim_right, uppercase, url_decode,
 };
 
 /// Result returned by a transformation.
@@ -85,3 +86,32 @@ impl std::fmt::Display for TransformationError {
 }
 
 impl std::error::Error for TransformationError {}
+
+#[cfg(test)]
+#[expect(clippy::panic, reason = "reachability test uses fixed rules")]
+mod tests {
+    use crate::seclang::Parser;
+
+    /// Proves each new transformation is reachable from a `SecRule` and affects detection.
+    #[test]
+    fn new_transformations_are_reachable_from_seclang() {
+        for (name, argument, operator) in [
+            ("cmdLine", b"C^OMMAND".as_slice(), "@streq command"),
+            ("removeComments", b"at/**/tack", "@streq attack"),
+            ("removeCommentsChar", b"at/**/tack", "@streq attack"),
+            ("replaceComments", b"at/**/tack", "@streq at tack"),
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!("SecRule ARGS \"{operator}\" \"id:90,phase:1,t:{name},deny\""))
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let waf = parser.into_waf().unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let mut transaction = waf.new_transaction_with_id("transform-reachability");
+            transaction.add_get_argument("q", argument);
+            let interruption = transaction
+                .process_request_headers()
+                .unwrap_or_else(|| panic!("{name} did not interrupt"));
+            assert_eq!(interruption.rule_id, 90, "{name}");
+        }
+    }
+}

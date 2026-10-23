@@ -164,6 +164,186 @@ pub fn url_decode(input: &[u8]) -> TransformationResult {
     (transformed, true, None)
 }
 
+/// Normalizes a command line as Go Coraza's `t:cmdLine` does.
+///
+/// Removes quotes, backslashes and carets, drops the space before `/` and `(`,
+/// replaces `,` and `;` with a space, collapses whitespace runs to one space,
+/// and lowercases ASCII letters.
+pub fn cmd_line(input: &[u8]) -> TransformationResult {
+    let Some(start) = input.iter().position(|byte| needs_cmd_line(*byte)) else {
+        return (input.to_vec(), false, None);
+    };
+
+    let mut transformed = Vec::with_capacity(input.len());
+    transformed.extend_from_slice(input.get(..start).unwrap_or_default());
+    let mut changed = false;
+    let mut space = false;
+    let mut offset = start;
+    while let Some(&byte) = input.get(offset) {
+        match byte {
+            b'"' | b'\'' | b'\\' | b'^' => changed = true,
+            b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' => {
+                if space {
+                    changed = true;
+                } else {
+                    changed |= byte != b' ';
+                    transformed.push(b' ');
+                    space = true;
+                }
+            },
+            b'/' | b'(' => {
+                if space && transformed.pop().is_some() {
+                    changed = true;
+                }
+                space = false;
+                transformed.push(byte);
+            },
+            _ => {
+                let lowered = byte.to_ascii_lowercase();
+                changed |= lowered != byte;
+                transformed.push(lowered);
+                space = false;
+            },
+        }
+        offset += 1;
+    }
+    (transformed, changed, None)
+}
+
+/// Removes C-style, HTML, `--` and `#` comments as Go Coraza's
+/// `t:removeComments` does.
+///
+/// A comment terminator consumes the marker and copies the byte that follows
+/// it, matching Go's padded-input implementation. An unterminated comment
+/// becomes one trailing space.
+pub fn remove_comments(input: &[u8]) -> TransformationResult {
+    let mut transformed = Vec::with_capacity(input.len());
+    let mut in_comment = false;
+    let mut changed = false;
+    let mut offset = 0;
+    while let Some(&byte) = input.get(offset) {
+        if in_comment {
+            if starts_with_at(input, offset, b"*/") {
+                in_comment = false;
+                offset += 2;
+                // Go pads the input with NUL and copies the byte after the
+                // terminator, including that pad at end of input.
+                transformed.push(input.get(offset).copied().unwrap_or_default());
+                offset += 1;
+            } else if starts_with_at(input, offset, b"-->") {
+                in_comment = false;
+                offset += 3;
+                transformed.push(input.get(offset).copied().unwrap_or_default());
+                offset += 1;
+            } else {
+                offset += 1;
+            }
+        } else if starts_with_at(input, offset, b"/*") {
+            in_comment = true;
+            changed = true;
+            offset += 2;
+        } else if starts_with_at(input, offset, b"<!--") {
+            in_comment = true;
+            changed = true;
+            offset += 4;
+        } else if starts_with_at(input, offset, b"--") || byte == b'#' {
+            changed = true;
+            break;
+        } else {
+            transformed.push(byte);
+            offset += 1;
+        }
+    }
+    if in_comment {
+        changed = true;
+        transformed.push(b' ');
+    }
+    (transformed, changed, None)
+}
+
+/// Removes comment delimiter characters as Go Coraza's
+/// `t:removeCommentsChar` does.
+///
+/// Comment content is preserved; only `/*`, `*/`, `<!--`, `-->`, `--` and `#`
+/// markers are removed.
+pub fn remove_comments_char(input: &[u8]) -> TransformationResult {
+    let mut transformed = Vec::with_capacity(input.len());
+    let mut changed = false;
+    let mut offset = 0;
+    while let Some(&byte) = input.get(offset) {
+        if starts_with_at(input, offset, b"/*") || starts_with_at(input, offset, b"*/") {
+            offset += 2;
+            changed = true;
+        } else if starts_with_at(input, offset, b"<!--") {
+            offset += 4;
+            changed = true;
+        } else if starts_with_at(input, offset, b"-->") {
+            offset += 3;
+            changed = true;
+        } else if starts_with_at(input, offset, b"--") {
+            offset += 2;
+            changed = true;
+        } else if byte == b'#' {
+            offset += 1;
+            changed = true;
+        } else {
+            transformed.push(byte);
+            offset += 1;
+        }
+    }
+    (transformed, changed, None)
+}
+
+/// Replaces C-style comments with one space as Go Coraza's
+/// `t:replaceComments` does.
+///
+/// An unterminated comment becomes a single trailing space. HTML, `--` and
+/// `#` markers are not comments for this transformation.
+pub fn replace_comments(input: &[u8]) -> TransformationResult {
+    let mut transformed = Vec::with_capacity(input.len());
+    let mut in_comment = false;
+    let mut changed = false;
+    let mut offset = 0;
+    while let Some(&byte) = input.get(offset) {
+        if in_comment {
+            if starts_with_at(input, offset, b"*/") {
+                in_comment = false;
+                offset += 2;
+                transformed.push(b' ');
+            } else {
+                offset += 1;
+            }
+        } else if starts_with_at(input, offset, b"/*") {
+            in_comment = true;
+            changed = true;
+            offset += 2;
+        } else {
+            transformed.push(byte);
+            offset += 1;
+        }
+    }
+    if in_comment {
+        transformed.push(b' ');
+    }
+    (transformed, changed, None)
+}
+
+/// Returns whether `byte` starts a command-line normalization.
+fn needs_cmd_line(byte: u8) -> bool {
+    byte.is_ascii_uppercase()
+        || matches!(
+            byte,
+            b'"' | b'\'' | b'\\' | b'^' | b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' | b'/' | b'('
+        )
+}
+
+/// Returns whether `needle` occurs at `offset` in `input`.
+fn starts_with_at(input: &[u8], offset: usize, needle: &[u8]) -> bool {
+    input
+        .get(offset..offset.saturating_add(needle.len()))
+        .is_some_and(|candidate| candidate == needle)
+}
+
 /// Maps valid UTF-8 segments and copies malformed bytes unchanged.
 fn map_case(input: &[u8], lowercase: bool) -> Vec<u8> {
     let mut transformed = Vec::with_capacity(input.len());
@@ -235,7 +415,8 @@ fn is_trim_space(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        compress_whitespace, lowercase, remove_whitespace, trim, trim_left, trim_right, uppercase, url_decode,
+        cmd_line, compress_whitespace, lowercase, remove_comments, remove_comments_char, remove_whitespace,
+        replace_comments, trim, trim_left, trim_right, uppercase, url_decode,
     };
 
     #[test]
@@ -293,5 +474,134 @@ mod tests {
         assert_eq!(unchanged, b"plain");
         assert!(!unchanged_changed);
         assert_eq!(unchanged_error, None);
+    }
+
+    // Ported from: coraza/internal/transformations/cmd_line_test.go::TestCmdLine and
+    // coraza/internal/transformations/testdata/cmdLine.json.
+    #[test]
+    fn cmd_line_matches_go_semantics() {
+        for (input, output, changed) in [
+            (b"".as_slice(), b"".as_slice(), false),
+            (b"test", b"test", false),
+            (b"/etc/passwd", b"/etc/passwd", false),
+            (b"/?file=../../etc/passwd", b"/?file=../../etc/passwd", false),
+            (b" trail ", b" trail ", false),
+            (b"C^OMMAND", b"command", true),
+            (b"\"command\"", b"command", true),
+            (b"'command'", b"command", true),
+            (br#""command" /c DiR"#, b"command/c dir", true),
+            (br#"\"quoted\""#, b"quoted", true),
+            (b"a , b", b"a b", true),
+            (b"dir /s", b"dir/s", true),
+            (b"a  b", b"a b", true),
+            (b"a\t\r\nb", b"a b", true),
+            (b"a (b)", b"a(b)", true),
+            (b"C^OMMAND /C DIR", b"command/c dir", true),
+            (b"C^oMMaNd /C DiR", b"command/c dir", true),
+            (b"cmd,/c DiR", b"cmd/c dir", true),
+            (b"C^OMMAND\xff /C DIR", b"command\xff/c dir", true),
+        ] {
+            let (result, result_changed, error) = cmd_line(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
+    }
+
+    // Ported from: coraza/internal/transformations/remove_comments_test.go::TestRemoveComments and
+    // coraza/internal/transformations/testdata/removeComments.json.
+    #[test]
+    fn remove_comments_matches_go_semantics() {
+        for (input, output, changed) in [
+            (b"hello world".as_slice(), b"hello world".as_slice(), false),
+            (b"hello /* comment */ world", b"hello  world", true),
+            (b"hello <!-- comment --> world", b"hello  world", true),
+            (b"/* comment */", b"\x00", true),
+            (b"<!-- comment -->", b"\x00", true),
+            (b"hello /* unclosed", b"hello  ", true),
+            (b"hello <!-- unclosed", b"hello  ", true),
+            (b"hello -- rest", b"hello ", true),
+            (b"hello # rest", b"hello ", true),
+            (b"", b"", false),
+            (b"Before/* TestCase */After", b"BeforeAfter", true),
+            (b"Before /* */ ops */ Test\nCase ", b"Before  ops */ Test\nCase ", true),
+            (b"Test\nCase /**/ After", b"Test\nCase  After", true),
+            (b"Test/*\nCase */ After", b"Test After", true),
+            (b"/*Test\r\nCase */After", b"After", true),
+            (b"Test\r\nCase */After", b"Test\r\nCase */After", false),
+            (b"/*Before/* Test\r\nCase ", b" ", true),
+            (b"/*a/*b*/c", b"c", true),
+            (b"/*a*//*b*/", b"/*b*/", true),
+            (b"a<!-b", b"a<!-b", false),
+            (b"a/", b"a/", false),
+            (b"a#b", b"a", true),
+            (b"a--b", b"a", true),
+            (b"\xff/*x*/y\xfe", b"\xffy\xfe", true),
+        ] {
+            let (result, result_changed, error) = remove_comments(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
+    }
+
+    // Ported from: coraza/internal/transformations/testdata/removeCommentsChar.json.
+    #[test]
+    fn remove_comments_char_matches_go_semantics() {
+        for (input, output, changed) in [
+            (b"".as_slice(), b"".as_slice(), false),
+            (b"TestCase", b"TestCase", false),
+            (br"Test\u0000Case", br"Test\u0000Case", false),
+            (b"Test\x00Case", b"Test\x00Case", false),
+            (b"/* TestCase */", b" TestCase ", true),
+            (b"/*TestCase*/", b"TestCase", true),
+            (b"/* TestCase*/", b" TestCase", true),
+            (b"/*TestCase */", b"TestCase ", true),
+            (b"Before/* TestCase */After", b"Before TestCase After", true),
+            (b"Before /* TestCase */ After", b"Before  TestCase  After", true),
+            (b"/* Test\nCase */", b" Test\nCase ", true),
+            (b"/* Test\r\nCase */", b" Test\r\nCase ", true),
+            (b"Before/* Test\r\nCase ", b"Before Test\r\nCase ", true),
+            (b"Before /* Test\nCase ", b"Before  Test\nCase ", true),
+            (b"Test\r\nCase */After", b"Test\r\nCase After", true),
+            (b"Test\nCase */ After", b"Test\nCase  After", true),
+            (b"a<!--b-->c", b"abc", true),
+            (b"a#b", b"ab", true),
+            (b"/*/**/*/", b"", true),
+            (b"*/*", b"*", true),
+            (b"\xff/*x*/\xfe", b"\xffx\xfe", true),
+        ] {
+            let (result, result_changed, error) = remove_comments_char(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
+    }
+
+    // Ported from: coraza/internal/transformations/replace_comments_test.go::TestReplaceComments and
+    // coraza/internal/transformations/testdata/replaceComments.json.
+    #[test]
+    fn replace_comments_matches_go_semantics() {
+        for (input, output, changed) in [
+            (b"".as_slice(), b"".as_slice(), false),
+            (b"Not a comment", b"Not a comment", false),
+            (b"Test\r\nCase */After", b"Test\r\nCase */After", false),
+            (b"This is/*this is a comment*/text", b"This is text", true),
+            (b"/*this is a comment*/a comment", b" a comment", true),
+            (b"/**/", b" ", true),
+            (b"/*comment", b" ", true),
+            (b"Before/* TestCase */After", b"Before After", true),
+            (b"Before /* TestCase */ After", b"Before   After", true),
+            (b"Before/* Test\r\nCase ", b"Before ", true),
+            (b"/*a*//*b*/", b"  ", true),
+            (b"/**/*/", b" */", true),
+            (b"a/*b", b"a ", true),
+            (b"\xff/*x*/\xfe", b"\xff \xfe", true),
+        ] {
+            let (result, result_changed, error) = replace_comments(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
     }
 }
