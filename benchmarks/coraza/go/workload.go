@@ -226,6 +226,7 @@ func LoadWorkloadWithInfo(root string) ([]*PreparedCase, WorkloadInfo, error) {
 	}
 
 	seen := make(map[string]struct{}, len(entries))
+	caseIDs := make(map[string]string, len(entries))
 	prepared := make([]*PreparedCase, 0, len(entries))
 	for index, entry := range entries {
 		entryContext := fmt.Sprintf("manifest case %d", index)
@@ -263,6 +264,13 @@ func LoadWorkloadWithInfo(root string) ([]*PreparedCase, WorkloadInfo, error) {
 		if err != nil {
 			return nil, WorkloadInfo{}, err
 		}
+		if firstPath, duplicate := caseIDs[parsed.id]; duplicate {
+			return nil, WorkloadInfo{}, fmt.Errorf(
+				"%s: duplicate case id %q in %s and %s",
+				entryContext, parsed.id, firstPath, path,
+			)
+		}
+		caseIDs[parsed.id] = path
 		engine, err := New(parsed.secLang)
 		if err != nil {
 			return nil, WorkloadInfo{}, fmt.Errorf("case %s: %w", parsed.id, err)
