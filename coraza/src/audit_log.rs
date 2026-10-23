@@ -951,6 +951,9 @@ enum Writer {
     },
     /// One message each, to syslog
     Syslog(Mutex<Syslog>),
+    /// One POST each, to an HTTP endpoint
+    #[cfg(feature = "https-audit")]
+    Https(https::HttpsWriter),
 }
 
 impl fmt::Debug for Writer {
@@ -960,6 +963,8 @@ impl fmt::Debug for Writer {
             Self::Serial(_) => f.write_str("Serial"),
             Self::Concurrent { dir, .. } => f.debug_struct("Concurrent").field("dir", dir).finish(),
             Self::Syslog(_) => f.write_str("Syslog"),
+            #[cfg(feature = "https-audit")]
+            Self::Https(_) => f.write_str("Https"),
         }
     }
 }
@@ -979,7 +984,8 @@ impl AuditLogger {
     /// # Errors
     ///
     /// If the file or syslog can't be opened, `SecAuditLogRelevantStatus` isn't a
-    /// regular expression, or the writer is `HTTPS`, which isn't supported here.
+    /// regular expression, the writer is `HTTPS` and the `https-audit` feature is
+    /// disabled or the target isn't a valid URI.
     pub(crate) fn open(config: &WafConfig) -> Result<Self, String> {
         let relevant_status = match config.audit_log_relevant_status.as_str() {
             "" => None,
@@ -995,9 +1001,14 @@ impl AuditLogger {
             return Err("SecAuditLogStorageDir is required for concurrent audit logs".to_owned());
         }
         let writer = match (config.audit_log_type, target) {
-            // HTTPS needs an HTTP client with TLS, which no dependency provides
+            #[cfg(feature = "https-audit")]
+            (AuditLogType::Https, target) => Writer::Https(https::HttpsWriter::open(target, config.audit_log_format)?),
+            #[cfg(not(feature = "https-audit"))]
             (AuditLogType::Https, _) => {
-                return Err("audit log type HTTPS is not supported".to_owned());
+                return Err(
+                    "audit log type HTTPS is not supported in this build; enable the \"https-audit\" crate feature"
+                        .to_owned(),
+                );
             },
             (AuditLogType::Syslog, target) => Writer::Syslog(Mutex::new(
                 Syslog::connect(target).map_err(|e| format!("syslog dial failure: {e}"))?,
@@ -1044,6 +1055,8 @@ impl AuditLogger {
         }
         match &self.writer {
             Writer::Discard => Ok(()),
+            #[cfg(feature = "https-audit")]
+            Writer::Https(https) => https.write(&formatted),
             Writer::Syslog(syslog) => syslog
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1269,6 +1282,314 @@ fn hostname() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
+/// The writer Go Coraza selects for `SecAuditLogType HTTPS`: one blocking POST per
+/// entry, with the Go writer's headers, MIME type and one-second client timeout.
+#[cfg(feature = "https-audit")]
+mod https {
+    use std::{io, time::Duration};
+
+    use crate::types::AuditLogFormat;
+
+    /// `User-Agent` Go Coraza's HTTPS writer sends with every entry.
+    const USER_AGENT: &str = "Coraza+v3";
+
+    /// Whole-request timeout Go Coraza's HTTPS client applies, in seconds.
+    const TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// One audit entry POST, as Go Coraza's HTTPS writer sends it.
+    struct HttpPost<'a> {
+        /// The method; always `POST`, as in Go Coraza.
+        method: &'static str,
+        /// The configured target.
+        url: &'a str,
+        /// The `User-Agent` header value.
+        user_agent: &'static str,
+        /// The formatter's MIME type, sent as `Content-Type`.
+        content_type: &'a str,
+        /// The formatted audit entry.
+        body: &'a [u8],
+        /// The whole-request timeout, as Go Coraza's client applies it.
+        timeout: Duration,
+    }
+
+    /// Performs the HTTP exchange for one audit entry, so tests need no network.
+    trait HttpExchange: Send + Sync {
+        /// POSTs `post` and returns the response status, draining the response body.
+        fn post(&self, post: &HttpPost<'_>) -> Result<u16, String>;
+    }
+
+    /// The writer selected by `SecAuditLogType HTTPS`.
+    pub(super) struct HttpsWriter {
+        /// The configured target.
+        url: String,
+        /// The `Content-Type` of entries, from the configured format.
+        content_type: &'static str,
+        /// The HTTP client, or a test double.
+        exchange: Box<dyn HttpExchange>,
+    }
+
+    impl HttpsWriter {
+        /// Opens the writer `target` describes.
+        ///
+        /// `http` targets are accepted and send entries unencrypted, as Go Coraza
+        /// accepts them. The target is parsed here, as Go Coraza parses it at
+        /// `Init`.
+        ///
+        /// # Errors
+        ///
+        /// If `target` isn't a valid URI.
+        pub(super) fn open(target: &str, format: AuditLogFormat) -> Result<Self, String> {
+            target
+                .parse::<ureq::http::Uri>()
+                .map_err(|error| format!("invalid HTTPS audit log target {target:?}: {error}"))?;
+            Ok(Self::with_exchange(target, format, Box::new(UreqExchange::new())))
+        }
+
+        /// A writer sending through `exchange`.
+        fn with_exchange(target: &str, format: AuditLogFormat, exchange: Box<dyn HttpExchange>) -> Self {
+            Self {
+                url: target.to_owned(),
+                content_type: format_mime(format),
+                exchange,
+            }
+        }
+
+        /// POSTs one formatted entry, as Go Coraza's HTTPS writer does.
+        ///
+        /// # Errors
+        ///
+        /// If the request fails or the response status isn't 2xx.
+        pub(super) fn write(&self, body: &str) -> io::Result<()> {
+            let post = HttpPost {
+                method: "POST",
+                url: &self.url,
+                user_agent: USER_AGENT,
+                content_type: self.content_type,
+                body: body.as_bytes(),
+                timeout: TIMEOUT,
+            };
+            let status = self.exchange.post(&post).map_err(io::Error::other)?;
+            if (200..300).contains(&status) {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!("unexpected status code {status}")))
+            }
+        }
+    }
+
+    /// [`HttpExchange`] backed by the `ureq` blocking client with rustls.
+    struct UreqExchange(ureq::Agent);
+
+    impl UreqExchange {
+        /// The client Go Coraza's HTTPS writer uses, except that statuses are
+        /// returned instead of turned into errors, so every non-2xx status fails the
+        /// write.
+        fn new() -> Self {
+            let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+            Self(ureq::Agent::new_with_config(config))
+        }
+    }
+
+    impl HttpExchange for UreqExchange {
+        fn post(&self, post: &HttpPost<'_>) -> Result<u16, String> {
+            let request = ureq::http::Request::builder()
+                .method(post.method)
+                .uri(post.url)
+                .header("User-Agent", post.user_agent)
+                .header("Content-Type", post.content_type)
+                .body(post.body)
+                .map_err(|error| format!("invalid HTTPS audit log request: {error}"))?;
+            // Go Coraza sets the budget on its client; ureq applies it per request.
+            let request = self
+                .0
+                .configure_request(request)
+                .timeout_global(Some(post.timeout))
+                .build();
+            let response = self
+                .0
+                .run(request)
+                .map_err(|error| format!("HTTPS audit log request failed: {error}"))?;
+            let status = response.status().as_u16();
+            // As in Go, a response body that fails to drain does not fail the write.
+            let mut body = response.into_body().into_reader();
+            drop(io::copy(&mut body, &mut io::sink()));
+            Ok(status)
+        }
+    }
+
+    /// The `Content-Type` of entries in `format`, as Go Coraza's formatters report it.
+    fn format_mime(format: AuditLogFormat) -> &'static str {
+        match format {
+            AuditLogFormat::Native => "application/x-coraza-auditlog-native",
+            AuditLogFormat::Json | AuditLogFormat::JsonLegacy => "application/json; charset=utf-8",
+            AuditLogFormat::Ocsf => "application/json",
+        }
+    }
+
+    #[cfg(test)]
+    #[expect(clippy::unwrap_used, reason = "HTTPS audit log tests use scripted exchanges")]
+    mod tests {
+        use std::{
+            collections::VecDeque,
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+
+        use super::{HttpExchange, HttpPost, HttpsWriter, TIMEOUT};
+        use crate::types::AuditLogFormat;
+
+        /// An [`HttpExchange`] that records requests and returns scripted responses.
+        #[derive(Clone, Default)]
+        struct ScriptedExchange {
+            /// Responses to return, in order; success when empty.
+            responses: Arc<Mutex<VecDeque<Result<u16, String>>>>,
+            /// Requests received, in order.
+            requests: Arc<Mutex<Vec<RecordedPost>>>,
+        }
+
+        /// A request recorded by [`ScriptedExchange`].
+        #[derive(Clone, Debug)]
+        struct RecordedPost {
+            /// The request method.
+            method: String,
+            /// The target URL.
+            url: String,
+            /// The `User-Agent` header.
+            user_agent: String,
+            /// The `Content-Type` header.
+            content_type: String,
+            /// The request body.
+            body: Vec<u8>,
+            /// The whole-request timeout.
+            timeout: Duration,
+        }
+
+        impl ScriptedExchange {
+            /// An exchange returning `responses`, in order.
+            fn new(responses: impl IntoIterator<Item = Result<u16, String>>) -> Self {
+                Self {
+                    responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            /// The requests received so far.
+            fn recorded(&self) -> Vec<RecordedPost> {
+                self.requests.lock().unwrap().clone()
+            }
+        }
+
+        impl HttpExchange for ScriptedExchange {
+            fn post(&self, post: &HttpPost<'_>) -> Result<u16, String> {
+                let request = RecordedPost {
+                    method: post.method.to_owned(),
+                    url: post.url.to_owned(),
+                    user_agent: post.user_agent.to_owned(),
+                    content_type: post.content_type.to_owned(),
+                    body: post.body.to_vec(),
+                    timeout: post.timeout,
+                };
+                self.requests.lock().unwrap().push(request);
+                self.responses.lock().unwrap().pop_front().unwrap_or(Ok(200))
+            }
+        }
+
+        /// A writer using an exchange scripted with `responses`, and that exchange.
+        fn scripted_writer(
+            target: &str,
+            format: AuditLogFormat,
+            responses: impl IntoIterator<Item = Result<u16, String>>,
+        ) -> (HttpsWriter, ScriptedExchange) {
+            let exchange = ScriptedExchange::new(responses);
+            (
+                HttpsWriter::with_exchange(target, format, Box::new(exchange.clone())),
+                exchange,
+            )
+        }
+
+        #[test]
+        fn writer_posts_the_entry_as_go_does() {
+            let (writer, exchange) = scripted_writer("http://127.0.0.1:8080/audit", AuditLogFormat::Json, [Ok(200)]);
+            writer.write("{\"transaction\":{}}").unwrap();
+
+            let requests = exchange.recorded();
+            assert_eq!(requests.len(), 1);
+            let request = requests.first().unwrap();
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.url, "http://127.0.0.1:8080/audit");
+            assert_eq!(request.user_agent, "Coraza+v3");
+            assert_eq!(request.content_type, "application/json; charset=utf-8");
+            assert_eq!(request.body.as_slice(), b"{\"transaction\":{}}");
+            assert_eq!(request.timeout, Duration::from_secs(1));
+        }
+
+        #[test]
+        fn content_type_is_the_go_formatter_mime() {
+            for (format, mime) in [
+                (AuditLogFormat::Native, "application/x-coraza-auditlog-native"),
+                (AuditLogFormat::Json, "application/json; charset=utf-8"),
+                (AuditLogFormat::JsonLegacy, "application/json; charset=utf-8"),
+                (AuditLogFormat::Ocsf, "application/json"),
+            ] {
+                let (writer, exchange) = scripted_writer("https://example.com/audit", format, [Ok(200)]);
+                writer.write("entry").unwrap();
+                let requests = exchange.recorded();
+                let request = requests.first().unwrap();
+                assert_eq!(request.content_type, mime);
+            }
+        }
+
+        #[test]
+        fn success_is_only_2xx() {
+            for status in [200, 201, 204, 299] {
+                let (writer, _exchange) =
+                    scripted_writer("https://example.com/audit", AuditLogFormat::Native, [Ok(status)]);
+                writer.write("entry").unwrap();
+            }
+        }
+
+        #[test]
+        fn non_2xx_statuses_fail_as_in_go() {
+            for status in [199, 300, 301, 400, 404, 500] {
+                let (writer, _exchange) =
+                    scripted_writer("https://example.com/audit", AuditLogFormat::Native, [Ok(status)]);
+                let error = writer.write("entry").unwrap_err();
+                assert_eq!(error.to_string(), format!("unexpected status code {status}"));
+            }
+        }
+
+        #[test]
+        fn transport_errors_propagate() {
+            let (writer, _exchange) = scripted_writer(
+                "https://example.com/audit",
+                AuditLogFormat::Native,
+                [Err("connection refused".to_owned())],
+            );
+            let error = writer.write("entry").unwrap_err();
+            assert!(error.to_string().contains("connection refused"), "{error}");
+        }
+
+        #[test]
+        fn timeout_is_the_go_second() {
+            assert_eq!(TIMEOUT, Duration::from_secs(1));
+        }
+
+        #[test]
+        fn open_accepts_https_and_plaintext_http_targets() {
+            assert!(HttpsWriter::open("https://example.com/audit", AuditLogFormat::Json).is_ok());
+            assert!(HttpsWriter::open("http://127.0.0.1:8080/audit", AuditLogFormat::Json).is_ok());
+        }
+
+        #[test]
+        fn open_rejects_an_invalid_target() {
+            let error = HttpsWriter::open("http://exa mple.com/audit", AuditLogFormat::Json)
+                .err()
+                .unwrap();
+            assert!(error.contains("invalid HTTPS audit log target"), "{error}");
+        }
+    }
+}
+
 /// Open `path` for append, creating it with `mode` when needed.
 fn open_append(path: &str, mode: u32) -> Result<File, String> {
     let mut options = OpenOptions::new();
@@ -1372,6 +1693,29 @@ mod tests {
         let logger = AuditLogger::open(&config).unwrap();
         assert!(logger.is_relevant(false, "403"));
         assert!(!logger.is_relevant(true, "200"));
+    }
+
+    #[cfg(not(feature = "https-audit"))]
+    #[test]
+    fn https_audit_log_requires_the_https_audit_feature() {
+        let config = WafConfig {
+            audit_log_type: AuditLogType::Https,
+            audit_log: "https://127.0.0.1:8080/audit".to_owned(),
+            ..WafConfig::default()
+        };
+        let error = AuditLogger::open(&config).unwrap_err();
+        assert!(error.contains("https-audit"), "{error}");
+    }
+
+    #[cfg(feature = "https-audit")]
+    #[test]
+    fn https_audit_log_opens_with_the_https_audit_feature() {
+        let config = WafConfig {
+            audit_log_type: AuditLogType::Https,
+            audit_log: "http://127.0.0.1:8080/audit".to_owned(),
+            ..WafConfig::default()
+        };
+        assert!(AuditLogger::open(&config).is_ok());
     }
 
     #[test]
