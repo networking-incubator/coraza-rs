@@ -537,7 +537,7 @@
       },
       "ctl": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_ctl",
+        "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -1254,72 +1254,72 @@
     "variables": {
       "ARGS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_COMBINED_SIZE": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_GET": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_GET_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_PATH": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_POST": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGS_POST_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "ARGUMENTS_LIMIT_REACHED": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1342,40 +1342,40 @@
       },
       "ENV": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "FILES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "FILES_COMBINED_SIZE": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "FILES_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "FILES_SIZES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1390,8 +1390,8 @@
       },
       "FILES_TMPNAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1422,16 +1422,16 @@
       },
       "HIGHEST_SEVERITY": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "INBOUND_DATA_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1454,32 +1454,32 @@
       },
       "MATCHED_VAR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MATCHED_VAR_NAME": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MATCHED_VARS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MATCHED_VARS_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1526,8 +1526,8 @@
       },
       "MULTIPART_DUPLICATE_PART_HEADER": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1542,24 +1542,24 @@
       },
       "MULTIPART_FILENAME": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MULTIPART_FILENAME_CHARSET": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MULTIPART_FILENAME_LANGUAGE": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1590,8 +1590,8 @@
       },
       "MULTIPART_INVALID_QUOTING": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1614,24 +1614,24 @@
       },
       "MULTIPART_NAME": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MULTIPART_PART_HEADERS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "MULTIPART_STRICT_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1646,8 +1646,8 @@
       },
       "OUTBOUND_DATA_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1670,8 +1670,8 @@
       },
       "REMOTE_ADDR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1686,48 +1686,48 @@
       },
       "REMOTE_PORT": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQBODY_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQBODY_ERROR_MSG": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQBODY_PROCESSOR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQBODY_PROCESSOR_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQBODY_PROCESSOR_ERROR_MSG": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1742,32 +1742,32 @@
       },
       "REQUEST_BODY": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_BODY_LENGTH": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_COOKIES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_COOKIES_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1782,16 +1782,16 @@
       },
       "REQUEST_HEADERS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_HEADERS_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1806,24 +1806,24 @@
       },
       "REQUEST_METHOD": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_PROTOCOL": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "REQUEST_URI": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -1838,152 +1838,152 @@
       },
       "REQUEST_XML": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RES_BODY_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RES_BODY_ERROR_MSG": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RES_BODY_PROCESSOR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RES_BODY_PROCESSOR_ERROR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RES_BODY_PROCESSOR_ERROR_MSG": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_ARGS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_BODY": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_CONTENT_LENGTH": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_CONTENT_TYPE": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_HEADERS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_HEADERS_NAMES": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_PROTOCOL": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_STATUS": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RESPONSE_XML": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "RULE": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "SERVER_ADDR": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "SERVER_NAME": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "SERVER_PORT": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2078,16 +2078,16 @@
       },
       "TX": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
       },
       "UNIQUE_ID": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2126,8 +2126,8 @@
       },
       "XML": {
         "state": "implemented",
-        "producer": "coraza/src/transaction.rs:variable_storage!",
-        "evaluator": "coraza/src/transaction.rs:Transaction::get_variable",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
         "differences": []
@@ -2236,7 +2236,7 @@
       },
       "requestBodyProcessor": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::set_request_body_processor",
+        "evaluator": "coraza/src/transaction/request_body.rs:Transaction::set_request_body_processor",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -2255,7 +2255,7 @@
       },
       "responseBodyProcessor": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::set_response_body_processor",
+        "evaluator": "coraza/src/transaction/response_body.rs:Transaction::set_response_body_processor",
         "go_reference": null,
         "fixtures": [],
         "differences": []
@@ -2286,21 +2286,21 @@
       },
       "ruleRemoveTargetById": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []
       },
       "ruleRemoveTargetByMsg": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []
       },
       "ruleRemoveTargetByTag": {
         "state": "implemented",
-        "evaluator": "coraza/src/transaction.rs:Transaction::apply_rule_target_removal",
+        "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
         "go_reference": null,
         "fixtures": [],
         "differences": []
