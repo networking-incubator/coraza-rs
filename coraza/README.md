@@ -30,6 +30,13 @@ With the feature, each entry is POSTed to `SecAuditLog` with a one-second
 timeout, as in Go Coraza. The target may be `http://` or `https://`, as Go
 Coraza accepts both, so entries sent to a plaintext target are not encrypted.
 
+The feature uses `rustls` with the compiled-in Mozilla root bundle
+(`webpki-roots`), not the host trust store. Certificates issued by a private CA
+that is installed only in the host trust store are therefore not trusted; use
+an endpoint with a public-CA certificate or terminate TLS at a local proxy.
+Redirects are followed as in Go Coraza, except that a 307 or 308 response fails
+the write instead of re-POSTing the entry.
+
 Call `Transaction::process_logging` after response processing when the caller
 needs to observe audit writer errors. Dropping a transaction runs the logging
 phase automatically and ignores writer errors. `Parser::on_error_log` provides

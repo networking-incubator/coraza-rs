@@ -135,7 +135,10 @@ pub struct WafConfig {
     /// Audit logging mode (`SecAuditEngine`).
     pub audit_engine: AuditEngineStatus,
 
-    /// Path of the audit log file; empty when unset (`SecAuditLog`).
+    /// Target of the audit log, empty when unset (`SecAuditLog`): a file path for
+    /// `Serial` and `Concurrent`, a syslog target for `Syslog`, and an endpoint URL
+    /// for `HTTPS`, which accepts both `https://` and plaintext `http://` targets as
+    /// Go Coraza does and requires the `https-audit` crate feature.
     pub audit_log: String,
 
     /// Format of audit log entries (`SecAuditLogFormat`).
