@@ -172,6 +172,46 @@ func TestTamperedManifestHashRejected(t *testing.T) {
 	}
 }
 
+// TestDuplicateCaseIDRejected rejects two case files that declare one case_id.
+func TestDuplicateCaseIDRejected(t *testing.T) {
+	temporary := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(temporary, "cases"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	value := minimalCase()
+	value["case_id"] = "duplicate"
+	source, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]any, 0, 2)
+	for _, name := range []string{"a.json", "b.json"} {
+		if err := os.WriteFile(filepath.Join(temporary, "cases", name), source, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, map[string]any{
+			"path":   "cases/" + name,
+			"sha256": sha256Hex(source),
+		})
+	}
+	writeManifest(t, temporary, map[string]any{
+		"schema_version": 1,
+		"workload_id":    "duplicate",
+		"description":    "duplicate case id manifest",
+		"case_schema":    "coraza/conformance/corpus-schema.json",
+		"cases":          entries,
+	})
+	_, err = LoadWorkload(temporary)
+	if err == nil || !strings.Contains(err.Error(), `duplicate case id "duplicate"`) {
+		t.Fatalf("error = %v, want duplicate case id rejection", err)
+	}
+	for _, name := range []string{"cases/a.json", "cases/b.json"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("error = %v, want %s", err, name)
+		}
+	}
+}
+
 // TestCasePathTraversalRejected rejects parent traversal in case paths.
 func TestCasePathTraversalRejected(t *testing.T) {
 	temporary := t.TempDir()
