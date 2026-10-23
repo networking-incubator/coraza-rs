@@ -40,7 +40,7 @@ const VARIABLES_SOURCE: &str = include_str!("../src/types/variables.rs");
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
 const GO_COMMIT: &str = "d9cc9befc2721fd217ce1660a0e91aca1157221d";
 const EXAMPLE_FIXTURE_SHA: &str = "7dfaa62fe41c266f931e9d05fb8cefd7ecba57c929b11f02af0ef8737fc93c04";
-const REVIEWED_LEDGER: [(&str, &str); 14] = [
+const REVIEWED_LEDGER: [(&str, &str); 15] = [
     (
         "sql-nul-after-hex-prefix",
         "ada05d3c4ccbcb21de99ab1609081812dbe7a37e76a516595d44af97cb6ed02e",
@@ -96,6 +96,10 @@ const REVIEWED_LEDGER: [(&str, &str); 14] = [
     (
         "raw-0373",
         "e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373",
+    ),
+    (
+        "args-get-invalid-utf8-names",
+        "3c9133937f99186e0ef69373aef20e1a5382ce02ece6b94936da02a4c07cb95f",
     ),
 ];
 
@@ -387,8 +391,7 @@ fn check_factories(manifest: &Value) {
 fn check_variables(manifest: &Value) {
     let stored = stored_variants();
     let variants = variable_variants();
-    let mut manifest_variables = manifest_names(manifest, "variables");
-    manifest_variables.remove("uri_parse_error");
+    let manifest_variables = manifest_names(manifest, "variables");
     let source_variables = variants
         .iter()
         .map(|(_, name)| name.to_ascii_lowercase())
@@ -405,11 +408,6 @@ fn check_variables(manifest: &Value) {
             assert_ne!(state, "implemented", "unstored variable {name} claims implemented");
         }
     }
-    assert_eq!(
-        variable_state(manifest, "URI_PARSE_ERROR"),
-        Some("unavailable"),
-        "missing URI_PARSE_ERROR must stay classified as unavailable"
-    );
 }
 
 #[test]

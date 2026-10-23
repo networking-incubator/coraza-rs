@@ -15,12 +15,13 @@ Reference profiles:
 
 Keys are `case_id` plus `fixture_sha256`. The hash is SHA-256 over the exact
 input bytes, lower-case hexadecimal. A case may appear only once per key.
-Rows below are carried over from the reviewed detector differences in
+Detector rows below are carried over from the reviewed detector differences in
 `libperfusion/tests/parity/mismatch-ledger.md`; they are documented outcomes,
-not results executed by the Coraza engine. New rows must come from a real
-shared-corpus driver run and must state which side was observed.
+not results executed by the Coraza engine. Engine rows come from a direct
+Go Coraza/Rust comparison of the fixture bytes named in the reason. New rows
+must state which side was observed.
 
-## Reviewed detector differences
+## Reviewed engine and detector differences
 
 | Case ID | Fixture SHA-256 | Expected Go | Expected Rust | Reason |
 | --- | --- | --- | --- | --- |
@@ -38,6 +39,7 @@ shared-corpus driver run and must state which side was observed.
 | `raw-0292` | `245ac590dddc9898908c6d974085e33488a08219c48957278145049618d69b38` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0365` | `58c14b7bcbc569d32c0a70b54939c2c97aa53d4cfd68e17f7e933d515bf87527` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0373` | `e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
+| `args-get-invalid-utf8-names` | `3c9133937f99186e0ef69373aef20e1a5382ce02ece6b94936da02a4c07cb95f` | `/?%ff=a&%fe=b` yields two `ARGS_GET` keys, the single bytes `0xff` and `0xfe` | The same target yields one `ARGS_GET` key, `U+FFFD`, with values `a` and `b` | Decoded parameter names are Rust `String`s, so invalid UTF-8 becomes `U+FFFD` and distinct byte names collide. Values stay byte-exact. The byte-key collection refactor is deferred; do not emulate byte identity with lossy lookups. |
 
 ## Deliberate deviation classes without engine case IDs yet
 

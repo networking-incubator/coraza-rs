@@ -395,6 +395,11 @@ mod tests {
         assert!(parse_variables("INVALID_VAR").is_err());
         assert!(parse_variables("REQUEST_URI:foo").is_err());
         assert!(parse_variables("REQUEST_URI://").is_err());
+        assert!(parse_variables("URI_PARSE_ERROR:foo").is_err());
+        assert_eq!(
+            parse_variables("URI_PARSE_ERROR").map(|variables| variables.len()),
+            Ok(1)
+        );
         assert_eq!(
             parse_variables("REQUEST_URI:/foo/").err(),
             parse_variables("REQUEST_URI:foo").err()
