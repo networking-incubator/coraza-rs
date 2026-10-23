@@ -51,10 +51,39 @@ pub use validation::{
 
 use crate::transaction::Transaction;
 
+/// The result of evaluating an operator against one input value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorOutcome {
+    /// The operator inspected the input and it matched.
+    Matched,
+    /// The operator inspected the input and it did not match.
+    NotMatched,
+    /// The operator could not inspect the input, so it has no verdict.
+    ///
+    /// Rules treat this as not matched and record it on the transaction so an
+    /// embedder can tell a skipped inspection from a benign value.
+    NotInspected,
+}
+
 /// An operator evaluates one transaction value without changing the transaction.
 pub trait Operator {
     /// Whether `input` matches this operator's configured parameter.
     fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool;
+
+    /// Evaluate `input` and report whether it matched, did not match, or could
+    /// not be inspected.
+    ///
+    /// The default implementation maps [`Operator::evaluate`] onto
+    /// [`OperatorOutcome::Matched`] and [`OperatorOutcome::NotMatched`]. An
+    /// operator that can skip an input overrides this method and reports
+    /// [`OperatorOutcome::NotInspected`] instead.
+    fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
+        if self.evaluate(tx, input, out) {
+            OperatorOutcome::Matched
+        } else {
+            OperatorOutcome::NotMatched
+        }
+    }
 }
 
 /// Named lists used by the `...FromDataset` operators.
@@ -247,34 +276,39 @@ impl OperatorEnum {
 
     /// Evaluate the selected operator.
     pub fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
+    }
+
+    /// Evaluate the selected operator, keeping a skipped-inspection result.
+    pub fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
         match self {
-            Self::Rx(operator) => operator.evaluate(tx, input, out),
-            Self::RestPath(operator) => operator.evaluate(tx, input, out),
-            Self::Pm(operator) => operator.evaluate(tx, input, out),
-            Self::PmFromFile(operator) => operator.evaluate(tx, input, out),
-            Self::PmFromDataset(operator) => operator.evaluate(tx, input, out),
-            Self::StrMatch(operator) => operator.evaluate(tx, input, out),
-            Self::Within(operator) => operator.evaluate(tx, input, out),
-            Self::Eq(operator) => operator.evaluate(tx, input, out),
-            Self::Lt(operator) => operator.evaluate(tx, input, out),
-            Self::Le(operator) => operator.evaluate(tx, input, out),
-            Self::Gt(operator) => operator.evaluate(tx, input, out),
-            Self::Ge(operator) => operator.evaluate(tx, input, out),
-            Self::StrEq(operator) => operator.evaluate(tx, input, out),
-            Self::Contains(operator) => operator.evaluate(tx, input, out),
-            Self::BeginsWith(operator) => operator.evaluate(tx, input, out),
-            Self::EndsWith(operator) => operator.evaluate(tx, input, out),
-            Self::DetectSQLi(operator) => operator.evaluate(tx, input, out),
-            Self::DetectXSS(operator) => operator.evaluate(tx, input, out),
-            Self::IpMatch(operator) => operator.evaluate(tx, input, out),
-            Self::IpMatchFromFile(operator) => operator.evaluate(tx, input, out),
-            Self::IpMatchFromDataset(operator) => operator.evaluate(tx, input, out),
-            Self::ValidateByteRange(operator) => operator.evaluate(tx, input, out),
-            Self::ValidateUrlEncoding(operator) => operator.evaluate(tx, input, out),
-            Self::ValidateUtf8Encoding(operator) => operator.evaluate(tx, input, out),
-            Self::ValidateNid(operator) => operator.evaluate(tx, input, out),
-            Self::UnconditionalMatch(operator) => operator.evaluate(tx, input, out),
-            Self::NoMatch(operator) => operator.evaluate(tx, input, out),
+            Self::Rx(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::RestPath(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Pm(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::PmFromFile(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::PmFromDataset(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::StrMatch(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Within(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Eq(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Lt(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Le(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Gt(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Ge(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::StrEq(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Contains(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::BeginsWith(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::EndsWith(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::DetectSQLi(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::DetectXSS(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::IpMatch(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::IpMatchFromFile(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::IpMatchFromDataset(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::ValidateByteRange(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::ValidateUrlEncoding(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::ValidateUtf8Encoding(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::ValidateNid(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::UnconditionalMatch(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::NoMatch(operator) => operator.evaluate_outcome(tx, input, out),
         }
     }
 }

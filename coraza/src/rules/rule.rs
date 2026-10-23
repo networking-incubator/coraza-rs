@@ -23,7 +23,7 @@
 use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
     collection::MatchData,
-    operators::Outputs,
+    operators::{OperatorOutcome, Outputs},
     rules::{RuleOperator, VariableSpec},
     transaction::Transaction,
 };
@@ -194,16 +194,20 @@ impl Rule {
                 };
                 for candidate in candidates {
                     let mut outputs = Outputs::new(self.metadata.capture);
-                    let operator_matched = operator.evaluate(tx, &candidate, &mut outputs);
+                    let outcome = operator.evaluate_outcome(tx, &candidate, &mut outputs);
                     tx.store_operator_outputs(&mut outputs);
-                    if operator_matched {
-                        let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
-                        tx.record_matched_variable(&matched);
-                        self.run_nondisruptive_actions(tx);
-                        if self.chain.is_empty() {
-                            (matched.message, matched.data) = self.describe_match(tx);
-                        }
-                        matched_values.push(matched);
+                    match outcome {
+                        OperatorOutcome::Matched => {
+                            let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
+                            tx.record_matched_variable(&matched);
+                            self.run_nondisruptive_actions(tx);
+                            if self.chain.is_empty() {
+                                (matched.message, matched.data) = self.describe_match(tx);
+                            }
+                            matched_values.push(matched);
+                        },
+                        OperatorOutcome::NotMatched => {},
+                        OperatorOutcome::NotInspected => tx.record_inspection_incomplete(id),
                     }
                 }
             }
