@@ -39,7 +39,6 @@ must state which side was observed.
 | `raw-0292` | `245ac590dddc9898908c6d974085e33488a08219c48957278145049618d69b38` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0365` | `58c14b7bcbc569d32c0a70b54939c2c97aa53d4cfd68e17f7e933d515bf87527` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0373` | `e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
-| `json-invalid-utf8-keys` | `5475fd660355bbc435ec9208d8cb01b6cb2206e28a7ad500af8ff4b4782d9a05` | `{"k\xff":1,"k\xfe":2}` yields two `ARGS_POST` keys with the byte sequences `json.k\xff` and `json.k\xfe` | The same body yields one `ARGS_POST` key, `json.k` followed by `U+FFFD`, with values `1` and `2` | Flattened JSON keys are Rust `String`s, so invalid UTF-8 key bytes become `U+FFFD` and distinct byte keys collide; both values are still published. Values and `TX.json_request_body`/`TX.json_response_body` stay byte-exact on both sides. |
 
 ## Resolved differences
 
@@ -49,6 +48,7 @@ case ID and fixture hash are kept so the case stays traceable.
 | Case ID | Fixture SHA-256 | Resolution |
 | --- | --- | --- |
 | `args-get-invalid-utf8-names` | `3c9133937f99186e0ef69373aef20e1a5382ce02ece6b94936da02a4c07cb95f` | Resolved end to end. URL-decoded query and form argument names are decoded to bytes in the transaction and stored byte-exactly, so `/?%ff=a&%fe=b` yields two `ARGS_GET` keys, the single bytes `0xff` and `0xfe`, with values `a` and `b`, and the same names in a URL-encoded body yield two `ARGS_POST` keys. Go Coraza v3.8.1 reports the same keys. Text interfaces use a lossy view but do not decide which entries exist. |
+| `json-invalid-utf8-keys` | `5475fd660355bbc435ec9208d8cb01b6cb2206e28a7ad500af8ff4b4782d9a05` | Resolved end to end. Flattened JSON argument keys are published to `ARGS_POST`, `ARGS` and `RESPONSE_ARGS` as the exact key bytes instead of a lossy `String`, so `{"k\xff":1,"k\xfe":2}` yields two distinct keys, `json.k\xff` and `json.k\xfe`, with values `1` and `2`. Go Coraza v3.8.1 reports the same keys. JSON parsing, flattening order, budgets and error semantics are unchanged, and values and `TX.json_request_body`/`TX.json_response_body` stay byte-exact. |
 
 ## Remaining byte-identity restrictions
 

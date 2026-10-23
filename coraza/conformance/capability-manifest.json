@@ -3534,9 +3534,7 @@
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
         "go_reference": null,
         "fixtures": [],
-        "differences": [
-          "Flattened keys are Rust Strings, so invalid UTF-8 key bytes become U+FFFD and distinct byte keys collide; values and TX.json_request_body/TX.json_response_body stay byte-exact. See json-invalid-utf8-keys in difference-ledger.md."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3574,9 +3572,7 @@
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
         "go_reference": null,
         "fixtures": [],
-        "differences": [
-          "Decoded argument names lose byte identity: invalid UTF-8 names become the same replacement-character String, unlike Go's byte-preserving keys (F01). Values remain byte-preserving."
-        ]
+        "differences": []
       },
       {
         "names": [

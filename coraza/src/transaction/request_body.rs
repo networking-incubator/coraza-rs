@@ -1502,17 +1502,16 @@ fn for_each_argument(arguments: &JsonArguments, mut visit: impl FnMut(&[u8], &[u
 
 /// Publish flattened JSON arguments to the request or response collection.
 ///
-/// Keys with invalid UTF-8 become U+FFFD because collection keys are `String`s;
-/// values stay byte-exact. See the difference ledger.
+/// Keys are stored exactly as the JSON document encoded them, so keys that are
+/// not valid UTF-8 stay distinct; values stay byte-exact.
 pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &JsonArguments, response: bool) {
     for_each_argument(arguments, |key, value| {
-        let key = text_of(key);
         if response {
-            tx.response_args.add(&key, value);
+            tx.response_args.add_bytes(key, value);
         } else {
-            tx.args_post.add(&key, value);
-            tx.args.add(&key, value);
-            tx.update_args_combined_size(key.as_bytes(), value);
+            tx.args_post.add_bytes(key, value);
+            tx.args.add_bytes(key, value);
+            tx.update_args_combined_size(key, value);
         }
     });
 }
