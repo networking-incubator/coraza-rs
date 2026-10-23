@@ -1222,7 +1222,7 @@ fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
             ),
             None => (after_slashes, ""),
         };
-        let (userinfo, host) = parse_authority(&scheme, authority)?;
+        let (userinfo, host) = parse_authority(authority)?;
         (Some(host), userinfo, path, false)
     } else if !scheme.is_empty() {
         (None, None, rest, true)
@@ -1327,12 +1327,12 @@ fn split_query(rest: &str) -> (&str, &str, bool) {
 type UserInfo = (Vec<u8>, Option<Vec<u8>>);
 
 /// Parse an authority into optional userinfo and a host.
-fn parse_authority(scheme: &str, authority: &str) -> Option<(Option<UserInfo>, Vec<u8>)> {
+fn parse_authority(authority: &str) -> Option<(Option<UserInfo>, Vec<u8>)> {
     let at = authority.rfind('@');
     let host_part = at.map_or(authority, |index| {
         authority.get(index.saturating_add(1)..).unwrap_or_default()
     });
-    let host = parse_host(scheme, host_part)?;
+    let host = parse_host(host_part)?;
     let Some(at) = at else {
         return Some((None, host));
     };
@@ -1351,7 +1351,7 @@ fn parse_authority(scheme: &str, authority: &str) -> Option<(Option<UserInfo>, V
 }
 
 /// Validate and decode a host, rejecting the malformed ports and IP literals Go rejects.
-fn parse_host(scheme: &str, host: &str) -> Option<Vec<u8>> {
+fn parse_host(host: &str) -> Option<Vec<u8>> {
     if let Some(open) = host.rfind('[') {
         if open > 0 {
             return None;
@@ -1381,14 +1381,9 @@ fn parse_host(scheme: &str, host: &str) -> Option<Vec<u8>> {
         host.extend_from_slice(&colon_port);
         return Some(host);
     }
-    if let Some(first) = host.find(':') {
-        let last = host.rfind(':').unwrap_or(first);
-        let colon = if last != first && matches!(scheme, "http" | "https") {
-            // Go 1.26+ rejects more than one colon in an http(s) host.
-            first
-        } else {
-            last
-        };
+    if let Some(colon) = host.rfind(':') {
+        // The pinned Coraza module declares Go 1.25, so net/url keeps its historical
+        // last-colon port split instead of the stricter Go 1.26 multi-colon rule.
         if !valid_optional_port(host.get(colon..).unwrap_or_default().as_bytes()) {
             return None;
         }
@@ -3478,6 +3473,54 @@ payload\r\n\
                 query: "",
                 parse_error: "0",
             },
+            // The pinned Coraza module declares Go 1.25, where net/url keeps splitting
+            // the port at the last colon even for http(s) hosts with several colons.
+            Case {
+                target: "https://127.0:.0.1:80/a/./b?a=?b#",
+                request_uri: "https://127.0:.0.1:80/a/./b?a=?b",
+                request_uri_raw: "https://127.0:.0.1:80/a/./b?a=?b#",
+                filename: "/a/./b",
+                basename: "b",
+                query: "a=?b",
+                parse_error: "0",
+            },
+            Case {
+                target: "HTTP://K::1/é?=x#?a=b",
+                request_uri: "http://K::1/%C3%A9?=x",
+                request_uri_raw: "HTTP://K::1/é?=x#?a=b",
+                filename: "/é",
+                basename: "é",
+                query: "=x",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://a:b:/a\\b?a=b;c=d#f",
+                request_uri: "http://a:b:/a%5Cb?a=b;c=d",
+                request_uri_raw: "http://a:b:/a\\b?a=b;c=d#f",
+                filename: "/a\\b",
+                basename: "b",
+                query: "a=b;c=d",
+                parse_error: "0",
+            },
+            Case {
+                target: "https://a:b:/#",
+                request_uri: "https://a:b:/",
+                request_uri_raw: "https://a:b:/#",
+                filename: "/",
+                basename: "/",
+                query: "",
+                parse_error: "0",
+            },
+            // A non-numeric segment after the last colon is still an invalid port.
+            Case {
+                target: "http://a:b:bad/x",
+                request_uri: "http://a:b:bad/x",
+                request_uri_raw: "http://a:b:bad/x",
+                filename: "http://a:b:bad/x",
+                basename: "x",
+                query: "",
+                parse_error: "1",
+            },
         ];
 
         for case in cases {
@@ -3630,6 +3673,10 @@ payload\r\n\
         assert!(uri_rule_matches(
             "SecRule REQUEST_FILENAME \"@contains admin\" \"id:109,phase:1,deny\"",
             "http://example.com:bad/admin"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_FILENAME \"@contains /a/./b\" \"id:111,phase:1,deny\"",
+            "https://127.0:.0.1:80/a/./b"
         ));
     }
 
