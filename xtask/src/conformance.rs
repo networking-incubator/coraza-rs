@@ -143,13 +143,13 @@ const GROUPS: [GroupSpec; 7] = [
     GroupSpec {
         key: "variables",
         producer: "coraza/src/types/variables.rs:RuleVariable",
-        evaluator: "coraza/src/transaction.rs:variable_storage!",
+        evaluator: "coraza/src/transaction/variables.rs:variable_storage!",
         source: Source::Variables,
     },
     GroupSpec {
         key: "body_processors",
-        producer: "coraza/src/transaction.rs:BodyProcessor::parse",
-        evaluator: "coraza/src/transaction.rs:process_request_body",
+        producer: "coraza/src/transaction/variables.rs:BodyProcessor::parse",
+        evaluator: "coraza/src/transaction/request_body.rs:process_request_body",
         source: Source::StringList {
             file: "coraza/src/actions/mod.rs",
             signature: "fn is_body_processor",
@@ -158,11 +158,11 @@ const GROUPS: [GroupSpec; 7] = [
     GroupSpec {
         key: "runtime_controls",
         producer: "coraza/src/actions/mod.rs:validate_ctl",
-        evaluator: "coraza/src/transaction.rs:Transaction::apply_ctl",
+        evaluator: "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
         source: Source::MatchArms {
             sources: &[
                 ("coraza/src/actions/mod.rs", "fn validate_ctl"),
-                ("coraza/src/transaction.rs", "pub(crate) fn apply_ctl"),
+                ("coraza/src/transaction/ctl.rs", "pub(crate) fn apply_ctl"),
             ],
             extra: &[],
         },

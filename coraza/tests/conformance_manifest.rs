@@ -33,7 +33,8 @@ const EXAMPLE: &str = include_str!("../conformance/example-case.json");
 const ACTIONS_SOURCE: &str = include_str!("../src/actions/mod.rs");
 const OPERATORS_SOURCE: &str = include_str!("../src/operators/mod.rs");
 const PARSER_SOURCE: &str = include_str!("../src/seclang/parser.rs");
-const TRANSACTION_SOURCE: &str = include_str!("../src/transaction.rs");
+const TRANSACTION_CTL_SOURCE: &str = include_str!("../src/transaction/ctl.rs");
+const TRANSACTION_VARIABLES_SOURCE: &str = include_str!("../src/transaction/variables.rs");
 const VARIABLES_SOURCE: &str = include_str!("../src/types/variables.rs");
 
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
@@ -186,9 +187,11 @@ fn variable_variants() -> Vec<(String, String)> {
 }
 
 fn stored_variants() -> BTreeSet<String> {
-    let start = TRANSACTION_SOURCE.find("macro_rules! variable_storage").unwrap();
-    let end = TRANSACTION_SOURCE.find("#[derive(Clone, Copy)]").unwrap();
-    let body = TRANSACTION_SOURCE.get(start..end).unwrap();
+    let start = TRANSACTION_VARIABLES_SOURCE
+        .find("macro_rules! variable_storage")
+        .unwrap();
+    let end = TRANSACTION_VARIABLES_SOURCE.find("#[derive(Clone, Copy)]").unwrap();
+    let body = TRANSACTION_VARIABLES_SOURCE.get(start..end).unwrap();
     let pattern = Regex::new(r"RuleVariable::(\w+)").unwrap();
     pattern
         .captures_iter(body)
@@ -353,7 +356,7 @@ fn check_factories(manifest: &Value) {
     );
     let mut controls = match_arm_names(function_body(ACTIONS_SOURCE, "fn validate_ctl"));
     controls.extend(match_arm_names(function_body(
-        TRANSACTION_SOURCE,
+        TRANSACTION_CTL_SOURCE,
         "pub(crate) fn apply_ctl",
     )));
     assert_eq!(
