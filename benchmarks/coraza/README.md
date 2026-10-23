@@ -3,9 +3,9 @@
 Shared workload layer, Rust and Go drivers, a correctness-first parity runner
 and a local coordinator for the local Go-versus-Rust Coraza comparison. The
 workload, both drivers, cross-engine outcome comparison, the coordinator and
-the Go timing driver are in place. The Rust driver still runs only its
-correctness mode, so this branch produces no benchmark numbers and makes no
-performance claim; speed ratios start only after correctness parity passes.
+both timing drivers are in place. This branch produces no benchmark numbers
+and makes no performance claim; speed ratios start only after correctness
+parity passes.
 
 The existing conformance case schema at
 [`coraza/conformance/corpus-schema.json`](../../coraza/conformance/corpus-schema.json)
@@ -104,8 +104,8 @@ body is supplied once.
 The driver is a harness-less bench target in the `coraza` crate rather than an
 isolated crate. This follows the repository convention for native benchmark
 drivers (`libperfusion/benches/*`, `harness = false`), keeps the workspace
-lockfile and lints in effect, and gives the next wave one executable that can
-gain a timing loop around `run_case` without moving the code.
+lockfile and lints in effect, and keeps the correctness and timing modes in
+one executable.
 
 Run it:
 
@@ -378,10 +378,9 @@ Without a report, a successful gate marks every case eligible.
 
 ### Timing contract
 
-The Go timing driver (`go/cmd/bench`) implements this contract. The Rust
-driver does not have a timing mode yet, so a coordinator `bench` run stops at
-the Rust driver until that mode lands. The coordinator invokes each driver
-with:
+Both timing drivers implement this contract: the Go driver (`go/cmd/bench`)
+and the Rust `coraza_workload` bench target. The coordinator invokes each
+driver with:
 
 ```text
 <driver> --workloads <dir> --timing <path> --iterations <n>
@@ -430,9 +429,9 @@ passed as shell-quoted arguments.
   from the cargo JSON messages and runs it from the repository root.
 - Go default build: `go build -o <run>/bin/coraza-go-driver ./cmd/bench` in
   `benchmarks/coraza/go`, run from that module directory. `go/cmd/bench` is
-  the Go timing driver described above. `make coraza-bench` still stops at the
-  Rust driver until the Rust timing mode lands; `make coraza-parity` is
-  unaffected.
+  the Go timing driver described above. `make coraza-bench` runs the
+  correctness gate and the paired timing protocol for both drivers;
+  `make coraza-parity` is unaffected.
 - `CORAZA_RUST_DRIVER_CMD` and `CORAZA_GO_DRIVER_CMD` use a prebuilt driver
   command and skip the default build. Optionally pair them with
   `CORAZA_RUST_BUILD_CMD` and `CORAZA_GO_BUILD_CMD`, which run once before the
@@ -489,7 +488,7 @@ artifact produced so far.
 No benchmark numbers are produced by this wave. The coordinator, identity gate,
 collector and protocol are exercised with mock drivers and synthetic documents
 by `make coraza-coordinator-check`; the Go timing driver is covered by the Go
-tests, and the Rust timing mode is still outstanding.
+tests, and the Rust timing mode by the `coraza_workload` Rust tests.
 
 ## Running correctness parity locally
 
