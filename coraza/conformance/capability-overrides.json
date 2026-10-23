@@ -1657,12 +1657,12 @@
         ]
       },
       "QUERY_STRING": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (QUERY_STRING)"
-        ]
+        "differences": []
       },
       "REMOTE_ADDR": {
         "state": "implemented",
@@ -1729,12 +1729,12 @@
         "differences": []
       },
       "REQUEST_BASENAME": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_BASENAME)"
-        ]
+        "differences": []
       },
       "REQUEST_BODY": {
         "state": "implemented",
@@ -1769,12 +1769,12 @@
         "differences": []
       },
       "REQUEST_FILENAME": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_FILENAME)"
-        ]
+        "differences": []
       },
       "REQUEST_HEADERS": {
         "state": "implemented",
@@ -1793,12 +1793,12 @@
         "differences": []
       },
       "REQUEST_LINE": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_LINE)"
-        ]
+        "differences": []
       },
       "REQUEST_METHOD": {
         "state": "implemented",
@@ -1825,12 +1825,12 @@
         "differences": []
       },
       "REQUEST_URI_RAW": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (REQUEST_URI_RAW)"
-        ]
+        "differences": []
       },
       "REQUEST_XML": {
         "state": "implemented",
@@ -2001,75 +2001,91 @@
         ]
       },
       "TIME": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_DAY": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_DAY)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_EPOCH": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_EPOCH)"
-        ]
+        "differences": []
       },
       "TIME_HOUR": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_HOUR)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_MIN": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MIN)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_MON": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_MON)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_SEC": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_SEC)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_WDAY": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_WDAY)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TIME_YEAR": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go has a producer or initialized storage for this value. (TIME_YEAR)"
+          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
         ]
       },
       "TX": {
@@ -2097,12 +2113,12 @@
         ]
       },
       "URI_PARSE_ERROR": {
-        "state": "unavailable",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go:885",
         "fixtures": [],
-        "differences": [
-          "Absent from RuleVariable and query recovery; current Go exposes it at internal/variables/variables.go:750. Rules naming it fail compilation in this build."
-        ]
+        "differences": []
       },
       "URLENCODED_ERROR": {
         "state": "unavailable",

@@ -56,6 +56,40 @@ use crate::{
     utils::time::UtcTime,
 };
 
+/// URI derivatives and start-time values, boxed so `Transaction` stays small.
+struct ComputedVariables {
+    /// The request URI as received, including any fragment.
+    request_uri_raw: Single,
+    /// The full request line supplied by the connector.
+    request_line: Single,
+    /// The decoded request path.
+    request_filename: Single,
+    /// The last path segment.
+    request_basename: Single,
+    /// The raw query string.
+    query_string: Single,
+    /// Whether the request URI could not be parsed.
+    uri_parse_error: Single,
+    /// Transaction start time as `hh:mm:ss`.
+    time: Single,
+    /// Transaction start day of month.
+    time_day: Single,
+    /// Transaction start time in seconds since the Unix epoch.
+    time_epoch: Single,
+    /// Transaction start hour of day.
+    time_hour: Single,
+    /// Transaction start minute of hour.
+    time_min: Single,
+    /// Transaction start month of year.
+    time_mon: Single,
+    /// Transaction start second of minute.
+    time_sec: Single,
+    /// Transaction start weekday, with Sunday as zero.
+    time_wday: Single,
+    /// Transaction start four-digit year.
+    time_year: Single,
+}
+
 /// A disruptive action selected by a matching rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interruption {
@@ -218,6 +252,8 @@ pub struct Transaction {
     rule: Map,
     /// The request URI supplied by the connector.
     request_uri: Single,
+    /// URI derivatives and start-time values computed for this transaction.
+    computed: Box<ComputedVariables>,
     /// The request method supplied by the connector.
     request_method: Single,
     /// The request protocol supplied by the connector.
@@ -307,8 +343,20 @@ impl Transaction {
             value.set("0");
             value
         };
+        let text = |variable: RuleVariable, value: String| {
+            let mut single = Single::new(variable);
+            single.set(value);
+            single
+        };
         let mut unique_id = Single::new(RuleVariable::UniqueID);
         unique_id.set(id.into());
+
+        let started = SystemTime::now();
+        let epoch = started
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let at = UtcTime::from_unix(epoch);
 
         Self {
             rule_engine: config.rule_engine,
@@ -325,7 +373,7 @@ impl Transaction {
             audit_logger: None,
             error_log: None,
             matched_rules: Vec::new(),
-            started: SystemTime::now(),
+            started,
             audit_request_body: Vec::new(),
             audit_response_body: Vec::new(),
             config,
@@ -376,6 +424,26 @@ impl Transaction {
             matched_vars: map(RuleVariable::MatchedVars),
             rule: map(RuleVariable::Rule),
             request_uri: Single::new(RuleVariable::RequestURI),
+            computed: Box::new(ComputedVariables {
+                request_uri_raw: Single::new(RuleVariable::RequestURIRaw),
+                request_line: Single::new(RuleVariable::RequestLine),
+                request_filename: Single::new(RuleVariable::RequestFilename),
+                request_basename: Single::new(RuleVariable::RequestBasename),
+                query_string: Single::new(RuleVariable::QueryString),
+                uri_parse_error: flag(RuleVariable::URIParseError),
+                time: text(
+                    RuleVariable::Time,
+                    format!("{:02}:{:02}:{:02}", at.hour, at.minute, at.second),
+                ),
+                time_day: text(RuleVariable::TimeDay, at.day.to_string()),
+                time_epoch: text(RuleVariable::TimeEpoch, epoch.to_string()),
+                time_hour: text(RuleVariable::TimeHour, format!("{:02}", at.hour)),
+                time_min: text(RuleVariable::TimeMin, format!("{:02}", at.minute)),
+                time_mon: text(RuleVariable::TimeMon, at.month.to_string()),
+                time_sec: text(RuleVariable::TimeSec, format!("{:02}", at.second)),
+                time_wday: text(RuleVariable::TimeWday, at.weekday.to_string()),
+                time_year: text(RuleVariable::TimeYear, at.year.to_string()),
+            }),
             request_method: Single::new(RuleVariable::RequestMethod),
             request_protocol: Single::new(RuleVariable::RequestProtocol),
             remote_addr: Single::new(RuleVariable::RemoteAddr),
@@ -899,16 +967,49 @@ impl Transaction {
         self.set_single(RuleVariable::ResponseStatus, status.to_string());
     }
 
-    /// Set the request line fields and populate query arguments from `uri`.
+    /// Set the request line fields and populate the URI and query variables.
+    ///
+    /// This mirrors Go Coraza's `ProcessURI`: the target is parsed as an absolute URI or
+    /// absolute path, URI derivatives come from the parsed form, and a target Go would
+    /// reject still populates `QUERY_STRING` and `ARGS_GET` from a best-effort split.
     pub fn process_uri(&mut self, uri: &str, method: &str, protocol: &str) {
-        let uri = uri.split_once('#').map_or(uri, |(uri, _)| uri);
-        self.set_request_uri(uri);
+        self.set_single(RuleVariable::RequestLine, format!("{method} {uri} {protocol}"));
+        self.set_single(RuleVariable::RequestURIRaw, uri);
         self.set_request_method(method);
         self.set_request_protocol(protocol);
-        if let Some((_, query)) = uri.split_once('?') {
-            for (key, value) in parse_urlencoded(query.as_bytes()) {
-                self.add_get_argument(&key, value);
-            }
+
+        let target = uri.split_once('#').map_or(uri, |(target, _)| target);
+        if let Some(parsed) = parse_request_target(target) {
+            self.set_single(RuleVariable::RequestURI, &parsed.request_uri);
+            self.set_single(RuleVariable::QueryString, &parsed.raw_query);
+            self.set_request_path(&parsed.path);
+            self.add_query_arguments(&parsed.raw_query);
+        } else {
+            self.set_single(RuleVariable::URIParseError, "1");
+            self.set_single(RuleVariable::RequestURI, target);
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            self.set_single(RuleVariable::QueryString, query);
+            self.set_request_path(path.as_bytes());
+            self.add_query_arguments(query);
+        }
+    }
+
+    /// Store `REQUEST_FILENAME` and `REQUEST_BASENAME` for a decoded path.
+    fn set_request_path(&mut self, path: &[u8]) {
+        let basename = path
+            .iter()
+            .rposition(|&byte| matches!(byte, b'/' | b'\\'))
+            .filter(|offset| path.len() > offset.saturating_add(1))
+            .and_then(|offset| path.get(offset.saturating_add(1)..))
+            .unwrap_or(path);
+        self.set_single(RuleVariable::RequestBasename, basename);
+        self.set_single(RuleVariable::RequestFilename, path);
+    }
+
+    /// Add the decoded pairs of a raw query string to the GET collections.
+    fn add_query_arguments(&mut self, query: &str) {
+        for (key, value) in parse_urlencoded(query.as_bytes()) {
+            self.add_get_argument(&key, value);
         }
     }
 
@@ -944,13 +1045,44 @@ impl Transaction {
     }
 
     /// Store a request header value as supplied by the connector.
+    ///
+    /// `Cookie` headers are also parsed into `REQUEST_COOKIES`, as Go Coraza does.
+    /// Connectors that already split cookies may keep using [`Transaction::add_request_cookie`];
+    /// both paths accumulate values.
     pub fn add_request_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
         let value = value.as_ref();
         let first_content_type =
             key.eq_ignore_ascii_case("content-type") && self.request_headers.first("content-type").is_none();
         self.request_headers.add(key, value);
+        if key.eq_ignore_ascii_case("cookie") {
+            self.parse_request_cookies(value);
+        }
         if first_content_type && let Some(processor) = BodyProcessor::for_content_type(value) {
             self.set_request_body_processor(processor.name());
+        }
+    }
+
+    /// Split one `Cookie` header into `REQUEST_COOKIES` the way Go's parser does.
+    fn parse_request_cookies(&mut self, value: &[u8]) {
+        for part in value.split(|&byte| byte == b';') {
+            let part = trim_cookie(part);
+            if part.is_empty() {
+                continue;
+            }
+            let (name, value) = match part.iter().position(|&byte| byte == b'=') {
+                Some(index) => (
+                    part.get(..index).unwrap_or_default(),
+                    part.get(index.saturating_add(1)..).unwrap_or_default(),
+                ),
+                None => (part, &b""[..]),
+            };
+            let name = trim_cookie(name);
+            let value = trim_cookie(value);
+            // Go keeps a pair with an empty name but a non-empty value, such as "=payload".
+            if name.is_empty() && value.is_empty() {
+                continue;
+            }
+            self.request_cookies.add(&text_of(name), value);
         }
     }
 
@@ -1003,6 +1135,444 @@ impl Transaction {
             .saturating_add(key.len())
             .saturating_add(value.len());
         self.args_combined_size_value.set(self.args_combined_size.to_string());
+    }
+}
+
+/// Trim the ASCII control bytes and spaces Go trims around a cookie name or value.
+fn trim_cookie(bytes: &[u8]) -> &[u8] {
+    let kept = |byte: &u8| *byte > 0x20 && *byte != 0x7F;
+    let start = bytes.iter().position(kept).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(kept)
+        .map_or(start, |index| index.saturating_add(1));
+    bytes.get(start..end).unwrap_or_default()
+}
+
+/// A request target parsed the way Go's `net/url.ParseRequestURI` parses one.
+struct ParsedRequestTarget {
+    /// `REQUEST_URI`, rendered the way Go's `URL.String` renders the parsed URL.
+    request_uri: Vec<u8>,
+    /// `REQUEST_FILENAME`, the decoded path.
+    path: Vec<u8>,
+    /// `QUERY_STRING`, without the leading `?`.
+    raw_query: String,
+}
+
+/// The URL components that decide how Go re-encodes a value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscapeMode {
+    /// A URL path.
+    Path,
+    /// A host name.
+    Host,
+    /// An IPv6 zone identifier.
+    Zone,
+    /// A userinfo user name or password.
+    UserPassword,
+}
+
+/// Parse an absolute URI or absolute path as Go's `ParseRequestURI` does.
+///
+/// Returns `None` for targets Go rejects, including empty targets, relative paths,
+/// raw control bytes, malformed escapes, malformed ports and invalid IP literals.
+fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
+    if target.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
+        return None;
+    }
+    if target.is_empty() {
+        return None;
+    }
+    if target == "*" {
+        return Some(ParsedRequestTarget {
+            request_uri: b"*".to_vec(),
+            path: b"*".to_vec(),
+            raw_query: String::new(),
+        });
+    }
+
+    let (scheme, rest) = split_scheme(target)?;
+    let (rest, raw_query, force_query) = split_query(rest);
+
+    if !rest.starts_with('/') {
+        // A rootless target after a scheme is opaque; without a scheme it is invalid.
+        if scheme.is_empty() {
+            return None;
+        }
+        let mut request_uri = scheme.into_bytes();
+        request_uri.push(b':');
+        request_uri.extend_from_slice(rest.as_bytes());
+        if force_query || !raw_query.is_empty() {
+            request_uri.push(b'?');
+            request_uri.extend_from_slice(raw_query.as_bytes());
+        }
+        return Some(ParsedRequestTarget {
+            request_uri,
+            path: Vec::new(),
+            raw_query: raw_query.to_owned(),
+        });
+    }
+
+    let (host, userinfo, path_source, omit_host) = if !scheme.is_empty() && rest.starts_with("//") {
+        let after_slashes = rest.strip_prefix("//").unwrap_or_default();
+        let (authority, path) = match after_slashes.find('/') {
+            Some(index) => (
+                after_slashes.get(..index).unwrap_or_default(),
+                after_slashes.get(index..).unwrap_or_default(),
+            ),
+            None => (after_slashes, ""),
+        };
+        let (userinfo, host) = parse_authority(&scheme, authority)?;
+        (Some(host), userinfo, path, false)
+    } else if !scheme.is_empty() {
+        (None, None, rest, true)
+    } else {
+        (None, None, rest, false)
+    };
+
+    let path = unescape(path_source.as_bytes(), EscapeMode::Path)?;
+    let escaped = escape(&path, EscapeMode::Path);
+    let raw_path = (path_source.as_bytes() != escaped.as_slice()).then_some(path_source.as_bytes());
+    let request_uri = match raw_path {
+        Some(raw) if valid_encoded(raw) && unescape(raw, EscapeMode::Path).as_deref() == Some(path.as_slice()) => raw,
+        _ => escaped.as_slice(),
+    };
+
+    let mut rendered = Vec::new();
+    if !scheme.is_empty() {
+        rendered.extend_from_slice(scheme.as_bytes());
+        rendered.push(b':');
+    }
+    if scheme.is_empty() && host.is_none() && userinfo.is_none() {
+        rendered.extend_from_slice(request_uri);
+    } else if omit_host {
+        match request_uri.strip_prefix(b"//") {
+            Some(path) => {
+                rendered.extend_from_slice(b"%2F");
+                rendered.extend_from_slice(path);
+            },
+            None => rendered.extend_from_slice(request_uri),
+        }
+    } else {
+        let host_present = host.as_ref().is_some_and(|value| !value.is_empty());
+        if host_present || !request_uri.is_empty() || userinfo.is_some() {
+            rendered.extend_from_slice(b"//");
+        }
+        if let Some((username, password)) = userinfo {
+            rendered.extend_from_slice(&escape(&username, EscapeMode::UserPassword));
+            if let Some(password) = password {
+                rendered.push(b':');
+                rendered.extend_from_slice(&escape(&password, EscapeMode::UserPassword));
+            }
+            rendered.push(b'@');
+        }
+        if let Some(host) = host {
+            rendered.extend_from_slice(&escape(&host, EscapeMode::Host));
+        }
+        if !request_uri.is_empty() && !request_uri.starts_with(b"/") && host_present {
+            rendered.push(b'/');
+        }
+        rendered.extend_from_slice(request_uri);
+    }
+    if force_query || !raw_query.is_empty() {
+        rendered.push(b'?');
+        rendered.extend_from_slice(raw_query.as_bytes());
+    }
+
+    Some(ParsedRequestTarget {
+        request_uri: rendered,
+        path,
+        raw_query: raw_query.to_owned(),
+    })
+}
+
+/// Split the scheme from a target, lowercased, following Go's `getScheme`.
+fn split_scheme(target: &str) -> Option<(String, &str)> {
+    for (index, byte) in target.bytes().enumerate() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' => {},
+            b'0'..=b'9' | b'+' | b'-' | b'.' => {
+                if index == 0 {
+                    return Some((String::new(), target));
+                }
+            },
+            b':' => {
+                if index == 0 {
+                    return None;
+                }
+                return Some((
+                    target.get(..index).unwrap_or_default().to_ascii_lowercase(),
+                    target.get(index.saturating_add(1)..)?,
+                ));
+            },
+            _ => return Some((String::new(), target)),
+        }
+    }
+    Some((String::new(), target))
+}
+
+/// Split a trailing query from the rest of the target.
+fn split_query(rest: &str) -> (&str, &str, bool) {
+    if rest.ends_with('?') && rest.bytes().filter(|&byte| byte == b'?').count() == 1 {
+        (rest.get(..rest.len().saturating_sub(1)).unwrap_or_default(), "", true)
+    } else {
+        match rest.split_once('?') {
+            Some((before, query)) => (before, query, false),
+            None => (rest, "", false),
+        }
+    }
+}
+
+/// A user name and optional password, both decoded.
+type UserInfo = (Vec<u8>, Option<Vec<u8>>);
+
+/// Parse an authority into optional userinfo and a host.
+fn parse_authority(scheme: &str, authority: &str) -> Option<(Option<UserInfo>, Vec<u8>)> {
+    let at = authority.rfind('@');
+    let host_part = at.map_or(authority, |index| {
+        authority.get(index.saturating_add(1)..).unwrap_or_default()
+    });
+    let host = parse_host(scheme, host_part)?;
+    let Some(at) = at else {
+        return Some((None, host));
+    };
+    let userinfo = authority.get(..at).unwrap_or_default();
+    if !valid_userinfo(userinfo) {
+        return None;
+    }
+    let userinfo = match userinfo.split_once(':') {
+        None => (unescape(userinfo.as_bytes(), EscapeMode::UserPassword)?, None),
+        Some((username, password)) => (
+            unescape(username.as_bytes(), EscapeMode::UserPassword)?,
+            Some(unescape(password.as_bytes(), EscapeMode::UserPassword)?),
+        ),
+    };
+    Some((Some(userinfo), host))
+}
+
+/// Validate and decode a host, rejecting the malformed ports and IP literals Go rejects.
+fn parse_host(scheme: &str, host: &str) -> Option<Vec<u8>> {
+    if let Some(open) = host.rfind('[') {
+        if open > 0 {
+            return None;
+        }
+        let close = host.rfind(']')?;
+        let colon_port = host.get(close.saturating_add(1)..).unwrap_or_default();
+        if !valid_optional_port(colon_port.as_bytes()) {
+            return None;
+        }
+        let colon_port = unescape(colon_port.as_bytes(), EscapeMode::Host)?;
+        let literal = host.get(1..close)?;
+        let literal = match literal.find("%25") {
+            Some(zone) => {
+                let mut hostname = unescape(literal.get(..zone)?.as_bytes(), EscapeMode::Host)?;
+                hostname.extend_from_slice(&unescape(literal.get(zone..)?.as_bytes(), EscapeMode::Zone)?);
+                hostname
+            },
+            None => unescape(literal.as_bytes(), EscapeMode::Host)?,
+        };
+        if !valid_ip_literal(&literal) {
+            return None;
+        }
+        let mut host = Vec::new();
+        host.push(b'[');
+        host.extend_from_slice(&literal);
+        host.push(b']');
+        host.extend_from_slice(&colon_port);
+        return Some(host);
+    }
+    if let Some(first) = host.find(':') {
+        let last = host.rfind(':').unwrap_or(first);
+        let colon = if last != first && matches!(scheme, "http" | "https") {
+            // Go 1.26+ rejects more than one colon in an http(s) host.
+            first
+        } else {
+            last
+        };
+        if !valid_optional_port(host.get(colon..).unwrap_or_default().as_bytes()) {
+            return None;
+        }
+    }
+    unescape(host.as_bytes(), EscapeMode::Host)
+}
+
+/// Whether `text` contains only the characters Go accepts before an `@` in a URL.
+fn valid_userinfo(text: &str) -> bool {
+    text.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '-' | '.'
+                    | '_'
+                    | ':'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | '%'
+                    | '@'
+            )
+    })
+}
+
+/// Whether a bracketed host is an IPv6 literal, optionally with a non-empty zone.
+fn valid_ip_literal(hostname: &[u8]) -> bool {
+    let Ok(hostname) = std::str::from_utf8(hostname) else {
+        return false;
+    };
+    match hostname.split_once('%') {
+        Some((address, zone)) if !zone.is_empty() => address.parse::<std::net::Ipv6Addr>().is_ok(),
+        Some(_) => false,
+        None => hostname.parse::<std::net::Ipv6Addr>().is_ok(),
+    }
+}
+
+/// Whether `port` is empty or a colon followed by digits.
+fn valid_optional_port(port: &[u8]) -> bool {
+    match port {
+        [] => true,
+        [b':', digits @ ..] => digits.iter().all(u8::is_ascii_digit),
+        _ => false,
+    }
+}
+
+/// Whether bytes form an escaped path Go would return unchanged from `EscapedPath`.
+fn valid_encoded(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&byte| {
+        matches!(
+            byte,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'['
+                | b']'
+                | b'%'
+        ) || !should_escape(byte, EscapeMode::Path)
+    })
+}
+
+/// Whether `byte` must be percent-encoded in `mode`, following Go's `shouldEscape`.
+fn should_escape(byte: u8, mode: EscapeMode) -> bool {
+    if byte.is_ascii_alphanumeric() {
+        return false;
+    }
+    if matches!(mode, EscapeMode::Host | EscapeMode::Zone)
+        && matches!(
+            byte,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+                | b'<'
+                | b'>'
+                | b'"'
+        )
+    {
+        return false;
+    }
+    match byte {
+        b'-' | b'_' | b'.' | b'~' => false,
+        b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'?' | b'@' => match mode {
+            EscapeMode::Path => byte == b'?',
+            EscapeMode::UserPassword => matches!(byte, b'@' | b'/' | b'?' | b':'),
+            EscapeMode::Host | EscapeMode::Zone => true,
+        },
+        _ => true,
+    }
+}
+
+/// Percent-encode `bytes` for `mode` with upper-case hex digits.
+fn escape(bytes: &[u8], mode: EscapeMode) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if should_escape(byte, mode) {
+            escaped.push(b'%');
+            escaped.push(hex_digit(byte >> 4));
+            escaped.push(hex_digit(byte & 0x0F));
+        } else {
+            escaped.push(byte);
+        }
+    }
+    escaped
+}
+
+/// The upper-case hex digit of a nibble.
+const fn hex_digit(value: u8) -> u8 {
+    if value < 10 { b'0' + value } else { b'A' + value - 10 }
+}
+
+/// Percent-decode `bytes`, enforcing the mode-specific restrictions Go applies.
+fn unescape(bytes: &[u8], mode: EscapeMode) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while let Some(&byte) = bytes.get(offset) {
+        match byte {
+            b'%' => {
+                let high = *bytes.get(offset.saturating_add(1))?;
+                let low = *bytes.get(offset.saturating_add(2))?;
+                if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                    return None;
+                }
+                let value = (unhex(high) << 4) | unhex(low);
+                let escaped = bytes.get(offset..offset.saturating_add(3));
+                if mode == EscapeMode::Host && unhex(high) < 8 && escaped != Some(&b"%25"[..]) {
+                    return None;
+                }
+                if mode == EscapeMode::Zone
+                    && escaped != Some(&b"%25"[..])
+                    && value != b' '
+                    && should_escape(value, EscapeMode::Host)
+                {
+                    return None;
+                }
+                decoded.push(value);
+                offset = offset.saturating_add(3);
+            },
+            byte => {
+                if matches!(mode, EscapeMode::Host | EscapeMode::Zone) && byte < 0x80 && should_escape(byte, mode) {
+                    return None;
+                }
+                decoded.push(byte);
+                offset = offset.saturating_add(1);
+            },
+        }
+    }
+    Some(decoded)
+}
+
+/// The value of one hex digit.
+const fn unhex(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
     }
 }
 
@@ -2558,5 +3128,618 @@ payload\r\n\
             Some("\u{fffd}")
         );
         assert_eq!(tx.get_variable(RuleVariable::RemotePort, None), Some(String::new()));
+    }
+
+    /// The URI derivatives Go's `ProcessURI` produces for each kind of request target.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one reviewed row per Go request-target shape")]
+    fn process_uri_populates_go_uri_derivatives() {
+        struct Case {
+            target: &'static str,
+            request_uri: &'static str,
+            request_uri_raw: &'static str,
+            filename: &'static str,
+            basename: &'static str,
+            query: &'static str,
+            parse_error: &'static str,
+        }
+
+        let cases = [
+            Case {
+                target: "/search?q=hello+world&encoded=%ff#section",
+                request_uri: "/search?q=hello+world&encoded=%ff",
+                request_uri_raw: "/search?q=hello+world&encoded=%ff#section",
+                filename: "/search",
+                basename: "search",
+                query: "q=hello+world&encoded=%ff",
+                parse_error: "0",
+            },
+            Case {
+                target: "/foo%20bar",
+                request_uri: "/foo%20bar",
+                request_uri_raw: "/foo%20bar",
+                filename: "/foo bar",
+                basename: "foo bar",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/foo/bar/",
+                request_uri: "/foo/bar/",
+                request_uri_raw: "/foo/bar/",
+                filename: "/foo/bar/",
+                basename: "/foo/bar/",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "//foo/bar",
+                request_uri: "//foo/bar",
+                request_uri_raw: "//foo/bar",
+                filename: "//foo/bar",
+                basename: "bar",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "///foo/bar",
+                request_uri: "///foo/bar",
+                request_uri_raw: "///foo/bar",
+                filename: "///foo/bar",
+                basename: "bar",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/a%2Fb",
+                request_uri: "/a%2Fb",
+                request_uri_raw: "/a%2Fb",
+                filename: "/a/b",
+                basename: "b",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/a\\b",
+                request_uri: "/a%5Cb",
+                request_uri_raw: "/a\\b",
+                filename: "/a\\b",
+                basename: "b",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/foo bar",
+                request_uri: "/foo%20bar",
+                request_uri_raw: "/foo bar",
+                filename: "/foo bar",
+                basename: "foo bar",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/h%C3%A9llo",
+                request_uri: "/h%C3%A9llo",
+                request_uri_raw: "/h%C3%A9llo",
+                filename: "/héllo",
+                basename: "héllo",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/héllo",
+                request_uri: "/h%C3%A9llo",
+                request_uri_raw: "/héllo",
+                filename: "/héllo",
+                basename: "héllo",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "*",
+                request_uri: "*",
+                request_uri_raw: "*",
+                filename: "*",
+                basename: "*",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "",
+                request_uri: "",
+                request_uri_raw: "",
+                filename: "",
+                basename: "",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "foo",
+                request_uri: "foo",
+                request_uri_raw: "foo",
+                filename: "foo",
+                basename: "foo",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "foo/bar",
+                request_uri: "foo/bar",
+                request_uri_raw: "foo/bar",
+                filename: "foo/bar",
+                basename: "bar",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "?a=b",
+                request_uri: "?a=b",
+                request_uri_raw: "?a=b",
+                filename: "",
+                basename: "",
+                query: "a=b",
+                parse_error: "1",
+            },
+            Case {
+                target: "/foo%zz?a=b",
+                request_uri: "/foo%zz?a=b",
+                request_uri_raw: "/foo%zz?a=b",
+                filename: "/foo%zz",
+                basename: "foo%zz",
+                query: "a=b",
+                parse_error: "1",
+            },
+            Case {
+                target: "/foo?bar=baz#qux",
+                request_uri: "/foo?bar=baz",
+                request_uri_raw: "/foo?bar=baz#qux",
+                filename: "/foo",
+                basename: "foo",
+                query: "bar=baz",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://example.com/path/to/file.html?query=string&other=value",
+                request_uri: "http://example.com/path/to/file.html?query=string&other=value",
+                request_uri_raw: "http://example.com/path/to/file.html?query=string&other=value",
+                filename: "/path/to/file.html",
+                basename: "file.html",
+                query: "query=string&other=value",
+                parse_error: "0",
+            },
+            Case {
+                target: "HTTP://Example.COM/A?b=1",
+                request_uri: "http://Example.COM/A?b=1",
+                request_uri_raw: "HTTP://Example.COM/A?b=1",
+                filename: "/A",
+                basename: "A",
+                query: "b=1",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://example.com",
+                request_uri: "http://example.com",
+                request_uri_raw: "http://example.com",
+                filename: "",
+                basename: "",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://example.com/",
+                request_uri: "http://example.com/",
+                request_uri_raw: "http://example.com/",
+                filename: "/",
+                basename: "/",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://user:pass@example.com/a",
+                request_uri: "http://user:pass@example.com/a",
+                request_uri_raw: "http://user:pass@example.com/a",
+                filename: "/a",
+                basename: "a",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://user:pa%73s@example.com/a",
+                request_uri: "http://user:pass@example.com/a",
+                request_uri_raw: "http://user:pa%73s@example.com/a",
+                filename: "/a",
+                basename: "a",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://user:p%40ss@example.com/a",
+                request_uri: "http://user:p%40ss@example.com/a",
+                request_uri_raw: "http://user:p%40ss@example.com/a",
+                filename: "/a",
+                basename: "a",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://example.com:bad/path?q=1",
+                request_uri: "http://example.com:bad/path?q=1",
+                request_uri_raw: "http://example.com:bad/path?q=1",
+                filename: "http://example.com:bad/path",
+                basename: "path",
+                query: "q=1",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://example.com:8080/path",
+                request_uri: "http://example.com:8080/path",
+                request_uri_raw: "http://example.com:8080/path",
+                filename: "/path",
+                basename: "path",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://[::1]:8080/a?b=1",
+                request_uri: "http://[::1]:8080/a?b=1",
+                request_uri_raw: "http://[::1]:8080/a?b=1",
+                filename: "/a",
+                basename: "a",
+                query: "b=1",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://[1.2.3.4]/a",
+                request_uri: "http://[1.2.3.4]/a",
+                request_uri_raw: "http://[1.2.3.4]/a",
+                filename: "http://[1.2.3.4]/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://[fe80::1%25eth0]/a",
+                request_uri: "http://[fe80::1%25eth0]/a",
+                request_uri_raw: "http://[fe80::1%25eth0]/a",
+                filename: "/a",
+                basename: "a",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://[::1/a",
+                request_uri: "http://[::1/a",
+                request_uri_raw: "http://[::1/a",
+                filename: "http://[::1/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http:/foo",
+                request_uri: "http:/foo",
+                request_uri_raw: "http:/foo",
+                filename: "/foo",
+                basename: "foo",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "mailto:user@example.com",
+                request_uri: "mailto:user@example.com",
+                request_uri_raw: "mailto:user@example.com",
+                filename: "",
+                basename: "",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/foo?",
+                request_uri: "/foo?",
+                request_uri_raw: "/foo?",
+                filename: "/foo",
+                basename: "foo",
+                query: "",
+                parse_error: "0",
+            },
+            Case {
+                target: "/a?b?c",
+                request_uri: "/a?b?c",
+                request_uri_raw: "/a?b?c",
+                filename: "/a",
+                basename: "a",
+                query: "b?c",
+                parse_error: "0",
+            },
+            Case {
+                target: "http://exa mple.com/a",
+                request_uri: "http://exa mple.com/a",
+                request_uri_raw: "http://exa mple.com/a",
+                filename: "http://exa mple.com/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://a:b:c/d",
+                request_uri: "http://a:b:c/d",
+                request_uri_raw: "http://a:b:c/d",
+                filename: "http://a:b:c/d",
+                basename: "d",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "/?",
+                request_uri: "/?",
+                request_uri_raw: "/?",
+                filename: "/",
+                basename: "/",
+                query: "",
+                parse_error: "0",
+            },
+        ];
+
+        for case in cases {
+            let mut tx = Transaction::new("uri-derivatives");
+            tx.process_uri(case.target, "GET", "HTTP/1.1");
+            let value = |variable| tx.get_variable(variable, None);
+            assert_eq!(
+                value(RuleVariable::RequestURI).as_deref(),
+                Some(case.request_uri),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::RequestURIRaw).as_deref(),
+                Some(case.request_uri_raw),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::RequestFilename).as_deref(),
+                Some(case.filename),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::RequestBasename).as_deref(),
+                Some(case.basename),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::QueryString).as_deref(),
+                Some(case.query),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::URIParseError).as_deref(),
+                Some(case.parse_error),
+                "target {:?}",
+                case.target
+            );
+            assert_eq!(
+                value(RuleVariable::RequestLine).as_deref(),
+                Some(format!("GET {} HTTP/1.1", case.target).as_str()),
+                "target {:?}",
+                case.target
+            );
+        }
+    }
+
+    #[test]
+    fn process_uri_recovers_query_arguments_and_byte_values() {
+        let mut tx = Transaction::new("uri-recovery");
+        tx.process_uri("/search?q=ATTACK%00&y=1", "GET", "HTTP/1.1");
+        let spec = VariableSpec::new_string(RuleVariable::ArgsGet, "q".to_owned());
+        assert_eq!(
+            tx.find_matches(&spec).first().map(|matched| matched.value.as_slice()),
+            Some(&b"ATTACK\0"[..])
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::QueryString, None).as_deref(),
+            Some("q=ATTACK%00&y=1")
+        );
+
+        let mut raw = Transaction::new("uri-control-byte");
+        raw.process_uri("/search?q=a\x00&y=1", "GET", "HTTP/1.1");
+        assert_eq!(
+            raw.get_variable(RuleVariable::URIParseError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            raw.get_variable(RuleVariable::QueryString, None).as_deref(),
+            Some("q=a\x00&y=1")
+        );
+        let spec = VariableSpec::new_string(RuleVariable::ArgsGet, "q".to_owned());
+        assert_eq!(
+            raw.find_matches(&spec).first().map(|matched| matched.value.as_slice()),
+            Some(&b"a\0"[..])
+        );
+
+        let mut port = Transaction::new("uri-bad-port");
+        port.process_uri("http://example.com:bad/path?q=attack", "GET", "HTTP/1.1");
+        assert_eq!(
+            port.get_variable(RuleVariable::URIParseError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            port.get_variable(RuleVariable::ArgsGet, Some("q")).as_deref(),
+            Some("attack")
+        );
+    }
+
+    /// Compile one phase-1 rule and report whether `target` makes it interrupt.
+    fn uri_rule_matches(rule: &str, target: &str) -> bool {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rule).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("uri-rule");
+        tx.process_uri(target, "GET", "HTTP/1.1");
+        tx.process_request_headers().is_some()
+    }
+
+    #[test]
+    fn uri_derivative_rules_match_go_producer_values() {
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_FILENAME \"@contains /admin\" \"id:101,phase:1,deny\"",
+            "/admin"
+        ));
+        assert!(!uri_rule_matches(
+            "SecRule REQUEST_FILENAME \"@contains /admin\" \"id:101,phase:1,deny\"",
+            "/public"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_BASENAME \"@streq passwd\" \"id:102,phase:1,deny\"",
+            "/etc/passwd"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule QUERY_STRING \"@contains attack\" \"id:103,phase:1,deny\"",
+            "/?q=attack"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_URI_RAW \"@contains fragment\" \"id:104,phase:1,deny\"",
+            "/a#fragment"
+        ));
+        assert!(!uri_rule_matches(
+            "SecRule REQUEST_URI \"@contains fragment\" \"id:105,phase:1,deny\"",
+            "/a#fragment"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_LINE \"@beginsWith GET /a HTTP/1.1\" \"id:106,phase:1,deny\"",
+            "/a"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule URI_PARSE_ERROR \"@eq 1\" \"id:107,phase:1,deny\"",
+            "relative-only"
+        ));
+        assert!(!uri_rule_matches(
+            "SecRule URI_PARSE_ERROR \"@eq 1\" \"id:107,phase:1,deny\"",
+            "/valid"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule URI_PARSE_ERROR \"@eq 1\" \"id:110,phase:1,deny\"",
+            "/foo%zz?a=b"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule ARGS_GET:q \"@contains attack\" \"id:108,phase:1,deny\"",
+            "/search?q=attack\x00"
+        ));
+        assert!(uri_rule_matches(
+            "SecRule REQUEST_FILENAME \"@contains admin\" \"id:109,phase:1,deny\"",
+            "http://example.com:bad/admin"
+        ));
+    }
+
+    #[test]
+    fn cookie_headers_populate_request_cookies_like_go() {
+        let mut tx = Transaction::new("cookies");
+        tx.add_request_header("Cookie", "a=1; b=2; a=3");
+        tx.add_request_header("cookie", " a=4 ;");
+        let values = |tx: &Transaction, key: &str| {
+            let spec = VariableSpec::new_string(RuleVariable::RequestCookies, key.to_owned());
+            tx.find_matches(&spec)
+                .into_iter()
+                .map(|matched| String::from_utf8_lossy(&matched.value).into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&tx, "a"), ["1", "3", "4"]);
+        assert_eq!(values(&tx, "b"), ["2"]);
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestCookiesNames, Some("a")).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestCookiesNames, Some("b")).as_deref(),
+            Some("b")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestCookiesNames, Some("c")), None);
+
+        // The explicit connector path still accumulates values.
+        tx.add_request_cookie("a", "5");
+        assert_eq!(values(&tx, "a"), ["1", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn cookie_parsing_keeps_go_edge_cases() {
+        let mut tx = Transaction::new("cookie-edges");
+        tx.add_request_header("Cookie", "=payload");
+        tx.add_request_header("Cookie", "= ");
+        tx.add_request_header("Cookie", "\x01=trimmed");
+        tx.add_request_header("Cookie", "flag");
+        tx.add_request_header("Cookie", "b=1;b=2;c=");
+        assert!(matches!(
+            tx.collection(RuleVariable::RequestCookies),
+            Some(VariableCollection::Map(_))
+        ));
+        if let Some(VariableCollection::Map(cookies)) = tx.collection(RuleVariable::RequestCookies) {
+            assert_eq!(cookies.get(""), ["payload", "trimmed"]);
+            assert_eq!(cookies.get("flag"), [""]);
+            assert_eq!(cookies.get("b"), ["1", "2"]);
+            assert_eq!(cookies.get("c"), [""]);
+        }
+    }
+
+    #[test]
+    fn cookie_headers_drive_rule_outcomes() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule REQUEST_COOKIES:session \"@streq attack\" \"id:120,phase:1,deny\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("cookie-rule");
+        tx.add_request_header("X-Other", "1");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        assert!(tx.process_request_headers().is_none());
+        let mut tx = waf.new_transaction_with_id("cookie-rule-match");
+        tx.add_request_header("Cookie", "session=attack");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        assert!(tx.process_request_headers().is_some());
+    }
+
+    #[test]
+    fn time_variables_are_populated_and_match_rules() {
+        let tx = Transaction::new("time");
+        let epoch = tx.get_variable(RuleVariable::TimeEpoch, None).unwrap();
+        assert!(epoch.parse::<u64>().is_ok());
+        let value = |variable| tx.get_variable(variable, None).unwrap();
+        assert!(
+            regex::Regex::new("^[0-9]{2}:[0-9]{2}:[0-9]{2}$")
+                .unwrap()
+                .is_match(&value(RuleVariable::Time))
+        );
+        assert!(
+            regex::Regex::new("^[0-9]{2}$")
+                .unwrap()
+                .is_match(&value(RuleVariable::TimeHour))
+        );
+        assert!(
+            regex::Regex::new("^[0-9]{2}$")
+                .unwrap()
+                .is_match(&value(RuleVariable::TimeMin))
+        );
+        assert!(
+            regex::Regex::new("^[0-9]{2}$")
+                .unwrap()
+                .is_match(&value(RuleVariable::TimeSec))
+        );
+        assert!((1..=31).contains(&value(RuleVariable::TimeDay).parse::<u8>().unwrap()));
+        assert!((1..=12).contains(&value(RuleVariable::TimeMon).parse::<u8>().unwrap()));
+        assert!((0..=6).contains(&value(RuleVariable::TimeWday).parse::<u8>().unwrap()));
+        assert!(value(RuleVariable::TimeYear).parse::<u32>().unwrap() >= 2024);
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule TIME \"@rx ^[0-9]{2}:[0-9]{2}:[0-9]{2}$\" \"id:130,phase:1,deny\"\n\
+             SecRule TIME_EPOCH \"@rx ^[0-9]+$\" \"id:131,phase:5,pass\"\n\
+             SecRule TIME_WDAY \"@rx ^[0-6]$\" \"id:132,phase:5,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("time-rule");
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 130);
     }
 }

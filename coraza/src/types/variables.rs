@@ -238,11 +238,11 @@ pub enum RuleVariable {
     TimeHour,
     /// `TIME_MIN` - Current minute of hour (0-59)
     TimeMin,
-    /// `TIME_MON` - Current month of year (0-11)
+    /// `TIME_MON` - Current month of year (1-12, January=1)
     TimeMon,
     /// `TIME_SEC` - Current second of minute (0-59)
     TimeSec,
-    /// `TIME_WDAY` - Current weekday value (1-7, Monday=1)
+    /// `TIME_WDAY` - Current weekday value (0-6, Sunday=0)
     TimeWday,
     /// `TIME_YEAR` - Current four-digit year
     TimeYear,
@@ -255,6 +255,8 @@ pub enum RuleVariable {
     MultipartFilenameCharset,
     /// `MULTIPART_FILENAME_LANGUAGE` - Language from the filename* parameter (collection)
     MultipartFilenameLanguage,
+    /// `URI_PARSE_ERROR` - Set to 1 when the request URI could not be parsed
+    URIParseError,
 }
 
 /// Lookup table of variable variants and names in enum order.
@@ -380,6 +382,7 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
     ),
     (RuleVariable::MultipartFilenameCharset, "MULTIPART_FILENAME_CHARSET"),
     (RuleVariable::MultipartFilenameLanguage, "MULTIPART_FILENAME_LANGUAGE"),
+    (RuleVariable::URIParseError, "URI_PARSE_ERROR"),
 ];
 
 impl RuleVariable {
@@ -652,9 +655,6 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            usize::from(RuleVariable::MultipartFilenameLanguage.as_u8()) + 1,
-            VARIABLES.len()
-        );
+        assert_eq!(usize::from(RuleVariable::URIParseError.as_u8()) + 1, VARIABLES.len());
     }
 }
