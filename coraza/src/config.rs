@@ -148,6 +148,15 @@ pub struct WafConfig {
     /// Maximum number of ARGS processed per transaction (`SecArgumentsLimit`).
     pub argument_limit: usize,
 
+    /// Whether argument collection keys are matched case-sensitively.
+    ///
+    /// Applies to `ARGS`, `ARGS_GET`, `ARGS_POST`, `ARGS_PATH` and their `*_NAMES`
+    /// views. `false`, the default, matches Go Coraza's default behavior, where keyed
+    /// lookups fold case. `true` is equivalent to Go's
+    /// `coraza.rule.case_sensitive_args_keys` build tag. Other collections stay
+    /// case-insensitive, as in Go. There is no SecLang directive for this, as in Go.
+    pub case_sensitive_args_keys: bool,
+
     /// Application id; apps sharing it share persistent collections (`SecWebAppId`).
     pub web_app_id: String,
 
@@ -215,6 +224,7 @@ impl Default for WafConfig {
             collection_timeout: 3600,
             debug_log_level: 0,
             argument_limit: DEFAULT_ARGUMENT_LIMIT,
+            case_sensitive_args_keys: false,
             web_app_id: String::new(),
             sensor_id: String::new(),
             server_signature: String::new(),
@@ -248,6 +258,7 @@ mod tests {
         assert_eq!(config.response_body_limit, 524_288);
         assert_eq!(config.audit_engine, AuditEngineStatus::Off);
         assert_eq!(config.argument_limit, 1000);
+        assert!(!config.case_sensitive_args_keys);
         assert_eq!(config.audit_log_format, AuditLogFormat::Native);
         assert_eq!(config.audit_log_type, AuditLogType::Serial);
         assert!(!config.request_body_access);

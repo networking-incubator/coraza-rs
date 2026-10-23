@@ -339,8 +339,9 @@ impl Transaction {
         reason = "initializes the transaction's typed variable collections"
     )]
     pub(crate) fn with_rules(config: Arc<WafConfig>, rules: Arc<RuleGroup>, id: impl Into<String>) -> Self {
+        let case_sensitive_args_keys = config.case_sensitive_args_keys;
         let map = |variable: RuleVariable| {
-            if variable.has_case_sensitive_keys() {
+            if case_sensitive_args_keys && variable.has_case_sensitive_keys() {
                 Map::new_case_sensitive(variable)
             } else {
                 Map::new(variable)
@@ -1722,6 +1723,253 @@ mod tests {
             (b"json.k\xff".to_vec(), b"1".to_vec()),
         ];
         assert_eq!(byte_entries(&tx, RuleVariable::ResponseArgs), expected);
+    }
+
+    #[test]
+    fn args_key_lookup_folds_case_and_reports_the_original_name() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS:name \"@contains attack\" \"id:170,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        for supplied in ["Name", "NAME", "nAmE"] {
+            let mut tx = waf.new_transaction_with_id("args-case");
+            tx.add_get_argument(supplied, b"an attack");
+
+            assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(170));
+            assert_eq!(
+                tx.get_variable(RuleVariable::MatchedVarName, None).as_deref(),
+                Some(format!("ARGS:{supplied}").as_str())
+            );
+            let matched = tx.matched_rules().first().unwrap();
+            assert_eq!(matched.matches.len(), 1);
+            assert_eq!(matched.matches.first().map(|item| item.key.as_str()), Some(supplied));
+            assert_eq!(
+                matched.matches.first().map(|item| item.value.as_slice()),
+                Some(&b"an attack"[..])
+            );
+
+            let entries = byte_entries(&tx, RuleVariable::Args);
+            assert_eq!(entries, [(supplied.as_bytes().to_vec(), b"an attack".to_vec())]);
+        }
+    }
+
+    #[test]
+    fn args_names_keep_the_original_spellings() {
+        let mut tx = Transaction::new("args-names-case");
+        tx.add_get_argument("Name", b"1");
+        tx.add_get_argument("NAME", b"2");
+        tx.add_get_argument("other", b"3");
+
+        let matches = tx.find_matches(&VariableSpec::new(RuleVariable::ArgsNames));
+        let mut names: Vec<_> = matches.iter().map(|item| item.value.clone()).collect();
+        names.sort();
+        assert_eq!(names, [b"NAME".to_vec(), b"Name".to_vec(), b"other".to_vec()]);
+        assert!(matches.iter().all(|item| item.variable == RuleVariable::ArgsNames));
+    }
+
+    #[test]
+    fn args_post_key_lookup_folds_case() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRule ARGS_POST:password \"@contains secret\" \"id:171,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("args-post-case");
+        tx.add_request_header("Content-Type", b"application/x-www-form-urlencoded");
+        tx.process_request_headers();
+
+        assert_eq!(
+            tx.process_request_body(b"Password=mysecret").map(|item| item.rule_id),
+            Some(171)
+        );
+        assert_eq!(
+            tx.matched_rules()
+                .first()
+                .and_then(|matched| matched.matches.first())
+                .map(|item| item.key.as_str()),
+            Some("Password")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("password")).as_deref(),
+            Some("mysecret")
+        );
+    }
+
+    #[test]
+    fn args_path_key_lookup_folds_case() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS_PATH:route \"@contains admin\" \"id:172,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("args-path-case");
+        tx.add_path_argument("Route", b"admin area");
+
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(172));
+        assert_eq!(
+            tx.matched_rules()
+                .first()
+                .and_then(|matched| matched.matches.first())
+                .map(|item| item.key.as_str()),
+            Some("Route")
+        );
+    }
+
+    #[test]
+    fn multipart_names_and_file_sizes_fold_case() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let mut parser = crate::seclang::Parser::new();
+        let rules = format!("SecRequestBodyAccess On\nSecUploadDir {}", upload_dir.path().display());
+        parser.from_string(&rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-case");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"Message\"; filename=\"Legacy.TXT\"\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+payload\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body), None);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::MultipartName, Some("message")).as_deref(),
+            Some("Message")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("legacy.txt")).as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("LEGACY.TXT")).as_deref(),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn request_xml_key_lookup_folds_case() {
+        let mut tx = Transaction::new("xml-case");
+        tx.request_xml.add("Secret", b"value");
+
+        let matches = tx.find_matches(&VariableSpec::new_string(RuleVariable::RequestXML, "secret".to_owned()));
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.first().map(|item| item.key.as_str()), Some("Secret"));
+        assert_eq!(matches.first().map(|item| item.value.as_slice()), Some(&b"value"[..]));
+    }
+
+    #[test]
+    fn response_args_key_lookup_folds_case() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecResponseBodyAccess On\n\
+                 SecResponseBodyMimeType application/json\n\
+                 SecAction \"id:173,phase:3,ctl:responseBodyProcessor=JSON,pass\"\n\
+                 SecRule RESPONSE_ARGS:json.admin \"@streq true\" \"id:174,phase:4,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("response-args-case");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(
+            tx.process_response_body(br#"{"Admin":true}"#).map(|item| item.rule_id),
+            Some(174)
+        );
+        assert_eq!(
+            tx.matched_rules()
+                .iter()
+                .find(|matched| matched.rule_id() == 174)
+                .and_then(|matched| matched.matches.first())
+                .map(|item| item.key.as_str()),
+            Some("json.Admin")
+        );
+    }
+
+    #[test]
+    fn case_sensitive_args_keys_option_limits_sensitivity_to_arguments() {
+        let rule = "SecRule ARGS:password \"@contains secret\" \"id:175,phase:1,deny,status:403\"";
+
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rule).unwrap();
+        let default_waf = parser.into_waf().unwrap();
+
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rule).unwrap();
+        parser.config_mut().case_sensitive_args_keys = true;
+        let strict_waf = parser.into_waf().unwrap();
+
+        let mut tx = default_waf.new_transaction_with_id("args-default-case");
+        tx.add_get_argument("Password", b"a secret");
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(175));
+
+        let mut tx = strict_waf.new_transaction_with_id("args-strict-case");
+        tx.add_get_argument("Password", b"a secret");
+        tx.add_request_header("X-Trace", b"value");
+
+        assert_eq!(tx.process_request_headers(), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsGet, Some("Password")).as_deref(),
+            Some("a secret")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("password")), None);
+        let exact = VariableSpec::new_string(RuleVariable::Args, "Password".to_owned());
+        let folded = VariableSpec::new_string(RuleVariable::Args, "password".to_owned());
+        assert_eq!(tx.find_matches(&exact).len(), 1);
+        assert!(tx.find_matches(&folded).is_empty());
+        // Collections other than the arguments stay case-insensitive, as in Go.
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestHeaders, Some("x-trace"))
+                .as_deref(),
+            Some("value")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestHeaders, Some("X-TRACE"))
+                .as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn case_folding_keeps_invalid_utf8_keys_distinct() {
+        let mut tx = Transaction::new("invalid-utf8-case");
+        tx.add_get_argument(b"Id\xff", b"one");
+        tx.add_get_argument(b"ID\xff", b"two");
+        tx.add_get_argument(b"Id\xfe", b"three");
+
+        let entries = byte_entries(&tx, RuleVariable::ArgsGet);
+        assert_eq!(
+            entries,
+            [
+                (b"ID\xff".to_vec(), b"two".to_vec()),
+                (b"Id\xfe".to_vec(), b"three".to_vec()),
+                (b"Id\xff".to_vec(), b"one".to_vec()),
+            ]
+        );
+
+        let map = match tx.collection(RuleVariable::ArgsGet) {
+            Some(VariableCollection::Map(map)) => Some(map),
+            _ => None,
+        }
+        .unwrap();
+        // The two ASCII case variants fold into one lookup bucket but stay separate entries.
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.values(b"id\xff").count(), 2);
+        assert_eq!(map.values(b"ID\xff").count(), 2);
+        assert_eq!(map.values(b"id\xfe").count(), 1);
+        // Distinct invalid byte sequences are not merged by lowercasing.
+        assert_eq!(map.values(b"id\xfd").count(), 0);
     }
 
     #[test]

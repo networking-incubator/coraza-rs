@@ -460,7 +460,12 @@ impl RuleVariable {
         )
     }
 
-    /// Whether keys of this variable are matched case-sensitively.
+    /// Whether this variable's keys can be matched case-sensitively.
+    ///
+    /// Only the argument collections can: they use case-sensitive keys when
+    /// `WafConfig::case_sensitive_args_keys` is set, matching Go's
+    /// `coraza.rule.case_sensitive_args_keys` build tag. Every other collection
+    /// stores case-insensitive keys, as Go does by default.
     pub const fn has_case_sensitive_keys(self) -> bool {
         matches!(
             self,
@@ -471,19 +476,6 @@ impl RuleVariable {
                 | Self::ArgsNames
                 | Self::ArgsGetNames
                 | Self::ArgsPostNames
-                | Self::Files
-                | Self::FilesTmpNames
-                | Self::FilesSizes
-                | Self::FilesNames
-                | Self::MultipartPartHeaders
-                | Self::MultipartName
-                | Self::MultipartFilename
-                | Self::MultipartFilenameCharset
-                | Self::MultipartFilenameLanguage
-                | Self::RequestXML
-                | Self::ResponseArgs
-                | Self::ResponseXML
-                | Self::Env
         )
     }
 }
@@ -640,6 +632,38 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.name(), name);
             assert_eq!(name.to_lowercase().parse::<RuleVariable>().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_case_sensitive_key_variables() {
+        for variable in [
+            RuleVariable::Args,
+            RuleVariable::ArgsGet,
+            RuleVariable::ArgsPost,
+            RuleVariable::ArgsPath,
+            RuleVariable::ArgsNames,
+            RuleVariable::ArgsGetNames,
+            RuleVariable::ArgsPostNames,
+        ] {
+            assert!(variable.has_case_sensitive_keys(), "{variable:?}");
+        }
+        for variable in [
+            RuleVariable::Files,
+            RuleVariable::FilesNames,
+            RuleVariable::FilesSizes,
+            RuleVariable::FilesTmpNames,
+            RuleVariable::MultipartPartHeaders,
+            RuleVariable::MultipartName,
+            RuleVariable::MultipartFilename,
+            RuleVariable::MultipartFilenameCharset,
+            RuleVariable::MultipartFilenameLanguage,
+            RuleVariable::RequestXML,
+            RuleVariable::ResponseArgs,
+            RuleVariable::ResponseXML,
+            RuleVariable::Env,
+        ] {
+            assert!(!variable.has_case_sensitive_keys(), "{variable:?}");
         }
     }
 
