@@ -21,7 +21,7 @@
 //! Operator evaluation and SecLang negation.
 
 use crate::{
-    operators::{OperatorEnum, Outputs},
+    operators::{OperatorEnum, OperatorOutcome, Outputs},
     transaction::Transaction,
 };
 
@@ -40,10 +40,24 @@ impl RuleOperator {
         Self { operator, negated }
     }
 
-    /// Evaluate one value, applying SecLang negation after the operator runs.
+    /// Whether the operator matched, applying SecLang negation.
+    #[cfg(test)]
     pub(crate) fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
-        let matched = self.operator.evaluate(tx, input, out);
-        if self.negated { !matched } else { matched }
+        self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
+    }
+
+    /// Evaluate one value, applying SecLang negation after the operator runs.
+    ///
+    /// Negation flips [`OperatorOutcome::Matched`] and
+    /// [`OperatorOutcome::NotMatched`]. A skipped inspection stays
+    /// [`OperatorOutcome::NotInspected`], because a negated operator has no
+    /// verdict for the input either.
+    pub(crate) fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
+        match self.operator.evaluate_outcome(tx, input, out) {
+            OperatorOutcome::Matched if self.negated => OperatorOutcome::NotMatched,
+            OperatorOutcome::NotMatched if self.negated => OperatorOutcome::Matched,
+            outcome => outcome,
+        }
     }
 }
 
@@ -52,7 +66,7 @@ impl RuleOperator {
 mod tests {
     use super::RuleOperator;
     use crate::{
-        operators::{OperatorEnum, Outputs},
+        operators::{OperatorEnum, OperatorOutcome, Outputs},
         transaction::Transaction,
     };
 
@@ -62,7 +76,26 @@ mod tests {
         let operator = RuleOperator::new(operator, true);
         let tx = Transaction::new("test");
 
-        assert!(!operator.evaluate(&tx, b"admin", &mut Outputs::default()));
-        assert!(operator.evaluate(&tx, b"user", &mut Outputs::default()));
+        assert_eq!(
+            operator.evaluate_outcome(&tx, b"admin", &mut Outputs::default()),
+            OperatorOutcome::NotMatched
+        );
+        assert_eq!(
+            operator.evaluate_outcome(&tx, b"user", &mut Outputs::default()),
+            OperatorOutcome::Matched
+        );
+    }
+
+    #[test]
+    fn negation_keeps_a_skipped_inspection() {
+        let operator = OperatorEnum::new("detectSQLi", "").unwrap();
+        let operator = RuleOperator::new(operator, true);
+        let tx = Transaction::new("test");
+        let input = vec![b' '; libperfusion::MAX_INPUT_LEN + 1];
+
+        assert_eq!(
+            operator.evaluate_outcome(&tx, &input, &mut Outputs::default()),
+            OperatorOutcome::NotInspected
+        );
     }
 }

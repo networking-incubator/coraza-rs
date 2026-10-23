@@ -32,7 +32,7 @@
         "go_reference": "internal/operators/detect_sqli.go",
         "fixtures": [],
         "differences": [
-          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+          "The libperfusion public wrapper does not scan inputs over 65536 bytes. The operator reports OperatorOutcome::NotInspected, the transaction sets TX.inspection_incomplete=1 and Transaction::inspection_incomplete() returns true, and WafConfig::detector_inspection_action defaults to RecordOnly (a miss with the signal); FailClosed interrupts the transaction instead (F02)."
         ]
       },
       "detectXSS": {
@@ -41,7 +41,7 @@
         "go_reference": "internal/operators/detect_xss.go",
         "fixtures": [],
         "differences": [
-          "The default libperfusion wrapper returns a miss for inputs over 65536 bytes instead of reporting incomplete inspection (F02)."
+          "The libperfusion public wrapper does not scan inputs over 65536 bytes. The operator reports OperatorOutcome::NotInspected, the transaction sets TX.inspection_incomplete=1 and Transaction::inspection_incomplete() returns true, and WafConfig::detector_inspection_action defaults to RecordOnly (a miss with the signal); FailClosed interrupts the transaction instead (F02)."
         ]
       },
       "endsWith": {

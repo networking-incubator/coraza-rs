@@ -87,6 +87,15 @@ adding them requires a shared-corpus fixture first.
 - `SecRequestBodyNoFilesLimit` is accepted, validated and documented as not enforced,
   matching Go Coraza v3.8.1 (`internal/corazawaf/waf.go:120`, corazawaf/coraza#896).
   No admission decision depends on it on either side.
+- Detector input bound. The `detectSQLi` and `detectXSS` operators use
+  libperfusion's public wrappers, which do not scan inputs longer than 65536 bytes;
+  Go Coraza passes any length to libinjection-go. The operators report
+  `OperatorOutcome::NotInspected` for these inputs, the transaction sets
+  `TX.inspection_incomplete` to `"1"` and `Transaction::inspection_incomplete()`
+  returns true, and `WafConfig::detector_inspection_action` defaults to
+  `RecordOnly`, which keeps the miss verdict and the signal. `FailClosed`
+  interrupts the transaction instead. No partial scan, splitting or chunking is
+  performed.
 
 ## Rust-only multipart parser hardening budgets
 
