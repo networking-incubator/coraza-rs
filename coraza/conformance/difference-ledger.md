@@ -40,6 +40,7 @@ must state which side was observed.
 | `raw-0365` | `58c14b7bcbc569d32c0a70b54939c2c97aa53d4cfd68e17f7e933d515bf87527` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0373` | `e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `args-get-invalid-utf8-names` | `3c9133937f99186e0ef69373aef20e1a5382ce02ece6b94936da02a4c07cb95f` | `/?%ff=a&%fe=b` yields two `ARGS_GET` keys, the single bytes `0xff` and `0xfe` | The same target yields one `ARGS_GET` key, `U+FFFD`, with values `a` and `b` | Decoded parameter names are Rust `String`s, so invalid UTF-8 becomes `U+FFFD` and distinct byte names collide. Values stay byte-exact. The byte-key collection refactor is deferred; do not emulate byte identity with lossy lookups. |
+| `json-invalid-utf8-keys` | `5475fd660355bbc435ec9208d8cb01b6cb2206e28a7ad500af8ff4b4782d9a05` | `{"k\xff":1,"k\xfe":2}` yields two `ARGS_POST` keys with the byte sequences `json.k\xff` and `json.k\xfe` | The same body yields one `ARGS_POST` key, `json.k` followed by `U+FFFD`, with values `1` and `2` | Flattened JSON keys are Rust `String`s, so invalid UTF-8 key bytes become `U+FFFD` and distinct byte keys collide; both values are still published. Values and `TX.json_request_body`/`TX.json_response_body` stay byte-exact on both sides. |
 
 ## Deliberate deviation classes without engine case IDs yet
 

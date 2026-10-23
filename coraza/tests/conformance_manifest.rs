@@ -40,7 +40,7 @@ const VARIABLES_SOURCE: &str = include_str!("../src/types/variables.rs");
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
 const GO_COMMIT: &str = "d9cc9befc2721fd217ce1660a0e91aca1157221d";
 const EXAMPLE_FIXTURE_SHA: &str = "7dfaa62fe41c266f931e9d05fb8cefd7ecba57c929b11f02af0ef8737fc93c04";
-const REVIEWED_LEDGER: [(&str, &str); 15] = [
+const REVIEWED_LEDGER: [(&str, &str); 16] = [
     (
         "sql-nul-after-hex-prefix",
         "ada05d3c4ccbcb21de99ab1609081812dbe7a37e76a516595d44af97cb6ed02e",
@@ -100,6 +100,10 @@ const REVIEWED_LEDGER: [(&str, &str); 15] = [
     (
         "args-get-invalid-utf8-names",
         "3c9133937f99186e0ef69373aef20e1a5382ce02ece6b94936da02a4c07cb95f",
+    ),
+    (
+        "json-invalid-utf8-keys",
+        "5475fd660355bbc435ec9208d8cb01b6cb2206e28a7ad500af8ff4b4782d9a05",
     ),
 ];
 
