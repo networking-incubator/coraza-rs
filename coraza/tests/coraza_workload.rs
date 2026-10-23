@@ -31,7 +31,8 @@ use std::{
 };
 
 use driver::{
-    compare_expected, load_workload, outcome_document, parse_case_bytes, run_case, sha256_hex, write_outcomes,
+    compare_expected, load_workload, outcome_document, parse_case_bytes, parse_iterations, run_case, run_timing,
+    sha256_hex, timing_document, write_outcomes, write_timing_document,
 };
 use serde_json::{Value, json};
 
@@ -111,8 +112,9 @@ fn minimal_case() -> Value {
 
 #[test]
 fn workload_loads_and_validates_hashes_and_ranges() {
-    let cases = load_workload(&workload_root()).expect("shipped workload must load");
-    let ids = cases
+    let workload = load_workload(&workload_root()).expect("shipped workload must load");
+    let ids = workload
+        .cases
         .iter()
         .map(|prepared| prepared.case.case_id.as_str())
         .collect::<Vec<_>>();
@@ -132,8 +134,8 @@ fn workload_loads_and_validates_hashes_and_ranges() {
 
 #[test]
 fn driver_matches_every_expected_outcome() {
-    let cases = load_workload(&workload_root()).expect("shipped workload must load");
-    for prepared in &cases {
+    let workload = load_workload(&workload_root()).expect("shipped workload must load");
+    for prepared in &workload.cases {
         let outcome = run_case(prepared).expect("case must run");
         compare_expected(&prepared.case, &outcome)
             .unwrap_or_else(|error| panic!("case {}: {error}", prepared.case.case_id));
@@ -142,9 +144,10 @@ fn driver_matches_every_expected_outcome() {
 
 #[test]
 fn outcome_documents_are_emitted_as_ndjson() {
-    let cases = load_workload(&workload_root()).expect("shipped workload must load");
+    let workload = load_workload(&workload_root()).expect("shipped workload must load");
+    let cases = &workload.cases;
     let mut documents = Vec::new();
-    for prepared in &cases {
+    for prepared in cases {
         let outcome = run_case(prepared).expect("case must run");
         documents.push(outcome_document(&prepared.case, &outcome));
     }
@@ -155,7 +158,7 @@ fn outcome_documents_are_emitted_as_ndjson() {
 
     let lines = text.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), cases.len(), "one outcome line per case");
-    for (line, prepared) in lines.iter().zip(&cases) {
+    for (line, prepared) in lines.iter().zip(cases) {
         let document: Value = serde_json::from_str(line).expect("each line is JSON");
         assert_eq!(document["case_id"], prepared.case.case_id);
         assert!(document["matches"].is_array(), "matches is an array");
@@ -302,5 +305,114 @@ fn fixture_ranges_and_hashes_are_validated() {
     assert!(
         error.to_string().contains("SHA-256"),
         "error must name the fixture hash: {error}"
+    );
+}
+
+#[test]
+fn timing_document_matches_the_contract_shape_and_order() {
+    let workload = load_workload(&workload_root()).expect("shipped workload must load");
+    let iterations = 2;
+    let samples = run_timing(&workload, iterations).expect("timing run");
+    let document = timing_document(&workload, iterations, &samples);
+
+    let object = document.as_object().expect("timing document is an object");
+    let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "cases",
+            "engine",
+            "iterations",
+            "manifest_sha256",
+            "schema_version",
+            "workload_id",
+        ],
+        "the timing document must have exactly the contract fields"
+    );
+    assert_eq!(document["schema_version"], 1, "timing schema version");
+    assert_eq!(document["engine"], "rust", "engine name");
+    assert_eq!(document["workload_id"], "coraza-common-subset-v1", "workload identity");
+    let manifest = fs::read(workload_root().join("manifest.json")).expect("read manifest");
+    assert_eq!(
+        document["manifest_sha256"],
+        sha256_hex(&manifest),
+        "manifest hash covers the exact manifest bytes"
+    );
+    assert_eq!(document["iterations"], 2, "iteration count");
+
+    let cases = document["cases"].as_array().expect("cases is an array");
+    let expected_ids = workload
+        .cases
+        .iter()
+        .map(|prepared| prepared.case.case_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(cases.len(), expected_ids.len(), "one entry per manifest case");
+    for (entry, expected_id) in cases.iter().zip(&expected_ids) {
+        assert_eq!(entry["case_id"].as_str(), Some(*expected_id), "manifest order");
+        let samples = entry["samples_ns"].as_array().expect("samples is an array");
+        assert_eq!(samples.len(), iterations, "one sample per iteration");
+        for sample in samples {
+            assert!(sample.as_u64().is_some(), "samples are non-negative integers");
+        }
+    }
+}
+
+#[test]
+fn timing_document_is_written_atomically_and_round_trips() {
+    let workload = load_workload(&workload_root()).expect("shipped workload must load");
+    let iterations = 1;
+    let samples = run_timing(&workload, iterations).expect("timing run");
+    let document = timing_document(&workload, iterations, &samples);
+
+    let temporary = tempfile::tempdir().expect("create temporary directory");
+    let path = temporary.path().join("timing.json");
+    write_timing_document(&path, &document).expect("write timing document");
+    let text = fs::read_to_string(&path).expect("read timing document");
+    let parsed: Value = serde_json::from_str(&text).expect("written timing document is JSON");
+    assert_eq!(parsed, document, "the written document matches the timed samples");
+
+    let entries = fs::read_dir(temporary.path())
+        .expect("list temporary directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read temporary directory entries");
+    assert_eq!(entries.len(), 1, "the temporary file was renamed, not left behind");
+}
+
+#[test]
+fn invalid_iterations_are_rejected() {
+    for invalid in ["", "0", "-1", "1.5", "ten", "10000001", "18446744073709551616"] {
+        let error = parse_iterations(invalid).expect_err("an invalid iteration count must fail");
+        assert!(
+            error.to_string().contains("--iterations"),
+            "error must name the flag: {error}"
+        );
+    }
+    assert_eq!(parse_iterations("1").expect("the minimum is accepted"), 1);
+    assert_eq!(
+        parse_iterations("10000000").expect("the documented maximum is accepted"),
+        10_000_000
+    );
+}
+
+#[test]
+fn timing_document_write_rejects_an_unwritable_path() {
+    let temporary = tempfile::tempdir().expect("create temporary directory");
+    let path = temporary.path().join("missing").join("timing.json");
+    let error = write_timing_document(&path, &json!({"schema_version": 1}))
+        .expect_err("a missing destination directory must fail");
+    assert!(
+        error.to_string().contains("temporary timing file"),
+        "error must name the write failure: {error}"
+    );
+    assert!(!path.exists(), "no document is created on failure");
+
+    let directory = temporary.path().join("destination");
+    fs::create_dir(&directory).expect("create destination directory");
+    let error = write_timing_document(&directory, &json!({"schema_version": 1}))
+        .expect_err("a directory destination must fail");
+    assert!(
+        error.to_string().contains("cannot replace"),
+        "error must name the rename failure: {error}"
     );
 }

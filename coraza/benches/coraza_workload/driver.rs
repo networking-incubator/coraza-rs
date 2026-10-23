@@ -22,6 +22,7 @@ use std::{
     fs,
     io::Write as _,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -35,6 +36,12 @@ use sha2::{Digest as _, Sha256};
 
 /// Case schema version understood by this driver.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
+
+/// Timing document schema version understood by the coordinator.
+pub(crate) const TIMING_SCHEMA_VERSION: u64 = 1;
+
+/// Largest accepted `--iterations` value, matching the coordinator bound.
+pub(crate) const MAX_ITERATIONS: u64 = 10_000_000;
 
 /// Highest TX index a Coraza capture can occupy.
 const MAX_CAPTURE_INDEX: usize = 9;
@@ -253,6 +260,26 @@ pub(crate) struct PreparedCase {
     pub(crate) case: Case,
     /// Shared compiled policy and configuration.
     waf: Waf,
+}
+
+/// One validated workload with every policy compiled once.
+#[derive(Debug)]
+pub(crate) struct Workload {
+    /// Stable workload identifier from the manifest.
+    pub(crate) workload_id: String,
+    /// Lower-case SHA-256 of the exact manifest file bytes.
+    pub(crate) manifest_sha256: String,
+    /// Cases in manifest order, each with its policy compiled once.
+    pub(crate) cases: Vec<PreparedCase>,
+}
+
+/// One case's raw per-transaction durations.
+#[derive(Debug)]
+pub(crate) struct TimingCase {
+    /// Stable case identifier from the manifest.
+    pub(crate) case_id: String,
+    /// One non-negative duration in nanoseconds per fresh transaction.
+    pub(crate) samples_ns: Vec<u64>,
 }
 
 /// One observed rule match.
@@ -1291,10 +1318,11 @@ fn check_fixture_sha(
 // -----------------------------------------------------------------------------
 
 /// Reads the manifest, verifies every case hash and compiles every policy once.
-pub(crate) fn load_workload(root: &Path) -> Result<Vec<PreparedCase>, DriverError> {
+pub(crate) fn load_workload(root: &Path) -> Result<Workload, DriverError> {
     let manifest_path = root.join("manifest.json");
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|error| DriverError::Load(format!("cannot read {}: {error}", manifest_path.display())))?;
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| DriverError::Load(format!("manifest is not valid JSON: {error}")))?;
     let object = as_object(&manifest, "manifest")?;
@@ -1308,9 +1336,11 @@ pub(crate) fn load_workload(root: &Path) -> Result<Vec<PreparedCase>, DriverErro
             "manifest schema_version must be {SCHEMA_VERSION}"
         )));
     }
-    if string_field(object, "workload_id", "manifest")?.is_empty() {
+    let workload_id = string_field(object, "workload_id", "manifest")?;
+    if workload_id.is_empty() {
         return Err(DriverError::Load("manifest workload_id is empty".to_owned()));
     }
+    let workload_id = workload_id.to_owned();
     if optional_string_field(object, "description", "manifest")?.is_none() {
         return Err(DriverError::Load("manifest description is missing".to_owned()));
     }
@@ -1353,7 +1383,11 @@ pub(crate) fn load_workload(root: &Path) -> Result<Vec<PreparedCase>, DriverErro
         let waf = compile_policy(&case.sec_lang, &case.case_id)?;
         prepared.push(PreparedCase { case, waf });
     }
-    Ok(prepared)
+    Ok(Workload {
+        workload_id,
+        manifest_sha256,
+        cases: prepared,
+    })
 }
 
 /// Compiles one policy outside any transaction.
@@ -1380,26 +1414,11 @@ pub(crate) fn run_case(prepared: &PreparedCase) -> Result<Outcome, DriverError> 
             case.case_id
         ))
     })?;
-    let mut transaction = prepared.waf.new_transaction_with_id(case.case_id.clone());
     let mut matches = Vec::new();
     let mut seen = 0_usize;
-    let mut logging_ran = false;
-    for call in &case.phase_calls {
-        drive_call(&mut transaction, case, uri, call)?;
-        absorb_matches(&transaction, call.phase, &mut seen, &mut matches);
-        if call.call == Call::ProcessLogging {
-            logging_ran = true;
-        }
-        if transaction.interruption().is_some() {
-            break;
-        }
-    }
-    if !logging_ran {
-        transaction
-            .process_logging()
-            .map_err(|error| DriverError::Run(format!("case {} logging failed: {error}", case.case_id)))?;
-        absorb_matches(&transaction, 5, &mut seen, &mut matches);
-    }
+    let transaction = drive_lifecycle(prepared, uri, |transaction, phase| {
+        absorb_matches(transaction, phase, &mut seen, &mut matches);
+    })?;
     let interruption = transaction.interruption().map(|value| OutcomeInterruption {
         rule_id: value.rule_id,
         action: value.action.clone(),
@@ -1416,6 +1435,39 @@ pub(crate) fn run_case(prepared: &PreparedCase) -> Result<Outcome, DriverError> 
         flags: read_flags(&transaction, &case.expected.flags),
         collections,
     })
+}
+
+/// Drives one fresh transaction through the ordered lifecycle, including logging.
+///
+/// `after_call` observes the transaction after each call, which the outcome
+/// mode uses to attribute matches to phases. Interruption stops later calls
+/// and logging always runs. The transaction is returned so the caller decides
+/// when it is dropped.
+fn drive_lifecycle(
+    prepared: &PreparedCase,
+    uri: &str,
+    mut after_call: impl FnMut(&Transaction, u8),
+) -> Result<Transaction, DriverError> {
+    let case = &prepared.case;
+    let mut transaction = prepared.waf.new_transaction_with_id(case.case_id.clone());
+    let mut logging_ran = false;
+    for call in &case.phase_calls {
+        drive_call(&mut transaction, case, uri, call)?;
+        after_call(&transaction, call.phase);
+        if call.call == Call::ProcessLogging {
+            logging_ran = true;
+        }
+        if transaction.interruption().is_some() {
+            break;
+        }
+    }
+    if !logging_ran {
+        transaction
+            .process_logging()
+            .map_err(|error| DriverError::Run(format!("case {} logging failed: {error}", case.case_id)))?;
+        after_call(&transaction, 5);
+    }
+    Ok(transaction)
 }
 
 /// Executes one lifecycle call.
@@ -1563,6 +1615,116 @@ fn read_collections(
         });
     }
     Ok(collections)
+}
+
+// -----------------------------------------------------------------------------
+// Timing
+// -----------------------------------------------------------------------------
+
+/// Parses and bounds the `--iterations` value.
+pub(crate) fn parse_iterations(text: &str) -> Result<usize, DriverError> {
+    let iterations = text
+        .parse::<u64>()
+        .map_err(|error| DriverError::Load(format!("--iterations {text} is not a non-negative integer: {error}")))?;
+    if iterations == 0 || iterations > MAX_ITERATIONS {
+        return Err(DriverError::Load(format!(
+            "--iterations must be between 1 and {MAX_ITERATIONS}, got {iterations}"
+        )));
+    }
+    usize::try_from(iterations)
+        .map_err(|error| DriverError::Load(format!("--iterations {iterations} is too large: {error}")))
+}
+
+/// Runs every case in manifest order for exactly `iterations` fresh transactions.
+///
+/// The timed section of each iteration covers one complete transaction: the
+/// public construction call on the already compiled WAF, every ordered
+/// lifecycle call for the case (connection, URI, request headers, request body,
+/// response headers, response body and logging), the same interruption
+/// short-circuit the outcome mode uses, and the transaction drop that closes
+/// it. Workload loading, hash validation, policy compilation, outcome
+/// observation and comparison, timing bookkeeping and document serialization
+/// stay outside the timed section. No warmup pass runs here; the coordinator
+/// owns repetitions.
+pub(crate) fn run_timing(workload: &Workload, iterations: usize) -> Result<Vec<TimingCase>, DriverError> {
+    let mut cases = Vec::with_capacity(workload.cases.len());
+    for prepared in &workload.cases {
+        let uri = std::str::from_utf8(&prepared.case.request.uri).map_err(|error| {
+            DriverError::Run(format!(
+                "case {} request URI is not UTF-8; the Rust public API requires text: {error}",
+                prepared.case.case_id
+            ))
+        })?;
+        let mut samples_ns = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = Instant::now();
+            run_timed_transaction(prepared, uri)?;
+            let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            samples_ns.push(elapsed);
+        }
+        cases.push(TimingCase {
+            case_id: prepared.case.case_id.clone(),
+            samples_ns,
+        });
+    }
+    Ok(cases)
+}
+
+/// Drives and closes one fresh transaction; the caller times the call.
+fn run_timed_transaction(prepared: &PreparedCase, uri: &str) -> Result<(), DriverError> {
+    let transaction = drive_lifecycle(prepared, uri, |_, _| {})?;
+    drop(transaction);
+    Ok(())
+}
+
+/// Builds the timing document defined by the coordinator contract.
+///
+/// The document has exactly the `schema_version`, `engine`, `workload_id`,
+/// `manifest_sha256`, `iterations` and `cases` fields. Each case carries its
+/// manifest identifier and exactly the configured number of non-negative
+/// nanosecond samples.
+pub(crate) fn timing_document(workload: &Workload, iterations: usize, cases: &[TimingCase]) -> Value {
+    let cases = cases
+        .iter()
+        .map(|case| {
+            json!({
+                "case_id": case.case_id,
+                "samples_ns": case.samples_ns,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": TIMING_SCHEMA_VERSION,
+        "engine": "rust",
+        "workload_id": workload.workload_id,
+        "manifest_sha256": workload.manifest_sha256,
+        "iterations": iterations,
+        "cases": cases,
+    })
+}
+
+/// Writes the timing document by renaming a temporary file over `path`.
+///
+/// The temporary file lives in the destination directory, so a failed run
+/// cannot leave a partial document at `path`.
+pub(crate) fn write_timing_document(path: &Path, document: &Value) -> Result<(), DriverError> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(directory).map_err(|error| {
+        DriverError::Load(format!(
+            "cannot create a temporary timing file in {}: {error}",
+            directory.display()
+        ))
+    })?;
+    serde_json::to_writer(&mut file, document)
+        .map_err(|error| DriverError::Load(format!("cannot encode the timing document: {error}")))?;
+    file.write_all(b"\n")
+        .map_err(|error| DriverError::Load(format!("cannot write the timing document: {error}")))?;
+    file.persist(path)
+        .map_err(|error| DriverError::Load(format!("cannot replace {}: {error}", path.display())))?;
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
