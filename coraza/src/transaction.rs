@@ -1678,6 +1678,53 @@ mod tests {
     }
 
     #[test]
+    fn json_body_keeps_decoded_argument_name_bytes() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:160,phase:1,ctl:requestBodyProcessor=JSON,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("json-byte-keys");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"{\"k\xff\":1,\"k\xfe\":2}"), None);
+
+        let expected = vec![
+            (b"json.k\xfe".to_vec(), b"2".to_vec()),
+            (b"json.k\xff".to_vec(), b"1".to_vec()),
+        ];
+        assert_eq!(byte_entries(&tx, RuleVariable::ArgsPost), expected);
+        assert_eq!(byte_entries(&tx, RuleVariable::Args), expected);
+    }
+
+    #[test]
+    fn json_response_body_keeps_decoded_argument_name_bytes() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecResponseBodyAccess On\n\
+                 SecResponseBodyMimeType application/json\n\
+                 SecAction \"id:161,phase:3,ctl:responseBodyProcessor=JSON,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("json-response-byte-keys");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.process_response_body(b"{\"k\xff\":1,\"k\xfe\":2}"), None);
+
+        let expected = vec![
+            (b"json.k\xfe".to_vec(), b"2".to_vec()),
+            (b"json.k\xff".to_vec(), b"1".to_vec()),
+        ];
+        assert_eq!(byte_entries(&tx, RuleVariable::ResponseArgs), expected);
+    }
+
+    #[test]
     fn stores_and_matches_byte_arguments() {
         let mut tx = Transaction::new("tx-1");
         tx.add_get_argument("id", b"\xff");
