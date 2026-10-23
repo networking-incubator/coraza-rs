@@ -678,7 +678,12 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
         base_dir: options.config_dir,
         datasets: options.datasets,
     };
-    let rule = compile_sec_rule_in(&options.opts, &context, options.default_actions);
+    let rule = compile_sec_rule_in(
+        &options.opts,
+        &context,
+        options.default_actions,
+        options.waf_config.case_sensitive_args_keys,
+    );
     add_rule(options, rule)
 }
 
@@ -794,7 +799,8 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
 fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     let (ids, variables) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateTargetById ID \"VARIABLES\"")?;
-    let variables = VariableList::parse(variables).map_err(|e| e.message)?;
+    let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
+    let variables = VariableList::parse(variables, case_sensitive_args_keys).map_err(|e| e.message)?;
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
@@ -821,7 +827,8 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
 fn directive_sec_rule_update_target_by_tag(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     let (tag, variables) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateTargetByTag TAG \"VARIABLES\"")?;
-    let variables = VariableList::parse(variables).map_err(|e| e.message)?;
+    let variables =
+        VariableList::parse(variables, options.waf_config.case_sensitive_args_keys).map_err(|e| e.message)?;
 
     options
         .rules

@@ -1942,6 +1942,49 @@ payload\r\n\
     }
 
     #[test]
+    fn args_regex_key_selector_folds_case_in_default_mode() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS:/^userId$/ \"@contains attack\" \"id:176,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        for supplied in ["USERID", "UserId"] {
+            let mut tx = waf.new_transaction_with_id("args-regex-default");
+            tx.add_get_argument(supplied, b"an attack");
+
+            assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(176));
+            assert_eq!(
+                tx.matched_rules()
+                    .first()
+                    .and_then(|matched| matched.matches.first())
+                    .map(|item| item.key.as_str()),
+                Some(supplied)
+            );
+        }
+    }
+
+    #[test]
+    fn args_regex_key_selector_is_exact_in_strict_mode() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.config_mut().case_sensitive_args_keys = true;
+        parser
+            .from_string("SecRule ARGS:/^userId$/ \"@contains attack\" \"id:177,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        for supplied in ["USERID", "UserId"] {
+            let mut tx = waf.new_transaction_with_id("args-regex-strict-miss");
+            tx.add_get_argument(supplied, b"an attack");
+            assert_eq!(tx.process_request_headers(), None, "{supplied}");
+        }
+
+        let mut tx = waf.new_transaction_with_id("args-regex-strict-hit");
+        tx.add_get_argument("userId", b"an attack");
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(177));
+    }
+
+    #[test]
     fn case_folding_keeps_invalid_utf8_keys_distinct() {
         let mut tx = Transaction::new("invalid-utf8-case");
         tx.add_get_argument(b"Id\xff", b"one");
