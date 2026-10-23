@@ -16,10 +16,19 @@ SecAuditLogFormat JSON
 SecAuditLogParts ABFHKZ
 ```
 
+For `SecAuditLogType HTTPS`, `SecAuditLog` is the endpoint URL instead of a
+path, for example `SecAuditLog https://collector.example/audit`.
+
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
 supported writers are serial files or standard output/error, concurrent files,
-and syslog. `HTTPS` is recognized but rejected when the WAF is built. Audit
-timestamps are UTC, while Go Coraza uses the process local time zone.
+syslog, and HTTP(S) endpoints. Audit timestamps are UTC, while Go Coraza uses
+the process local time zone.
+
+`SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
+WAF is built with that writer rejected, never silently replaced by another one.
+With the feature, each entry is POSTed to `SecAuditLog` with a one-second
+timeout, as in Go Coraza. The target may be `http://` or `https://`, as Go
+Coraza accepts both, so entries sent to a plaintext target are not encrypted.
 
 Call `Transaction::process_logging` after response processing when the caller
 needs to observe audit writer errors. Dropping a transaction runs the logging
