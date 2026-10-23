@@ -452,15 +452,13 @@
         "names": [
           "cmdLine"
         ],
-        "state": "unavailable",
+        "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:cmd_line",
         "go_reference": "internal/transformations/cmd_line.go",
         "fixtures": [],
-        "differences": [
-          "Registered by Go at internal/transformations/transformations.go:34 but absent from the Rust transformation factory."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -630,29 +628,25 @@
         "names": [
           "removeComments"
         ],
-        "state": "unavailable",
+        "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:remove_comments",
         "go_reference": "internal/transformations/remove_comments.go",
         "fixtures": [],
-        "differences": [
-          "Registered by Go at internal/transformations/transformations.go:50 but absent from the Rust transformation factory."
-        ]
+        "differences": []
       },
       {
         "names": [
           "removeCommentsChar"
         ],
-        "state": "unavailable",
+        "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:remove_comments_char",
         "go_reference": "internal/transformations/remove_comments_char.go",
         "fixtures": [],
-        "differences": [
-          "Registered by Go at internal/transformations/transformations.go:51 but absent from the Rust transformation factory."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -682,15 +676,13 @@
         "names": [
           "replaceComments"
         ],
-        "state": "unavailable",
+        "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/actions/mod.rs:transformation_by_name",
+        "evaluator": "coraza/src/transformations/simple.rs:replace_comments",
         "go_reference": "internal/transformations/replace_comments.go",
         "fixtures": [],
-        "differences": [
-          "Registered by Go at internal/transformations/transformations.go:54 but absent from the Rust transformation factory."
-        ]
+        "differences": []
       },
       {
         "names": [
