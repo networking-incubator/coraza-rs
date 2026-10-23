@@ -23,7 +23,7 @@
 use super::{
     Interruption, Transaction,
     body_buffer::BodyBuffer,
-    request_body::{flatten_json_value, parse_json},
+    request_body::{publish_json_arguments, read_json_body},
     variables::BodyProcessor,
 };
 use crate::types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase};
@@ -96,7 +96,9 @@ impl Transaction {
             return self.interruption.clone();
         }
 
-        if processable && !self.response_body_buffer.is_empty() {
+        // Go runs the selected processor even for an empty response body
+        // (`internal/corazawaf/transaction.go:1389-1423`).
+        if processable {
             let mut buffer = std::mem::take(&mut self.response_body_buffer);
             let inspected = buffer.contiguous().map(|body| {
                 let length = body.len();
@@ -118,18 +120,36 @@ impl Transaction {
     }
 
     /// Parse or store response body data before phase 4 rules run.
+    ///
+    /// With the JSON processor, Go Coraza stores the raw body in
+    /// `TX.json_response_body` after a successful parse and leaves
+    /// `RESPONSE_BODY` unset (`internal/bodyprocessors/json.go:92-99`,
+    /// `internal/corazawaf/transaction.go:1399-1423`). Other processors keep the
+    /// existing contract.
     fn inspect_response_body(&mut self, body: &[u8]) {
-        self.response_body.set(body);
         if let Some(BodyProcessor::Json) = self.response_body_processor {
-            match parse_json(body, self.config.response_body_json_depth_limit) {
-                Ok(value) => flatten_json_value(&value, &mut String::from("json"), self, true),
-                Err(message) => {
+            // Arguments are published before the error is checked so a valid
+            // prefix stays inspectable; see Go Coraza `json.go:74-97`.
+            let parsed = read_json_body(
+                body,
+                self.config.response_body_json_depth_limit,
+                self.config.argument_limit,
+            );
+            publish_json_arguments(self, &parsed.arguments, true);
+            if parsed.truncated {
+                self.arguments_limit_reached.set("1");
+            }
+            match parsed.error {
+                Some(message) => {
                     self.res_body_error.set("1");
-                    self.res_body_error_msg.set(format!("JSON: malformed json: {message}"));
+                    self.res_body_error_msg.set(format!("JSON: {message}"));
                     self.res_body_processor_error.set("1");
                     self.res_body_processor_error_msg.set(message);
                 },
+                None => self.set_tx_variable("json_response_body", body),
             }
+        } else {
+            self.response_body.set(body);
         }
     }
 
@@ -137,13 +157,5 @@ impl Transaction {
     pub(super) fn set_response_body_processor(&mut self, name: &str) {
         self.response_body_processor = BodyProcessor::parse(name);
         self.res_body_processor.set(name.to_ascii_uppercase());
-    }
-
-    /// Add a parsed response body argument to `RESPONSE_ARGS`.
-    pub(super) fn add_response_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
-        let value = value.as_ref();
-        if self.within_argument_limit(self.response_args.value_count()) {
-            self.response_args.add(key, value);
-        }
     }
 }

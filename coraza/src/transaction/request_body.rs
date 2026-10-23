@@ -21,6 +21,8 @@
 //! Request body ingestion and request body processor parsing.
 
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     io::Write as _,
     path::{Path, PathBuf},
 };
@@ -155,15 +157,25 @@ impl Transaction {
                 }
             },
             BodyProcessor::Json => {
-                let depth_limit = self.config.request_body_json_depth_limit;
-                match parse_json(body, depth_limit) {
-                    Ok(value) => flatten_json_value(&value, &mut String::from("json"), self, false),
-                    Err(message) => {
+                // Arguments are published before the error is checked so a valid
+                // prefix stays inspectable; see Go Coraza `json.go:34-62`.
+                let parsed = read_json_body(
+                    body,
+                    self.config.request_body_json_depth_limit,
+                    self.config.argument_limit,
+                );
+                publish_json_arguments(self, &parsed.arguments, false);
+                if parsed.truncated {
+                    self.arguments_limit_reached.set("1");
+                }
+                match parsed.error {
+                    Some(message) => {
                         self.reqbody_error.set("1");
                         self.reqbody_error_msg.set(format!("JSON: {message}"));
                         self.reqbody_processor_error.set("1");
                         self.reqbody_processor_error_msg.set(message);
                     },
+                    None => self.set_tx_variable("json_request_body", body),
                 }
             },
             BodyProcessor::Xml => match xml::parse(body) {
@@ -317,84 +329,1234 @@ pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec
         })
 }
 
-/// Parse JSON and enforce the configured nesting limit.
-pub(super) fn parse_json(body: &[u8], depth_limit: usize) -> Result<serde_json::Value, String> {
-    let body = String::from_utf8_lossy(body);
-    // shortcut: serde_json caps nesting at 128; replace it if configured limits above 128 must work.
-    let value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
-    if json_depth(&value) > depth_limit {
-        return Err(format!("nesting deeper than the limit of {depth_limit}"));
-    }
-    Ok(value)
+/// Bounds the flattened form relative to the body that produced it.
+///
+/// `SecArgumentsLimit` counts entries, not bytes, and the flattened key is the
+/// full path rewritten for every leaf, so memory grows with depth times leaves
+/// while the entry count grows only with leaves. Go Coraza uses the same factor
+/// (`internal/bodyprocessors/json.go:113`); see the comment there.
+const FLATTEN_BYTES_FACTOR: usize = 8;
+
+/// Keeps small bodies unaffected, where a few long keys can legitimately
+/// outweigh the input (`internal/bodyprocessors/json.go:117`).
+const FLATTEN_BYTES_FLOOR: usize = 4096;
+
+/// Why flattening stopped with an error, as Go Coraza reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonFlattenError {
+    /// The configured container depth was exhausted.
+    Recursion,
+    /// The flattened form outgrew its byte budget.
+    Budget,
 }
 
-/// Return the deepest object or array nesting, with scalars at depth zero.
-fn json_depth(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
-        serde_json::Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
-        _ => 0,
-    }
+/// A JSON body flattened the way Go Coraza's `readJSON` does.
+pub(super) struct JsonBody {
+    /// Dot-separated paths, in discovery order per path, with raw value bytes.
+    pub(super) arguments: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Whether the argument or array-length cap stopped the walk.
+    pub(super) truncated: bool,
+    /// The parser error message, after any best-effort arguments were collected.
+    pub(super) error: Option<String>,
 }
 
-/// Flatten JSON values into the dot-separated `ARGS_POST` names used by Coraza.
-pub(super) fn flatten_json_value(value: &serde_json::Value, key: &mut String, tx: &mut Transaction, response: bool) {
-    match value {
-        serde_json::Value::Object(values) => {
-            for (name, value) in values {
-                let previous_len = key.len();
-                key.push('.');
-                key.push_str(name);
-                flatten_json_value(value, key, tx, response);
-                key.truncate(previous_len);
+/// A JSON value as gjson sees it while flattening.
+enum JsonValue<'a> {
+    /// An object or array, holding the raw text it was read from.
+    Json(&'a [u8]),
+    /// A string, holding its unescaped content.
+    String(Cow<'a, [u8]>),
+    /// A null, which Go Coraza flattens to an empty string.
+    Null,
+    /// A `true` literal, holding its raw token.
+    True(&'a [u8]),
+    /// A `false` literal, holding its raw token.
+    False(&'a [u8]),
+    /// A number, holding its raw token so its spelling survives.
+    Number(&'a [u8]),
+}
+
+/// A child of an object, an array element, or the single value of a scalar root.
+enum JsonKey<'a> {
+    /// An object member name, unescaped.
+    Name(Cow<'a, [u8]>),
+    /// An array element index, or the zero key gjson gives a scalar root.
+    Index(usize),
+}
+
+/// Reads one object or array the way gjson's `Result.ForEach` does.
+struct JsonChildScanner<'a> {
+    /// The container text, when the value is an object or array.
+    raw: Option<&'a [u8]>,
+    /// Byte offset of the next candidate child.
+    offset: usize,
+    /// Whether `raw` holds an object rather than an array.
+    object: bool,
+    /// Index the next array element reports.
+    index: usize,
+    /// A scalar root, reported once as a child.
+    single: Option<JsonValue<'a>>,
+}
+
+impl<'a> JsonChildScanner<'a> {
+    /// Build a scanner for a parsed value.
+    fn new(value: Option<JsonValue<'a>>) -> Self {
+        match value {
+            Some(JsonValue::Json(raw)) => Self::container(raw),
+            Some(other) => Self {
+                raw: None,
+                offset: 0,
+                object: false,
+                index: 0,
+                single: Some(other),
+            },
+            None => Self::empty(),
+        }
+    }
+
+    /// Build a scanner with nothing to report.
+    fn empty() -> Self {
+        Self {
+            raw: None,
+            offset: 0,
+            object: false,
+            index: 0,
+            single: None,
+        }
+    }
+
+    /// Build a scanner over container text.
+    fn container(raw: &'a [u8]) -> Self {
+        let mut offset = 0_usize;
+        let mut object = true;
+        loop {
+            match raw.get(offset).copied() {
+                Some(b'{') => {
+                    offset += 1;
+                    break;
+                },
+                Some(b'[') => {
+                    object = false;
+                    offset += 1;
+                    break;
+                },
+                Some(byte) if byte > b' ' => {
+                    // gjson's ForEach stops on anything but a container or whitespace.
+                    return Self::empty();
+                },
+                Some(_) => offset += 1,
+                None => return Self::empty(),
             }
-        },
-        serde_json::Value::Array(values) => {
-            if !values.is_empty() {
-                let length = values.len().to_string();
-                if response {
-                    tx.add_response_argument(key, length.as_bytes());
+        }
+        Self {
+            raw: Some(raw),
+            offset,
+            object,
+            index: 0,
+            single: None,
+        }
+    }
+
+    /// The next child, with its key, in document order.
+    fn next(&mut self) -> Option<(JsonKey<'a>, JsonValue<'a>)> {
+        if let Some(single) = self.single.take() {
+            return Some((JsonKey::Index(0), single));
+        }
+        let raw = self.raw?;
+        if self.object {
+            loop {
+                if raw.get(self.offset).copied() != Some(b'"') {
+                    raw.get(self.offset)?;
+                    self.offset += 1;
+                    continue;
+                }
+                let key_start = self.offset;
+                let (end, escaped, ok) = scan_json_string(raw, key_start + 1);
+                if !ok {
+                    return None;
+                }
+                let content = raw.get(key_start + 1..end.checked_sub(1)?).unwrap_or_default();
+                let name = if escaped {
+                    Cow::Owned(unescape_json_string(content))
                 } else {
-                    tx.add_post_argument(key, length.as_bytes());
+                    Cow::Borrowed(content)
+                };
+                self.offset = end;
+                self.skip_separators(raw);
+                let (end, value) = parse_any_value(raw, self.offset)?;
+                // gjson's ForEach advances one more byte after each pair.
+                self.offset = end.saturating_add(1);
+                return Some((JsonKey::Name(name), value));
+            }
+        }
+        self.skip_separators(raw);
+        let index = self.index;
+        self.index += 1;
+        let (end, value) = parse_any_value(raw, self.offset)?;
+        // gjson's ForEach advances one more byte after each element.
+        self.offset = end.saturating_add(1);
+        Some((JsonKey::Index(index), value))
+    }
+
+    /// Skip the whitespace, commas and colons gjson skips before a value.
+    fn skip_separators(&mut self, raw: &[u8]) {
+        while raw
+            .get(self.offset)
+            .is_some_and(|byte| *byte <= b' ' || *byte == b',' || *byte == b':')
+        {
+            self.offset += 1;
+        }
+    }
+}
+
+/// One open container in the flattening walk.
+struct JsonFrame<'a> {
+    /// Reads this container's children.
+    scanner: JsonChildScanner<'a>,
+    /// Path length of this container's own key.
+    base_len: usize,
+    /// Path length to restore when the container ends.
+    restore_len: usize,
+    /// Container levels still allowed below this one.
+    depth_remaining: usize,
+    /// Array elements reported at this level.
+    array_len: usize,
+}
+
+/// The state of one gjson-compatible flattening walk.
+struct JsonFlattener {
+    /// Flattened paths and their values, in discovery order.
+    values: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Bytes retained in `values` so far.
+    used_bytes: usize,
+    /// Values counted against the argument limit.
+    argument_count: usize,
+    /// Array-length entries counted against their own cap.
+    length_count: usize,
+    /// Configured argument limit; zero means unlimited.
+    argument_limit: usize,
+    /// Maximum key and value bytes the flattened form may retain.
+    byte_budget: usize,
+}
+
+impl JsonFlattener {
+    /// Start a walk with the given caps.
+    fn new(argument_limit: usize, byte_budget: usize) -> Self {
+        Self {
+            values: HashMap::new(),
+            used_bytes: 0,
+            argument_count: 0,
+            length_count: 0,
+            argument_limit,
+            byte_budget,
+        }
+    }
+
+    /// Flatten `root`, returning whether the argument or length cap was hit.
+    fn flatten<'a>(&mut self, root: Option<JsonValue<'a>>, max_recursion: usize) -> Result<bool, JsonFlattenError> {
+        if max_recursion == 0 {
+            return Err(JsonFlattenError::Recursion);
+        }
+        let mut path = b"json".to_vec();
+        let mut frames: Vec<JsonFrame<'a>> = vec![JsonFrame {
+            scanner: JsonChildScanner::new(root),
+            base_len: path.len(),
+            restore_len: path.len(),
+            depth_remaining: max_recursion,
+            array_len: 0,
+        }];
+        let mut truncated = false;
+        loop {
+            let next = match frames.last_mut() {
+                Some(frame) => frame.scanner.next(),
+                None => return Ok(truncated),
+            };
+            match next {
+                None => {
+                    let Some(frame) = frames.pop() else {
+                        return Ok(truncated);
+                    };
+                    if frame.array_len > 0 {
+                        // Go checks the length cap only when this level was not
+                        // already truncated by a nested call.
+                        if self.argument_limit > 0 && self.length_count >= self.argument_limit {
+                            truncated = true;
+                        } else {
+                            self.write_array_length(&path, &frame)?;
+                        }
+                    }
+                    path.truncate(frame.restore_len);
+                },
+                Some((key, value)) => {
+                    // Go checks the cap when its ForEach callback is invoked, so
+                    // exactly filling the limit without another item is not
+                    // truncation. Once it is hit no level writes anything more
+                    // (json.go:254-257), so ending the walk is equivalent.
+                    if self.argument_limit > 0 && self.argument_count >= self.argument_limit {
+                        return Ok(true);
+                    }
+                    self.flatten_item(&mut frames, &mut path, key, value)?;
+                },
+            }
+        }
+    }
+
+    /// Write one container's array-length entry.
+    fn write_array_length(&mut self, path: &[u8], frame: &JsonFrame<'_>) -> Result<(), JsonFlattenError> {
+        let length = frame.array_len.to_string();
+        let key = path.get(..frame.base_len).unwrap_or_default();
+        self.record(key, length.as_bytes())?;
+        self.length_count += 1;
+        Ok(())
+    }
+
+    /// Flatten one child.
+    fn flatten_item<'a>(
+        &mut self,
+        frames: &mut Vec<JsonFrame<'a>>,
+        path: &mut Vec<u8>,
+        key: JsonKey<'a>,
+        value: JsonValue<'a>,
+    ) -> Result<(), JsonFlattenError> {
+        let Some(frame) = frames.last_mut() else {
+            return Ok(());
+        };
+        let depth_remaining = frame.depth_remaining;
+        let previous_len = path.len();
+        path.push(b'.');
+        match key {
+            JsonKey::Name(name) => path.extend_from_slice(name.as_ref()),
+            JsonKey::Index(index) => {
+                path.extend_from_slice(index.to_string().as_bytes());
+                frame.array_len += 1;
+            },
+        }
+        let value: Cow<'_, [u8]> = match value {
+            JsonValue::Json(raw) => {
+                let depth = depth_remaining.saturating_sub(1);
+                if depth == 0 {
+                    return Err(JsonFlattenError::Recursion);
                 }
-                for (index, value) in values.iter().enumerate() {
-                    let previous_len = key.len();
-                    key.push('.');
-                    key.push_str(&index.to_string());
-                    flatten_json_value(value, key, tx, response);
-                    key.truncate(previous_len);
+                frames.push(JsonFrame {
+                    scanner: JsonChildScanner::container(raw),
+                    base_len: path.len(),
+                    restore_len: previous_len,
+                    depth_remaining: depth,
+                    array_len: 0,
+                });
+                return Ok(());
+            },
+            JsonValue::String(text) => text,
+            JsonValue::Null => Cow::Borrowed(b""),
+            JsonValue::True(raw) | JsonValue::False(raw) | JsonValue::Number(raw) => Cow::Borrowed(raw),
+        };
+        self.record(path, value.as_ref())?;
+        self.argument_count += 1;
+        path.truncate(previous_len);
+        Ok(())
+    }
+
+    /// Retain one flattened entry, enforcing the byte budget.
+    fn record(&mut self, key: &[u8], value: &[u8]) -> Result<(), JsonFlattenError> {
+        let used = self.used_bytes.saturating_add(key.len()).saturating_add(value.len());
+        if used > self.byte_budget {
+            return Err(JsonFlattenError::Budget);
+        }
+        self.used_bytes = used;
+        self.values.entry(key.to_vec()).or_default().push(value.to_vec());
+        Ok(())
+    }
+}
+
+/// Whether the quote at `quote` is escaped by an odd run of backslashes.
+///
+/// `lowest` is the first index gjson's run counter may read: `1` for
+/// `parseString` and the quote's next byte for `parseSquash`.
+fn is_escaped_quote(input: &[u8], quote: usize, lowest: usize) -> bool {
+    if quote.checked_sub(1).and_then(|index| input.get(index)) != Some(&b'\\') {
+        return false;
+    }
+    let mut run = 0_usize;
+    let mut index = quote.saturating_sub(2);
+    while index >= lowest {
+        if input.get(index) != Some(&b'\\') {
+            break;
+        }
+        run += 1;
+        let Some(previous) = index.checked_sub(1) else {
+            break;
+        };
+        index = previous;
+    }
+    run.is_multiple_of(2)
+}
+
+/// Scans a JSON string whose opening quote is just before `start`.
+///
+/// Mirrors gjson's `parseString`: it stops at the first quote that is not
+/// escaped by an odd run of backslashes and does not validate the content.
+/// Returns where scanning stopped, whether an escape was seen, and whether a
+/// closing quote was found.
+fn scan_json_string(input: &[u8], start: usize) -> (usize, bool, bool) {
+    let mut index = start;
+    while let Some(&byte) = input.get(index) {
+        if byte > b'\\' {
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            return (index + 1, false, true);
+        }
+        if byte == b'\\' {
+            index += 1;
+            while let Some(&escaped) = input.get(index) {
+                if escaped > b'\\' {
+                    index += 1;
+                    continue;
                 }
+                if escaped == b'"' && !is_escaped_quote(input, index, 1) {
+                    return (index + 1, true, true);
+                }
+                index += 1;
             }
-        },
-        serde_json::Value::String(value) => {
-            if response {
-                tx.add_response_argument(key, value.as_bytes());
+            break;
+        }
+        index += 1;
+    }
+    (index, false, false)
+}
+
+/// Finds the end of a string inside a squashed container.
+///
+/// Mirrors the string scan in gjson's `parseSquash` and returns the index just
+/// past its closing quote, or the input length when there is none.
+fn skip_squashed_string(input: &[u8], quote: usize) -> usize {
+    let lowest = quote + 1;
+    let mut index = lowest;
+    while let Some(&byte) = input.get(index) {
+        if byte != b'"' {
+            index += 1;
+            continue;
+        }
+        if !is_escaped_quote(input, index, lowest) {
+            return index + 1;
+        }
+        index += 1;
+    }
+    index
+}
+
+/// Finds the end of an object or array token, as gjson's `parseSquash` does.
+fn squash_json_value(input: &[u8], start: usize) -> (usize, &[u8]) {
+    let mut index = start + 1;
+    let mut depth = 1_usize;
+    while let Some(&byte) = input.get(index) {
+        match byte {
+            b'"' => index = skip_squashed_string(input, index),
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                index += 1;
+            },
+            b'}' | b')' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = index + 1;
+                    return (end, input.get(start..end).unwrap_or_default());
+                }
+                index += 1;
+            },
+            _ => index += 1,
+        }
+    }
+    (index, input.get(start..).unwrap_or_default())
+}
+
+/// Scans a number token the way gjson's `parseNumber` does.
+fn scan_number(input: &[u8], start: usize) -> (usize, &[u8]) {
+    let mut index = start + 1;
+    while let Some(&byte) = input.get(index) {
+        if byte <= b' ' || byte == b',' || byte == b']' || byte == b'}' {
+            return (index, input.get(start..index).unwrap_or_default());
+        }
+        index += 1;
+    }
+    (index, input.get(start..).unwrap_or_default())
+}
+
+/// Scans a lowercase literal token the way gjson's `tolit` does.
+fn scan_literal(input: &[u8], start: usize) -> (usize, &[u8]) {
+    let mut index = start + 1;
+    while input.get(index).is_some_and(u8::is_ascii_lowercase) {
+        index += 1;
+    }
+    (index, input.get(start..index).unwrap_or_default())
+}
+
+/// Scans the number token gjson's `Parse` reads at the start of the input.
+fn scan_root_number(input: &[u8], start: usize) -> (usize, &[u8]) {
+    let mut index = start + 1;
+    while let Some(&byte) = input.get(index) {
+        if byte <= b'-' {
+            if byte <= b' ' || byte == b',' {
+                return (index, input.get(start..index).unwrap_or_default());
+            }
+        } else if byte == b']' || byte == b'}' {
+            return (index, input.get(start..index).unwrap_or_default());
+        }
+        index += 1;
+    }
+    (index, input.get(start..).unwrap_or_default())
+}
+
+/// Parses the next value gjson's `parseAny` would read at `start`.
+fn parse_any_value(input: &[u8], start: usize) -> Option<(usize, JsonValue<'_>)> {
+    let mut index = start;
+    while let Some(&byte) = input.get(index) {
+        if byte == b'{' || byte == b'[' {
+            let (end, raw) = squash_json_value(input, index);
+            return Some((end, JsonValue::Json(raw)));
+        }
+        if byte <= b' ' {
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            let (end, escaped, ok) = scan_json_string(input, index + 1);
+            if !ok {
+                return None;
+            }
+            let content = input.get(index + 1..end.checked_sub(1)?).unwrap_or_default();
+            let value = if escaped {
+                Cow::Owned(unescape_json_string(content))
             } else {
-                tx.add_post_argument(key, value.as_bytes());
+                Cow::Borrowed(content)
+            };
+            return Some((end, JsonValue::String(value)));
+        }
+        match byte {
+            b'n' if input.get(index + 1).is_some_and(|next| *next != b'u') => {
+                let (end, raw) = scan_number(input, index);
+                return Some((end, JsonValue::Number(raw)));
+            },
+            b'n' | b't' | b'f' => {
+                let (end, raw) = scan_literal(input, index);
+                let value = match byte {
+                    b't' => JsonValue::True(raw),
+                    b'f' => JsonValue::False(raw),
+                    _ => JsonValue::Null,
+                };
+                return Some((end, value));
+            },
+            b'+' | b'-' | b'0'..=b'9' | b'i' | b'I' | b'N' => {
+                let (end, raw) = scan_number(input, index);
+                return Some((end, JsonValue::Number(raw)));
+            },
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Parses the single value gjson's `Parse` reads at the start of the input.
+fn parse_json_root(input: &[u8]) -> Option<JsonValue<'_>> {
+    let mut index = 0_usize;
+    while let Some(&byte) = input.get(index) {
+        match byte {
+            b'{' | b'[' => return Some(JsonValue::Json(input.get(index..).unwrap_or_default())),
+            _ if byte <= b' ' => index += 1,
+            b'+' | b'-' | b'0'..=b'9' | b'i' | b'I' | b'N' => {
+                let (_, raw) = scan_root_number(input, index);
+                return Some(JsonValue::Number(raw));
+            },
+            b'n' => {
+                if input.get(index + 1).is_some_and(|next| *next != b'u') {
+                    let (_, number) = scan_root_number(input, index);
+                    return Some(JsonValue::Number(number));
+                }
+                return Some(JsonValue::Null);
+            },
+            b't' => {
+                let (_, raw) = scan_literal(input, index);
+                return Some(JsonValue::True(raw));
+            },
+            b'f' => {
+                let (_, raw) = scan_literal(input, index);
+                return Some(JsonValue::False(raw));
+            },
+            b'"' => return Some(JsonValue::String(scan_root_string(input, index))),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Reads the string gjson's `Parse` returns for a document that is one string.
+fn scan_root_string(input: &[u8], start: usize) -> Cow<'_, [u8]> {
+    let mut index = start + 1;
+    while let Some(&byte) = input.get(index) {
+        if byte > b'\\' {
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            return Cow::Borrowed(input.get(start + 1..index).unwrap_or_default());
+        }
+        if byte == b'\\' {
+            index += 1;
+            while let Some(&escaped) = input.get(index) {
+                if escaped > b'\\' {
+                    index += 1;
+                    continue;
+                }
+                if escaped == b'"' && !is_escaped_quote(input, index, 1) {
+                    return Cow::Owned(unescape_json_string(input.get(start + 1..index).unwrap_or_default()));
+                }
+                index += 1;
             }
-        },
-        serde_json::Value::Number(value) => {
-            let value = value.to_string();
+            return Cow::Owned(unescape_json_string(input.get(start + 1..).unwrap_or_default()));
+        }
+        index += 1;
+    }
+    Cow::Borrowed(input.get(start + 1..).unwrap_or_default())
+}
+
+/// Parses the first four hexadecimal digits as Go's `runeit` does.
+fn parse_hex_rune(input: &[u8]) -> i32 {
+    let mut value = 0_u32;
+    for byte in input.iter().take(4) {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'f' => u32::from(byte - b'a') + 10,
+            b'A'..=b'F' => u32::from(byte - b'A') + 10,
+            _ => return 0,
+        };
+        value = value * 16 + digit;
+    }
+    i32::try_from(value).unwrap_or(0)
+}
+
+/// Decodes a UTF-16 surrogate pair the way Go's `utf16.DecodeRune` does.
+fn decode_surrogate_pair(first: i32, second: i32) -> i32 {
+    if !(0xD800..=0xDBFF).contains(&first) || !(0xDC00..=0xDFFF).contains(&second) {
+        return 0xFFFD;
+    }
+    0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+}
+
+/// Appends one rune's UTF-8 encoding, replacing invalid runes like Go does.
+fn push_encoded_rune(output: &mut Vec<u8>, rune: i32) {
+    let character = u32::try_from(rune).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+    let mut buffer = [0_u8; 4];
+    output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+}
+
+/// Unescapes a JSON string body the way gjson's `unescape` does.
+///
+/// Like Go, it stops at a control byte or an unknown escape instead of failing.
+fn unescape_json_string(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0_usize;
+    while let Some(&byte) = input.get(index) {
+        if byte < b' ' {
+            return output;
+        }
+        if byte != b'\\' {
+            output.push(byte);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(&escape) = input.get(index) else {
+            return output;
+        };
+        match escape {
+            b'\\' => output.push(b'\\'),
+            b'/' => output.push(b'/'),
+            b'b' => output.push(0x08),
+            b'f' => output.push(0x0C),
+            b'n' => output.push(b'\n'),
+            b'r' => output.push(b'\r'),
+            b't' => output.push(b'\t'),
+            b'"' => output.push(b'"'),
+            b'u' => {
+                if index + 5 > input.len() {
+                    return output;
+                }
+                let mut rune = parse_hex_rune(input.get(index + 1..).unwrap_or_default());
+                index += 5;
+                if (0xD800..=0xDFFF).contains(&rune)
+                    && input.len().saturating_sub(index) >= 6
+                    && input.get(index) == Some(&b'\\')
+                    && input.get(index + 1) == Some(&b'u')
+                {
+                    let second = parse_hex_rune(input.get(index + 2..).unwrap_or_default());
+                    rune = decode_surrogate_pair(rune, second);
+                    index += 6;
+                }
+                push_encoded_rune(&mut output, rune);
+                index -= 1;
+            },
+            _ => return output,
+        }
+        index += 1;
+    }
+    output
+}
+
+/// Reports whether the raw input nests containers deeper than `limit`.
+///
+/// This is gjson's `jsonNestingExceedsLimit`: one pass with a depth counter and
+/// no recursion, so it is safe to run on any input before validation.
+fn json_nesting_exceeds_limit(input: &[u8], limit: usize) -> bool {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut depth = 0_i64;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in input {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            },
+            b'}' | b']' => depth -= 1,
+            _ => {},
+        }
+    }
+    false
+}
+
+/// Index of the first non-whitespace byte at or after `index`, if any.
+fn skip_whitespace(input: &[u8], index: usize) -> Option<usize> {
+    let mut index = index;
+    while input
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        index += 1;
+    }
+    (index < input.len()).then_some(index)
+}
+
+/// Reports whether the whole input is valid JSON, as gjson's `Valid` does.
+fn valid_json_document(input: &[u8]) -> bool {
+    let Some(start) = skip_whitespace(input, 0) else {
+        return false;
+    };
+    scan_valid_value(input, start).is_some_and(|end| skip_whitespace(input, end).is_none())
+}
+
+/// Validates one JSON value without recursion, returning where it ends.
+fn scan_valid_value(input: &[u8], start: usize) -> Option<usize> {
+    let mut containers: Vec<bool> = Vec::new();
+    let mut index = start;
+    'value: loop {
+        index = skip_whitespace(input, index)?;
+        match input.get(index).copied()? {
+            b'{' => {
+                index = skip_whitespace(input, index + 1)?;
+                if input.get(index).copied() == Some(b'}') {
+                    index += 1;
+                } else {
+                    index = scan_valid_member_header(input, index)?;
+                    containers.push(true);
+                    continue 'value;
+                }
+            },
+            b'[' => {
+                index = skip_whitespace(input, index + 1)?;
+                if input.get(index).copied() == Some(b']') {
+                    index += 1;
+                } else {
+                    containers.push(false);
+                    continue 'value;
+                }
+            },
+            b'"' => index = scan_valid_string(input, index + 1)?,
+            b'-' | b'0'..=b'9' => index = scan_valid_number(input, index)?,
+            b't' => index = scan_valid_literal(input, index, b"true")?,
+            b'f' => index = scan_valid_literal(input, index, b"false")?,
+            b'n' => index = scan_valid_literal(input, index, b"null")?,
+            _ => return None,
+        }
+        loop {
+            let Some(object) = containers.last().copied() else {
+                return Some(index);
+            };
+            index = skip_whitespace(input, index)?;
+            match input.get(index).copied()? {
+                b',' => {
+                    index += 1;
+                    if object {
+                        index = skip_whitespace(input, index)?;
+                        index = scan_valid_member_header(input, index)?;
+                    }
+                    continue 'value;
+                },
+                b'}' if object => {
+                    index += 1;
+                    containers.pop();
+                },
+                b']' if !object => {
+                    index += 1;
+                    containers.pop();
+                },
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Reads an object member's quoted name and colon, as `validobject` does.
+fn scan_valid_member_header(input: &[u8], index: usize) -> Option<usize> {
+    if input.get(index).copied() != Some(b'"') {
+        return None;
+    }
+    let index = scan_valid_string(input, index + 1)?;
+    let index = skip_whitespace(input, index)?;
+    if input.get(index).copied() != Some(b':') {
+        return None;
+    }
+    Some(index + 1)
+}
+
+/// Validates a string token, as gjson's `validstring` does.
+fn scan_valid_string(input: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while let Some(&byte) = input.get(index) {
+        if byte < b' ' {
+            return None;
+        }
+        if byte == b'\\' {
+            index += 1;
+            let escape = input.get(index).copied()?;
+            match escape {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {},
+                b'u' => {
+                    for _ in 0..4 {
+                        index += 1;
+                        if !input.get(index).is_some_and(u8::is_ascii_hexdigit) {
+                            return None;
+                        }
+                    }
+                },
+                _ => return None,
+            }
+        } else if byte == b'"' {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Validates a number token, as gjson's `validnumber` does.
+fn scan_valid_number(input: &[u8], mut index: usize) -> Option<usize> {
+    if input.get(index).copied() == Some(b'-') {
+        index += 1;
+        if !input.get(index).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+    }
+    if index >= input.len() {
+        return None;
+    }
+    if input.get(index).copied() == Some(b'0') {
+        index += 1;
+    } else {
+        while input.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    }
+    if index >= input.len() {
+        return Some(index);
+    }
+    if input.get(index).copied() == Some(b'.') {
+        index += 1;
+        if !input.get(index).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        index += 1;
+        while input.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    }
+    if index >= input.len() {
+        return Some(index);
+    }
+    if matches!(input.get(index).copied(), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(input.get(index).copied(), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        if !input.get(index).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        index += 1;
+        while input.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+    }
+    Some(index)
+}
+
+/// Matches one literal, as `validtrue`, `validfalse` and `validnull` do.
+fn scan_valid_literal(input: &[u8], index: usize, literal: &[u8]) -> Option<usize> {
+    let end = index.checked_add(literal.len())?;
+    (input.get(index..end) == Some(literal)).then_some(end)
+}
+
+/// Flattens a JSON body the way Go Coraza's `readJSON` does.
+///
+/// The walk runs before validation so a valid prefix still populates arguments
+/// on a best-effort basis (`internal/bodyprocessors/json.go:141-179`).
+pub(super) fn read_json_body(body: &[u8], max_recursion: usize, argument_limit: usize) -> JsonBody {
+    let byte_budget = body.len().saturating_mul(FLATTEN_BYTES_FACTOR).max(FLATTEN_BYTES_FLOOR);
+    let mut flattener = JsonFlattener::new(argument_limit, byte_budget);
+    let (truncated, error) = match flattener.flatten(parse_json_root(body), max_recursion) {
+        Ok(truncated) => (truncated, json_error_after_walk(body, max_recursion)),
+        Err(JsonFlattenError::Recursion) => (
+            false,
+            Some("max recursion reached while reading json object".to_owned()),
+        ),
+        Err(JsonFlattenError::Budget) => (
+            false,
+            Some(format!(
+                "flattened form exceeds the {byte_budget} byte budget for a {} byte body",
+                body.len()
+            )),
+        ),
+    };
+    JsonBody {
+        arguments: flattener.values,
+        truncated,
+        error,
+    }
+}
+
+/// The error Go Coraza reports after a best-effort walk, if any.
+fn json_error_after_walk(body: &[u8], max_recursion: usize) -> Option<String> {
+    if json_nesting_exceeds_limit(body, max_recursion) {
+        Some("max recursion reached while reading json object".to_owned())
+    } else if valid_json_document(body) {
+        None
+    } else {
+        Some("invalid JSON".to_owned())
+    }
+}
+
+/// Publish flattened JSON arguments to the request or response collection.
+///
+/// Keys with invalid UTF-8 become U+FFFD because collection keys are `String`s;
+/// values stay byte-exact. See the difference ledger.
+pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &HashMap<Vec<u8>, Vec<Vec<u8>>>, response: bool) {
+    for (key, values) in arguments {
+        let key = text_of(key);
+        for value in values {
             if response {
-                tx.add_response_argument(key, value.as_bytes());
+                tx.response_args.add(&key, value);
             } else {
-                tx.add_post_argument(key, value.as_bytes());
+                tx.args_post.add(&key, value);
+                tx.args.add(&key, value);
+                tx.update_args_combined_size(&key, value);
             }
-        },
-        serde_json::Value::Bool(value) => {
-            let value = value.to_string();
-            if response {
-                tx.add_response_argument(key, value.as_bytes());
-            } else {
-                tx.add_post_argument(key, value.as_bytes());
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod json_tests {
+    use super::{JsonBody, json_nesting_exceeds_limit, read_json_body};
+
+    /// Flatten with Go Coraza's test limits: no argument cap, generous depth.
+    fn flatten(body: &[u8]) -> JsonBody {
+        read_json_body(body, 10_000, 0)
+    }
+
+    /// Values stored under `key`, in discovery order.
+    fn values(parsed: &JsonBody, key: &str) -> Vec<Vec<u8>> {
+        parsed.arguments.get(key.as_bytes()).cloned().unwrap_or_default()
+    }
+
+    /// Text form of [`values`], for readable assertions.
+    fn text(parsed: &JsonBody, key: &str) -> Vec<String> {
+        values(parsed, key)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect()
+    }
+
+    /// Total flattened values, counting collisions separately.
+    fn total_values(parsed: &JsonBody) -> usize {
+        parsed.arguments.values().map(Vec::len).sum()
+    }
+
+    fn nested_objects(depth: usize) -> Vec<u8> {
+        let mut body = b"{\"a\":".repeat(depth);
+        body.push(b'1');
+        body.extend(std::iter::repeat_n(b'}', depth));
+        body
+    }
+
+    #[test]
+    fn duplicate_members_and_dotted_keys_append_values() {
+        let parsed = flatten(br#"{"x":{"a":"attack"},"x":{"b":"safe"}}"#);
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.x.a"), ["attack"]);
+        assert_eq!(text(&parsed, "json.x.b"), ["safe"]);
+
+        // A nested path and a literal dotted name collide; both values survive in order.
+        let parsed = flatten(br#"{"account":{"role":"ATTACK"},"account.role":"SAFE"}"#);
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.account.role"), ["ATTACK", "SAFE"]);
+
+        let parsed = flatten(br#"{"a":1,"a":2,"a":3}"#);
+        assert_eq!(text(&parsed, "json.a"), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn numeric_tokens_keep_their_raw_spelling() {
+        let parsed =
+            flatten(br#"{"big":123456789012345678901234567890,"exp":1e2,"neg":-0,"frac":1.500,"sci":-2.5E+10}"#);
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.big"), ["123456789012345678901234567890"]);
+        assert_eq!(text(&parsed, "json.exp"), ["1e2"]);
+        assert_eq!(text(&parsed, "json.neg"), ["-0"]);
+        assert_eq!(text(&parsed, "json.frac"), ["1.500"]);
+        assert_eq!(text(&parsed, "json.sci"), ["-2.5E+10"]);
+    }
+
+    #[test]
+    fn best_effort_prefix_is_kept_before_the_error() {
+        for (body, expected) in [
+            (br#"{"a": 1} trailing garbage"#.as_slice(), ("json.a", "1")),
+            (br#"{"a":1,"b":"#.as_slice(), ("json.a", "1")),
+            (br#"{"a":[1,2"#.as_slice(), ("json.a", "2")),
+        ] {
+            let parsed = flatten(body);
+            assert_eq!(parsed.error.as_deref(), Some("invalid JSON"));
+            assert_eq!(text(&parsed, expected.0), [expected.1]);
+        }
+
+        // Truncated array members are published before the parser error.
+        let parsed = flatten(br#"{"a":[1,2"#);
+        assert_eq!(text(&parsed, "json.a.0"), ["1"]);
+        assert_eq!(text(&parsed, "json.a.1"), ["2"]);
+    }
+
+    #[test]
+    fn argument_and_array_length_caps_are_counted_separately() {
+        const LIMIT: usize = 5;
+        let exact = b"[1,1,1,1,1]".to_vec();
+        let longer = b"[1,1,1,1,1,1]".to_vec();
+        let mut padded = Vec::new();
+        padded.extend_from_slice(b"{");
+        for index in 0..LIMIT {
+            padded.extend_from_slice(format!(r#""p{index}":[{{}}],"#).as_bytes());
+        }
+        padded.extend_from_slice(br#""items":[1,2,3]}"#);
+
+        let cases: [(&[u8], bool, usize); 4] = [
+            (b"[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]", true, LIMIT + 1),
+            (&exact, false, LIMIT + 1),
+            (&longer, true, LIMIT),
+            (&padded, true, LIMIT + 3),
+        ];
+        for (body, truncated, expected_values) in cases {
+            let parsed = read_json_body(body, 10_000, LIMIT);
+            assert_eq!(parsed.error, None);
+            assert_eq!(parsed.truncated, truncated);
+            assert_eq!(total_values(&parsed), expected_values);
+        }
+    }
+
+    #[test]
+    fn byte_budget_stops_the_flattened_form() {
+        const LIMIT: usize = 1000;
+        let mut long_paths = Vec::new();
+        for index in 0..8 {
+            long_paths.extend_from_slice(format!(r#"{{"{}{index}":"#, "p".repeat(200)).as_bytes());
+        }
+        long_paths.push(b'{');
+        for index in 0..999 {
+            if index > 0 {
+                long_paths.push(b',');
             }
-        },
-        serde_json::Value::Null => {
-            if response {
-                tx.add_response_argument(key, b"");
-            } else {
-                tx.add_post_argument(key, b"");
+            long_paths.extend_from_slice(format!(r#""leaf{index}":"{}""#, "v".repeat(20)).as_bytes());
+        }
+        long_paths.push(b'}');
+        long_paths.extend(std::iter::repeat_n(b'}', 8));
+
+        let mut long_key = b"{\"".to_vec();
+        long_key.extend(std::iter::repeat_n(b'a', 20_000));
+        long_key.extend_from_slice(br#"":"#);
+        long_key.extend(std::iter::repeat_n(b'[', 200));
+        long_key.extend(std::iter::repeat_n(b']', 200));
+        long_key.push(b'}');
+
+        for body in [long_paths, long_key] {
+            let parsed = read_json_body(&body, 10_000, LIMIT);
+            let message = parsed.error.as_deref().unwrap_or_default();
+            assert!(message.contains("flattened form exceeds"), "{message}");
+            assert!(!parsed.truncated);
+            assert!(!parsed.arguments.is_empty());
+            assert!(parsed.arguments.len() < LIMIT);
+            let budget = (body.len() * 8).max(4096);
+            let stored: usize = parsed
+                .arguments
+                .iter()
+                .map(|(key, values)| key.len() + values.iter().map(Vec::len).sum::<usize>())
+                .sum();
+            assert!(stored <= budget);
+        }
+
+        // An ordinary API payload stays well inside the budget.
+        let mut ordinary = br#"{"users":["#.to_vec();
+        for index in 0..200 {
+            if index > 0 {
+                ordinary.push(b',');
             }
-        },
+            ordinary.extend_from_slice(
+                format!(r#"{{"id":{index},"name":"user{index}","email":"u{index}@example.com","active":true}}"#)
+                    .as_bytes(),
+            );
+        }
+        ordinary.extend_from_slice(b"]}");
+        let parsed = read_json_body(&ordinary, 10_000, LIMIT);
+        assert_eq!(parsed.error, None);
+        assert!(!parsed.truncated);
+    }
+
+    #[test]
+    fn depth_uses_the_configured_limit_not_serde_default() {
+        // 300 container levels exceed serde_json's default recursion limit of 128.
+        let body = nested_objects(300);
+        let parsed = read_json_body(&body, 300, 0);
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, &format!("json.{}a", "a.".repeat(299))), ["1"]);
+
+        let parsed = read_json_body(&body, 299, 0);
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some("max recursion reached while reading json object")
+        );
+
+        // 5,000 levels are flattened iteratively without exhausting the stack.
+        let parsed = read_json_body(&nested_objects(5_000), 5_000, 0);
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn deep_bomb_stops_at_the_recursion_limit() {
+        let mut body = b"{\"a\":".repeat(15_000);
+        body.push(b'1');
+        body.extend(std::iter::repeat_n(b'}', 15_000));
+        let parsed = read_json_body(&body, 10_000, 0);
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some("max recursion reached while reading json object")
+        );
+        assert!(parsed.arguments.is_empty());
+    }
+
+    #[test]
+    fn nesting_check_ignores_string_contents() {
+        assert!(!json_nesting_exceeds_limit(br#"{"a":"[[[[[[[[[[[["}"#, 10));
+        assert!(!json_nesting_exceeds_limit(br#"{"a":"\"[[[[[[[[[[["}"#, 10));
+        assert!(json_nesting_exceeds_limit(&b"[".repeat(11), 10));
+        assert!(!json_nesting_exceeds_limit(&b"[".repeat(10), 10));
+        assert!(json_nesting_exceeds_limit(&b"[".repeat(11), 10));
+        // Unbalanced closers still move the signed depth, as in Go.
+        assert!(!json_nesting_exceeds_limit(b"}[[[", 2));
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_survive_in_keys_and_values() {
+        let parsed = flatten(b"{\"k\xff\":\"v\xfe\"}");
+        assert_eq!(parsed.error, None);
+        assert_eq!(
+            parsed.arguments.get(b"json.k\xff".as_slice()),
+            Some(&vec![b"v\xfe".to_vec()])
+        );
+    }
+
+    #[test]
+    fn empty_containers_and_scalar_roots_match_gjson() {
+        let parsed = flatten(b"{}");
+        assert_eq!(parsed.error, None);
+        assert!(parsed.arguments.is_empty());
+
+        let parsed = flatten(br#"{"a": {}, "b": []}"#);
+        assert_eq!(parsed.error, None);
+        assert!(parsed.arguments.is_empty());
+
+        let parsed = flatten(b"1");
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.0"), ["1"]);
+        assert_eq!(text(&parsed, "json"), ["1"]);
+
+        let parsed = flatten(br#""s""#);
+        assert_eq!(text(&parsed, "json.0"), ["s"]);
+
+        let parsed = flatten(b"null");
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.0"), [""]);
+    }
+
+    #[test]
+    fn malformed_traversal_matches_gjson_foreach() {
+        // gjson's ForEach advances one byte past each value, so malformed input
+        // is traversed exactly this way; keep the differential pins.
+        let parsed = flatten(br#"["x","y"{],"account.role":"z"}"#);
+        assert_eq!(parsed.error.as_deref(), Some("invalid JSON"));
+        assert_eq!(text(&parsed, "json.0"), ["x"]);
+        assert_eq!(text(&parsed, "json.1"), ["y"]);
+        assert_eq!(text(&parsed, "json.2"), ["account.role"]);
+        assert_eq!(text(&parsed, "json.3"), ["z"]);
+        assert_eq!(text(&parsed, "json"), ["4"]);
+
+        let parsed = flatten(br#"[1,2,"3]},{"+":null}]"#);
+        assert_eq!(text(&parsed, "json.2"), ["3]},{"]);
+        assert_eq!(text(&parsed, "json"), ["3"]);
+
+        let parsed = flatten(br#"{"a":[1,2,3],}{"b":null}"#);
+        assert_eq!(text(&parsed, "json.a.2"), ["3"]);
+        assert_eq!(text(&parsed, "json.b"), [""]);
+
+        let mut body = b"{\"a\":\"".to_vec();
+        body.extend(std::iter::repeat_n(b'\\', 10));
+        body.extend_from_slice(b"\"\",\"b\":\"x");
+        body.extend(std::iter::repeat_n(b'\\', 7));
+        body.extend_from_slice(b"\"y\"}");
+        let parsed = flatten(&body);
+        assert_eq!(values(&parsed, "json.a"), vec![vec![b'\\'; 5]]);
+        let mut expected_b = b"x".to_vec();
+        expected_b.extend(std::iter::repeat_n(b'\\', 3));
+        expected_b.extend_from_slice(b"\"y");
+        assert_eq!(values(&parsed, "json.b"), vec![expected_b]);
+    }
+
+    #[test]
+    fn escaped_unicode_matches_go_unescaping() {
+        let parsed =
+            flatten(b"{\"a\":\"\\u0041\\u00e9\",\"b\":\"\\ud83d\\ude00\",\"c\":\"\\ud83d\",\"d\":\"\\ud83d\\u0041\"}");
+        assert_eq!(parsed.error, None);
+        assert_eq!(text(&parsed, "json.a"), ["Aé"]);
+        assert_eq!(text(&parsed, "json.b"), ["😀"]);
+        assert_eq!(text(&parsed, "json.c"), ["\u{fffd}"]);
+        assert_eq!(text(&parsed, "json.d"), ["\u{fffd}"]);
     }
 }

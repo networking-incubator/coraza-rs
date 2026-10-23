@@ -475,10 +475,12 @@ impl Transaction {
             response_body: Single::new(RuleVariable::ResponseBody),
             response_content_length: Single::new(RuleVariable::ResponseContentLength),
             outbound_data_error: flag(RuleVariable::OutboundDataError),
-            res_body_error: flag(RuleVariable::ResBodyError),
+            // Go leaves the response body parser error variables unset until an
+            // error occurs (internal/corazawaf/waf.go:274-283).
+            res_body_error: Single::new(RuleVariable::ResBodyError),
             res_body_error_msg: Single::new(RuleVariable::ResBodyErrorMsg),
             res_body_processor: Single::new(RuleVariable::ResBodyProcessor),
-            res_body_processor_error: flag(RuleVariable::ResBodyProcessorError),
+            res_body_processor_error: Single::new(RuleVariable::ResBodyProcessorError),
             res_body_processor_error_msg: Single::new(RuleVariable::ResBodyProcessorErrorMsg),
             highest_severity: {
                 let mut value = Single::new(RuleVariable::HighestSeverity);
@@ -2620,6 +2622,10 @@ payload\r\n\
             tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
             Some("0")
         );
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("json_request_body")).as_deref(),
+            std::str::from_utf8(body).ok()
+        );
     }
 
     #[test]
@@ -2640,7 +2646,7 @@ payload\r\n\
             (
                 "deep-json",
                 br#"{"a":{"b":1}}"#.as_slice(),
-                "JSON: nesting deeper than the limit of 1",
+                "JSON: max recursion reached while reading json object",
             ),
         ] {
             let mut tx = waf.new_transaction_with_id(id);
@@ -2867,10 +2873,12 @@ payload\r\n\
                 .as_deref(),
             Some("true")
         );
+        // Go's JSON processor stores the raw body in TX and leaves RESPONSE_BODY unset.
         assert_eq!(
-            tx.get_variable(RuleVariable::ResponseBody, None).as_deref(),
+            tx.get_variable(RuleVariable::TX, Some("json_response_body")).as_deref(),
             Some(r#"{"admin":true}"#)
         );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
         assert_eq!(
             tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
             Some("14")
@@ -3268,9 +3276,9 @@ payload\r\n\
 
         assert_eq!(tx.process_response_body(b"not json"), None);
         assert_eq!(tx.get_variable(RuleVariable::ResBodyError, None).as_deref(), Some("1"));
-        assert!(
-            tx.get_variable(RuleVariable::ResBodyErrorMsg, None)
-                .is_some_and(|message| message.starts_with("JSON: malformed json:"))
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyErrorMsg, None).as_deref(),
+            Some("JSON: invalid JSON")
         );
         assert_eq!(
             tx.get_variable(RuleVariable::ResBodyProcessorError, None).as_deref(),
@@ -4320,5 +4328,139 @@ payload\r\n\
         let waf = parser.into_waf().unwrap();
         let mut tx = waf.new_transaction_with_id("time-rule");
         assert_eq!(tx.process_request_headers().unwrap().rule_id, 130);
+    }
+
+    #[test]
+    fn json_request_tx_variable_follows_successful_processing() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:140,phase:1,ctl:requestBodyProcessor=JSON,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let body = br#"{"user":"coraza"}"#;
+        let mut tx = waf.new_transaction_with_id("json-tx");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(body), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("json_request_body")).as_deref(),
+            Some(r#"{"user":"coraza"}"#)
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("0"));
+
+        // A parse error still publishes the valid prefix but no raw body variable.
+        let mut tx = waf.new_transaction_with_id("json-tx-error");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(br#"{"a":1} trailing"#), None);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("json_request_body")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+            Some("JSON: invalid JSON")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.a")).as_deref(),
+            Some("1")
+        );
+
+        // Go's ProcessRequestBody skips empty request bodies entirely.
+        let mut tx = waf.new_transaction_with_id("json-tx-empty");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b""), None);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("json_request_body")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn json_response_tx_variable_replaces_the_response_body_contract() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecResponseBodyAccess On\n\
+                 SecResponseBodyMimeType application/json\n\
+                 SecAction \"id:141,phase:3,ctl:responseBodyProcessor=JSON,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let body = br#"{"user":"coraza"}"#;
+        let mut tx = waf.new_transaction_with_id("json-res-tx");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.process_response_body(body), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("json_response_body")).as_deref(),
+            Some(r#"{"user":"coraza"}"#)
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
+        assert_eq!(tx.get_variable(RuleVariable::ResBodyError, None).as_deref(), Some(""));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseArgs, Some("json.user"))
+                .as_deref(),
+            Some("coraza")
+        );
+
+        let mut tx = waf.new_transaction_with_id("json-res-error");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.process_response_body(br#"{"a":1} trailing"#), None);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("json_response_body")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ResBodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyErrorMsg, None).as_deref(),
+            Some("JSON: invalid JSON")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseArgs, Some("json.a")).as_deref(),
+            Some("1")
+        );
+
+        // Go runs the selected processor even for an empty response body.
+        let mut tx = waf.new_transaction_with_id("json-res-empty");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.process_response_body(b""), None);
+        assert_eq!(tx.get_variable(RuleVariable::ResBodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyErrorMsg, None).as_deref(),
+            Some("JSON: invalid JSON")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("json_response_body")), None);
+    }
+
+    #[test]
+    fn json_response_argument_limit_sets_the_flag() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_mime_types: vec!["application/json".to_owned()],
+            argument_limit: 5,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("json-res-limit", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "application/json");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.set_response_body_processor("JSON");
+        assert_eq!(tx.process_response_body(b"[1,1,1,1,1,1,1]"), None);
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("json_response_body")).as_deref(),
+            Some("[1,1,1,1,1,1,1]")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseArgs, Some("json.4")).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseArgs, Some("json.5")), None);
     }
 }
