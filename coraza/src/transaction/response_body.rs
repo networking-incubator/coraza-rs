@@ -22,6 +22,7 @@
 
 use super::{
     Interruption, Transaction,
+    body_buffer::BodyBuffer,
     request_body::{flatten_json_value, parse_json},
     variables::BodyProcessor,
 };
@@ -43,37 +44,72 @@ impl Transaction {
     }
 
     /// Process an eligible response body and evaluate response-body rules.
+    ///
+    /// When the body is eligible, bytes are retained in a bounded buffer truncated to
+    /// [`Transaction::response_body_limit`]. Like Go Coraza v3.8.1 `WriteResponseBody`
+    /// (`internal/corazawaf/transaction.go:1263`), reaching the limit itself sets
+    /// `OUTBOUND_DATA_ERROR`, so the boundary is `>=`. The response buffer never spills:
+    /// its memory limit equals the response body limit, as in Go. An I/O failure while
+    /// retaining or replaying the body fails closed with a 500 interruption.
     pub fn process_response_body(&mut self, body: &[u8]) -> Option<Interruption> {
         if !self.begin_phase(RulePhase::ResponseBody) {
             return self.interruption.clone();
+        }
+
+        let mut ingest_error = false;
+        let processable = self.response_body_access && self.is_response_body_processable();
+        if processable {
+            self.response_content_length.set(body.len().to_string());
+            if !body.is_empty() {
+                let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
+                self.response_body_buffer = BodyBuffer::new(limit, limit);
+                if body.len() >= limit.saturating_sub(self.response_body_buffer.len()) {
+                    self.outbound_data_error.set("1");
+                    if self.config.response_body_limit_action == BodyLimitAction::Reject {
+                        self.interrupt(0, "deny", 500, "");
+                        if self.interruption.is_some() {
+                            self.response_body_buffer.refuse(body.len());
+                            return self.interruption.clone();
+                        }
+                    }
+                }
+                if self.response_body_buffer.accept(body).is_err() {
+                    ingest_error = true;
+                }
+            }
         }
 
         if self.audit_engine != AuditEngineStatus::Off
             && (self.audit_log_parts.contains(&AuditLogPart::IntermediaryResponseBody)
                 || self.audit_log_parts.contains(&AuditLogPart::ResponseBody))
         {
-            let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
             self.audit_response_body.clear();
-            self.audit_response_body
-                .extend_from_slice(body.get(..body.len().min(limit)).unwrap_or_default());
+            match self.response_body_buffer.contiguous() {
+                Ok(retained) => self.audit_response_body.extend_from_slice(&retained),
+                Err(_) => ingest_error = true,
+            }
         }
 
-        if self.response_body_access && self.is_response_body_processable() {
-            self.response_content_length.set(body.len().to_string());
-            if !body.is_empty() {
-                let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
-                let mut body = body;
-                if body.len() > limit {
-                    self.outbound_data_error.set("1");
-                    if self.config.response_body_limit_action == BodyLimitAction::Reject {
-                        self.interrupt(0, "deny", 500, "");
-                        if self.interruption.is_some() {
-                            return self.interruption.clone();
-                        }
-                    }
-                    body = body.get(..limit).unwrap_or_default();
-                }
-                self.inspect_response_body(body);
+        if ingest_error {
+            self.outbound_data_error.set("1");
+            self.interrupt(0, "deny", 500, "");
+            return self.interruption.clone();
+        }
+
+        if processable && !self.response_body_buffer.is_empty() {
+            let mut buffer = std::mem::take(&mut self.response_body_buffer);
+            let inspected = buffer.contiguous().map(|body| {
+                let length = body.len();
+                self.inspect_response_body(&body);
+                length
+            });
+            self.response_body_buffer = buffer;
+            if let Ok(length) = inspected {
+                self.response_body_buffer.set_inspected(length);
+            } else {
+                self.outbound_data_error.set("1");
+                self.interrupt(0, "deny", 500, "");
+                return self.interruption.clone();
             }
         }
 

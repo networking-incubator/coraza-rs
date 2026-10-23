@@ -145,6 +145,13 @@ fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
             "request body in-memory limit must be non-negative".to_owned(),
         ));
     }
+    // Zero means unset; a positive limit may not exceed the body limit. This matches Go
+    // (internal/corazawaf/waf.go:448-457).
+    if config.request_body_in_memory_limit > config.request_body_limit {
+        return Err(ConfigError(
+            "request body limit must be at least the in-memory limit".to_owned(),
+        ));
+    }
     if config.request_body_no_files_limit < 0 {
         return Err(ConfigError(
             "request body no-files limit must be non-negative".to_owned(),
@@ -172,6 +179,41 @@ fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
 mod tests {
     use super::Waf;
     use crate::config::WafConfig;
+
+    #[test]
+    fn validates_request_body_memory_limit_against_the_body_limit() {
+        assert!(
+            Waf::new(WafConfig {
+                request_body_in_memory_limit: -1,
+                ..WafConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Waf::new(WafConfig {
+                request_body_limit: 1024,
+                request_body_in_memory_limit: 2048,
+                ..WafConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Waf::new(WafConfig {
+                request_body_limit: 1024,
+                request_body_in_memory_limit: 1024,
+                ..WafConfig::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            Waf::new(WafConfig {
+                request_body_limit: 1024,
+                request_body_in_memory_limit: 0,
+                ..WafConfig::default()
+            })
+            .is_ok()
+        );
+    }
 
     #[test]
     fn validates_configuration_and_creates_transactions() {

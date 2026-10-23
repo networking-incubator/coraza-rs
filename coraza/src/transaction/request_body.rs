@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{Interruption, Transaction, variables::BodyProcessor};
+use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyProcessor};
 use crate::{
     body_processors::{multipart, xml},
     transformations::{text_of, url_decode},
@@ -43,37 +43,85 @@ impl Transaction {
     /// empty body. The first `Content-Type` header selects URLENCODED or MULTIPART;
     /// `ctl:requestBodyProcessor` selects RAW, JSON, or XML. Phase 2 rules still run when
     /// body access is disabled or no processor is selected.
+    ///
+    /// When body access is enabled, bytes are retained in a bounded buffer, truncated to
+    /// [`Transaction::request_body_limit`], and spilled to a private temporary file above
+    /// `SecRequestBodyInMemoryLimit`. Like Go Coraza v3.8.1 `WriteRequestBody`
+    /// (`internal/corazawaf/transaction.go:965-967`), a disabled rule engine or disabled
+    /// body access returns without buffering, limit checks or audit capture, and the `>=`
+    /// comparison at the limit matches `WriteRequestBody` (`transaction.go:992`). A
+    /// processor that requires one contiguous slice receives a copy read back from the
+    /// spill file, bounded by the body limit. An I/O failure while retaining or replaying
+    /// the body fails closed with a 500 interruption.
     pub fn process_request_body(&mut self, body: &[u8]) -> Option<Interruption> {
         if !self.begin_phase(RulePhase::RequestBody) {
             return self.interruption.clone();
         }
 
-        if self.audit_engine != AuditEngineStatus::Off && self.audit_log_parts.contains(&AuditLogPart::RequestBody) {
-            let limit = usize::try_from(self.request_body_limit).unwrap_or(0);
-            self.audit_request_body.clear();
-            self.audit_request_body
-                .extend_from_slice(body.get(..body.len().min(limit)).unwrap_or_default());
-        }
-
+        let mut ingest_error = false;
         if self.request_body_access && !body.is_empty() {
-            if self.force_request_body_variable && self.reqbody_processor.get_bytes().is_empty() {
-                self.set_request_body_processor("URLENCODED");
-            }
-
             let limit = usize::try_from(self.request_body_limit).unwrap_or(0);
-            let mut body = body;
-            if body.len() >= limit {
+            let configured_memory = usize::try_from(self.config.request_body_in_memory_limit).unwrap_or(0);
+            // Zero means unset: follow the body limit, as in Go
+            // (internal/corazawaf/waf.go:242-247).
+            let memory_limit = if configured_memory == 0 {
+                limit
+            } else {
+                configured_memory
+            };
+            self.request_body_buffer = BodyBuffer::new(memory_limit, limit);
+            if body.len() >= limit.saturating_sub(self.request_body_buffer.len()) {
                 self.inbound_data_error.set("1");
                 if self.config.request_body_limit_action == BodyLimitAction::Reject {
                     self.interrupt(0, "deny", 413, "");
                     if self.interruption.is_some() {
+                        self.request_body_buffer.refuse(body.len());
                         return self.interruption.clone();
                     }
                 }
-                body = body.get(..limit).unwrap_or_default();
+            }
+            if self.request_body_buffer.accept(body).is_err() {
+                ingest_error = true;
+            }
+        }
+
+        if self.audit_engine != AuditEngineStatus::Off && self.audit_log_parts.contains(&AuditLogPart::RequestBody) {
+            self.audit_request_body.clear();
+            match self.request_body_buffer.contiguous() {
+                Ok(retained) => self.audit_request_body.extend_from_slice(&retained),
+                Err(_) => ingest_error = true,
+            }
+        }
+
+        if ingest_error {
+            self.inbound_data_error.set("1");
+            self.interrupt(0, "deny", 500, "");
+            return self.interruption.clone();
+        }
+
+        if self.request_body_access && !self.request_body_buffer.is_empty() {
+            if self.force_request_body_variable && self.reqbody_processor.get_bytes().is_empty() {
+                self.set_request_body_processor("URLENCODED");
             }
 
-            self.inspect_request_body(body);
+            // Without a selected processor there is nothing to replay the buffer for;
+            // audit capture above reads the retained bytes independently.
+            if self.request_body_processor.is_some() {
+                let mut buffer = std::mem::take(&mut self.request_body_buffer);
+                let inspected = buffer.contiguous().map(|body| {
+                    let length = body.len();
+                    self.inspect_request_body(&body);
+                    length
+                });
+                self.request_body_buffer = buffer;
+                if let Ok(length) = inspected {
+                    self.request_body_buffer.set_inspected(length);
+                } else {
+                    self.inbound_data_error.set("1");
+                    self.interrupt(0, "deny", 500, "");
+                    return self.interruption.clone();
+                }
+            }
         }
 
         self.run_phase(RulePhase::RequestBody);
