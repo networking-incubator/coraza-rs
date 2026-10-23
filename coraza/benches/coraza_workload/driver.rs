@@ -40,8 +40,9 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 /// Timing document schema version understood by the coordinator.
 pub(crate) const TIMING_SCHEMA_VERSION: u64 = 1;
 
-/// Largest accepted `--iterations` value, matching the coordinator bound.
-pub(crate) const MAX_ITERATIONS: u64 = 10_000_000;
+/// Largest accepted `--iterations` value, matching the coordinator's
+/// per-case sample bound.
+pub(crate) const MAX_ITERATIONS: u64 = 1_000_000;
 
 /// Highest TX index a Coraza capture can occupy.
 const MAX_CAPTURE_INDEX: usize = 9;

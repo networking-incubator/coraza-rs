@@ -381,7 +381,7 @@ fn timing_document_is_written_atomically_and_round_trips() {
 
 #[test]
 fn invalid_iterations_are_rejected() {
-    for invalid in ["", "0", "-1", "1.5", "ten", "10000001", "18446744073709551616"] {
+    for invalid in ["", "0", "-1", "1.5", "ten", "1000001", "18446744073709551616"] {
         let error = parse_iterations(invalid).expect_err("an invalid iteration count must fail");
         assert!(
             error.to_string().contains("--iterations"),
@@ -390,8 +390,8 @@ fn invalid_iterations_are_rejected() {
     }
     assert_eq!(parse_iterations("1").expect("the minimum is accepted"), 1);
     assert_eq!(
-        parse_iterations("10000000").expect("the documented maximum is accepted"),
-        10_000_000
+        parse_iterations("1000000").expect("the documented maximum is accepted"),
+        1_000_000
     );
 }
 
