@@ -1906,8 +1906,8 @@ payload\r\n\
         let default_waf = parser.into_waf().unwrap();
 
         let mut parser = crate::seclang::Parser::new();
-        parser.from_string(rule).unwrap();
         parser.config_mut().case_sensitive_args_keys = true;
+        parser.from_string(rule).unwrap();
         let strict_waf = parser.into_waf().unwrap();
 
         let mut tx = default_waf.new_transaction_with_id("args-default-case");

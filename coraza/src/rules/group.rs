@@ -27,12 +27,40 @@ use crate::rules::Rule;
 pub(crate) struct RuleGroup {
     /// Top-level rules in directive order.
     rules: Vec<Rule>,
+    /// `case_sensitive_args_keys` the variable parser used for these rules.
+    ///
+    /// `None` until a variable list is compiled. `Waf::with_rules` rejects a
+    /// configuration whose setting differs, so compiled selectors and transaction maps
+    /// cannot disagree.
+    case_sensitive_args_keys: Option<bool>,
 }
 
 impl RuleGroup {
     /// Creates an empty rule group.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the key mode for a variable compilation.
+    ///
+    /// Returns an error when rules were already compiled under a different mode, so a
+    /// rule set can never silently mix selector modes.
+    pub(crate) fn record_case_sensitive_args_keys(&mut self, case_sensitive_args_keys: bool) -> Result<(), String> {
+        match self.case_sensitive_args_keys {
+            Some(compiled) if compiled != case_sensitive_args_keys => Err(format!(
+                "case_sensitive_args_keys changed after rules were compiled (was {compiled}, now \
+                 {case_sensitive_args_keys}); compile all rules under one setting"
+            )),
+            _ => {
+                self.case_sensitive_args_keys = Some(case_sensitive_args_keys);
+                Ok(())
+            },
+        }
+    }
+
+    /// The key mode these rules were compiled with, if any.
+    pub(crate) fn compiled_case_sensitive_args_keys(&self) -> Option<bool> {
+        self.case_sensitive_args_keys
     }
 
     /// Add a rule, attaching it to an open chain when needed.
