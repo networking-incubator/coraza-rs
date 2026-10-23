@@ -65,10 +65,21 @@ pub struct WafConfig {
     /// Maximum request body size, in bytes (`SecRequestBodyLimit`).
     pub request_body_limit: i64,
 
-    /// Request body bytes kept in memory before spilling to disk (`SecRequestBodyInMemoryLimit`).
+    /// Request body bytes kept in memory before spilling to a private temporary file
+    /// (`SecRequestBodyInMemoryLimit`).
+    ///
+    /// `0` means unset: the effective limit follows [`Self::request_body_limit`], as in
+    /// Go Coraza when the directive is unset, so the default path never spills. A positive
+    /// value is used as configured and must not exceed [`Self::request_body_limit`].
     pub request_body_in_memory_limit: i64,
 
-    /// Maximum request body size excluding uploaded files, in bytes (`SecRequestBodyNoFilesLimit`).
+    /// Maximum request body size excluding uploaded files, in bytes
+    /// (`SecRequestBodyNoFilesLimit`).
+    ///
+    /// Parsed and validated for compatibility, but **not enforced**: Go Coraza v3.8.1
+    /// also accepts this directive without implementing it
+    /// (<https://github.com/corazawaf/coraza/issues/896>). No request admission decision
+    /// depends on this field.
     pub request_body_no_files_limit: i64,
 
     /// What happens when the request body exceeds its limit (`SecRequestBodyLimitAction`).
@@ -173,7 +184,9 @@ impl Default for WafConfig {
             rule_engine: RuleEngineStatus::On,
             request_body_access: false,
             request_body_limit: 128 * 1024 * 1024,
-            request_body_in_memory_limit: 128 * 1024,
+            // Unset; the effective limit follows request_body_limit, as in Go
+            // (internal/corazawaf/waf.go:242-247), so the default path never spills.
+            request_body_in_memory_limit: 0,
             request_body_no_files_limit: 64 * 1024,
             request_body_limit_action: BodyLimitAction::Reject,
             response_body_access: false,
@@ -231,6 +244,7 @@ mod tests {
         let config = WafConfig::default();
         assert_eq!(config.rule_engine, RuleEngineStatus::On);
         assert_eq!(config.request_body_limit, 134_217_728);
+        assert_eq!(config.request_body_in_memory_limit, 0);
         assert_eq!(config.response_body_limit, 524_288);
         assert_eq!(config.audit_engine, AuditEngineStatus::Off);
         assert_eq!(config.argument_limit, 1000);

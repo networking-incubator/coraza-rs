@@ -21,8 +21,10 @@
 //! Transaction variable storage and lookup.
 //!
 //! This module stores values supplied by a connector and evaluates request and response
-//! phases. Callers must apply transport limits before passing a body.
+//! phases. Body bytes are retained in a bounded buffer that spills to a temporary file,
+//! and each transaction exposes counters for what it supplied, retained and inspected.
 
+mod body_buffer;
 mod ctl;
 mod request_body;
 mod response_body;
@@ -37,6 +39,8 @@ use std::{
     time::SystemTime,
 };
 
+use body_buffer::BodyBuffer;
+pub use body_buffer::BodyIngestionStats;
 use request_body::parse_urlencoded;
 use variables::BodyProcessor;
 pub use variables::VariableCollection;
@@ -132,6 +136,8 @@ pub struct Transaction {
     request_body_access: bool,
     /// Maximum body size for this transaction, in bytes.
     request_body_limit: i64,
+    /// Bounded retention of the request body supplied to this transaction.
+    request_body_buffer: BodyBuffer,
     /// Whether to process a body without a recognized content type.
     force_request_body_variable: bool,
     /// Processor chosen by the first content type or a `ctl` action.
@@ -140,6 +146,8 @@ pub struct Transaction {
     response_body_access: bool,
     /// Maximum response body size for this transaction, in bytes.
     response_body_limit: i64,
+    /// Bounded retention of the response body supplied to this transaction.
+    response_body_buffer: BodyBuffer,
     /// Whether to inspect a response body without a configured MIME type.
     force_response_body_variable: bool,
     /// Processor selected by a `ctl` action for the response body.
@@ -362,10 +370,12 @@ impl Transaction {
             rule_engine: config.rule_engine,
             request_body_access: config.request_body_access,
             request_body_limit: config.request_body_limit,
+            request_body_buffer: BodyBuffer::default(),
             force_request_body_variable: false,
             request_body_processor: None,
             response_body_access: config.response_body_access,
             response_body_limit: config.response_body_limit,
+            response_body_buffer: BodyBuffer::default(),
             force_response_body_variable: false,
             response_body_processor: None,
             audit_engine: config.audit_engine,
@@ -542,6 +552,22 @@ impl Transaction {
     /// Return the request body limit currently applied to this transaction.
     pub fn request_body_limit(&self) -> i64 {
         self.request_body_limit
+    }
+
+    /// Return counters for the request body bytes this transaction received.
+    pub fn request_body_stats(&self) -> BodyIngestionStats {
+        self.request_body_buffer.stats()
+    }
+
+    /// Return counters for the response body bytes this transaction received.
+    pub fn response_body_stats(&self) -> BodyIngestionStats {
+        self.response_body_buffer.stats()
+    }
+
+    /// Return the request body spill file path, if the body spilled, for cleanup tests.
+    #[cfg(test)]
+    fn request_body_spill_path(&self) -> Option<&std::path::Path> {
+        self.request_body_buffer.spill_path()
     }
 
     /// Evaluate request-header rules once using the values already stored on this
@@ -1590,12 +1616,12 @@ impl Drop for Transaction {
 mod tests {
     use std::sync::Arc;
 
-    use super::{Transaction, VariableCollection};
+    use super::{BodyIngestionStats, Transaction, VariableCollection};
     use crate::{
         config::WafConfig,
         operators::Outputs,
         rules::VariableSpec,
-        types::{BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
+        types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
     };
 
     #[test]
@@ -2047,6 +2073,389 @@ payload\r\n\
         assert_eq!(
             tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
             Some("1")
+        );
+    }
+
+    /// Build a transaction that inspects a RAW request body with the supplied limits.
+    fn request_body_transaction(id: &str, limit: i64, action: BodyLimitAction) -> Transaction {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: limit,
+            request_body_limit_action: action,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config(id, Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+        tx
+    }
+
+    #[test]
+    fn request_body_limit_reject_boundaries() {
+        let mut tx = request_body_transaction("request-limit-below", 4, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b"abc"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some("abc"));
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 3,
+                retained: 3,
+                inspected: 3,
+                truncated: false,
+                spilled: false,
+            }
+        );
+
+        let mut tx = request_body_transaction("request-limit-equal", 4, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b"abcd").map(|item| item.status), Some(413));
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 4,
+                retained: 0,
+                inspected: 0,
+                truncated: true,
+                spilled: false,
+            }
+        );
+
+        let mut tx = request_body_transaction("request-limit-above", 4, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b"abcde").map(|item| item.status), Some(413));
+        assert_eq!(tx.request_body_stats().supplied, 5);
+        assert_eq!(tx.request_body_stats().retained, 0);
+        assert!(tx.request_body_stats().truncated);
+
+        let mut tx = request_body_transaction("request-limit-zero", 0, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b"a").map(|item| item.status), Some(413));
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.request_body_stats().retained, 0);
+        assert!(tx.request_body_stats().truncated);
+
+        // An empty body never crosses the limit, even at zero.
+        let mut tx = request_body_transaction("request-limit-zero-empty", 0, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b""), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.request_body_stats(), BodyIngestionStats::default());
+    }
+
+    #[test]
+    fn request_body_limit_process_partial_boundaries() {
+        let mut tx = request_body_transaction("request-partial-below", 4, BodyLimitAction::ProcessPartial);
+        assert_eq!(tx.process_request_body(b"abc"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some("abc"));
+        assert_eq!(tx.request_body_stats().inspected, 3);
+        assert!(!tx.request_body_stats().truncated);
+
+        let mut tx = request_body_transaction("request-partial-equal", 4, BodyLimitAction::ProcessPartial);
+        assert_eq!(tx.process_request_body(b"abcd"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(tx.request_body_stats().retained, 4);
+        assert_eq!(tx.request_body_stats().inspected, 4);
+        assert!(!tx.request_body_stats().truncated);
+
+        let mut tx = request_body_transaction("request-partial-above", 4, BodyLimitAction::ProcessPartial);
+        assert_eq!(tx.process_request_body(b"abcde"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(tx.request_body_stats().supplied, 5);
+        assert_eq!(tx.request_body_stats().retained, 4);
+        assert_eq!(tx.request_body_stats().inspected, 4);
+        assert!(tx.request_body_stats().truncated);
+
+        let mut tx = request_body_transaction("request-partial-zero", 0, BodyLimitAction::ProcessPartial);
+        assert_eq!(tx.process_request_body(b"a"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+        assert_eq!(tx.request_body_stats().supplied, 1);
+        assert_eq!(tx.request_body_stats().retained, 0);
+        assert_eq!(tx.request_body_stats().inspected, 0);
+        assert!(tx.request_body_stats().truncated);
+
+        let mut tx = request_body_transaction("request-partial-zero-empty", 0, BodyLimitAction::ProcessPartial);
+        assert_eq!(tx.process_request_body(b""), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.request_body_stats(), BodyIngestionStats::default());
+    }
+
+    #[test]
+    fn request_body_without_a_processor_is_retained_but_not_inspected() {
+        // The one-byte memory limit forces a spill, so a replay would read the file.
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 8,
+            request_body_in_memory_limit: 1,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-no-processor", Arc::new(config));
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"abc"), None);
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 3,
+                retained: 3,
+                inspected: 0,
+                truncated: false,
+                spilled: true,
+            }
+        );
+        assert_eq!(tx.request_body_buffer.replay_count(), 0);
+    }
+
+    #[test]
+    fn request_body_is_not_buffered_or_audited_when_access_is_off() {
+        // A one-byte in-memory limit makes any retained byte spill, so a missing spill
+        // path proves admission never happened.
+        let config = WafConfig {
+            request_body_access: false,
+            request_body_limit: 16,
+            request_body_in_memory_limit: 1,
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: vec![AuditLogPart::Header, AuditLogPart::RequestBody, AuditLogPart::EndMarker],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-audit-access-off", Arc::new(config));
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"audited"), None);
+        assert_eq!(tx.get_variable(RuleVariable::RequestBody, None).as_deref(), Some(""));
+        assert_eq!(tx.request_body_stats(), BodyIngestionStats::default());
+        assert_eq!(tx.audit_log().transaction.request.body, "");
+        assert!(tx.request_body_spill_path().is_none());
+    }
+
+    #[test]
+    fn request_body_limit_is_not_applied_when_access_is_off() {
+        for action in [BodyLimitAction::Reject, BodyLimitAction::ProcessPartial] {
+            let config = WafConfig {
+                request_body_access: false,
+                request_body_limit: 4,
+                request_body_limit_action: action,
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("request-limit-access-off", Arc::new(config));
+            tx.process_request_headers();
+
+            assert_eq!(tx.process_request_body(b"attack"), None);
+            assert_eq!(
+                tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+                Some("0")
+            );
+            assert_eq!(tx.request_body_stats(), BodyIngestionStats::default());
+            assert!(!tx.request_body_stats().truncated);
+        }
+    }
+
+    #[test]
+    fn request_body_is_not_buffered_when_the_rule_engine_is_off() {
+        let config = WafConfig {
+            rule_engine: RuleEngineStatus::Off,
+            request_body_access: true,
+            request_body_limit: 16,
+            request_body_in_memory_limit: 1,
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: vec![AuditLogPart::Header, AuditLogPart::RequestBody, AuditLogPart::EndMarker],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-engine-off", Arc::new(config));
+        // `begin_phase` returns false while the rule engine is off, so no phase starts.
+        tx.process_request_headers();
+        assert_eq!(tx.last_phase(), None);
+
+        assert_eq!(tx.process_request_body(b"audited"), None);
+        assert_eq!(tx.request_body_stats(), BodyIngestionStats::default());
+        assert_eq!(tx.audit_log().transaction.request.body, "");
+        assert!(tx.request_body_spill_path().is_none());
+    }
+
+    #[test]
+    fn response_body_with_access_off_is_not_buffered_audited_or_limited() {
+        let config = WafConfig {
+            response_body_access: false,
+            response_body_limit: 4,
+            response_body_limit_action: BodyLimitAction::Reject,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: vec![
+                AuditLogPart::Header,
+                AuditLogPart::ResponseBody,
+                AuditLogPart::EndMarker,
+            ],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-access-off", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"attack"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.response_body_stats(), BodyIngestionStats::default());
+        assert_eq!(tx.audit_log().transaction.response.unwrap().body, "");
+    }
+
+    #[test]
+    fn request_body_spills_to_a_temporary_file_and_replays_to_processor_and_audit() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 16,
+            request_body_in_memory_limit: 2,
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: vec![AuditLogPart::Header, AuditLogPart::RequestBody, AuditLogPart::EndMarker],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-spill", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+
+        assert_eq!(tx.process_request_body(b"0123456789"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("0123456789")
+        );
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 10,
+                retained: 10,
+                inspected: 10,
+                truncated: false,
+                spilled: true,
+            }
+        );
+        assert_eq!(tx.audit_log().transaction.request.body, "0123456789");
+
+        let path = tx.request_body_spill_path().unwrap().to_owned();
+        assert!(path.exists(), "spill file {path:?} should exist");
+        drop(tx);
+        assert!(
+            !path.exists(),
+            "spill file {path:?} should be removed with the transaction"
+        );
+    }
+
+    #[test]
+    fn default_in_memory_limit_keeps_a_body_above_128_kib_in_memory() {
+        // The unset default follows the raised body limit, so a body above 128 KiB stays
+        // in memory instead of spilling at a fixed 128 KiB threshold.
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 1024 * 1024,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-default-memory", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+
+        let body = vec![b'a'; 128 * 1024 + 1];
+        assert_eq!(tx.process_request_body(&body), None);
+        assert!(!tx.request_body_stats().spilled);
+        assert_eq!(tx.request_body_stats().retained, u64::try_from(body.len()).unwrap());
+        assert_eq!(tx.request_body_stats().inspected, u64::try_from(body.len()).unwrap());
+        assert!(!tx.request_body_stats().truncated);
+    }
+
+    #[test]
+    fn explicit_in_memory_limit_spills_above_the_configured_value() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 1024 * 1024,
+            request_body_in_memory_limit: 131_072,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-explicit-memory", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+
+        let body = vec![b'a'; 131_073];
+        assert_eq!(tx.process_request_body(&body), None);
+        assert!(tx.request_body_stats().spilled);
+        assert_eq!(tx.request_body_stats().retained, u64::try_from(body.len()).unwrap());
+        assert_eq!(tx.request_body_stats().inspected, u64::try_from(body.len()).unwrap());
+    }
+
+    #[test]
+    fn explicit_zero_in_memory_limit_follows_the_body_limit() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 1024 * 1024,
+            request_body_in_memory_limit: 0,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-zero-memory", Arc::new(config));
+        tx.process_request_headers();
+
+        let body = vec![b'a'; 128 * 1024 + 1];
+        assert_eq!(tx.process_request_body(&body), None);
+        assert!(!tx.request_body_stats().spilled);
+        assert_eq!(tx.request_body_stats().retained, u64::try_from(body.len()).unwrap());
+        assert_eq!(tx.request_body_stats().inspected, 0);
+        assert_eq!(tx.request_body_buffer.replay_count(), 0);
+    }
+
+    #[test]
+    fn spilled_request_body_replays_through_the_json_processor() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 64,
+            request_body_in_memory_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("request-spill-json", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("JSON");
+
+        let body = br#"{"user":"attack"}"#;
+        assert_eq!(tx.process_request_body(body), None);
+        assert!(tx.request_body_stats().spilled);
+        assert_eq!(tx.request_body_stats().inspected, u64::try_from(body.len()).unwrap());
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("json.user")).as_deref(),
+            Some("attack")
         );
     }
 
@@ -2569,7 +2978,9 @@ payload\r\n\
     }
 
     #[test]
-    fn response_body_equal_to_limit_is_not_rejected() {
+    fn response_body_limit_boundaries_match_go_write_semantics() {
+        // Go WriteResponseBody uses `>=`, so a body exactly at the limit is rejected by
+        // the Reject action and partially inspected by ProcessPartial.
         let config = WafConfig {
             response_body_access: true,
             response_body_limit: 3,
@@ -2577,7 +2988,31 @@ payload\r\n\
             response_body_mime_types: vec!["text/plain".to_owned()],
             ..WafConfig::default()
         };
-        let mut tx = Transaction::with_config("response-limit-equal", Arc::new(config));
+        let mut tx = Transaction::with_config("response-limit-equal-reject", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"abc").map(|item| item.status), Some(500));
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
+        assert_eq!(tx.response_body_stats().supplied, 3);
+        assert_eq!(tx.response_body_stats().retained, 0);
+        assert_eq!(tx.response_body_stats().inspected, 0);
+        assert!(tx.response_body_stats().truncated);
+
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::ProcessPartial,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-limit-equal-partial", Arc::new(config));
         tx.process_request_headers();
         tx.process_request_body(b"");
         tx.add_response_header("Content-Type", "text/plain");
@@ -2586,16 +3021,111 @@ payload\r\n\
         assert_eq!(tx.process_response_body(b"abc"), None);
         assert_eq!(
             tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
-            Some("0")
+            Some("1")
         );
         assert_eq!(
             tx.get_variable(RuleVariable::ResponseBody, None).as_deref(),
             Some("abc")
         );
+        assert_eq!(tx.response_body_stats().retained, 3);
+        assert_eq!(tx.response_body_stats().inspected, 3);
+        assert!(!tx.response_body_stats().truncated);
+        assert!(!tx.response_body_stats().spilled);
+
+        // One byte below the limit is neither rejected nor flagged.
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::Reject,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-limit-below", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"ab"), None);
         assert_eq!(
-            tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
-            Some("3")
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
         );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some("ab"));
+
+        // One byte above the limit truncates and flags the body.
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::ProcessPartial,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-limit-above", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"abcd"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseBody, None).as_deref(),
+            Some("abc")
+        );
+        assert!(tx.response_body_stats().truncated);
+        assert_eq!(tx.response_body_stats().supplied, 4);
+        assert_eq!(tx.response_body_stats().retained, 3);
+    }
+
+    #[test]
+    fn zero_response_limit_rejects_only_non_empty_bodies() {
+        for action in [BodyLimitAction::Reject, BodyLimitAction::ProcessPartial] {
+            let config = WafConfig {
+                response_body_access: true,
+                response_body_limit: 0,
+                response_body_limit_action: action,
+                response_body_mime_types: vec!["text/plain".to_owned()],
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("response-limit-zero", Arc::new(config));
+            tx.process_request_headers();
+            tx.process_request_body(b"");
+            tx.add_response_header("Content-Type", "text/plain");
+            tx.process_response_headers(200, "HTTP/1.1");
+
+            assert_eq!(tx.process_response_body(b""), None);
+            assert_eq!(
+                tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+                Some("0")
+            );
+            assert_eq!(tx.response_body_stats().supplied, 0);
+
+            let config = WafConfig {
+                response_body_access: true,
+                response_body_limit: 0,
+                response_body_limit_action: action,
+                response_body_mime_types: vec!["text/plain".to_owned()],
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("response-limit-zero-body", Arc::new(config));
+            tx.process_request_headers();
+            tx.process_request_body(b"");
+            tx.add_response_header("Content-Type", "text/plain");
+            tx.process_response_headers(200, "HTTP/1.1");
+
+            let interruption = tx.process_response_body(b"a");
+            assert_eq!(
+                interruption.map(|item| item.status),
+                (action == BodyLimitAction::Reject).then_some(500)
+            );
+            assert_eq!(
+                tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+                Some("1")
+            );
+            assert_eq!(tx.response_body_stats().retained, 0);
+            assert_eq!(tx.response_body_stats().supplied, 1);
+            assert!(tx.response_body_stats().truncated);
+        }
     }
 
     #[test]
@@ -2985,11 +3515,13 @@ payload\r\n\
         let callback_output = Arc::clone(&callback_lines);
         let mut parser = crate::seclang::Parser::new();
         *parser.config_mut() = WafConfig {
-            audit_engine: crate::types::AuditEngineStatus::On,
+            audit_engine: AuditEngineStatus::On,
             audit_log: path.to_string_lossy().into_owned(),
             audit_log_format: crate::types::AuditLogFormat::Json,
             audit_log_parts: crate::types::parse_audit_log_parts("ABCFGHKZ").unwrap(),
             request_body_access: true,
+            response_body_access: true,
+            response_body_mime_types: vec!["text/plain".to_owned()],
             ..WafConfig::default()
         };
         parser.on_error_log(move |matched| {
@@ -3057,7 +3589,7 @@ payload\r\n\
         let path = dir.path().join("audit.log");
         let mut parser = crate::seclang::Parser::new();
         *parser.config_mut() = WafConfig {
-            audit_engine: crate::types::AuditEngineStatus::RelevantOnly,
+            audit_engine: AuditEngineStatus::RelevantOnly,
             audit_log: path.to_string_lossy().into_owned(),
             audit_log_parts: crate::types::parse_audit_log_parts("ABFHKZ").unwrap(),
             ..WafConfig::default()

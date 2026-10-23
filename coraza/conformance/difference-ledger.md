@@ -57,6 +57,19 @@ adding them requires a shared-corpus fixture first.
   `libperfusion/tests/regressions.rs`.
 - Twelve URL-bearing attributes and the `MATH` tag added. Cases are pinned in
   `libperfusion/tests/regressions.rs` and the two XSS corpus rows above.
+- Body-limit `Reject` under `SecRuleEngine DetectionOnly`. Go Coraza sets a blocking
+  interruption even in detection-only mode; this port records
+  `would_be_interruption` and inspects the bytes retained up to the limit.
+- Zero body limits. Go Coraza refuses `SecRequestBodyLimit 0`,
+  `SecRequestBodyInMemoryLimit 0` and `SecResponseBodyLimit 0` during configuration
+  validation; this port accepts zero, treats any non-empty body as over the limit while
+  an empty body bypasses the check, and uses `SecRequestBodyInMemoryLimit 0` as the
+  sentinel for "unset", where the effective memory limit follows `SecRequestBodyLimit`.
+  Go instead rejects an explicit zero and distinguishes unset only through its nullable
+  configuration value.
+- `SecRequestBodyNoFilesLimit` is accepted, validated and documented as not enforced,
+  matching Go Coraza v3.8.1 (`internal/corazawaf/waf.go:120`, corazawaf/coraza#896).
+  No admission decision depends on it on either side.
 
 ## Rust-only multipart parser hardening budgets
 

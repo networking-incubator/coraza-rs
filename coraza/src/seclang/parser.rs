@@ -993,6 +993,7 @@ fn directive_sec_response_body_limit_action(options: &mut DirectiveOptions<'_>) 
 /// `SecRequestBodyInMemoryLimit` `limit_in_bytes`
 ///
 /// Sets the limit for request body data stored in memory before writing to disk.
+/// `0` means unset, so the effective limit follows `SecRequestBodyLimit`.
 fn directive_sec_request_body_in_memory_limit(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     let limit = options
         .opts
