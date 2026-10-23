@@ -239,7 +239,7 @@ pub struct Transaction {
     /// Path arguments supplied by the connector.
     args_path: Map,
     /// Indices of path arguments in the combined `ARGS` map, in insertion order.
-    args_path_indices: Vec<(String, usize)>,
+    args_path_indices: Vec<(Vec<u8>, usize)>,
     /// Request headers supplied by the connector.
     request_headers: Map,
     /// Request cookies supplied by a connector that parsed them.
@@ -1037,38 +1037,41 @@ impl Transaction {
     /// Add the decoded pairs of a raw query string to the GET collections.
     fn add_query_arguments(&mut self, query: &str) {
         for (key, value) in parse_urlencoded(query.as_bytes()) {
-            self.add_get_argument(&key, value);
+            self.add_get_argument(key, value);
         }
     }
 
-    /// Add a query argument to `ARGS_GET` and `ARGS`.
-    pub fn add_get_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
+    /// Add a query argument to `ARGS_GET` and `ARGS`, keeping the decoded name bytes.
+    pub fn add_get_argument(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_get.value_count()) {
-            self.args_get.add(key, value);
-            self.args.add(key, value);
+            self.args_get.add_bytes(key, value);
+            self.args.add_bytes(key, value);
             self.update_args_combined_size(key, value);
         }
     }
 
-    /// Add a request body argument to `ARGS_POST` and `ARGS`.
-    pub fn add_post_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
+    /// Add a request body argument to `ARGS_POST` and `ARGS`, keeping the decoded name bytes.
+    pub fn add_post_argument(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_post.value_count()) {
-            self.args_post.add(key, value);
-            self.args.add(key, value);
+            self.args_post.add_bytes(key, value);
+            self.args.add_bytes(key, value);
             self.update_args_combined_size(key, value);
         }
     }
 
-    /// Add a connector-supplied path argument to `ARGS_PATH` and `ARGS`.
-    pub fn add_path_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
+    /// Add a connector-supplied path argument to `ARGS_PATH` and `ARGS`, keeping the name bytes.
+    pub fn add_path_argument(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_path.value_count()) {
             let args_index = self.args.values(key).count();
-            self.args_path.add(key, value);
-            self.args.add(key, value);
-            self.args_path_indices.push((key.to_owned(), args_index));
+            self.args_path.add_bytes(key, value);
+            self.args.add_bytes(key, value);
+            self.args_path_indices.push((key.to_vec(), args_index));
         }
     }
 
@@ -1157,7 +1160,7 @@ impl Transaction {
     }
 
     /// Add one GET or POST argument's byte lengths to the combined size.
-    fn update_args_combined_size(&mut self, key: &str, value: &[u8]) {
+    fn update_args_combined_size(&mut self, key: &[u8], value: &[u8]) {
         self.args_combined_size = self
             .args_combined_size
             .saturating_add(key.len())
@@ -1623,11 +1626,56 @@ mod tests {
         body_buffer::{BufferFailure, inject_failure},
     };
     use crate::{
+        Waf,
         config::WafConfig,
         operators::Outputs,
         rules::VariableSpec,
         types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
     };
+
+    /// The byte keys and values of a map collection, sorted so the test does not depend on
+    /// hash-map iteration order.
+    fn byte_entries(tx: &Transaction, variable: RuleVariable) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let map = match tx.collection(variable) {
+            Some(VariableCollection::Map(map)) => Some(map),
+            _ => None,
+        }
+        .unwrap();
+        let mut entries: Vec<_> = map
+            .iter_bytes()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn process_uri_keeps_decoded_argument_name_bytes() {
+        let waf = Waf::new(WafConfig::default()).unwrap();
+        let mut tx = waf.new_transaction();
+        tx.process_uri("/?%ff=a&%fe=b", "GET", "HTTP/1.1");
+
+        let expected = vec![(vec![0xFE], b"b".to_vec()), (vec![0xFF], b"a".to_vec())];
+        assert_eq!(byte_entries(&tx, RuleVariable::ArgsGet), expected);
+        assert_eq!(byte_entries(&tx, RuleVariable::Args), expected);
+    }
+
+    #[test]
+    fn urlencoded_body_keeps_decoded_argument_name_bytes() {
+        let config = WafConfig {
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let waf = Waf::new(config).unwrap();
+        let mut tx = waf.new_transaction();
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"%ff=a&%fe=b"), None);
+
+        let expected = vec![(vec![0xFE], b"b".to_vec()), (vec![0xFF], b"a".to_vec())];
+        assert_eq!(byte_entries(&tx, RuleVariable::ArgsPost), expected);
+        assert_eq!(byte_entries(&tx, RuleVariable::Args), expected);
+    }
 
     #[test]
     fn stores_and_matches_byte_arguments() {

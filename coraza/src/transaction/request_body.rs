@@ -149,7 +149,7 @@ impl Transaction {
                 self.request_body.set(body);
                 self.request_body_length.set(body.len().to_string());
                 for (key, value) in parse_urlencoded(body) {
-                    self.add_post_argument(&key, value);
+                    self.add_post_argument(key, value);
                 }
             },
             BodyProcessor::Multipart => {
@@ -268,7 +268,7 @@ impl Transaction {
                 }
                 self.files_names.add("", &part.name);
             } else {
-                self.add_post_argument(&part.name, part.data);
+                self.add_post_argument(part.name.as_bytes(), part.data);
             }
         }
 
@@ -315,8 +315,8 @@ fn canonical_header_name(name: &str) -> String {
         .collect()
 }
 
-/// Parses URLENCODED pairs in order, preserving decoded value bytes.
-pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec<u8>)> + '_ {
+/// Parses URLENCODED pairs in order, preserving decoded name and value bytes.
+pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
     body.split(|&byte| byte == b'&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
@@ -327,7 +327,7 @@ pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (String, Vec
                 ),
                 None => (pair, &b""[..]),
             };
-            let key = text_of(&url_decode(key).0).into_owned();
+            let key = url_decode(key).0;
             let value = url_decode(value).0;
             (key, value)
         })
@@ -1512,7 +1512,7 @@ pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &JsonArgum
         } else {
             tx.args_post.add(&key, value);
             tx.args.add(&key, value);
-            tx.update_args_combined_size(&key, value);
+            tx.update_args_combined_size(key.as_bytes(), value);
         }
     });
 }

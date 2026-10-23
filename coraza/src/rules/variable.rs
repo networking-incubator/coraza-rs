@@ -180,20 +180,21 @@ impl VariableSpec {
         let count_mode = self.count;
         let has_literal_exceptions = self.exceptions.iter().any(|exception| exception.key.is_some());
         {
-            let mut record = |variable: RuleVariable, key: &str, value: &[u8]| {
+            let mut record = |variable: RuleVariable, key: &[u8], value: &[u8]| {
                 if count_mode {
                     count = count.saturating_add(1);
                 } else {
-                    matches.push(MatchData::new(variable, key, value));
+                    matches.push(MatchData::new(variable, String::from_utf8_lossy(key), value));
                 }
             };
-            let keep = |key: &str| {
-                let key_lower = has_literal_exceptions.then(|| key.to_lowercase());
-                let key_lower = key_lower.as_deref().unwrap_or(key);
+            let keep = |key: &[u8]| {
+                let key_text = String::from_utf8_lossy(key);
+                let key_lower = has_literal_exceptions.then(|| key_text.to_lowercase());
+                let key_lower = key_lower.as_deref().unwrap_or(&key_text);
                 !self
                     .exceptions
                     .iter()
-                    .any(|exception| exception.matches(key, key_lower))
+                    .any(|exception| exception.matches(&key_text, key_lower))
             };
 
             match (collection, &self.key) {
@@ -204,12 +205,13 @@ impl VariableSpec {
                 }),
                 (CollectionView::Names(variable, map), _) => self.select(map, |key, _| {
                     if keep(key) {
-                        record(variable, key, key.as_bytes());
+                        // Go exposes the raw name bytes as the value, so keep them exact.
+                        record(variable, key, key);
                     }
                 }),
                 (CollectionView::Single(single), None) => {
-                    if keep("") {
-                        record(single.variable(), "", single.get_bytes());
+                    if keep(b"") {
+                        record(single.variable(), b"", single.get_bytes());
                     }
                 },
                 (CollectionView::Single(_), Some(_)) => {},
@@ -232,15 +234,15 @@ impl VariableSpec {
         self.variable
     }
 
-    /// Visit the map entries selected by this specification.
-    fn select<'a>(&'a self, map: &'a Map, mut found: impl FnMut(&'a str, &'a [u8])) {
+    /// Visit the map entries selected by this specification, with keys as stored.
+    fn select<'a>(&'a self, map: &'a Map, mut found: impl FnMut(&'a [u8], &'a [u8])) {
         match &self.key {
-            Some(VariableKey::Regex(regex)) => map.iter_regex(regex).for_each(|(key, value)| found(key, value)),
+            Some(VariableKey::Regex(regex)) => map.iter_regex_bytes(regex).for_each(|(key, value)| found(key, value)),
             Some(VariableKey::String(key)) if !key.is_empty() => {
-                map.iter_key(key)
+                map.iter_key_bytes(key.as_bytes())
                     .for_each(|(stored_key, value)| found(stored_key, value));
             },
-            _ => map.iter().for_each(|(key, value)| found(key, value)),
+            _ => map.iter_bytes().for_each(|(key, value)| found(key, value)),
         }
     }
 }
@@ -368,5 +370,61 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(spec.get_matches(Some(CollectionView::Map(&map))).len(), 3);
+    }
+
+    #[test]
+    fn args_matches_every_byte_key() {
+        // The decoded names of `/?%ff=a&%fe=b`.
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add_bytes(b"\xff", b"a");
+        map.add_bytes(b"\xfe", b"b");
+
+        let matches = VariableSpec::new(RuleVariable::Args).get_matches(Some(CollectionView::Map(&map)));
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().any(|matched| matched.value == b"a"));
+        assert!(matches.iter().any(|matched| matched.value == b"b"));
+    }
+
+    #[test]
+    fn names_view_returns_raw_key_bytes() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add_bytes(b"\xff", b"a");
+        map.add_bytes(b"\xfe", b"b");
+        map.add_bytes(b"a\0b", b"c");
+
+        let matches = VariableSpec::new(RuleVariable::ArgsNames)
+            .get_matches(Some(CollectionView::Names(RuleVariable::ArgsNames, &map)));
+
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().any(|matched| matched.value == b"\xff"));
+        assert!(matches.iter().any(|matched| matched.value == b"\xfe"));
+        assert!(matches.iter().any(|matched| matched.value == b"a\0b"));
+    }
+
+    #[test]
+    fn regex_selectors_match_the_lossy_key_text_without_merging() {
+        let mut args = Map::new_case_sensitive(RuleVariable::Args);
+        args.add_bytes(b"id\xff", b"a");
+        args.add_bytes(b"id\xfe", b"b");
+        let regex = Regex::new("^id").expect("test regex is valid");
+
+        let matches = VariableSpec::new_regex(RuleVariable::Args, regex).get_matches(Some(CollectionView::Map(&args)));
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|matched| matched.key == "id\u{fffd}"));
+        assert!(matches.iter().any(|matched| matched.value == b"a"));
+        assert!(matches.iter().any(|matched| matched.value == b"b"));
+
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add_bytes(b"X-Key\xff", b"a");
+        headers.add_bytes(b"X-Key\xfe", b"b");
+        let regex = Regex::new("^x-key").expect("test regex is valid");
+
+        let matches = VariableSpec::new_regex(RuleVariable::RequestHeaders, regex)
+            .get_matches(Some(CollectionView::Map(&headers)));
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|matched| matched.key == "X-Key\u{fffd}"));
     }
 }

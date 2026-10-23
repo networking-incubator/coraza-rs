@@ -313,7 +313,7 @@ impl Transaction {
         let args_index = self
             .args_path_indices
             .iter()
-            .find(|(path_key, _)| path_key == key)
+            .find(|(path_key, _)| path_key.as_slice() == key.as_bytes())
             .map(|(_, index)| *index);
         let Some(args_index) = args_index else {
             self.add_path_argument(key, value);

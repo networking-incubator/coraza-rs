@@ -22,8 +22,12 @@
 //!
 //! Provides key-value storage with optional case-insensitive keys.
 //! Multiple values per key are supported.
+//!
+//! Keys are byte strings, as they are in Go, so decoded names stay distinct even when they
+//! are not valid UTF-8. Text interfaces use the lossy view described on [`Map::iter`]; they
+//! never decide which entries exist.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, hash::Hash};
 
 use regex::Regex;
 
@@ -38,35 +42,102 @@ use crate::{transformations::text_of, types::RuleVariable};
 ///
 /// # Original Key Preservation
 ///
-/// Even when using case-insensitive mode, the original key casing is preserved
+/// Even when using case-insensitive mode, the original key bytes are preserved
 /// and returned in `MatchData` results.
 pub struct Map {
     /// Whether keys are case-sensitive
     case_sensitive: bool,
     /// Internal storage from `lookup_key` to `Vec<KeyValue>`.
     /// Keys are lowercase for case-insensitive maps.
-    data: HashMap<String, Vec<KeyValue>>,
+    data: HashMap<Key, Vec<KeyValue>>,
     /// The variable this collection represents
     variable: RuleVariable,
 }
 
+/// A stored key.
+///
+/// Keys that arrived as text stay `Text`, so the common path keeps a single allocation and a
+/// borrowed text view. Raw byte keys keep their bytes authoritative; their lossy text is
+/// computed once for the text interfaces.
+#[derive(Debug, Clone)]
+enum Key {
+    /// A valid UTF-8 key, with its original casing.
+    Text(String),
+    /// A byte key that is not valid UTF-8, with its lossy text view.
+    Bytes {
+        /// The key bytes, exactly as stored.
+        bytes: Box<[u8]>,
+        /// The text view, invalid UTF-8 replaced with U+FFFD.
+        lossy: String,
+    },
+}
+
+impl Key {
+    /// Stores `bytes`, keeping their exact spelling.
+    fn from_slice(bytes: &[u8]) -> Self {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::Text(text.to_owned()),
+            Err(_) => Self::Bytes {
+                bytes: bytes.into(),
+                lossy: String::from_utf8_lossy(bytes).into_owned(),
+            },
+        }
+    }
+
+    /// The key bytes.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Bytes { bytes, .. } => bytes,
+        }
+    }
+
+    /// The text view, invalid UTF-8 replaced with U+FFFD.
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Bytes { lossy, .. } => lossy,
+        }
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for Key {}
+
+impl Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for Key {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// Internal storage for a key-value pair.
 ///
-/// Preserves the original key casing even when the map is case-insensitive. Values are read
-/// and written as bytes; only this type knows how they are stored.
+/// Preserves the original key bytes and casing even when the map is case-insensitive. Values
+/// are read and written as bytes; only this type knows how they are stored.
 #[derive(Debug, Clone)]
 struct KeyValue {
     /// Original key (with original casing)
-    key: String,
+    key: Key,
     /// Value
     value: Vec<u8>,
 }
 
 impl KeyValue {
     /// Creates a stored key/value pair.
-    fn new(key: &str, value: &[u8]) -> Self {
+    fn new(key: Key, value: &[u8]) -> Self {
         Self {
-            key: key.to_owned(),
+            key,
             value: Self::stored(value),
         }
     }
@@ -87,11 +158,49 @@ impl KeyValue {
     }
 
     /// Replaces the key and value, reusing their buffers.
-    fn replace(&mut self, key: &str, value: &[u8]) {
-        self.key.clear();
-        self.key.push_str(key);
+    fn replace(&mut self, key: &[u8], value: &[u8]) {
+        if self.key.as_bytes() != key {
+            self.key = Key::from_slice(key);
+        }
         self.value.clear();
         self.value.extend_from_slice(value);
+    }
+}
+
+/// Lower-cases the valid UTF-8 parts of `key` and copies bytes that are not UTF-8 unchanged,
+/// so distinct invalid byte sequences stay distinct.
+fn lower_bytes(key: &[u8]) -> Vec<u8> {
+    let mut lowered = Vec::with_capacity(key.len());
+    let mut rest = key;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push_lowercase(&mut lowered, text);
+                return lowered;
+            },
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if let Some(prefix) = rest.get(..valid).and_then(|bytes| std::str::from_utf8(bytes).ok()) {
+                    push_lowercase(&mut lowered, prefix);
+                }
+                let invalid_len = error.error_len().unwrap_or_else(|| rest.len().saturating_sub(valid));
+                let end = valid.saturating_add(invalid_len).min(rest.len());
+                if let Some(bytes) = rest.get(valid..end) {
+                    lowered.extend_from_slice(bytes);
+                }
+                rest = rest.get(end..).unwrap_or_default();
+            },
+        }
+    }
+}
+
+/// Appends `text` to `out`, lower-cased.
+fn push_lowercase(out: &mut Vec<u8>, text: &str) {
+    for character in text.chars() {
+        for lower in character.to_lowercase() {
+            let mut buffer = [0_u8; 4];
+            out.extend_from_slice(lower.encode_utf8(&mut buffer).as_bytes());
+        }
     }
 }
 
@@ -120,36 +229,69 @@ impl Map {
 
     /// The key `key` is stored under: as it is in a case-sensitive map, lowercase otherwise.
     /// Borrowed when that is `key` itself, which spares lookups an allocation.
-    fn lookup_key<'k>(&self, key: &'k str) -> Cow<'k, str> {
-        if self.case_sensitive || !key.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+    fn lookup_key<'k>(&self, key: &'k [u8]) -> Cow<'k, [u8]> {
+        if self.case_sensitive || !key.iter().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
             Cow::Borrowed(key)
         } else {
-            Cow::Owned(key.to_lowercase())
+            Cow::Owned(lower_bytes(key))
         }
     }
 
     /// Every key, with its original casing, and value, in no particular order.
+    ///
+    /// This is a lossy text view: keys that are not valid UTF-8 have their invalid bytes
+    /// replaced with U+FFFD. Distinct byte keys still yield one entry each, so no entry is
+    /// merged or dropped; `Map::iter_bytes` gives the key bytes.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
-        self.data.values().flatten().map(|kv| (kv.key.as_str(), kv.value()))
+        self.data.values().flatten().map(|kv| (kv.key.text(), kv.value()))
+    }
+
+    /// Every key, exactly as stored, and value, in no particular order.
+    pub(crate) fn iter_bytes(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        self.data.values().flatten().map(|kv| (kv.key.as_bytes(), kv.value()))
     }
 
     /// The keys and values stored under `key` (whatever its case, in a case-insensitive map).
-    pub fn iter_key(&self, key: &str) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+    ///
+    /// The returned keys are the lossy text view described on [`Map::iter`].
+    pub fn iter_key(&self, key: impl AsRef<[u8]>) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        let lookup = self.lookup_key(key.as_ref());
+        self.data
+            .get(lookup.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|kv| (kv.key.text(), kv.value()))
+    }
+
+    /// The keys and values stored under the exact `key` bytes.
+    pub(crate) fn iter_key_bytes(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         let lookup = self.lookup_key(key);
         self.data
             .get(lookup.as_ref())
             .into_iter()
             .flatten()
-            .map(|kv| (kv.key.as_str(), kv.value()))
+            .map(|kv| (kv.key.as_bytes(), kv.value()))
     }
 
     /// The keys and values whose (lookup) key matches `regex`.
+    ///
+    /// The regex runs on the lossy text view described on [`Map::iter`]; matches are still
+    /// reported once per stored byte key.
     pub fn iter_regex<'a>(&'a self, regex: &'a Regex) -> impl Iterator<Item = (&'a str, &'a [u8])> {
         self.data
             .iter()
-            .filter(|(lookup_key, _)| regex.is_match(lookup_key))
+            .filter(|(lookup_key, _)| regex.is_match(lookup_key.text()))
             .flat_map(|(_, values)| values)
-            .map(|kv| (kv.key.as_str(), kv.value()))
+            .map(|kv| (kv.key.text(), kv.value()))
+    }
+
+    /// The keys and values whose (lookup) key matches `regex`, with keys as stored.
+    pub(crate) fn iter_regex_bytes<'a>(&'a self, regex: &'a Regex) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+        self.data
+            .iter()
+            .filter(|(lookup_key, _)| regex.is_match(lookup_key.text()))
+            .flat_map(|(_, values)| values)
+            .map(|kv| (kv.key.as_bytes(), kv.value()))
     }
 
     /// Name of the variable this map holds (e.g. `ARGS`).
@@ -163,14 +305,19 @@ impl Map {
     }
 
     /// The values of `key`; none if the key is absent.
-    pub fn values(&self, key: &str) -> impl Iterator<Item = &[u8]> + '_ {
-        self.iter_key(key).map(|(_, value)| value)
+    pub fn values(&self, key: impl AsRef<[u8]>) -> impl Iterator<Item = &[u8]> + '_ {
+        let lookup = self.lookup_key(key.as_ref());
+        self.data
+            .get(lookup.as_ref())
+            .into_iter()
+            .flatten()
+            .map(KeyValue::value)
     }
 
     /// All values for `key` as text, invalid UTF-8 replaced with U+FFFD; empty if the key
     /// is absent. [`Map::values`] gives them as they are.
-    pub fn get(&self, key: &str) -> Vec<String> {
-        let lookup = self.lookup_key(key);
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Vec<String> {
+        let lookup = self.lookup_key(key.as_ref());
         self.data
             .get(lookup.as_ref())
             .map(|values| values.iter().map(|kv| kv.text().into_owned()).collect())
@@ -178,34 +325,42 @@ impl Map {
     }
 
     /// The first value of `key`; `None` if the key is absent.
-    pub fn first(&self, key: &str) -> Option<&[u8]> {
+    pub fn first(&self, key: impl AsRef<[u8]>) -> Option<&[u8]> {
         self.values(key).next()
     }
 
     /// Appends `value` to the values of `key`.
     pub(crate) fn add(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        self.add_bytes(key.as_bytes(), value);
+    }
+
+    /// Appends `value` to the values of the exact key bytes.
+    pub(crate) fn add_bytes(&mut self, key: &[u8], value: impl AsRef<[u8]>) {
+        let value = value.as_ref();
         let lookup = self.lookup_key(key);
-        let kv = KeyValue::new(key, value.as_ref());
+        let kv = KeyValue::new(Key::from_slice(key), value);
         match self.data.get_mut(lookup.as_ref()) {
             Some(values) => values.push(kv),
             None => {
-                self.data.insert(lookup.into_owned(), vec![kv]);
+                self.data.insert(Key::from_slice(lookup.as_ref()), vec![kv]);
             },
         }
     }
 
     /// Replaces the values of `key`.
-    pub(crate) fn set<V: AsRef<[u8]>>(&mut self, key: &str, values: impl IntoIterator<Item = V>) {
+    pub(crate) fn set<V: AsRef<[u8]>>(&mut self, key: impl AsRef<[u8]>, values: impl IntoIterator<Item = V>) {
+        let key = key.as_ref();
         let lookup = self.lookup_key(key);
         let key_values: Vec<KeyValue> = values
             .into_iter()
-            .map(|value| KeyValue::new(key, value.as_ref()))
+            .map(|value| KeyValue::new(Key::from_slice(key), value.as_ref()))
             .collect();
-        self.data.insert(lookup.into_owned(), key_values);
+        self.data.insert(Key::from_slice(lookup.as_ref()), key_values);
     }
 
     /// Replaces the value at `index` of `key`, or appends it if `index` is past the end.
-    pub(crate) fn set_index(&mut self, key: &str, index: usize, value: impl AsRef<[u8]>) {
+    pub(crate) fn set_index(&mut self, key: impl AsRef<[u8]>, index: usize, value: impl AsRef<[u8]>) {
+        let key = key.as_ref();
         let lookup = self.lookup_key(key);
         let value = value.as_ref();
 
@@ -213,17 +368,20 @@ impl Map {
             Some(values) => match values.get_mut(index) {
                 // Rewritten in its buffers: RULE's values are set this way for every rule evaluated
                 Some(entry) => entry.replace(key, value),
-                None => values.push(KeyValue::new(key, value)),
+                None => values.push(KeyValue::new(Key::from_slice(key), value)),
             },
             None => {
-                self.data.insert(lookup.into_owned(), vec![KeyValue::new(key, value)]);
+                self.data.insert(
+                    Key::from_slice(lookup.as_ref()),
+                    vec![KeyValue::new(Key::from_slice(key), value)],
+                );
             },
         }
     }
 
     /// Removes `key` and all its values.
     pub(crate) fn remove(&mut self, key: &str) {
-        let lookup = self.lookup_key(key);
+        let lookup = self.lookup_key(key.as_bytes());
         self.data.remove(lookup.as_ref());
     }
 
@@ -239,12 +397,15 @@ impl Map {
 
     /// Every key, lowercase in a case-insensitive map, with its values as text (as
     /// [`Map::get`] gives them), sorted by key.
+    ///
+    /// This is a lossy text projection: distinct byte keys that share a lossy text view
+    /// share one entry here. `Map::iter_bytes` keeps them apart.
     pub fn entries(&self) -> std::collections::BTreeMap<String, Vec<String>> {
         self.data
             .iter()
             .map(|(key, values)| {
                 let values = values.iter().map(|kv| kv.text().into_owned()).collect();
-                (key.clone(), values)
+                (key.text().to_owned(), values)
             })
             .collect()
     }
@@ -265,7 +426,7 @@ impl std::fmt::Display for Map {
         writeln!(f, "{}:", self.name())?;
         for values in self.data.values() {
             if let Some(first) = values.first() {
-                write!(f, "    {}: ", first.key)?;
+                write!(f, "    {}: ", first.key.text())?;
                 for (i, kv) in values.iter().enumerate() {
                     if i > 0 {
                         write!(f, ",")?;
@@ -424,6 +585,54 @@ mod tests {
         assert_eq!(map.first("id"), Some(&b"\xff"[..]));
         assert_eq!(map.values("id").next(), Some(&b"\xff"[..]));
         assert_eq!(map.get("id"), vec!["\u{fffd}"]);
+    }
+
+    #[test]
+    fn decoded_argument_names_keep_byte_identity() {
+        // The decoded names of `/?%ff=a&%fe=b`, as Go's query parser produces them.
+        let mut map = Map::new_case_sensitive(RuleVariable::ArgsGet);
+        map.add_bytes(b"\xff", b"a");
+        map.add_bytes(b"\xfe", b"b");
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.value_count(), 2);
+        assert_eq!(map.values(b"\xff").collect::<Vec<_>>(), [b"a".as_slice()]);
+        assert_eq!(map.values(b"\xfe").collect::<Vec<_>>(), [b"b".as_slice()]);
+        // Lookups are byte-exact: the lossy name matches neither key.
+        assert!(map.values("\u{fffd}").next().is_none());
+        // The text view keeps one entry per byte key, even when they print alike.
+        assert_eq!(map.iter().count(), 2);
+        assert!(map.iter().all(|(key, _)| key == "\u{fffd}"));
+        assert_eq!(map.iter_bytes().count(), 2);
+    }
+
+    #[test]
+    fn nul_names_and_lossy_equal_names_stay_distinct() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add_bytes(b"a\0b", b"nul-b");
+        map.add_bytes(b"a\0c", b"nul-c");
+        map.add_bytes(b"a\xff", b"ff");
+        map.add_bytes(b"a\xfe", b"fe");
+
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.first(b"a\0b"), Some(&b"nul-b"[..]));
+        assert_eq!(map.first(b"a\0c"), Some(&b"nul-c"[..]));
+        assert_eq!(map.first(b"a\xff"), Some(&b"ff"[..]));
+        assert_eq!(map.first(b"a\xfe"), Some(&b"fe"[..]));
+        assert!(map.first(b"a\0d").is_none());
+        // The two invalid keys share the lossy text `a\u{fffd}`.
+        assert_eq!(map.iter().count(), 4);
+    }
+
+    #[test]
+    fn case_insensitive_maps_preserve_invalid_bytes() {
+        let mut map = Map::new(RuleVariable::RequestHeaders);
+        map.add_bytes(b"X\xff", b"ff");
+        map.add_bytes(b"X\xfe", b"fe");
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.first(b"x\xff"), Some(&b"ff"[..]));
+        assert_eq!(map.first(b"x\xfe"), Some(&b"fe"[..]));
     }
 
     /// The doc example of `collection::map::Map`, before it became internal.
