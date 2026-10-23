@@ -15,7 +15,9 @@ const (
 	timingSchemaVersion = 1
 	// maxTimingBytes bounds one raw timing document.
 	maxTimingBytes = 64 << 20
-	// maxSamplesPerCase bounds one case's sample array.
+	// maxSamplesPerCase bounds one case's sample array. The coordinator's
+	// maxIterations limit is derived from it, so an accepted --iterations
+	// value can never require rejecting the driver's samples.
 	maxSamplesPerCase = 1_000_000
 )
 

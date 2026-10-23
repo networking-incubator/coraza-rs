@@ -34,8 +34,9 @@ const (
 	// minRepetitions is the protocol minimum for paired repetitions.
 	minRepetitions = 3
 	// maxIterations bounds one driver invocation to catch typos and hostile
-	// configuration while leaving room for production measurements.
-	maxIterations = 10_000_000
+	// configuration. It is the per-case sample bound because a driver cannot
+	// produce more samples for a case than the iterations it ran.
+	maxIterations = maxSamplesPerCase
 )
 
 // config holds the resolved command-line and environment configuration.

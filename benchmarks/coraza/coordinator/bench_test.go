@@ -262,11 +262,28 @@ func TestBenchPublishesDivergentCases(t *testing.T) {
 	}
 }
 
+// TestParseConfigIterationBound verifies that the iteration CLI bound equals
+// the per-case sample bound: 1000000 is accepted and 1000001 is rejected.
+func TestParseConfigIterationBound(t *testing.T) {
+	clearCoordinatorEnv(t)
+	cfg, err := parseConfig("bench", []string{"--iterations", "1000000"})
+	requireNoError(t, err)
+	requireEqual(t, cfg.iterations, maxSamplesPerCase)
+
+	clearCoordinatorEnv(t)
+	_, err = parseConfig("bench", []string{"--iterations", "1000001"})
+	requireError(t, err)
+	if !strings.Contains(err.Error(), "1000000") {
+		t.Fatalf("error does not name the iteration bound: %v", err)
+	}
+}
+
 // TestParseConfigRejectsInvalidValues covers protocol preconditions.
 func TestParseConfigRejectsInvalidValues(t *testing.T) {
 	tests := [][]string{
 		{"--repetitions", "2"},
 		{"--iterations", "0"},
+		{"--iterations", "1000001"},
 		{"--go-profile", "vendor"},
 		{"--rust-build-command", "true"},
 		{"--go-build-command", "true"},
