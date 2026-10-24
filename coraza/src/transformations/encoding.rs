@@ -177,6 +177,9 @@ const BASE64_DEC_MAP: [u8; 128] = [
 ];
 
 /// Decodes Base64 with the partial decoding behavior used by Coraza.
+///
+/// The strict decoder stops at the first byte outside the alphabet, while the
+/// forgiving one skips those bytes and accepts the base64url alphabet.
 fn do_base64_decode(input: &[u8], extended: bool) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut count = 0;
@@ -189,12 +192,21 @@ fn do_base64_decode(input: &[u8], extended: bool) -> Vec<u8> {
         if matches!(byte, b'\r' | b'\n') {
             continue;
         }
-        if byte == b'=' || byte == b' ' || byte > 127 {
+        if byte == b'=' || byte == b' ' {
             break;
         }
 
+        let byte = match byte {
+            b'-' if extended => b'+',
+            b'_' if extended => b'/',
+            _ => byte,
+        };
+
         let value = BASE64_DEC_MAP.get(usize::from(byte)).copied().unwrap_or(127);
         if value == 127 {
+            if extended {
+                continue;
+            }
             break;
         }
 
@@ -354,6 +366,10 @@ mod tests {
             assert_eq!(error, None, "input: {input:?}");
         }
         assert_eq!(base64_decode(b"\xffSGVsbG8=").0, b"");
+        // The strict decoder still stops at the first invalid byte.
+        assert_eq!(base64_decode(b"Zm9v!YmFy").0, b"foo");
+        assert_eq!(base64_decode(b"-w==").0, b"");
+        assert_eq!(base64_decode(b"_w==").0, b"");
     }
 
     #[test]
@@ -366,6 +382,38 @@ mod tests {
             (b"PHNjcmlwd.D5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script>alert(1)</script>"),
             (b"PHNjcmlwdD.5hbGVydCgxKTwvc2NyaXB0Pg==", b"<script>alert(1)</script>"),
             (b"SGVs\n bG8=", b"Hello"),
+        ];
+        for (input, expected) in cases {
+            let (result, changed, error) = base64_decode_ext(input);
+            assert_eq!(result, *expected, "input: {input:?}");
+            assert!(changed, "input: {input:?}");
+            assert_eq!(error, None, "input: {input:?}");
+        }
+    }
+
+    // Ported from: coraza/internal/transformations/base64decodeext_test.go.
+    #[test]
+    fn extended_base64_decoding_skips_invalid_bytes_and_accepts_url_safe() {
+        let cases: &[(&[u8], &[u8])] = &[
+            // Bytes outside the alphabet are skipped, not fatal.
+            (b"\xc2\xa9dzBzV==", b"w0s"),
+            (b"dzBz\xc2\xa9V==", b"w0s"),
+            (b"!dzBzV==", b"w0s"),
+            (b"dz!BzV==", b"w0s"),
+            (b"Zm9v!YmFy", b"foobar"),
+            (b"\xffZm9v\xff", b"foo"),
+            // base64url substitutes '-' and '_' for '+' and '/'.
+            (b"-w==", b"\xfb"),
+            (b"_w==", b"\xff"),
+            (
+                b"eyJwIjoieHh-IiwiYWxnIjoibm9uZSIsInR5cCI6IkpXVCJ9",
+                br#"{"p":"xx~","alg":"none","typ":"JWT"}"#,
+            ),
+            // Decoded NUL bytes and padding stay byte-exact.
+            (b"VGVzdABDYXNl", b"Test\x00Case"),
+            (b"AA==", b"\x00"),
+            (b"Zg==", b"f"),
+            (b"Zg==Zg==", b"f"),
         ];
         for (input, expected) in cases {
             let (result, changed, error) = base64_decode_ext(input);
