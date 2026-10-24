@@ -27,8 +27,11 @@ the process local time zone.
 `SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
 WAF is built with that writer rejected, never silently replaced by another one.
 With the feature, each entry is POSTed to `SecAuditLog` with a one-second
-timeout, as in Go Coraza. The target may be `http://` or `https://`, as Go
-Coraza accepts both, so entries sent to a plaintext target are not encrypted.
+timeout, as in Go Coraza. The target must be an absolute `http://` or
+`https://` URL with a host; anything else is rejected when the WAF is built.
+This is stricter than Go Coraza, which accepts such a target at init and only
+fails when the first entry is written. Entries sent to a plaintext `http://`
+target are not encrypted.
 
 The feature uses `rustls` with the compiled-in Mozilla root bundle
 (`webpki-roots`), not the host trust store. Certificates issued by a private CA

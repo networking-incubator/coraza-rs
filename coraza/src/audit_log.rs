@@ -1337,11 +1337,20 @@ mod https {
         ///
         /// # Errors
         ///
-        /// If `target` isn't a valid URI.
+        /// If `target` isn't a valid URI, or if it isn't an absolute `http` or
+        /// `https` URL with a host. Go Coraza only parses the target at `Init`
+        /// and fails on the first write; this writer is built with the WAF, and
+        /// a dropped transaction ignores audit writer errors, so a target that
+        /// cannot be posted to would silently lose entries.
         pub(super) fn open(target: &str, format: AuditLogFormat) -> Result<Self, String> {
-            target
+            let uri = target
                 .parse::<ureq::http::Uri>()
                 .map_err(|error| format!("invalid HTTPS audit log target {target:?}: {error}"))?;
+            if !is_http_target(&uri) {
+                return Err(format!(
+                    "invalid HTTPS audit log target {target:?}: expected an absolute http:// or https:// URL with a host"
+                ));
+            }
             Ok(Self::with_exchange(target, format, Box::new(UreqExchange::new())))
         }
 
@@ -1375,6 +1384,13 @@ mod https {
                 Err(io::Error::other(format!("unexpected status code {status}")))
             }
         }
+    }
+
+    /// Whether `uri` is an absolute `http` or `https` URL with a host.
+    fn is_http_target(uri: &ureq::http::Uri) -> bool {
+        let scheme = uri.scheme_str().unwrap_or_default();
+        let is_http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+        is_http && uri.host().is_some_and(|host| !host.is_empty())
     }
 
     /// [`HttpExchange`] backed by the `ureq` blocking client with rustls.
@@ -1578,6 +1594,33 @@ mod https {
         fn open_accepts_https_and_plaintext_http_targets() {
             assert!(HttpsWriter::open("https://example.com/audit", AuditLogFormat::Json).is_ok());
             assert!(HttpsWriter::open("http://127.0.0.1:8080/audit", AuditLogFormat::Json).is_ok());
+        }
+
+        #[test]
+        fn open_accepts_an_uppercase_scheme() {
+            assert!(HttpsWriter::open("HTTP://example.com/audit", AuditLogFormat::Json).is_ok());
+            assert!(HttpsWriter::open("HtTpS://example.com/audit", AuditLogFormat::Json).is_ok());
+        }
+
+        #[test]
+        fn open_rejects_non_http_targets() {
+            for target in [
+                "/var/log/audit.log",
+                "ftp://example.com/audit",
+                "htps://example.com/audit",
+                "//example.com/audit",
+                "https://:8080/audit",
+            ] {
+                let error = HttpsWriter::open(target, AuditLogFormat::Json).err().unwrap();
+                assert!(
+                    error.starts_with(&format!("invalid HTTPS audit log target {target:?}:")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("expected an absolute http:// or https:// URL with a host"),
+                    "{error}"
+                );
+            }
         }
 
         #[test]
