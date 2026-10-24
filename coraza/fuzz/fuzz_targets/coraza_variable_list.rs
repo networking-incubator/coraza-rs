@@ -113,7 +113,7 @@ mod variable_parser;
 
 fuzz_target!(|data: &[u8]| {
     let input = String::from_utf8_lossy(data);
-    let outcome = variable_parser::parse_variables(&input).map(|specs| {
+    let outcome = variable_parser::parse_variables_in(&input, false).map(|specs| {
         specs
             .iter()
             .map(rules::VariableSpec::fingerprint)
