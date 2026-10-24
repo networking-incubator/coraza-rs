@@ -66,6 +66,23 @@ jobs:
           cargo fuzz run coraza_variable_list "$RUNNER_TEMP/fuzz/corpus/coraza_variable_list" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_variable_list/" > "$RUNNER_TEMP/fuzz/coraza_variable_list.log" 2>&1
           tail -n 4 "$RUNNER_TEMP/fuzz/coraza_variable_list.log"
 
+      - name: Run Coraza parser campaigns
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          RUSTUP_TOOLCHAIN: nightly-2026-10-06
+        working-directory: coraza
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_uri_parser" "$RUNNER_TEMP/fuzz/artifacts/coraza_uri_parser"
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_json_body" "$RUNNER_TEMP/fuzz/artifacts/coraza_json_body"
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_multipart_body" "$RUNNER_TEMP/fuzz/artifacts/coraza_multipart_body"
+          export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
+          cargo fuzz run coraza_uri_parser "$RUNNER_TEMP/fuzz/corpus/coraza_uri_parser" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_uri_parser/" > "$RUNNER_TEMP/fuzz/coraza_uri_parser.log" 2>&1
+          cargo fuzz run coraza_json_body "$RUNNER_TEMP/fuzz/corpus/coraza_json_body" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_json_body/" > "$RUNNER_TEMP/fuzz/coraza_json_body.log" 2>&1
+          cargo fuzz run coraza_multipart_body "$RUNNER_TEMP/fuzz/corpus/coraza_multipart_body" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_multipart_body/" > "$RUNNER_TEMP/fuzz/coraza_multipart_body.log" 2>&1
+          tail -n 4 "$RUNNER_TEMP/fuzz/coraza_uri_parser.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/coraza_json_body.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/coraza_multipart_body.log"
+
       - name: Upload fuzz logs and findings
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
