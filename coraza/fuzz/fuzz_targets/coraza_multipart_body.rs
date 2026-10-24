@@ -24,6 +24,13 @@ use libfuzzer_sys::fuzz_target;
 const MULTIPART_RULES: &str = "SecRequestBodyAccess On\n\
                                SecAction \"id:1,phase:1,ctl:requestBodyProcessor=MULTIPART,pass\"";
 
+/// Boundary for inputs that carry no newline, so their bytes still reach the parser.
+///
+/// Delimiters are only recognised at the start of a line, so in a newline-free body this
+/// boundary can only match at offset 0, where `--coraza-fuzz-fallback` is a real delimiter
+/// rather than an accidental split. It is absent from the seed corpus and fits RFC 2046.
+const FALLBACK_BOUNDARY: &[u8] = b"coraza-fuzz-fallback";
+
 /// The compiled WAF is immutable, so build it once instead of compiling rules per input.
 fn multipart_waf() -> &'static Waf {
     static WAF: OnceLock<Waf> = OnceLock::new();
@@ -39,11 +46,12 @@ fn multipart_waf() -> &'static Waf {
 fuzz_target!(|data: &[u8]| {
     let (mode, rest) = data.split_first().map_or((0, data), |(mode, rest)| (*mode, rest));
     // Split the boundary from the body at the first newline so the seed corpus can pair
-    // a boundary with a body that uses it. Malformed pairs stay interesting.
+    // a boundary with a body that uses it. Malformed pairs stay interesting. Without a
+    // newline the whole input is the body, so it is not dropped as an empty body.
     let (boundary, body) = rest
         .iter()
         .position(|byte| *byte == b'\n')
-        .map_or((rest, &[][..]), |newline| {
+        .map_or((FALLBACK_BOUNDARY, rest), |newline| {
             (
                 rest.get(..newline).unwrap_or_default(),
                 rest.get(newline.saturating_add(1)..).unwrap_or_default(),
