@@ -260,9 +260,7 @@
         "evaluator": "coraza/src/transformations/encoding.rs:base64_decode_ext",
         "go_reference": "internal/transformations/base64decodeext.go",
         "fixtures": [],
-        "differences": [
-          "Rust stops at invalid bytes; current Go skips invalid extended input and accepts the URL-safe alphabet (F13)."
-        ]
+        "differences": []
       },
       "base64Encode": {
         "state": "implemented",
@@ -283,9 +281,7 @@
         "evaluator": "coraza/src/transformations/simple.rs:compress_whitespace",
         "go_reference": "internal/transformations/compress_whitespace.go",
         "fixtures": [],
-        "differences": [
-          "Rust uses full Unicode whitespace; Go intentionally uses an ASCII/Latin-1 set and preserves malformed bytes (F13)."
-        ]
+        "differences": []
       },
       "cssDecode": {
         "state": "implemented",
@@ -327,9 +323,7 @@
         "evaluator": "coraza/src/transformations/escape.rs:js_decode",
         "go_reference": "internal/transformations/js_decode.go",
         "fixtures": [],
-        "differences": [
-          "Rust handles classic four-digit Unicode escapes; current Go also handles ES2015 braced escapes (F13)."
-        ]
+        "differences": []
       },
       "length": {
         "state": "implemented",
