@@ -1338,17 +1338,18 @@ mod https {
         /// # Errors
         ///
         /// If `target` isn't a valid URI, or if it isn't an absolute `http` or
-        /// `https` URL with a host. Go Coraza only parses the target at `Init`
-        /// and fails on the first write; this writer is built with the WAF, and
-        /// a dropped transaction ignores audit writer errors, so a target that
-        /// cannot be posted to would silently lose entries.
+        /// `https` URL with a host and a port that parses as a `u16`. Go Coraza
+        /// only parses the target at `Init` and fails on the first write; this
+        /// writer is built with the WAF, and a dropped transaction ignores audit
+        /// writer errors, so a target that cannot be posted to would silently
+        /// lose entries.
         pub(super) fn open(target: &str, format: AuditLogFormat) -> Result<Self, String> {
             let uri = target
                 .parse::<ureq::http::Uri>()
                 .map_err(|error| format!("invalid HTTPS audit log target {target:?}: {error}"))?;
             if !is_http_target(&uri) {
                 return Err(format!(
-                    "invalid HTTPS audit log target {target:?}: expected an absolute http:// or https:// URL with a host"
+                    "invalid HTTPS audit log target {target:?}: expected an absolute http:// or https:// URL with a host and a valid port"
                 ));
             }
             Ok(Self::with_exchange(target, format, Box::new(UreqExchange::new())))
@@ -1386,11 +1387,39 @@ mod https {
         }
     }
 
-    /// Whether `uri` is an absolute `http` or `https` URL with a host.
+    /// Whether `uri` is an absolute `http` or `https` URL with a host and a valid
+    /// explicit port.
     fn is_http_target(uri: &ureq::http::Uri) -> bool {
         let scheme = uri.scheme_str().unwrap_or_default();
         let is_http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
-        is_http && uri.host().is_some_and(|host| !host.is_empty())
+        is_http && uri.host().is_some_and(|host| !host.is_empty()) && !has_invalid_port(uri)
+    }
+
+    /// Whether `uri` carries an explicit port that is not a valid `u16`.
+    ///
+    /// [`ureq::http::Uri::port_u16`] is `None` both without a port and for a port
+    /// it cannot parse, so the authority text is inspected instead.
+    fn has_invalid_port(uri: &ureq::http::Uri) -> bool {
+        let Some(authority) = uri.authority() else {
+            return false;
+        };
+        // Userinfo may contain colons; host and port follow the last `@`.
+        let host_port = authority
+            .as_str()
+            .rsplit_once('@')
+            .map_or(authority.as_str(), |(_, host_port)| host_port);
+        if host_port.ends_with(']') {
+            return false; // An IPv6 literal with no port.
+        }
+        match host_port.rsplit_once(':') {
+            // Go accepts an empty port and resolves it to the scheme default. Any
+            // other port must be ASCII digits only, which `parse` alone doesn't
+            // enforce: it accepts a leading `+`.
+            Some((_, port)) => {
+                !port.is_empty() && (port.bytes().any(|byte| !byte.is_ascii_digit()) || port.parse::<u16>().is_err())
+            },
+            None => false,
+        }
     }
 
     /// [`HttpExchange`] backed by the `ureq` blocking client with rustls.
@@ -1592,8 +1621,17 @@ mod https {
 
         #[test]
         fn open_accepts_https_and_plaintext_http_targets() {
-            assert!(HttpsWriter::open("https://example.com/audit", AuditLogFormat::Json).is_ok());
-            assert!(HttpsWriter::open("http://127.0.0.1:8080/audit", AuditLogFormat::Json).is_ok());
+            for target in [
+                "https://example.com/audit",
+                "http://127.0.0.1:8080/audit",
+                "http://collector.example:65535/audit",
+                "https://example.com:/audit",
+                "http://[::1]:8080/audit",
+                "http://[::1]/audit",
+                "http://user:pass@collector.example/audit",
+            ] {
+                assert!(HttpsWriter::open(target, AuditLogFormat::Json).is_ok(), "{target}");
+            }
         }
 
         #[test]
@@ -1618,6 +1656,27 @@ mod https {
                 );
                 assert!(
                     error.contains("expected an absolute http:// or https:// URL with a host"),
+                    "{error}"
+                );
+            }
+        }
+
+        #[test]
+        fn open_rejects_malformed_ports() {
+            for target in [
+                "http://collector.example:abc/audit",
+                "https://collector.example:65536/audit",
+                "http://collector.example:+80/audit",
+                "http://[::1]:abc/audit",
+                "http://user:pass@collector.example:abc/audit",
+            ] {
+                let error = HttpsWriter::open(target, AuditLogFormat::Json).err().unwrap();
+                assert!(
+                    error.starts_with(&format!("invalid HTTPS audit log target {target:?}:")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("expected an absolute http:// or https:// URL with a host and a valid port"),
                     "{error}"
                 );
             }
