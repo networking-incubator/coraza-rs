@@ -95,31 +95,41 @@ pub fn remove_whitespace(input: &[u8]) -> TransformationResult {
     (transformed, changed, None)
 }
 
-/// Compresses each run of Unicode whitespace to one space byte.
+/// Compresses each run of Latin-1 whitespace to one space byte.
 ///
-/// Malformed UTF-8 bytes are copied unchanged.
+/// Only ASCII whitespace, U+0085, U+00A0 and a stray `0xA0` byte collapse.
+/// Other Unicode space characters such as U+3000 and malformed bytes are
+/// copied unchanged.
 pub fn compress_whitespace(input: &[u8]) -> TransformationResult {
     let mut transformed = Vec::with_capacity(input.len());
+    let mut changed = false;
     let mut in_whitespace = false;
-    for_each_utf8(input, |item| match item {
-        Ok(character) if character.is_whitespace() => {
-            if !in_whitespace {
+    for_each_utf8(input, |item| {
+        let whitespace = match item {
+            Ok(character) => is_latin_space(character),
+            Err(byte) => byte == 0xA0,
+        };
+        if whitespace {
+            if in_whitespace {
+                changed = true;
+            } else {
+                in_whitespace = true;
+                changed |= item != Ok(' ');
                 transformed.push(b' ');
             }
-            in_whitespace = true;
-        },
-        Ok(character) => {
-            let mut buffer = [0; 4];
-            transformed.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
-            in_whitespace = false;
-        },
-        Err(byte) => {
-            transformed.push(byte);
-            in_whitespace = false;
-        },
+            return;
+        }
+
+        in_whitespace = false;
+        match item {
+            Ok(character) => {
+                let mut buffer = [0; 4];
+                transformed.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            },
+            Err(byte) => transformed.push(byte),
+        }
     });
 
-    let changed = transformed.as_slice() != input;
     (transformed, changed, None)
 }
 
@@ -412,6 +422,15 @@ fn is_trim_space(byte: u8) -> bool {
     TRIM_SPACES.contains(&byte)
 }
 
+/// Returns whether `character` is one of the Latin-1 whitespace characters
+/// the Go reference collapses.
+fn is_latin_space(character: char) -> bool {
+    matches!(
+        character,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{85}' | '\u{a0}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -446,16 +465,36 @@ mod tests {
         assert_eq!(removed, b"a\xffb");
         assert!(removed_changed);
         assert_eq!(removed_error, None);
+    }
 
-        let (compressed, compressed_changed, compressed_error) = compress_whitespace(b"\t \xc2\xa0\xe3\x80\x80X");
-        assert_eq!(compressed, b" X");
-        assert!(compressed_changed);
-        assert_eq!(compressed_error, None);
-
-        let (unchanged, changed, error) = compress_whitespace(b"word");
-        assert_eq!(unchanged, b"word");
-        assert!(!changed);
-        assert_eq!(error, None);
+    // Ported from: coraza/internal/transformations/compress_whitespace.go::isLatinSpace
+    // and its raw 0xA0 handling.
+    #[test]
+    fn compress_whitespace_uses_the_latin1_whitespace_set() {
+        for (input, output, changed) in [
+            (b"".as_slice(), b"".as_slice(), false),
+            (b"word", b"word", false),
+            (b"a b", b"a b", false),
+            (b"a  b", b"a b", true),
+            (b"\t \r\n\x0b\x0c", b" ", true),
+            (b"\xc2\xa0a\xc2\xa0", b" a ", true),
+            (b"\xc2\x85a", b" a", true),
+            (b"SELECT\xa01", b"SELECT 1", true),
+            (b"a\xa0\xa0b", b"a b", true),
+            // U+3000 and the other Unicode spaces are outside the Latin-1 set.
+            (b"a\xe3\x80\x80b", b"a\xe3\x80\x80b", false),
+            (b"a\xe2\x80\x89b", b"a\xe2\x80\x89b", false),
+            // A stray 0x85 is not whitespace; malformed bytes are preserved.
+            (b"a\x85b", b"a\x85b", false),
+            (b"a\xff\xffb", b"a\xff\xffb", false),
+            (b"a \xff b", b"a \xff b", false),
+            (b"a\xc3", b"a\xc3", false),
+        ] {
+            let (result, result_changed, error) = compress_whitespace(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
     }
 
     #[test]

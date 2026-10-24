@@ -90,6 +90,25 @@ pub fn js_decode(input: &[u8]) -> TransformationResult {
         let suffix = input.get(offset..).unwrap_or_default();
         if byte == b'\\' {
             if let Some(&escaped) = suffix.get(1) {
+                // ES2015 `\u{H...H}`: one to six hex digits and a closing brace.
+                if suffix.get(1) == Some(&b'u')
+                    && suffix.get(2) == Some(&b'{')
+                    && let Some(length) = extended_escape_length(suffix.get(3..).unwrap_or_default())
+                {
+                    let digits = suffix.get(3..3 + length).unwrap_or_default();
+                    let code = digits.iter().fold(0_u32, |code, digit| {
+                        (code << 4) | u32::from(hex_value(*digit).unwrap_or_default())
+                    });
+                    let mut decoded = u8::try_from(code & 0xFF).unwrap_or_default();
+                    if (0xFF01..=0xFF5E).contains(&code) {
+                        decoded += 0x20;
+                    }
+                    output.push(decoded);
+                    offset += length + 4;
+                    changed = true;
+                    continue;
+                }
+
                 let digits = suffix.get(2..6).unwrap_or_default();
                 let unicode_digits =
                     suffix.get(1) == Some(&b'u') && digits.len() == 4 && digits.iter().all(u8::is_ascii_hexdigit);
@@ -348,6 +367,13 @@ fn hex_digit_count(digits: &[u8], limit: usize) -> usize {
     count
 }
 
+/// Returns the number of hex digits in a `\u{...}` escape body, or `None`
+/// when the body is empty, longer than six digits or unterminated.
+fn extended_escape_length(digits: &[u8]) -> Option<usize> {
+    let count = hex_digit_count(digits, 6);
+    (count > 0 && digits.get(count) == Some(&b'}')).then_some(count)
+}
+
 /// Returns the value of an ASCII hexadecimal digit.
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
@@ -457,6 +483,33 @@ mod tests {
         assert_result(js_decode, b"\\u123x\\x4z", b"u123xx4z", true);
         assert_result(js_decode, b"\\x80\\200", b"\x80\x80", true);
         assert_result(js_decode, b"\\", b"\\", false);
+    }
+
+    // Ported from: coraza/internal/transformations/js_decode.go, ES2015 `\u{...}` branch.
+    #[test]
+    fn js_decode_handles_braced_unicode_escapes() {
+        for (input, expected, changed) in [
+            (b"\\u{41}".as_slice(), b"A".as_slice(), true),
+            (b"\\u{41}\\u{42}", b"AB", true),
+            (b"\\u{ff41}", b"a", true),
+            (b"\\u{FF21}", b"A", true),
+            (b"\\u{0ff01}", b"!", true),
+            (b"\\u{7d}", b"}", true),
+            (b"a\\u{9}b", b"a\tb", true),
+            // Only the lower byte survives, whatever the resolved value.
+            (b"\\u{1F600}", b"\x00", true),
+            (b"\\u{110000}", b"\x00", true),
+            (b"\\u{10ffff}", b"\xff", true),
+            // Malformed or truncated escapes fall back to the simple escape.
+            (b"\\u{}", b"u{}", true),
+            (b"\\u{41", b"u{41", true),
+            (b"\\u{4141", b"u{4141", true),
+            (b"\\u{0000041}", b"u{0000041}", true),
+            (b"\\u{", b"u{", true),
+            (b"no escapes", b"no escapes", false),
+        ] {
+            assert_result(js_decode, input, expected, changed);
+        }
     }
 
     #[test]
