@@ -178,7 +178,13 @@ fn written_variable<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenVariable<
             opt(b'|').parse_next(input)?;
             WrittenKey::None
         },
-        Some(_) if *name == *b"XML" || *name == *b"JSON" => {
+        Some(_) if *name == *b"XML" || *name == *b"JSON" || *name == *b"REQUEST_XML" => {
+            // `REQUEST_XML` is the alias of `XML`, so an XPath selector such as `/*` must
+            // parse as a path. Go exposes the alias as selectable
+            // (`internal/variables/variables.go:594`, `RequestXML // CanBeSelected`) but
+            // sends `REQUEST_XML:/*` down its regex parser, where the trailing `*` is
+            // dropped and an empty pattern selects every XML entry. Parsing it as a path
+            // selects the document root children, exactly as `XML:/*` does.
             let path = terminated(take_till(0.., b'|'), opt(b'|')).parse_next(input)?;
             WrittenKey::Path(path)
         },
@@ -297,18 +303,33 @@ fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> P
 
 /// Parse a slash-delimited key as a regex, using the variable's key sensitivity.
 ///
-/// Key regexes run against lookup keys, which fold case in a case-insensitive map, so the
-/// regex must fold too unless the variable's map is actually case-sensitive.
+/// Go compiles selector regexes without the case-insensitive flag. For every variable
+/// except the argument collections it first lower-cases the pattern source, which changes
+/// what escapes and classes match: `REQUEST_HEADERS:/^\S+$/` becomes `^\s+$` and selects
+/// nothing (`internal/corazawaf/rule.go:586`). Argument selectors keep the written source
+/// and fold case only while their map folds it, because the regex runs against the
+/// lower-cased lookup keys.
 fn parse_key(variable: RuleVariable, key: &str, case_sensitive_args_keys: bool) -> ParseResult<VariableKey> {
-    let case_sensitive = case_sensitive_args_keys && variable.has_case_sensitive_keys();
-    match key.strip_prefix('/').and_then(|key| key.strip_suffix('/')) {
-        Some(pattern) if !pattern.is_empty() => RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map(VariableKey::Regex)
-            .map_err(|error| CompileError::new(format!("invalid regex pattern '{pattern}': {error}"))),
-        _ => Ok(VariableKey::String(key.to_owned())),
-    }
+    let Some(pattern) = key
+        .strip_prefix('/')
+        .and_then(|key| key.strip_suffix('/'))
+        .filter(|pattern| !pattern.is_empty())
+    else {
+        return Ok(VariableKey::String(key.to_owned()));
+    };
+
+    let (source, case_insensitive) = if variable.has_case_sensitive_regex_keys() {
+        // The argument collections keep the written source; the regex folds case exactly
+        // while the argument map folds it too.
+        (Cow::Borrowed(pattern), !case_sensitive_args_keys)
+    } else {
+        (Cow::Owned(pattern.to_lowercase()), false)
+    };
+    RegexBuilder::new(&source)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map(VariableKey::Regex)
+        .map_err(|error| CompileError::new(format!("invalid regex pattern '{source}': {error}")))
 }
 
 #[cfg(test)]
@@ -385,10 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn non_argument_regex_keys_stay_case_insensitive_in_both_modes() {
+    fn non_argument_regex_keys_are_lowered_in_both_modes() {
         let mut headers = Map::new(RuleVariable::RequestHeaders);
         headers.add("X-Trace", b"value");
 
+        // Go lower-cases the pattern source instead of enabling case-insensitive matching,
+        // so a lower-cased literal still selects the header in either key mode.
         assert_eq!(
             matches_in(
                 "REQUEST_HEADERS:/^X-TRACE$/",
@@ -407,6 +430,57 @@ mod tests {
             ),
             ["value"]
         );
+    }
+
+    #[test]
+    fn insensitive_regex_keys_are_lowered_like_go() {
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("Host", b"example");
+        headers.add("Xa", b"2");
+        headers.add("X-A", b"1");
+
+        // Go turns `^\S+$` into `^\s+$`, which no header name can match
+        // (`internal/corazawaf/rule.go:586`).
+        assert!(matches("REQUEST_HEADERS:/^\\S+$/", RuleVariable::RequestHeaders, &headers).is_empty());
+        // `\D` becomes `\d`, and no header name is all digits.
+        assert!(matches("REQUEST_HEADERS:/^\\D+$/", RuleVariable::RequestHeaders, &headers).is_empty());
+        // `[A-Z]` becomes `[a-z]`, which only the all-letter header names match.
+        let mut letters = matches("REQUEST_HEADERS:/^[A-Z]+$/", RuleVariable::RequestHeaders, &headers);
+        letters.sort_unstable();
+        assert_eq!(letters, ["2", "example"]);
+        // Literal letters are unaffected once both the pattern and the stored keys are
+        // lower-cased.
+        assert_eq!(
+            matches("REQUEST_HEADERS:/^Host$/", RuleVariable::RequestHeaders, &headers),
+            ["example"]
+        );
+        // Literal selectors never consult the regex path.
+        assert_eq!(
+            matches("REQUEST_HEADERS:Host", RuleVariable::RequestHeaders, &headers),
+            ["example"]
+        );
+        assert_eq!(
+            matches("REQUEST_HEADERS:'Host'", RuleVariable::RequestHeaders, &headers),
+            ["example"]
+        );
+    }
+
+    #[test]
+    fn argument_regex_keys_keep_their_case_in_strict_mode() {
+        let mut strict = Map::new_case_sensitive(RuleVariable::Args);
+        strict.add("userXd", b"1");
+        strict.add("userxd", b"2");
+
+        // Go leaves the argument pattern as written (`internal/corazawaf/rule.go:548`), so
+        // `\S` keeps its meaning and both spellings of the non-space character match.
+        let mut non_space = matches_in("ARGS:/^user\\Sd$/", RuleVariable::Args, &strict, true);
+        non_space.sort_unstable();
+        assert_eq!(non_space, ["1", "2"]);
+        // `\W` still means non-word, so it cannot match the upper-case `X`.
+        assert!(matches_in("ARGS:/^user\\Wd$/", RuleVariable::Args, &strict, true).is_empty());
+        // An upper-case class stays upper-case.
+        assert!(matches_in("ARGS:/^[A-Z]+$/", RuleVariable::Args, &strict, true).is_empty());
+        assert_eq!(matches_in("ARGS:/^userXd$/", RuleVariable::Args, &strict, true), ["1"]);
     }
 
     #[test]
@@ -461,6 +535,61 @@ mod tests {
     #[test]
     fn accepts_xml_and_json_paths() {
         assert_eq!(parsed("XML:/*|JSON:a.b").len(), 2);
+        assert_eq!(parsed("REQUEST_XML:/*").len(), 1);
+    }
+
+    #[test]
+    fn request_xml_selector_selects_the_root_children_in_both_key_modes() {
+        let mut xml = Map::new(RuleVariable::RequestXML);
+        xml.add("/*", b"superuser & guest");
+        xml.add("//@*", b"admin");
+
+        // Go marks REQUEST_XML selectable (`internal/variables/variables.go:594`), so the
+        // selector compiles in either key mode.
+        assert_eq!(
+            parse_variables_in("REQUEST_XML:/*", true).map(|variables| variables.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            matches("REQUEST_XML:/*", RuleVariable::RequestXML, &xml),
+            ["superuser & guest"]
+        );
+        assert_eq!(
+            matches_in("REQUEST_XML:/*", RuleVariable::RequestXML, &xml, true),
+            ["superuser & guest"]
+        );
+
+        // Selectability does not depend on the key mode, but single-value collections stay
+        // unselectable in both.
+        assert!(parse_variables("REQUEST_XML:foo").is_ok());
+        assert!(parse_variables_in("REQUEST_URI:foo", true).is_err());
+    }
+
+    #[test]
+    fn chained_rules_see_the_lowered_selector_patterns() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule REQUEST_HEADERS:/^\\S+$/ \"@unconditionalMatch\" \"id:90,phase:1,deny,chain\"\n\
+                 SecRule REQUEST_HEADERS:/^host$/ \"@unconditionalMatch\" \"\"",
+            )
+            .expect("chained rules compile");
+        let waf = parser.into_waf().expect("chained rules build a WAF");
+        let mut tx = waf.new_transaction_with_id("chain-lowered");
+        tx.add_request_header("Host", b"example");
+        assert_eq!(tx.process_request_headers(), None);
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule REQUEST_HEADERS:/.*/ \"@unconditionalMatch\" \"id:91,phase:1,deny,chain\"\n\
+                 SecRule REQUEST_HEADERS:/^host$/ \"@unconditionalMatch\" \"\"",
+            )
+            .expect("chained rules compile");
+        let waf = parser.into_waf().expect("chained rules build a WAF");
+        let mut tx = waf.new_transaction_with_id("chain-match");
+        tx.add_request_header("Host", b"example");
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(91));
     }
 
     #[test]

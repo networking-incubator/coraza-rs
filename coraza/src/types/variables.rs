@@ -452,6 +452,7 @@ impl RuleVariable {
                 | Self::XML
                 | Self::Env
                 | Self::ResponseArgs
+                | Self::RequestXML
                 | Self::ResponseXML
                 | Self::IP
                 | Self::MultipartPartHeaders
@@ -476,6 +477,19 @@ impl RuleVariable {
                 | Self::ArgsNames
                 | Self::ArgsGetNames
                 | Self::ArgsPostNames
+        )
+    }
+
+    /// Whether selector regexes for this variable keep their written case.
+    ///
+    /// Go lower-cases the pattern source for every variable except the argument
+    /// collections (`caseSensitiveVariable` in `internal/corazawaf/rule.go:548`), then
+    /// compiles it without the case-insensitive flag. `ARGS_PATH` is absent from Go's list
+    /// even though its map is case-sensitive under `coraza.rule.case_sensitive_args_keys`.
+    pub const fn has_case_sensitive_regex_keys(self) -> bool {
+        matches!(
+            self,
+            Self::Args | Self::ArgsGet | Self::ArgsPost | Self::ArgsNames | Self::ArgsGetNames | Self::ArgsPostNames
         )
     }
 }
@@ -664,6 +678,30 @@ mod tests {
             RuleVariable::Env,
         ] {
             assert!(!variable.has_case_sensitive_keys(), "{variable:?}");
+        }
+    }
+
+    #[test]
+    fn test_case_sensitive_regex_key_variables() {
+        for variable in [
+            RuleVariable::Args,
+            RuleVariable::ArgsGet,
+            RuleVariable::ArgsPost,
+            RuleVariable::ArgsNames,
+            RuleVariable::ArgsGetNames,
+            RuleVariable::ArgsPostNames,
+        ] {
+            assert!(variable.has_case_sensitive_regex_keys(), "{variable:?}");
+        }
+        // Go's `caseSensitiveVariable` leaves ARGS_PATH out even though the map itself is
+        // case-sensitive under its build tag.
+        for variable in [
+            RuleVariable::ArgsPath,
+            RuleVariable::RequestHeaders,
+            RuleVariable::RequestXML,
+            RuleVariable::XML,
+        ] {
+            assert!(!variable.has_case_sensitive_regex_keys(), "{variable:?}");
         }
     }
 
