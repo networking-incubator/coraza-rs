@@ -178,7 +178,14 @@ fn written_variable<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenVariable<
             opt(b'|').parse_next(input)?;
             WrittenKey::None
         },
-        Some(_) if *name == *b"XML" || *name == *b"JSON" || *name == *b"REQUEST_XML" => {
+        // Variable names are case-insensitive (`impl FromStr for RuleVariable`), so this
+        // guard must fold case too: `request_xml:/*` resolves to `RequestXML` and needs the
+        // same path parsing as `REQUEST_XML:/*`.
+        Some(_)
+            if name.eq_ignore_ascii_case(b"XML")
+                || name.eq_ignore_ascii_case(b"JSON")
+                || name.eq_ignore_ascii_case(b"REQUEST_XML") =>
+        {
             // `REQUEST_XML` is the alias of `XML`, so an XPath selector such as `/*` must
             // parse as a path. Go exposes the alias as selectable
             // (`internal/variables/variables.go:594`, `RequestXML // CanBeSelected`) but
@@ -536,6 +543,18 @@ mod tests {
     fn accepts_xml_and_json_paths() {
         assert_eq!(parsed("XML:/*|JSON:a.b").len(), 2);
         assert_eq!(parsed("REQUEST_XML:/*").len(), 1);
+
+        // Names parse case-insensitively, so every spelling must take the path branch.
+        // `/*` only survives it: the generic key parser reads it as an unterminated regex.
+        assert_eq!(parsed("xml:/*|json:a.b").len(), 2);
+        assert_eq!(parsed("Request_Xml:/*").len(), 1);
+
+        // The guard covers only those three names: another variable, however cased, still
+        // reaches the generic key parser, including pipes inside its regex.
+        let mut args = Map::new(RuleVariable::Args);
+        args.add("id_1", b"1");
+        args.add("name", b"2");
+        assert_eq!(matches("args:/a|e/", RuleVariable::Args, &args), ["2"]);
     }
 
     #[test]
@@ -545,19 +564,18 @@ mod tests {
         xml.add("//@*", b"admin");
 
         // Go marks REQUEST_XML selectable (`internal/variables/variables.go:594`), so the
-        // selector compiles in either key mode.
-        assert_eq!(
-            parse_variables_in("REQUEST_XML:/*", true).map(|variables| variables.len()),
-            Ok(1)
-        );
-        assert_eq!(
-            matches("REQUEST_XML:/*", RuleVariable::RequestXML, &xml),
-            ["superuser & guest"]
-        );
-        assert_eq!(
-            matches_in("REQUEST_XML:/*", RuleVariable::RequestXML, &xml, true),
-            ["superuser & guest"]
-        );
+        // selector compiles in either key mode, and the name is case-insensitive.
+        for selector in ["REQUEST_XML:/*", "request_xml:/*", "Request_Xml:/*"] {
+            assert_eq!(
+                parse_variables_in(selector, true).map(|variables| variables.len()),
+                Ok(1)
+            );
+            assert_eq!(matches(selector, RuleVariable::RequestXML, &xml), ["superuser & guest"]);
+            assert_eq!(
+                matches_in(selector, RuleVariable::RequestXML, &xml, true),
+                ["superuser & guest"]
+            );
+        }
 
         // Selectability does not depend on the key mode, but single-value collections stay
         // unselectable in both.
