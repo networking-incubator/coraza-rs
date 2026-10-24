@@ -34,4 +34,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "coraza_uri_parser"
+path = "fuzz_targets/coraza_uri_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coraza_json_body"
+path = "fuzz_targets/coraza_json_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coraza_multipart_body"
+path = "fuzz_targets/coraza_multipart_body.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
