@@ -22,6 +22,8 @@
 
 use regex::Regex;
 
+// Re-exported for `rules` and `transaction::ctl`, which import it from here.
+pub(crate) use crate::utils::lowercase_like_go;
 use crate::{
     collection::{Map, MatchData, Single},
     types::RuleVariable,
@@ -58,20 +60,6 @@ pub(crate) enum VariableKey {
     Regex(Regex),
 }
 
-/// Lower-case `value` the way Go's `strings.ToLower` does.
-///
-/// Rust's `str::to_lowercase` applies the full mapping, so `İ` (`U+0130`) becomes
-/// `i` + `U+0307`; Go's simple mapping gives `i`. `U+0130` is the only character whose
-/// full mapping expands, and the first character of any full expansion equals the simple
-/// mapping, so taking the first character matches Go for every input. Do not replace this
-/// with `str::to_lowercase`: it widens key comparisons that Go keeps separate.
-pub(crate) fn lowercase_like_go(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| character.to_lowercase().next().unwrap_or(character))
-        .collect()
-}
-
 /// A key excluded from a variable's matches.
 #[derive(Debug, Clone)]
 pub(crate) struct VariableException {
@@ -98,10 +86,12 @@ impl VariableException {
         }
     }
 
-    /// Check whether `key` is excluded.
-    fn matches(&self, key: &str, key_lower: &str) -> bool {
+    /// Check whether the lowered key `key_lower` is excluded.
+    fn matches(&self, key_lower: &str) -> bool {
         if let Some(regex) = &self.regex {
-            return regex.is_match(key);
+            // Go runs exception regexes against `strings.ToLower(c.Key())`
+            // (`internal/corazawaf/transaction.go:684-698`).
+            return regex.is_match(key_lower);
         }
         self.key
             .as_ref()
@@ -110,8 +100,7 @@ impl VariableException {
 
     /// Check a key without regard to case, as runtime rule-target exclusions do.
     pub(crate) fn matches_key(&self, key: &str) -> bool {
-        let key_lower = self.key.as_ref().map(|_| lowercase_like_go(key));
-        self.matches(key, key_lower.as_deref().unwrap_or(key))
+        self.matches(&lowercase_like_go(key))
     }
 }
 
@@ -192,7 +181,7 @@ impl VariableSpec {
         let mut matches = Vec::new();
         let mut count: usize = 0;
         let count_mode = self.count;
-        let has_literal_exceptions = self.exceptions.iter().any(|exception| exception.key.is_some());
+        let has_exceptions = !self.exceptions.is_empty();
         {
             let mut record = |variable: RuleVariable, key: &[u8], value: &[u8]| {
                 if count_mode {
@@ -203,12 +192,9 @@ impl VariableSpec {
             };
             let keep = |key: &[u8]| {
                 let key_text = String::from_utf8_lossy(key);
-                let key_lower = has_literal_exceptions.then(|| lowercase_like_go(&key_text));
+                let key_lower = has_exceptions.then(|| lowercase_like_go(&key_text));
                 let key_lower = key_lower.as_deref().unwrap_or(&key_text);
-                !self
-                    .exceptions
-                    .iter()
-                    .any(|exception| exception.matches(&key_text, key_lower))
+                !self.exceptions.iter().any(|exception| exception.matches(key_lower))
             };
 
             match (collection, &self.key) {
@@ -338,6 +324,22 @@ mod tests {
         assert!(exception.matches_key("\u{130}"));
         assert!(exception.matches_key("I"));
         assert!(!exception.matches_key("i\u{307}"));
+    }
+
+    #[test]
+    fn regex_exceptions_match_the_lowered_key() {
+        let lower = VariableException::new_regex(Regex::new("^user$").expect("test regex is valid"));
+
+        assert!(lower.matches_key("USER"));
+        assert!(lower.matches_key("user"));
+        assert!(!lower.matches_key("user2"));
+        // U+0130 folds to `i`, as `strings.ToLower` does, so the pattern sees `i`.
+        let single = VariableException::new_regex(Regex::new("^i$").expect("test regex is valid"));
+        assert!(single.matches_key("\u{130}"));
+        // Go matches the pattern against the lowered key, so an upper-case pattern never
+        // excludes the key it was written for.
+        let upper = VariableException::new_regex(Regex::new("^USER$").expect("test regex is valid"));
+        assert!(!upper.matches_key("USER"));
     }
 
     #[test]

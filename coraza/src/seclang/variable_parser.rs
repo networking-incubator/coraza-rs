@@ -184,14 +184,15 @@ fn written_variable<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenVariable<
         Some(_)
             if name.eq_ignore_ascii_case(b"XML")
                 || name.eq_ignore_ascii_case(b"JSON")
-                || name.eq_ignore_ascii_case(b"REQUEST_XML") =>
+                || name.eq_ignore_ascii_case(b"REQUEST_XML")
+                || name.eq_ignore_ascii_case(b"RESPONSE_XML") =>
         {
-            // `REQUEST_XML` is the alias of `XML`, so an XPath selector such as `/*` must
-            // parse as a path. Go exposes the alias as selectable
-            // (`internal/variables/variables.go:594`, `RequestXML // CanBeSelected`) but
-            // sends `REQUEST_XML:/*` down its regex parser, where the trailing `*` is
-            // dropped and an empty pattern selects every XML entry. Parsing it as a path
-            // selects the document root children, exactly as `XML:/*` does.
+            // `REQUEST_XML` and `RESPONSE_XML` are aliases of `XML`, so an XPath selector
+            // such as `/*` must parse as a path. Go exposes both as selectable
+            // (`internal/variables/variables.go:592`, `:594`) but sends
+            // `REQUEST_XML:/*` down its regex parser, where the trailing `*` is dropped
+            // and an empty pattern selects every XML entry. Parsing it as a path selects
+            // the document root children, exactly as `XML:/*` does.
             let path = terminated(take_till(0.., b'|'), opt(b'|')).parse_next(input)?;
             WrittenKey::Path(path)
         },
@@ -502,14 +503,13 @@ mod tests {
         let mut strict = Map::new_case_sensitive(RuleVariable::Args);
         strict.add("Foo", b"1");
         strict.add("foo", b"2");
-        assert_eq!(
-            matches_in("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &strict, true),
-            ["2"]
-        );
-        assert_eq!(
-            matches_in("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict, true),
-            ["1"]
-        );
+        // Go runs the exception regex against the lowered key, so a written `^Foo$` never
+        // excludes the stored `Foo`, while `^foo$` excludes both spellings
+        // (`internal/corazawaf/transaction.go:689`).
+        let mut both = matches_in("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &strict, true);
+        both.sort_unstable();
+        assert_eq!(both, ["1", "2"]);
+        assert!(matches_in("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict, true).is_empty());
     }
 
     #[test]
@@ -543,18 +543,44 @@ mod tests {
     fn accepts_xml_and_json_paths() {
         assert_eq!(parsed("XML:/*|JSON:a.b").len(), 2);
         assert_eq!(parsed("REQUEST_XML:/*").len(), 1);
+        assert_eq!(parsed("RESPONSE_XML:/*").len(), 1);
 
         // Names parse case-insensitively, so every spelling must take the path branch.
         // `/*` only survives it: the generic key parser reads it as an unterminated regex.
         assert_eq!(parsed("xml:/*|json:a.b").len(), 2);
         assert_eq!(parsed("Request_Xml:/*").len(), 1);
+        assert_eq!(parsed("response_xml:/*").len(), 1);
+        assert_eq!(parsed("Response_Xml:/*").len(), 1);
 
-        // The guard covers only those three names: another variable, however cased, still
+        // The guard covers only those four names: another variable, however cased, still
         // reaches the generic key parser, including pipes inside its regex.
         let mut args = Map::new(RuleVariable::Args);
         args.add("id_1", b"1");
         args.add("name", b"2");
         assert_eq!(matches("args:/a|e/", RuleVariable::Args, &args), ["2"]);
+    }
+
+    #[test]
+    fn response_xml_selector_selects_the_root_children() {
+        let mut xml = Map::new(RuleVariable::ResponseXML);
+        xml.add("/*", b"superuser & guest");
+
+        // Go marks RESPONSE_XML selectable (`internal/variables/variables.go:592`), so the
+        // XPath selector compiles in either key mode, and the name is case-insensitive.
+        for selector in ["RESPONSE_XML:/*", "response_xml:/*", "Response_Xml:/*"] {
+            assert_eq!(
+                parse_variables_in(selector, true).map(|variables| variables.len()),
+                Ok(1)
+            );
+            assert_eq!(
+                matches(selector, RuleVariable::ResponseXML, &xml),
+                ["superuser & guest"]
+            );
+            assert_eq!(
+                matches_in(selector, RuleVariable::ResponseXML, &xml, true),
+                ["superuser & guest"]
+            );
+        }
     }
 
     #[test]

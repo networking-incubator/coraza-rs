@@ -479,7 +479,9 @@ fn percent_decode_lenient(value: &[u8]) -> (Vec<u8>, bool) {
                     .and_then(|start| value.get(start..start.checked_add(2)?))
             })
             .flatten()
-            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+            // Only ASCII hex digits, as Go's `fromHex` accepts: `u8::from_str_radix`
+            // would also take the leading `+` of `%+1`.
+            .and_then(crate::utils::strings::x2c);
         if let Some(escaped) = escaped {
             decoded.push(escaped);
             i += 3;
@@ -1331,5 +1333,27 @@ two\r\n\
         assert!(parts.iter().all(|part| part.name.as_slice() == b"\xff"));
         assert_eq!(parts.first().unwrap().data, b"one");
         assert_eq!(parts.get(1).unwrap().data, b"two");
+    }
+
+    /// Go's `percentDecodeLenient` and `fromHex`
+    /// (`internal/bodyprocessors/multipart.go:519-555`).
+    #[test]
+    fn percent_decode_accepts_only_ascii_hex_digits() {
+        // A sign is not a hex digit, though `u8::from_str_radix` would take `+`.
+        assert_eq!(percent_decode_lenient(b"%+1"), (b"%+1".to_vec(), true));
+        assert_eq!(percent_decode_lenient(b"%-1"), (b"%-1".to_vec(), true));
+        assert_eq!(percent_decode_lenient(b"%zz"), (b"%zz".to_vec(), true));
+
+        // A truncated escape stays literal and is reported.
+        assert_eq!(percent_decode_lenient(b"%1"), (b"%1".to_vec(), true));
+        assert_eq!(percent_decode_lenient(b"%A"), (b"%A".to_vec(), true));
+        assert_eq!(percent_decode_lenient(b"a%2"), (b"a%2".to_vec(), true));
+        assert_eq!(percent_decode_lenient(b"%"), (b"%".to_vec(), true));
+
+        // Two digits decode, in either case, including at the end of input.
+        assert_eq!(percent_decode_lenient(b"%41%6a%6A"), (b"Ajj".to_vec(), false));
+        assert_eq!(percent_decode_lenient(b"%41"), (b"A".to_vec(), false));
+        assert_eq!(percent_decode_lenient(b"%ff"), (vec![0xFF], false));
+        assert_eq!(percent_decode_lenient(b"plain"), (b"plain".to_vec(), false));
     }
 }

@@ -194,14 +194,11 @@ fn lower_bytes(key: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Appends `text` to `out`, lower-cased.
+/// Appends `text` to `out`, lower-cased the way Go folds collection keys.
 fn push_lowercase(out: &mut Vec<u8>, text: &str) {
-    for character in text.chars() {
-        for lower in character.to_lowercase() {
-            let mut buffer = [0_u8; 4];
-            out.extend_from_slice(lower.encode_utf8(&mut buffer).as_bytes());
-        }
-    }
+    // Go's `strings.ToLower` is the simple mapping, not Rust's full one, so both the
+    // stored keys and the lookups go through the shared helper.
+    out.extend_from_slice(crate::utils::lowercase_like_go(text).as_bytes());
 }
 
 impl Map {
@@ -542,6 +539,20 @@ mod tests {
         );
         map.remove("\u{00dc}ber");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_maps_fold_keys_like_go() {
+        // Go lower-cases a `X-` name ending in U+0130 with its simple mapping, giving the
+        // ASCII `x-i`. Rust's full mapping would store `x-i` + U+0307 and never match it.
+        let mut map = Map::new(RuleVariable::RequestHeaders);
+        map.add("X-\u{130}", "value");
+
+        assert_eq!(map.first("x-i"), Some(&b"value"[..]));
+        assert_eq!(map.first("X-I"), Some(&b"value"[..]));
+        assert_eq!(map.entries().into_keys().collect::<Vec<_>>(), ["x-i"]);
+        // The two-code-point full mapping stays a distinct key, as it does in Go.
+        assert!(map.first("x-i\u{307}").is_none());
     }
 
     #[test]
