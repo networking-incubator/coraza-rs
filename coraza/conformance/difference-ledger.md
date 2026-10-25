@@ -57,7 +57,7 @@ case ID and fixture hash are kept so the case stays traceable.
 
 ## Remaining byte-identity restrictions
 
-No byte-identity restrictions remain as of this revision.
+No known byte-identity restrictions remain in the reviewed fixtures as of this revision.
 
 ## Deliberate deviation classes without engine case IDs yet
 
