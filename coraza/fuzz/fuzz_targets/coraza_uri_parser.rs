@@ -20,12 +20,10 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let (mode, target) = data.split_first().map_or((0, data), |(mode, rest)| (*mode, rest));
 
-    // The connector hands over the request target as raw bytes; the parser itself
-    // takes the text form, so non-UTF-8 inputs take the same lossy conversion a
-    // connector performs.
+    // The connector hands over the request target as raw bytes, which the parser
+    // takes directly, as Go's `url` package does.
     let mut tx = Transaction::new("uri-fuzz");
     tx.set_request_uri(target);
-    let target = String::from_utf8_lossy(target);
 
     let (method, protocol) = match mode % 5 {
         0 => ("GET", "HTTP/1.1"),
@@ -34,6 +32,6 @@ fuzz_target!(|data: &[u8]| {
         3 => ("PROPFIND", "HTTP/1.1"),
         _ => ("GET", "HTTP/2.0"),
     };
-    tx.process_uri(&target, method, protocol);
+    tx.process_uri(target, method, protocol);
     let _ = std::hint::black_box(tx.last_phase());
 });
