@@ -22,7 +22,7 @@
 
 use std::ops::RangeInclusive;
 
-use regex::RegexBuilder;
+use regex::Regex;
 
 use super::Transaction;
 use crate::{
@@ -147,7 +147,8 @@ impl Transaction {
         let key = key.trim();
         let exception = match key.strip_prefix('/').and_then(|key| key.strip_suffix('/')) {
             Some(pattern) if !pattern.is_empty() => {
-                let Ok(regex) = RegexBuilder::new(pattern).case_insensitive(true).build() else {
+                // Go compiles the pattern as written and lower-cases the key instead.
+                let Ok(regex) = Regex::new(pattern) else {
                     return;
                 };
                 VariableException::new_regex(regex)
@@ -195,11 +196,14 @@ impl Transaction {
 
     /// Whether `ctl` excluded this variable key from a rule for this transaction.
     pub(super) fn is_rule_target_removed(&self, id: i32, variable: RuleVariable, key: &str) -> bool {
-        self.removed_rule_targets.get(&id).is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|(removed_variable, exception)| *removed_variable == variable && exception.matches_key(key))
-        })
+        let Some(targets) = self.removed_rule_targets.get(&id) else {
+            return false;
+        };
+        // Go lower-cases the key, so a pattern keeps the case it was written with.
+        let key = key.to_lowercase();
+        targets
+            .iter()
+            .any(|(removed_variable, exception)| *removed_variable == variable && exception.matches_key(&key))
     }
 }
 
@@ -210,4 +214,116 @@ fn parse_id_range(value: &str) -> Option<RangeInclusive<i32>> {
     let end = end.parse::<i32>().ok()?;
     let range = start..=end;
     (!range.is_empty()).then_some(range)
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "ctl tests use fixed valid rules")]
+mod tests {
+    use super::Transaction;
+
+    /// Run `rules` against one request and return the ID of the rule that interrupted it.
+    fn interrupting_rule(rules: &str, setup: impl FnOnce(&mut Transaction)) -> Option<i32> {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut transaction = waf.new_transaction_with_id("ctl-target");
+        setup(&mut transaction);
+        transaction
+            .process_request_headers()
+            .map(|interruption| interruption.rule_id)
+    }
+
+    #[test]
+    fn lowercase_regex_target_removes_matching_keys() {
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^user$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| transaction.add_get_argument("user", "bad")),
+            None,
+            "a lower-case pattern matches the lower-cased key"
+        );
+        assert_eq!(
+            interrupting_rule(rules, |transaction| {
+                transaction.add_get_argument("user", "good");
+                transaction.add_get_argument("query", "bad");
+            }),
+            Some(81),
+            "only the removed key is skipped"
+        );
+    }
+
+    #[test]
+    fn uppercase_character_class_keeps_its_meaning() {
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^[A-Z]+$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| transaction.add_get_argument("ABC", "bad")),
+            Some(81),
+            "the key is lower-cased, so an upper-case class does not match it"
+        );
+    }
+
+    #[test]
+    fn literal_targets_lower_case_but_regex_targets_keep_their_case() {
+        let literal = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:User,pass\"\n\
+                       SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+        let regex = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^User$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(literal, |transaction| transaction.add_get_argument("user", "bad")),
+            None,
+            "a literal target is lower-cased like Go's"
+        );
+        assert_eq!(
+            interrupting_rule(regex, |transaction| transaction.add_get_argument("user", "bad")),
+            Some(81),
+            "a regex target is compiled as written like Go's"
+        );
+    }
+
+    #[test]
+    fn argument_and_non_argument_collections_match_lowercased_keys() {
+        let arguments = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^user$/,pass\"\n\
+                         SecRule ARGS:user \"@contains bad\" \"id:81,phase:1,deny\"";
+        let headers = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;REQUEST_HEADERS:/^x-secret$/,pass\"\n\
+                       SecRule REQUEST_HEADERS:X-Secret \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(arguments, |transaction| transaction.add_get_argument("user", "bad")),
+            None,
+            "argument collection keys are lower-cased"
+        );
+        assert_eq!(
+            interrupting_rule(headers, |transaction| transaction.add_request_header("X-Secret", "bad")),
+            None,
+            "non-argument collection keys are lower-cased"
+        );
+    }
+
+    #[test]
+    fn chained_child_rules_use_the_parent_target_removal() {
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^user$/,pass\"\n\
+                     SecRule ARGS:trigger \"@contains go\" \"id:81,phase:1,chain,deny\"\n\
+                     SecRule ARGS \"@contains bad\" \"\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| {
+                transaction.add_get_argument("trigger", "go");
+                transaction.add_get_argument("user", "bad");
+            }),
+            None,
+            "the chain child inherits the parent's target removal"
+        );
+        assert_eq!(
+            interrupting_rule(rules, |transaction| {
+                transaction.add_get_argument("trigger", "go");
+                transaction.add_get_argument("query", "bad");
+            }),
+            Some(81),
+            "other keys still reach the chain child"
+        );
+    }
 }
