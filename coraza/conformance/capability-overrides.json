@@ -82,11 +82,13 @@
         "differences": []
       },
       "inspectFile": {
-        "state": "unavailable",
+        "state": "implemented",
+        "evaluator": "coraza/src/operators/inspect_file.rs:InspectFile::evaluate",
         "go_reference": "internal/operators/inspect_file.go",
         "fixtures": [],
         "differences": [
-          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host command capability and deadline before it is added."
+          "Registered only with the host-operators crate feature; the default build rejects the name.",
+          "The program runs directly, without a shell, and stdout bytes precede stderr bytes in the combined output where Go interleaves both streams; the first-byte verdict is the same whenever the program writes to one stream."
         ]
       },
       "ipMatch": {
@@ -159,11 +161,14 @@
         ]
       },
       "rbl": {
-        "state": "unavailable",
+        "state": "implemented",
+        "evaluator": "coraza/src/operators/rbl.rs:Rbl::evaluate",
         "go_reference": "internal/operators/rbl.go",
         "fixtures": [],
         "differences": [
-          "Registered by native Go builds but absent from the Rust operator factory. Requires an explicit host DNS capability and deadline before it is added."
+          "Registered only with the host-operators crate feature; the default build rejects the name.",
+          "The lookup is a std::net::ToSocketAddrs A/AAAA query bounded by a 500ms worker-thread wait. Go additionally reads the TXT record, sets TX.httpbl_msg from its first entry, copies it into capture 0, and reports no match when the TXT lookup fails; without a DNS dependency this port matches on the address record alone.",
+          "An empty service is rejected at compile time because Go relies on the TXT lookup to reject the self-resolving name it would build."
         ]
       },
       "restPath": {
@@ -218,11 +223,13 @@
         "differences": []
       },
       "validateSchema": {
-        "state": "unavailable",
+        "state": "implemented",
+        "evaluator": "coraza/src/operators/validate_schema.rs:ValidateSchema::evaluate",
         "go_reference": "internal/operators/validate_schema.go",
         "fixtures": [],
         "differences": [
-          "Registered by native Go builds but absent from the Rust operator factory."
+          "Registered only with the validate-schema crate feature; the default build rejects the name.",
+          "Each operator compiles its own schema; Go's memoizer shares one compilation per schema content."
         ]
       },
       "validateUrlEncoding": {
