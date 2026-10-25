@@ -1371,7 +1371,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "Serial, Concurrent and Syslog writers are implemented. HTTPS is recognized but rejected when the WAF is built; audit timestamps are UTC rather than process-local."
+          "Serial, Concurrent and Syslog writers are implemented, and HTTPS is implemented behind the https-audit crate feature; without that feature an HTTPS writer is rejected when the WAF is built (coraza/src/audit_log.rs:1004-1013). Audit timestamps are UTC rather than process-local."
         ]
       },
       {
@@ -1631,7 +1631,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "Rust skips failed later directives when enabled. Go records the setting but does not act on it."
+          "Rust skips any later directive that fails while enabled (coraza/src/seclang/parser.rs:432-443). Go ignores a failed SecRule only, both while parsing it and while adding it (internal/seclang/directives.go:186-206); a failing non-rule directive still aborts the configuration in Go."
         ]
       },
       {
@@ -1718,14 +1718,14 @@
         "names": [
           "SecRequestBodyInMemoryLimit"
         ],
-        "state": "accepted_without_effect",
+        "state": "implemented",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "Parsed and validated, but ingestion accepts an already allocated body and never spills to disk (F03)."
+          "Request body bytes stay in memory up to the configured limit and spill to a private temporary file above it (coraza/src/transaction/request_body.rs:64-74, coraza/src/transaction/body_buffer.rs:21-25). A configured 0 is an unset sentinel that follows SecRequestBodyLimit; Go rejects an explicit 0 and distinguishes unset through a nullable configuration value."
         ]
       },
       {
@@ -2107,7 +2107,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "Boolean only; Go's RelevantOnly retention mode is not implemented in either engine."
+          "Boolean On/Off only; RelevantOnly is rejected at parse time (coraza/src/seclang/parser.rs:1103-1106). Go implements RelevantOnly as well, keeping temporary files only when a log-relevant rule matched (internal/corazawaf/transaction.go:1516-1531 and 1717-1723)."
         ]
       },
       {
@@ -2252,14 +2252,14 @@
         "names": [
           "DURATION"
         ],
-        "state": "unavailable",
+        "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
         "go_reference": "internal/corazawaf/waf.go:283",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:283 and no producer updating it was established."
+          "Registered in the VARIABLES table (coraza/src/types/variables.rs:302) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:283 and never updates it, so a rule matching 0 hits in Go and misses here."
         ]
       },
       {
@@ -2366,14 +2366,14 @@
         "names": [
           "FULL_REQUEST_LENGTH"
         ],
-        "state": "unavailable",
+        "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
         "go_reference": "internal/corazawaf/waf.go:275",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:275 and no producer updating it was established."
+          "Registered in the VARIABLES table (coraza/src/types/variables.rs:269) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:275 and never updates it, so a rule matching 0 hits in Go and misses here."
         ]
       },
       {
@@ -3480,14 +3480,14 @@
         "names": [
           "URLENCODED_ERROR"
         ],
-        "state": "unavailable",
+        "state": "accepted_without_effect",
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
-        "producer": null,
-        "evaluator": null,
+        "producer": "coraza/src/types/variables.rs:RuleVariable",
+        "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
         "go_reference": "internal/corazawaf/waf.go:272",
         "fixtures": [],
         "differences": [
-          "No runtime storage arm in variable_storage!. Go initializes the value to 0 at internal/corazawaf/waf.go:272; Rust has no value at all."
+          "Registered in the VARIABLES table (coraza/src/types/variables.rs:331) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:272 and never updates it, so a rule matching 0 hits in Go and misses here."
         ]
       },
       {
@@ -3579,7 +3579,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "REQUEST_XML:/* is rejected because the alias is not marked selectable (F05)."
+          "REQUEST_XML:/* now parses as an XPath and selects the document root children, like XML:/* (coraza/src/seclang/variable_parser.rs:184-197). Go's rule parser (internal/seclang/rule_parser.go:119-147) sends REQUEST_XML:/... down its regex path, so REQUEST_XML:/* loses the trailing * and compiles as an empty pattern that selects every XML entry, attribute values included."
         ]
       }
     ],
