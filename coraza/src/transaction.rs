@@ -2644,6 +2644,54 @@ payload\r\n\
     }
 
     #[test]
+    fn detection_only_process_partial_request_limit_inspects_the_truncated_prefix() {
+        // Go sets INBOUND_DATA_ERROR and truncates under ProcessPartial without
+        // interrupting (`internal/corazawaf/transaction.go:992-1003`); DetectionOnly
+        // only changes whether an interruption would be enforced.
+        let config = WafConfig {
+            rule_engine: RuleEngineStatus::DetectionOnly,
+            request_body_access: true,
+            request_body_limit: 4,
+            request_body_limit_action: BodyLimitAction::ProcessPartial,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("detection-only-partial", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+
+        assert_eq!(tx.process_request_body(b"attack"), None);
+        assert_eq!(tx.would_be_interruption(), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("atta")
+        );
+        assert_eq!(tx.request_body_stats().inspected, 4);
+        assert!(tx.request_body_stats().truncated);
+    }
+
+    #[test]
+    fn request_body_ingestion_is_single_shot_unlike_go_chunked_writes() {
+        // Go appends every WriteRequestBody chunk to one buffer
+        // (`internal/corazawaf/transaction.go:992`). This runtime takes the whole body
+        // in one call and ignores a later one because phase 2 already ran, so the limit
+        // boundary is always crossed inside a single call.
+        let mut tx = request_body_transaction("single-shot", 8, BodyLimitAction::Reject);
+        assert_eq!(tx.process_request_body(b"abcd"), None);
+        assert_eq!(tx.process_request_body(b"efgh"), None);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::RequestBody, None).as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(tx.request_body_stats().supplied, 4);
+        assert!(!tx.request_body_stats().truncated);
+    }
+
+    #[test]
     fn request_body_without_a_processor_is_retained_but_not_inspected() {
         // The one-byte memory limit forces a spill, so a replay would read the file.
         let config = WafConfig {
@@ -2903,6 +2951,10 @@ payload\r\n\
         let mut tx = waf.new_transaction_with_id("detect-only-body-limit");
         tx.process_request_headers();
 
+        // Deliberate difference: Go's Reject path sets the interruption directly
+        // (`internal/corazawaf/transaction.go:948-955`, called from 995-997), so even
+        // DetectionOnly drops the body there, while this runtime records the would-be
+        // interruption and still inspects the truncated prefix.
         assert_eq!(tx.process_request_body(b"attack"), None);
         assert!(tx.interruption().is_none());
         let would_be = tx.would_be_interruption().unwrap();
@@ -3228,6 +3280,123 @@ payload\r\n\
     }
 
     #[test]
+    fn content_type_selection_matches_go_media_type_prefixes() {
+        // Go trims the header value and prefix-matches both media types, ignoring
+        // case (`internal/corazawaf/transaction.go:411-416`), so a parameter list, a
+        // malformed suffix, or invalid bytes never suppress the selection. PHP's
+        // `sapi_read_post_data` prefix-matches the same way.
+        let cases: &[(&[u8], &str)] = &[
+            (b"application/x-www-form-urlencoded", "URLENCODED"),
+            (b"APPLICATION/X-WWW-FORM-URLENCODED", "URLENCODED"),
+            (b"application/x-www-form-urlencoded; charset=UTF-8", "URLENCODED"),
+            (b"application/x-www-form-urlencoded;charset", "URLENCODED"),
+            (b"  \tapplication/x-www-form-urlencoded\r\n", "URLENCODED"),
+            ("\u{a0}application/x-www-form-urlencoded".as_bytes(), "URLENCODED"),
+            ("\u{3000}application/x-www-form-urlencoded".as_bytes(), "URLENCODED"),
+            (b"application/x-www-form-urlencodedevil", "URLENCODED"),
+            (b"application/x-www-form-urlencoded=", "URLENCODED"),
+            (b"application/x-www-form-urlencoded\xff", "URLENCODED"),
+            (b"\xc2\xa0application/x-www-form-urlencoded\xff", "URLENCODED"),
+            (b"multipart/form-data", "MULTIPART"),
+            (b"MULTIPART/FORM-DATA; boundary=b", "MULTIPART"),
+            (b"multipart/form-datax", "MULTIPART"),
+            // Go only recognizes the form-data prefix, so other multipart subtypes
+            // stay unselected until ctl:requestBodyProcessor selects MULTIPART.
+            (b"multipart/mixed; boundary=b", ""),
+            (b"application/xwww-form-urlencoded", ""),
+            (b"application/json", ""),
+            (b"text/plain", ""),
+            ("\u{1F600}application/x-www-form-urlencoded".as_bytes(), ""),
+            (b"\xffapplication/x-www-form-urlencoded", ""),
+            (b"", ""),
+        ];
+        for (content_type, expected) in cases {
+            let config = WafConfig {
+                request_body_access: true,
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("content-type-prefix", Arc::new(config));
+            tx.add_request_header("Content-Type", *content_type);
+            tx.process_request_headers();
+            assert_eq!(
+                tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+                Some(*expected),
+                "content type {:?}",
+                String::from_utf8_lossy(content_type)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_urlencoded_content_type_still_parses_arguments() {
+        // Go selects on the prefix (`internal/corazawaf/transaction.go:412`), so a
+        // Content-Type that a strict MIME parser rejects still selects URLENCODED.
+        let config = WafConfig {
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("urlencoded-suffix", Arc::new(config));
+        tx.add_request_header("Content-Type", b"application/x-www-form-urlencoded\xff");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(b"key=value"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("URLENCODED")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("key")).as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn multipart_mixed_is_parsed_only_when_ctl_selects_multipart() {
+        // Go recognizes only the `multipart/form-data` prefix
+        // (`internal/corazawaf/transaction.go:414`), while its multipart processor
+        // accepts any `multipart/` media type
+        // (`internal/bodyprocessors/multipart.go:32`).
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"k\"\r\n\
+\r\n\
+v\r\n\
+--b--";
+
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-mixed-auto");
+        tx.add_request_header("Content-Type", b"multipart/mixed; boundary=b");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(body), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("k")), None);
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:36,phase:1,ctl:requestBodyProcessor=MULTIPART,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-mixed-ctl");
+        tx.add_request_header("Content-Type", b"multipart/mixed; boundary=b");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(body), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
+            Some("MULTIPART")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("k")).as_deref(), Some("v"));
+    }
+
+    #[test]
     fn evaluates_request_header_rules_from_a_compiled_waf() {
         let mut parser = crate::seclang::Parser::new();
         parser
@@ -3374,6 +3543,10 @@ payload\r\n\
         tx.add_response_header("Content-Type", "text/plain");
         tx.process_response_headers(200, "HTTP/1.1");
 
+        // Deliberate difference: Go's Reject path sets the interruption directly
+        // (`internal/corazawaf/transaction.go:948-955`, called from 1266-1268), so even
+        // DetectionOnly drops the response body there, while this runtime records the
+        // would-be interruption and still inspects the truncated prefix.
         assert_eq!(tx.process_response_body(b"attack"), None);
         assert_eq!(
             tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
@@ -3586,6 +3759,70 @@ payload\r\n\
         assert_eq!(
             tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
             Some("0")
+        );
+    }
+
+    #[test]
+    fn response_body_limit_process_partial_below_the_limit_keeps_the_body() {
+        // One byte under the limit never reaches the `>=` comparison
+        // (`internal/corazawaf/transaction.go:1263`), under either action.
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::ProcessPartial,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-limit-below-partial", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"ab"), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some("ab"));
+        assert!(!tx.response_body_stats().truncated);
+        assert_eq!(tx.response_body_stats().inspected, 2);
+    }
+
+    #[test]
+    fn response_body_limit_is_not_applied_when_the_rule_engine_is_off() {
+        // Go returns before the limit check when the rule engine is off
+        // (`internal/corazawaf/transaction.go:1239-1241`).
+        let config = WafConfig {
+            rule_engine: RuleEngineStatus::Off,
+            response_body_access: true,
+            response_body_limit: 3,
+            response_body_limit_action: BodyLimitAction::Reject,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: vec![AuditLogPart::ResponseBody],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-engine-off", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.last_phase(), None);
+
+        assert_eq!(tx.process_response_body(b"attack"), None);
+        assert_eq!(tx.response_body_stats(), BodyIngestionStats::default());
+        assert_eq!(
+            tx.get_variable(RuleVariable::OutboundDataError, None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResponseBody, None).as_deref(), Some(""));
+        assert_eq!(tx.would_be_interruption(), None);
+        assert!(
+            tx.audit_log()
+                .transaction
+                .response
+                .is_none_or(|response| response.body.is_empty())
         );
     }
 
