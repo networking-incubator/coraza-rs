@@ -58,6 +58,20 @@ pub(crate) enum VariableKey {
     Regex(Regex),
 }
 
+/// Lower-case `value` the way Go's `strings.ToLower` does.
+///
+/// Rust's `str::to_lowercase` applies the full mapping, so `İ` (`U+0130`) becomes
+/// `i` + `U+0307`; Go's simple mapping gives `i`. `U+0130` is the only character whose
+/// full mapping expands, and the first character of any full expansion equals the simple
+/// mapping, so taking the first character matches Go for every input. Do not replace this
+/// with `str::to_lowercase`: it widens key comparisons that Go keeps separate.
+pub(crate) fn lowercase_like_go(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect()
+}
+
 /// A key excluded from a variable's matches.
 #[derive(Debug, Clone)]
 pub(crate) struct VariableException {
@@ -71,7 +85,7 @@ impl VariableException {
     /// Create a literal-key exception.
     pub(crate) fn new_string(key: &str) -> Self {
         Self {
-            key: Some(key.to_lowercase()),
+            key: Some(lowercase_like_go(key)),
             regex: None,
         }
     }
@@ -96,7 +110,7 @@ impl VariableException {
 
     /// Check a key without regard to case, as runtime rule-target exclusions do.
     pub(crate) fn matches_key(&self, key: &str) -> bool {
-        let key_lower = self.key.as_ref().map(|_| key.to_lowercase());
+        let key_lower = self.key.as_ref().map(|_| lowercase_like_go(key));
         self.matches(key, key_lower.as_deref().unwrap_or(key))
     }
 }
@@ -189,7 +203,7 @@ impl VariableSpec {
             };
             let keep = |key: &[u8]| {
                 let key_text = String::from_utf8_lossy(key);
-                let key_lower = has_literal_exceptions.then(|| key_text.to_lowercase());
+                let key_lower = has_literal_exceptions.then(|| lowercase_like_go(&key_text));
                 let key_lower = key_lower.as_deref().unwrap_or(&key_text);
                 !self
                     .exceptions
@@ -252,7 +266,7 @@ impl VariableSpec {
 mod tests {
     use regex::Regex;
 
-    use super::{CollectionView, VariableSpec};
+    use super::{CollectionView, VariableException, VariableSpec};
     use crate::{
         collection::{Map, Single},
         types::RuleVariable,
@@ -313,6 +327,17 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches.first().map(|matched| matched.key.as_str()), Some("Cookie"));
+    }
+
+    #[test]
+    fn literal_exceptions_lower_keys_like_go() {
+        // Go lowers `İ` to `i` on both sides, so a literal `İ` exception still matches it,
+        // while the two-code-point `i` + U+0307 form stays distinct.
+        let exception = VariableException::new_string("\u{130}");
+
+        assert!(exception.matches_key("\u{130}"));
+        assert!(exception.matches_key("I"));
+        assert!(!exception.matches_key("i\u{307}"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use regex::Regex;
 
 use super::Transaction;
 use crate::{
-    rules::VariableException,
+    rules::{VariableException, lowercase_like_go},
     types::{AuditEngineStatus, RuleEngineStatus, RulePhase, RuleVariable},
 };
 
@@ -199,8 +199,8 @@ impl Transaction {
         let Some(targets) = self.removed_rule_targets.get(&id) else {
             return false;
         };
-        // Go lower-cases the key, so a pattern keeps the case it was written with.
-        let key = key.to_lowercase();
+        // Go lower-cases the key with its simple mapping, so a pattern keeps the case it was written with.
+        let key = lowercase_like_go(key);
         targets
             .iter()
             .any(|(removed_variable, exception)| *removed_variable == variable && exception.matches_key(&key))
@@ -324,6 +324,44 @@ mod tests {
             }),
             Some(81),
             "other keys still reach the chain child"
+        );
+    }
+
+    #[test]
+    fn full_lowercase_expansion_does_not_widen_target_removal() {
+        // Go lowers `İ` (U+0130) to `i`, so the ambiguous `i` + U+0307 pattern excludes nothing;
+        // Rust's full mapping would lower the key to exactly those two code points.
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^i\u{307}$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| transaction.add_get_argument("\u{130}", "bad")),
+            Some(81),
+            "the key is inspected, matching Go's simple lowercase mapping"
+        );
+    }
+
+    #[test]
+    fn simple_lowercase_mapping_still_removes_keys() {
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^i$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| transaction.add_get_argument("\u{130}", "bad")),
+            None,
+            "Go lowers `İ` to `i`, so the plain pattern excludes it"
+        );
+    }
+
+    #[test]
+    fn non_ascii_lowercase_still_removes_keys() {
+        let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^\u{00e4}$/,pass\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";
+
+        assert_eq!(
+            interrupting_rule(rules, |transaction| transaction.add_get_argument("\u{00c4}", "bad")),
+            None,
+            "single-character lowercase mappings still apply"
         );
     }
 }
