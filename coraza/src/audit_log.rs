@@ -63,7 +63,7 @@ pub struct AuditLog {
 /// The transaction an [`AuditLog`] is about.
 #[derive(Debug, Clone, Default)]
 pub struct AuditTransaction {
-    /// When the transaction started, as `2006/01/02 15:04:05`, in UTC
+    /// When the transaction started, as `2006/01/02 15:04:05`, in the process-local time zone
     pub timestamp: String,
     /// When the transaction started, in nanoseconds since the Unix epoch
     pub unix_timestamp: i64,

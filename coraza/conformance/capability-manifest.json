@@ -1371,7 +1371,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "Serial, Concurrent and Syslog writers are implemented, and HTTPS is implemented behind the https-audit crate feature; without that feature an HTTPS writer is rejected when the WAF is built (coraza/src/audit_log.rs:1004-1013). Audit timestamps are UTC rather than process-local."
+          "Serial, Concurrent and Syslog writers are implemented, and HTTPS is implemented behind the https-audit crate feature; without that feature an HTTPS writer is rejected when the WAF is built (coraza/src/audit_log.rs:1004-1013)."
         ]
       },
       {
@@ -3312,9 +3312,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3326,9 +3324,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3352,9 +3348,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3366,9 +3360,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3380,9 +3372,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3394,9 +3384,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3408,9 +3396,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
@@ -3422,9 +3408,7 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/transaction.go",
         "fixtures": [],
-        "differences": [
-          "Uses UTC from coraza/src/utils/time.rs; Go formats these values in the process local time zone."
-        ]
+        "differences": []
       },
       {
         "names": [
