@@ -1004,13 +1004,27 @@ impl Transaction {
     /// This mirrors Go Coraza's `ProcessURI`: the target is parsed as an absolute URI or
     /// absolute path, URI derivatives come from the parsed form, and a target Go would
     /// reject still populates `QUERY_STRING` and `ARGS_GET` from a best-effort split.
-    pub fn process_uri(&mut self, uri: &str, method: &str, protocol: &str) {
-        self.set_single(RuleVariable::RequestLine, format!("{method} {uri} {protocol}"));
+    /// The target keeps its exact bytes, as Go's `url` package does, so a target that
+    /// is not valid UTF-8 still yields `REQUEST_FILENAME` and `ARGS_GET`.
+    pub fn process_uri(&mut self, uri: impl AsRef<[u8]>, method: &str, protocol: &str) {
+        let uri = uri.as_ref();
+        let mut request_line =
+            Vec::with_capacity(method.len().saturating_add(uri.len()).saturating_add(protocol.len()));
+        request_line.extend_from_slice(method.as_bytes());
+        request_line.push(b' ');
+        request_line.extend_from_slice(uri);
+        request_line.push(b' ');
+        request_line.extend_from_slice(protocol.as_bytes());
+        self.set_single(RuleVariable::RequestLine, request_line);
         self.set_single(RuleVariable::RequestURIRaw, uri);
         self.set_request_method(method);
         self.set_request_protocol(protocol);
 
-        let target = uri.split_once('#').map_or(uri, |(target, _)| target);
+        // Go removes the anchor before parsing.
+        let target = match uri.iter().position(|&byte| byte == b'#') {
+            Some(hash) => uri.get(..hash).unwrap_or_default(),
+            None => uri,
+        };
         if let Some(parsed) = parse_request_target(target) {
             self.set_single(RuleVariable::RequestURI, &parsed.request_uri);
             self.set_single(RuleVariable::QueryString, &parsed.raw_query);
@@ -1019,9 +1033,15 @@ impl Transaction {
         } else {
             self.set_single(RuleVariable::URIParseError, "1");
             self.set_single(RuleVariable::RequestURI, target);
-            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let (path, query) = match target.iter().position(|&byte| byte == b'?') {
+                Some(question) => (
+                    target.get(..question).unwrap_or_default(),
+                    target.get(question.saturating_add(1)..).unwrap_or_default(),
+                ),
+                None => (target, &b""[..]),
+            };
             self.set_single(RuleVariable::QueryString, query);
-            self.set_request_path(path.as_bytes());
+            self.set_request_path(path);
             self.add_query_arguments(query);
         }
     }
@@ -1039,8 +1059,8 @@ impl Transaction {
     }
 
     /// Add the decoded pairs of a raw query string to the GET collections.
-    fn add_query_arguments(&mut self, query: &str) {
-        for (key, value) in parse_urlencoded(query.as_bytes()) {
+    fn add_query_arguments(&mut self, query: &[u8]) {
+        for (key, value) in parse_urlencoded(query) {
             self.add_get_argument(key, value);
         }
     }
@@ -1225,7 +1245,7 @@ struct ParsedRequestTarget {
     /// `REQUEST_FILENAME`, the decoded path.
     path: Vec<u8>,
     /// `QUERY_STRING`, without the leading `?`.
-    raw_query: String,
+    raw_query: Vec<u8>,
 }
 
 /// The URL components that decide how Go re-encodes a value.
@@ -1245,51 +1265,51 @@ enum EscapeMode {
 ///
 /// Returns `None` for targets Go rejects, including empty targets, relative paths,
 /// raw control bytes, malformed escapes, malformed ports and invalid IP literals.
-fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
-    if target.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
+fn parse_request_target(target: &[u8]) -> Option<ParsedRequestTarget> {
+    if target.iter().any(|&byte| byte < 0x20 || byte == 0x7F) {
         return None;
     }
     if target.is_empty() {
         return None;
     }
-    if target == "*" {
+    if matches!(target, b"*") {
         return Some(ParsedRequestTarget {
             request_uri: b"*".to_vec(),
             path: b"*".to_vec(),
-            raw_query: String::new(),
+            raw_query: Vec::new(),
         });
     }
 
     let (scheme, rest) = split_scheme(target)?;
     let (rest, raw_query, force_query) = split_query(rest);
 
-    if !rest.starts_with('/') {
+    if !rest.starts_with(b"/") {
         // A rootless target after a scheme is opaque; without a scheme it is invalid.
         if scheme.is_empty() {
             return None;
         }
-        let mut request_uri = scheme.into_bytes();
+        let mut request_uri = scheme;
         request_uri.push(b':');
-        request_uri.extend_from_slice(rest.as_bytes());
+        request_uri.extend_from_slice(rest);
         if force_query || !raw_query.is_empty() {
             request_uri.push(b'?');
-            request_uri.extend_from_slice(raw_query.as_bytes());
+            request_uri.extend_from_slice(raw_query);
         }
         return Some(ParsedRequestTarget {
             request_uri,
             path: Vec::new(),
-            raw_query: raw_query.to_owned(),
+            raw_query: raw_query.to_vec(),
         });
     }
 
-    let (host, userinfo, path_source, omit_host) = if !scheme.is_empty() && rest.starts_with("//") {
-        let after_slashes = rest.strip_prefix("//").unwrap_or_default();
-        let (authority, path) = match after_slashes.find('/') {
+    let (host, userinfo, path_source, omit_host) = if !scheme.is_empty() && rest.starts_with(b"//") {
+        let after_slashes = rest.strip_prefix(b"//").unwrap_or_default();
+        let (authority, path) = match after_slashes.iter().position(|&byte| byte == b'/') {
             Some(index) => (
                 after_slashes.get(..index).unwrap_or_default(),
                 after_slashes.get(index..).unwrap_or_default(),
             ),
-            None => (after_slashes, ""),
+            None => (after_slashes, &b""[..]),
         };
         let (userinfo, host) = parse_authority(authority)?;
         (Some(host), userinfo, path, false)
@@ -1299,9 +1319,9 @@ fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
         (None, None, rest, false)
     };
 
-    let path = unescape(path_source.as_bytes(), EscapeMode::Path)?;
+    let path = unescape(path_source, EscapeMode::Path)?;
     let escaped = escape(&path, EscapeMode::Path);
-    let raw_path = (path_source.as_bytes() != escaped.as_slice()).then_some(path_source.as_bytes());
+    let raw_path = (path_source != escaped.as_slice()).then_some(path_source);
     let request_uri = match raw_path {
         Some(raw) if valid_encoded(raw) && unescape(raw, EscapeMode::Path).as_deref() == Some(path.as_slice()) => raw,
         _ => escaped.as_slice(),
@@ -1309,7 +1329,7 @@ fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
 
     let mut rendered = Vec::new();
     if !scheme.is_empty() {
-        rendered.extend_from_slice(scheme.as_bytes());
+        rendered.extend_from_slice(&scheme);
         rendered.push(b':');
     }
     if scheme.is_empty() && host.is_none() && userinfo.is_none() {
@@ -1345,24 +1365,24 @@ fn parse_request_target(target: &str) -> Option<ParsedRequestTarget> {
     }
     if force_query || !raw_query.is_empty() {
         rendered.push(b'?');
-        rendered.extend_from_slice(raw_query.as_bytes());
+        rendered.extend_from_slice(raw_query);
     }
 
     Some(ParsedRequestTarget {
         request_uri: rendered,
         path,
-        raw_query: raw_query.to_owned(),
+        raw_query: raw_query.to_vec(),
     })
 }
 
 /// Split the scheme from a target, lowercased, following Go's `getScheme`.
-fn split_scheme(target: &str) -> Option<(String, &str)> {
-    for (index, byte) in target.bytes().enumerate() {
+fn split_scheme(target: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    for (index, &byte) in target.iter().enumerate() {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' => {},
             b'0'..=b'9' | b'+' | b'-' | b'.' => {
                 if index == 0 {
-                    return Some((String::new(), target));
+                    return Some((Vec::new(), target));
                 }
             },
             b':' => {
@@ -1374,20 +1394,24 @@ fn split_scheme(target: &str) -> Option<(String, &str)> {
                     target.get(index.saturating_add(1)..)?,
                 ));
             },
-            _ => return Some((String::new(), target)),
+            _ => return Some((Vec::new(), target)),
         }
     }
-    Some((String::new(), target))
+    Some((Vec::new(), target))
 }
 
 /// Split a trailing query from the rest of the target.
-fn split_query(rest: &str) -> (&str, &str, bool) {
-    if rest.ends_with('?') && rest.bytes().filter(|&byte| byte == b'?').count() == 1 {
-        (rest.get(..rest.len().saturating_sub(1)).unwrap_or_default(), "", true)
+fn split_query(rest: &[u8]) -> (&[u8], &[u8], bool) {
+    if rest.ends_with(b"?") && rest.iter().filter(|&&byte| byte == b'?').count() == 1 {
+        (rest.get(..rest.len().saturating_sub(1)).unwrap_or_default(), b"", true)
     } else {
-        match rest.split_once('?') {
-            Some((before, query)) => (before, query, false),
-            None => (rest, "", false),
+        match rest.iter().position(|&byte| byte == b'?') {
+            Some(index) => (
+                rest.get(..index).unwrap_or_default(),
+                rest.get(index.saturating_add(1)..).unwrap_or_default(),
+                false,
+            ),
+            None => (rest, b"", false),
         }
     }
 }
@@ -1396,11 +1420,12 @@ fn split_query(rest: &str) -> (&str, &str, bool) {
 type UserInfo = (Vec<u8>, Option<Vec<u8>>);
 
 /// Parse an authority into optional userinfo and a host.
-fn parse_authority(authority: &str) -> Option<(Option<UserInfo>, Vec<u8>)> {
-    let at = authority.rfind('@');
-    let host_part = at.map_or(authority, |index| {
-        authority.get(index.saturating_add(1)..).unwrap_or_default()
-    });
+fn parse_authority(authority: &[u8]) -> Option<(Option<UserInfo>, Vec<u8>)> {
+    let at = authority.iter().rposition(|&byte| byte == b'@');
+    let host_part = match at {
+        Some(index) => authority.get(index.saturating_add(1)..).unwrap_or_default(),
+        None => authority,
+    };
     let host = parse_host(host_part)?;
     let Some(at) = at else {
         return Some((None, host));
@@ -1409,36 +1434,39 @@ fn parse_authority(authority: &str) -> Option<(Option<UserInfo>, Vec<u8>)> {
     if !valid_userinfo(userinfo) {
         return None;
     }
-    let userinfo = match userinfo.split_once(':') {
-        None => (unescape(userinfo.as_bytes(), EscapeMode::UserPassword)?, None),
-        Some((username, password)) => (
-            unescape(username.as_bytes(), EscapeMode::UserPassword)?,
-            Some(unescape(password.as_bytes(), EscapeMode::UserPassword)?),
+    let userinfo = match userinfo.iter().position(|&byte| byte == b':') {
+        None => (unescape(userinfo, EscapeMode::UserPassword)?, None),
+        Some(colon) => (
+            unescape(userinfo.get(..colon).unwrap_or_default(), EscapeMode::UserPassword)?,
+            Some(unescape(
+                userinfo.get(colon.saturating_add(1)..).unwrap_or_default(),
+                EscapeMode::UserPassword,
+            )?),
         ),
     };
     Some((Some(userinfo), host))
 }
 
 /// Validate and decode a host, rejecting the malformed ports and IP literals Go rejects.
-fn parse_host(host: &str) -> Option<Vec<u8>> {
-    if let Some(open) = host.rfind('[') {
+fn parse_host(host: &[u8]) -> Option<Vec<u8>> {
+    if let Some(open) = host.iter().rposition(|&byte| byte == b'[') {
         if open > 0 {
             return None;
         }
-        let close = host.rfind(']')?;
+        let close = host.iter().rposition(|&byte| byte == b']')?;
         let colon_port = host.get(close.saturating_add(1)..).unwrap_or_default();
-        if !valid_optional_port(colon_port.as_bytes()) {
+        if !valid_optional_port(colon_port) {
             return None;
         }
-        let colon_port = unescape(colon_port.as_bytes(), EscapeMode::Host)?;
+        let colon_port = unescape(colon_port, EscapeMode::Host)?;
         let literal = host.get(1..close)?;
-        let literal = match literal.find("%25") {
+        let literal = match literal.windows(3).position(|window| window == b"%25") {
             Some(zone) => {
-                let mut hostname = unescape(literal.get(..zone)?.as_bytes(), EscapeMode::Host)?;
-                hostname.extend_from_slice(&unescape(literal.get(zone..)?.as_bytes(), EscapeMode::Zone)?);
+                let mut hostname = unescape(literal.get(..zone)?, EscapeMode::Host)?;
+                hostname.extend_from_slice(&unescape(literal.get(zone..)?, EscapeMode::Zone)?);
                 hostname
             },
-            None => unescape(literal.as_bytes(), EscapeMode::Host)?,
+            None => unescape(literal, EscapeMode::Host)?,
         };
         if !valid_ip_literal(&literal) {
             return None;
@@ -1450,39 +1478,39 @@ fn parse_host(host: &str) -> Option<Vec<u8>> {
         host.extend_from_slice(&colon_port);
         return Some(host);
     }
-    if let Some(colon) = host.rfind(':') {
+    if let Some(colon) = host.iter().rposition(|&byte| byte == b':') {
         // The pinned Coraza module declares Go 1.25, so net/url keeps its historical
         // last-colon port split instead of the stricter Go 1.26 multi-colon rule.
-        if !valid_optional_port(host.get(colon..).unwrap_or_default().as_bytes()) {
+        if !valid_optional_port(host.get(colon..).unwrap_or_default()) {
             return None;
         }
     }
-    unescape(host.as_bytes(), EscapeMode::Host)
+    unescape(host, EscapeMode::Host)
 }
 
 /// Whether `text` contains only the characters Go accepts before an `@` in a URL.
-fn valid_userinfo(text: &str) -> bool {
-    text.chars().all(|character| {
-        character.is_ascii_alphanumeric()
+fn valid_userinfo(text: &[u8]) -> bool {
+    text.iter().all(|&byte| {
+        byte.is_ascii_alphanumeric()
             || matches!(
-                character,
-                '-' | '.'
-                    | '_'
-                    | ':'
-                    | '~'
-                    | '!'
-                    | '$'
-                    | '&'
-                    | '\''
-                    | '('
-                    | ')'
-                    | '*'
-                    | '+'
-                    | ','
-                    | ';'
-                    | '='
-                    | '%'
-                    | '@'
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b':'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+                    | b'@'
             )
     })
 }
@@ -4815,6 +4843,25 @@ v\r\n\
             port.get_variable(RuleVariable::ArgsGet, Some("q")).as_deref(),
             Some("attack")
         );
+    }
+
+    #[test]
+    fn process_uri_keeps_non_utf8_target_bytes() {
+        // Go Coraza v3.8.1, which passes the target to `url.ParseRequestURI` as a
+        // byte string, reports `/a%FFb?%ff=x&%fe=y` as REQUEST_URI, `/a\xffb`
+        // as REQUEST_FILENAME and the two decoded `\xff`/`\xfe` ARGS_GET keys.
+        let mut tx = Transaction::new("uri-non-utf8");
+        tx.process_uri(b"/a\xffb?%ff=x&%fe=y", "GET", "HTTP/1.1");
+
+        assert_eq!(tx.computed.uri_parse_error.get_bytes(), b"0");
+        assert_eq!(tx.request_uri.get_bytes(), b"/a%FFb?%ff=x&%fe=y");
+        assert_eq!(tx.computed.request_uri_raw.get_bytes(), b"/a\xffb?%ff=x&%fe=y");
+        assert_eq!(tx.computed.query_string.get_bytes(), b"%ff=x&%fe=y");
+        assert_eq!(tx.computed.request_filename.get_bytes(), b"/a\xffb");
+        assert_eq!(tx.computed.request_basename.get_bytes(), b"a\xffb");
+        assert_eq!(tx.args_get.len(), 2);
+        assert_eq!(tx.args_get.first(b"\xff"), Some(&b"x"[..]));
+        assert_eq!(tx.args_get.first(b"\xfe"), Some(&b"y"[..]));
     }
 
     /// Compile one phase-1 rule and report whether `target` makes it interrupt.
