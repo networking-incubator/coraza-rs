@@ -51,10 +51,13 @@ impl std::error::Error for ParseError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilenameEncoding {
     /// e.g. `UTF-8`
-    pub(crate) charset: String,
+    pub(crate) charset: Vec<u8>,
     /// e.g. `en`; may be empty
-    pub(crate) language: String,
+    pub(crate) language: Vec<u8>,
 }
+
+/// A part's headers, in order: each name as sent, and its value bytes.
+pub(crate) type Headers = Vec<(String, Vec<u8>)>;
 
 /// A single part in a multipart message
 #[derive(Debug, Clone)]
@@ -63,15 +66,15 @@ pub(crate) struct FilenameEncoding {
     reason = "these flags report independent Coraza multipart conditions"
 )]
 pub(crate) struct Part<'a> {
-    /// Form field name (from Content-Disposition name parameter)
-    pub(crate) name: String,
+    /// Form field name (from Content-Disposition name parameter), exactly as sent
+    pub(crate) name: Vec<u8>,
 
     /// Filename, if this is a file upload: from the Content-Disposition `filename*`
     /// parameter, decoded, or else from `filename`
-    pub(crate) filename: Option<String>,
+    pub(crate) filename: Option<Vec<u8>>,
 
     /// The `filename` parameter, when `filename*` gave a different name
-    pub(crate) alt_filename: Option<String>,
+    pub(crate) alt_filename: Option<Vec<u8>>,
 
     /// The charset and language of the `filename*` parameter
     pub(crate) filename_encoding: Option<FilenameEncoding>,
@@ -79,8 +82,8 @@ pub(crate) struct Part<'a> {
     /// Whether the `filename*` parameter is malformed
     pub(crate) malformed_filename: bool,
 
-    /// Its headers, in order: each name as sent, and its value
-    pub(crate) headers: Vec<(String, String)>,
+    /// Its headers, in order: each name as sent, and its value bytes
+    pub(crate) headers: Headers,
 
     /// Whether the part repeats a header, or a parameter of its Content-Disposition
     pub(crate) repeats_header: bool,
@@ -312,20 +315,41 @@ fn parse_part<'a>(data: &'a [u8], total_header_bytes: &mut usize) -> Result<Part
 }
 
 /// The value of the first header named `name`, whatever its case.
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn header<'a>(headers: &'a Headers, name: &str) -> Option<&'a [u8]> {
     headers
         .iter()
         .find(|(header, _)| header.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| value.as_slice())
 }
 
-/// Parse headers from header data, in order, each name as sent
-fn parse_headers(data: &[u8]) -> Result<Vec<(String, String)>, ParseError> {
-    let mut headers = Vec::new();
-    let header_str = String::from_utf8_lossy(data);
+/// `bytes` without the ASCII whitespace Go's `textproto` trims around a header
+/// name or value.
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    trim_ascii_end(bytes.get(start..).unwrap_or_default())
+}
 
-    for line in header_str.lines() {
-        let line = line.trim_end();
+/// `bytes` without its trailing ASCII whitespace.
+fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index.saturating_add(1));
+    bytes.get(..end).unwrap_or_default()
+}
+
+/// Parse headers from header data, in order, each name as sent.
+///
+/// Values keep their exact bytes, as Go's `textproto` keeps them: an invalid
+/// UTF-8 value must not collapse into another one.
+fn parse_headers(data: &[u8]) -> Result<Headers, ParseError> {
+    let mut headers = Vec::new();
+
+    for line in data.split(|&byte| byte == b'\n') {
+        let line = trim_ascii_end(line);
         if line.is_empty() {
             continue;
         }
@@ -334,27 +358,33 @@ fn parse_headers(data: &[u8]) -> Result<Vec<(String, String)>, ParseError> {
                 "part has more than {MAX_PART_HEADERS} headers"
             )));
         }
-        if line.starts_with([' ', '\t']) {
+        if matches!(line.first(), Some(b' ' | b'\t')) {
             return Err(ParseError::MalformedHeaders(
                 "folded header lines are not supported".to_owned(),
             ));
         }
-        let (name, value) = line
-            .split_once(':')
+        let colon = line
+            .iter()
+            .position(|&byte| byte == b':')
             .ok_or_else(|| ParseError::MalformedHeaders("invalid header line".to_owned()))?;
+        let name = line.get(..colon).unwrap_or_default();
         if name.is_empty()
-            || name.trim() != name
+            || trim_ascii(name) != name
             || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
         {
             return Err(ParseError::MalformedHeaders("invalid header name".to_owned()));
         }
-        let value = value.trim();
-        if value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7F) {
+        let value = trim_ascii(line.get(colon.saturating_add(1)..).unwrap_or_default());
+        if value.iter().any(|&byte| (byte < 0x20 && byte != b'\t') || byte == 0x7F) {
             return Err(ParseError::MalformedHeaders("invalid header value".to_owned()));
         }
-        headers.push((name.to_owned(), value.to_owned()));
+        // A header name is confined to token bytes, which are ASCII.
+        let Ok(name) = std::str::from_utf8(name) else {
+            return Err(ParseError::MalformedHeaders("invalid header name".to_owned()));
+        };
+        headers.push((name.to_owned(), value.to_vec()));
     }
 
     Ok(headers)
@@ -366,12 +396,12 @@ fn parse_headers(data: &[u8]) -> Result<Vec<(String, String)>, ParseError> {
     reason = "these flags report independent Coraza multipart conditions"
 )]
 struct ContentDisposition {
-    /// The part name from `Content-Disposition`.
-    name: String,
+    /// The part name from `Content-Disposition`, exactly as sent.
+    name: Vec<u8>,
     /// `filename*` decoded, or else `filename`
-    filename: Option<String>,
+    filename: Option<Vec<u8>>,
     /// `filename`, when `filename*` gave a different one
-    alt_filename: Option<String>,
+    alt_filename: Option<Vec<u8>>,
     /// The charset and language of `filename*`
     filename_encoding: Option<FilenameEncoding>,
     /// Whether `filename*` isn't `charset'language'value` or holds an invalid escape
@@ -385,21 +415,29 @@ struct ContentDisposition {
 /// Extract name and filename from Content-Disposition header
 ///
 /// Example: `form-data; name="field"; filename="file.txt"`
-fn extract_content_disposition(headers: &[(String, String)]) -> Result<ContentDisposition, ParseError> {
+fn extract_content_disposition(headers: &Headers) -> Result<ContentDisposition, ParseError> {
     let disposition = header(headers, "content-disposition")
         .ok_or_else(|| ParseError::MalformedHeaders("missing Content-Disposition".to_owned()))?;
 
     let params = parse_header_params(disposition);
-    let param = |name: &str| params.iter().rev().find(|p| p.name == name).map(|p| p.value.clone());
+    let param = |name: &[u8]| {
+        params
+            .iter()
+            .rev()
+            .find(|param| param.name.as_slice() == name)
+            .map(|param| param.value.clone())
+    };
     let mut seen_params = std::collections::HashSet::with_capacity(params.len());
-    let repeats_param = params.iter().any(|param| !seen_params.insert(param.name.as_str()));
-    let quoted_extended_filename = params.iter().any(|p| p.name == "filename*" && p.quoted);
+    let repeats_param = params.iter().any(|param| !seen_params.insert(param.name.as_slice()));
+    let quoted_extended_filename = params
+        .iter()
+        .any(|param| param.name.as_slice() == b"filename*" && param.quoted);
 
     let name =
-        param("name").ok_or_else(|| ParseError::MalformedHeaders("missing name in Content-Disposition".to_owned()))?;
+        param(b"name").ok_or_else(|| ParseError::MalformedHeaders("missing name in Content-Disposition".to_owned()))?;
 
     // As Go Coraza reads RFC 5987's `filename*=charset'language'value`
-    let plain = param("filename");
+    let plain = param(b"filename");
     let mut disposition = ContentDisposition {
         name,
         filename: plain.clone(),
@@ -409,15 +447,16 @@ fn extract_content_disposition(headers: &[(String, String)]) -> Result<ContentDi
         repeats_param,
         quoted_extended_filename,
     };
-    if let Some(extended) = param("filename*") {
-        match extended.splitn(3, '\'').collect::<Vec<_>>().as_slice() {
+    if let Some(extended) = param(b"filename*") {
+        let segments: Vec<&[u8]> = extended.splitn(3, |&byte| byte == b'\'').collect();
+        match segments.as_slice() {
             [charset, language, value] => {
                 let (decoded, invalid_escape) = percent_decode_lenient(value);
                 disposition.alt_filename = plain.filter(|plain| !plain.is_empty() && *plain != decoded);
                 disposition.filename = Some(decoded);
                 disposition.filename_encoding = Some(FilenameEncoding {
-                    charset: (*charset).to_owned(),
-                    language: (*language).to_owned(),
+                    charset: (*charset).to_vec(),
+                    language: (*language).to_vec(),
                 });
                 disposition.malformed_extended_filename = invalid_escape;
             },
@@ -429,16 +468,15 @@ fn extract_content_disposition(headers: &[(String, String)]) -> Result<ContentDi
 
 /// `value` with its `%XX` escapes decoded, and whether it held an invalid one, which is
 /// kept as written.
-fn percent_decode_lenient(value: &str) -> (String, bool) {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
+fn percent_decode_lenient(value: &[u8]) -> (Vec<u8>, bool) {
+    let mut decoded = Vec::with_capacity(value.len());
     let mut invalid = false;
     let mut i = 0;
-    while let Some(&byte) = bytes.get(i) {
+    while let Some(&byte) = value.get(i) {
         let escaped = (byte == b'%')
             .then(|| {
                 i.checked_add(1)
-                    .and_then(|start| bytes.get(start..start.checked_add(2)?))
+                    .and_then(|start| value.get(start..start.checked_add(2)?))
             })
             .flatten()
             .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
@@ -451,16 +489,16 @@ fn percent_decode_lenient(value: &str) -> (String, bool) {
             i += 1;
         }
     }
-    (String::from_utf8_lossy(&decoded).into_owned(), invalid)
+    (decoded, invalid)
 }
 
 /// One `name=value` parameter of a header.
 #[derive(Debug, PartialEq)]
 struct HeaderParam {
     /// Lowercase name
-    name: String,
+    name: Vec<u8>,
     /// Value, without its quotes
-    value: String,
+    value: Vec<u8>,
     /// Whether the value was a quoted string
     quoted: bool,
 }
@@ -469,20 +507,20 @@ struct HeaderParam {
 ///
 /// As in Go Coraza, a `;` inside a quoted string doesn't end the parameter, and a
 /// quoted value is unquoted as Go's `mime` package does it.
-fn parse_header_params(header: &str) -> Vec<HeaderParam> {
+fn parse_header_params(header: &[u8]) -> Vec<HeaderParam> {
     let mut params = Vec::new();
 
     for part in split_header_params(header) {
-        let part = part.trim();
+        let part = trim_ascii(part);
 
-        if let Some((name, value)) = part.split_once('=') {
-            let name = name.trim().to_lowercase();
-            let value = value.trim();
+        if let Some(equals) = part.iter().position(|&byte| byte == b'=') {
+            let name = trim_ascii(part.get(..equals).unwrap_or_default()).to_ascii_lowercase();
+            let value = trim_ascii(part.get(equals.saturating_add(1)..).unwrap_or_default());
             let unquoted = unquote(value);
             params.push(HeaderParam {
                 name,
                 quoted: unquoted.is_some(),
-                value: unquoted.unwrap_or_else(|| value.to_owned()),
+                value: unquoted.unwrap_or_else(|| value.to_vec()),
             });
         }
     }
@@ -492,14 +530,13 @@ fn parse_header_params(header: &str) -> Vec<HeaderParam> {
 
 /// The `;`-separated parts of `header`, a `;` in a quoted string (where a backslash
 /// escapes the next character) not separating them.
-fn split_header_params(header: &str) -> Vec<&str> {
-    let bytes = header.as_bytes();
+fn split_header_params(header: &[u8]) -> Vec<&[u8]> {
     let mut parts = Vec::new();
     let mut in_quotes = false;
     let mut start = 0;
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes.get(i).copied() {
+    while i < header.len() {
+        match header.get(i).copied() {
             Some(b'\\') if in_quotes => i += 1,
             Some(b'"') => in_quotes = !in_quotes,
             Some(b';') if !in_quotes => {
@@ -521,19 +558,20 @@ fn split_header_params(header: &str) -> Vec<&str> {
 /// The content of `value` if it is a quoted string, with a backslash before one of
 /// RFC 2045's special characters removed; other backslashes are kept, as Go's `mime`
 /// package keeps them for the paths MSIE sends unescaped (`"C:\dev\x.txt"`).
-fn unquote(value: &str) -> Option<String> {
-    const SPECIALS: &str = "()<>@,;:\\\"/[]?=";
-    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
-    let mut unquoted = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        match chars.peek() {
-            Some(&next) if c == '\\' && SPECIALS.contains(next) => {
+fn unquote(value: &[u8]) -> Option<Vec<u8>> {
+    const SPECIALS: &[u8] = b"()<>@,;:\\\"/[]?=";
+    let inner = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    let mut unquoted = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while let Some(&byte) = inner.get(i) {
+        match inner.get(i.saturating_add(1)) {
+            Some(&next) if byte == b'\\' && SPECIALS.contains(&next) => {
                 unquoted.push(next);
-                chars.next();
+                i += 1;
             },
-            _ => unquoted.push(c),
+            _ => unquoted.push(byte),
         }
+        i += 1;
     }
     Some(unquoted)
 }
@@ -722,7 +760,7 @@ value\r\n\
 
         assert_eq!(parts.len(), 1);
         let part = parts.first().unwrap();
-        assert_eq!(part.name, "field");
+        assert_eq!(part.name.as_slice(), b"field");
         assert_eq!(part.filename, None);
         assert_eq!(part.data, b"value");
     }
@@ -741,9 +779,9 @@ file content\r\n\
 
         assert_eq!(parts.len(), 1);
         let part = parts.first().unwrap();
-        assert_eq!(part.name, "file");
-        assert_eq!(part.filename.as_deref(), Some("test.txt"));
-        assert_eq!(header(&part.headers, "Content-Type"), Some("text/plain"));
+        assert_eq!(part.name.as_slice(), b"file");
+        assert_eq!(part.filename.as_deref(), Some(&b"test.txt"[..]));
+        assert_eq!(header(&part.headers, "Content-Type"), Some(&b"text/plain"[..]));
         assert_eq!(part.data, b"file content");
     }
 
@@ -779,9 +817,9 @@ value2\r\n\
         assert_eq!(parts.len(), 2);
         let first = parts.first().unwrap();
         let second = parts.get(1).unwrap();
-        assert_eq!(first.name, "field1");
+        assert_eq!(first.name.as_slice(), b"field1");
         assert_eq!(first.data, b"value1");
-        assert_eq!(second.name, "field2");
+        assert_eq!(second.name.as_slice(), b"field2");
         assert_eq!(second.data, b"value2");
     }
 
@@ -821,7 +859,7 @@ value\n\
 
         assert_eq!(parts.len(), 1);
         let part = parts.first().unwrap();
-        assert_eq!(part.name, "field");
+        assert_eq!(part.name.as_slice(), b"field");
         assert_eq!(part.data, b"value");
     }
 
@@ -838,7 +876,7 @@ Content-Disposition: form-data; name=\"empty\"\r\n\
 
         assert_eq!(parts.len(), 1);
         let part = parts.first().unwrap();
-        assert_eq!(part.name, "empty");
+        assert_eq!(part.name.as_slice(), b"empty");
         assert_eq!(part.data, b"");
     }
 
@@ -911,11 +949,11 @@ value\r\n\
     #[test]
     fn test_parse_header_params() {
         let header = "form-data; name=\"field\"; filename=\"file.txt\"";
-        let params = parse_header_params(header);
+        let params = parse_header_params(header.as_bytes());
 
         let quoted = |name: &str, value: &str| HeaderParam {
-            name: name.to_owned(),
-            value: value.to_owned(),
+            name: name.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
             quoted: true,
         };
         assert_eq!(params, [quoted("name", "field"), quoted("filename", "file.txt")]);
@@ -924,15 +962,23 @@ value\r\n\
     #[test]
     fn test_parse_header_params_quoted_strings() {
         // A ';' or an escaped quote inside a quoted string is part of the value, as in Go
-        let params = parse_header_params(r#"form-data; name="zzz&auml;&euml;zzz"; filename="a\"b;c"; x=1"#);
-        let values: Vec<_> = params.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
+        let params = parse_header_params(br#"form-data; name="zzz&auml;&euml;zzz"; filename="a\"b;c"; x=1"#);
+        let values: Vec<_> = params
+            .iter()
+            .map(|p| {
+                (
+                    std::str::from_utf8(&p.name).unwrap(),
+                    std::str::from_utf8(&p.value).unwrap(),
+                )
+            })
+            .collect();
         assert_eq!(
             values,
             [("name", "zzz&auml;&euml;zzz"), ("filename", "a\"b;c"), ("x", "1")]
         );
         // A backslash escapes only a special character: MSIE sends paths unescaped
-        let params = parse_header_params(r#"form-data; filename="C:\dev\x.txt""#);
-        assert_eq!(params.first().unwrap().value, r"C:\dev\x.txt");
+        let params = parse_header_params(br#"form-data; filename="C:\dev\x.txt""#);
+        assert_eq!(params.first().unwrap().value.as_slice(), br"C:\dev\x.txt");
     }
 
     #[test]
@@ -954,10 +1000,10 @@ Content of a.txt.\r\n\
         assert_eq!(parts.len(), 2);
         let first = parts.first().unwrap();
         let second = parts.get(1).unwrap();
-        assert_eq!(first.name, "text");
+        assert_eq!(first.name.as_slice(), b"text");
         assert_eq!(first.data, b"text default");
-        assert_eq!(second.name, "file1");
-        assert_eq!(second.filename.as_deref(), Some("a.txt"));
+        assert_eq!(second.name.as_slice(), b"file1");
+        assert_eq!(second.filename.as_deref(), Some(&b"a.txt"[..]));
         assert_eq!(second.data, b"Content of a.txt.");
     }
 
@@ -982,7 +1028,7 @@ ok\r\n\
         let parts = MultipartParser::new("b", body).parse().unwrap();
         assert_eq!(parts.len(), 1);
         let part = parts.first().unwrap();
-        assert_eq!(part.name, "r");
+        assert_eq!(part.name.as_slice(), b"r");
         assert_eq!(part.data, b"ok");
     }
 
@@ -1225,15 +1271,65 @@ more\r\n\
     }
 
     #[test]
-    fn non_utf8_header_bytes_are_replaced_lossily() {
-        // Go's textproto keeps the raw bytes in the value; this parser decodes
-        // the header block lossily, so rules see U+FFFD. Pinned here.
+    fn non_utf8_header_bytes_are_kept_as_sent() {
+        // Go's textproto keeps the raw bytes in the value; so does this parser.
         let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\nX: \xff\xfe\r\n\r\nv\r\n--b--";
         let parts = MultipartParser::new("b", body).parse().unwrap();
-        assert_eq!(header(&parts.first().unwrap().headers, "X"), Some("\u{FFFD}\u{FFFD}"));
+        assert_eq!(header(&parts.first().unwrap().headers, "X"), Some(&b"\xff\xfe"[..]));
 
         // A non-UTF-8 header name is not a valid token and is rejected.
         let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\xff: v\r\n\r\nv\r\n--b--";
         assert!(MultipartParser::new("b", body).parse().is_err());
+    }
+
+    #[test]
+    fn part_names_that_are_not_utf8_stay_distinct() {
+        // Two names whose lossy text views are both U+FFFD, as Go's
+        // `mime.ParseMediaType` keeps them distinct.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"\xff\"\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"\xfe\"\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.first().unwrap().name.as_slice(), b"\xff");
+        assert_eq!(parts.first().unwrap().data, b"one");
+        assert_eq!(parts.get(1).unwrap().name.as_slice(), b"\xfe");
+        assert_eq!(parts.get(1).unwrap().data, b"two");
+    }
+
+    #[test]
+    fn utf8_part_names_are_unchanged() {
+        let body = "--b\r\n\
+Content-Disposition: form-data; name=\"na\u{ef}me\"\r\n\
+\r\n\
+v\r\n\
+--b--"
+            .as_bytes();
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.first().unwrap().name.as_slice(), "na\u{ef}me".as_bytes());
+    }
+
+    #[test]
+    fn duplicate_part_names_stay_repeated_values() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"\xff\"\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"\xff\"\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let parts = MultipartParser::new("b", body).parse().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.name.as_slice() == b"\xff"));
+        assert_eq!(parts.first().unwrap().data, b"one");
+        assert_eq!(parts.get(1).unwrap().data, b"two");
     }
 }
