@@ -52,14 +52,11 @@ case ID and fixture hash are kept so the case stays traceable.
 | `transform-base64decodeext-forgiving` | `d0db3a9154efe2f64b3fdad2f2cb8be26f6561e1679b0be302ab805adfe1109f` | Resolved. `t:base64DecodeExt` now skips bytes outside the Base64 alphabet instead of stopping at the first one, and maps the base64url `-` and `_` characters to `+` and `/`, matching Go Coraza v3.8.1. `\xc2\xa9dzBzV==` decodes to `w0s` on both sides; URL-safe tokens and invalid bytes between valid groups decode identically. The strict `t:base64Decode` behavior is unchanged: it still returns partial output up to the first invalid byte. Padding, decoded NUL bytes and the always-true changed flag are unchanged. |
 | `transform-jsdecode-braced-escape` | `00ba0dfd13fd6810393903d8cf8459be76bab3b0adaf13e7331c38e4bfaec3f8` | Resolved. `t:jsDecode` now decodes ES2015 `\u{H...H}` escapes of one to six hex digits in addition to the four-digit `\uHHHH` form, so `\u{41}` becomes `A` on both sides. Go's lower-byte truncation and full-width ASCII fold, checked against the resolved value, are preserved: supplementary values such as `\u{1F600}` and out-of-range scalars such as `\u{110000}` both collapse to `0x00`, and empty, over-long or unterminated bodies fall back to the simple escape. |
 | `transform-compresswhitespace-latin1` | `a2ad3a1ec45ebe0d391a75c57add9aec844e37d912f04c64dc6f5950f90bc458` | Resolved. `t:compressWhitespace` now collapses only ASCII whitespace, U+0085, U+00A0 and a stray `0xA0` byte, matching Go Coraza v3.8.1, instead of using full Unicode whitespace. U+3000 and the other Unicode spaces are preserved, malformed bytes are copied unchanged, and `SELECT\xa01` becomes `SELECT 1` on both sides. `t:removeWhitespace` still uses full Unicode whitespace, as in Go. |
+| `multipart-invalid-utf8-names` | `198682754b8b93bd8c634406ae9ecab9b3648501a8124adac6729219e88170a8` | Resolved end to end. Multipart part names, filenames, `filename*` charset and language, and part-header values are kept as bytes through parsing and published with `Map::add_bytes`, so two names that differ only in invalid UTF-8 bytes stay two distinct keys in `ARGS_POST`, `ARGS`, `MULTIPART_NAME`, `FILES_NAMES` and `MULTIPART_PART_HEADERS`, and part-header values are stored as `<canonical name>: <raw value bytes>`. Go Coraza v3.8.1 reports the same keys and the same header bytes. Lossy text remains only as a view (text getters, MIME type, audit filename) and does not decide which keys exist. Pinned by `field_names_that_are_not_utf8_are_distinct_keys` in `coraza/src/transaction/request_body.rs`, whose body bytes are the fixture. |
 
 ## Remaining byte-identity restrictions
 
-- Multipart part names still pass through lossy text decoding in the multipart
-  body processor (`String::from_utf8_lossy` in
-  `coraza/src/body_processors/multipart/parser.rs`), so names that are not
-  valid UTF-8 can still collide in `ARGS_POST`. URL-decoded query, form and
-  connector-supplied path names preserve their bytes.
+No byte-identity restrictions remain as of this revision.
 
 ## Deliberate deviation classes without engine case IDs yet
 
