@@ -20,12 +20,14 @@ For `SecAuditLogType HTTPS`, `SecAuditLog` is the endpoint URL instead of a
 path, for example `SecAuditLog https://collector.example/audit`.
 
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
-supported writers are serial files or standard output/error, concurrent files,
-syslog, and HTTP(S) endpoints. Audit timestamps, audit file names and the
-`TIME`, `TIME_DAY`, `TIME_HOUR`, `TIME_MIN`, `TIME_MON`, `TIME_SEC`, `TIME_WDAY`
-and `TIME_YEAR` variables use the process local time zone, as in Go Coraza: the
-zone named by `TZ` at startup, or the one `/etc/localtime` records. `TIME_EPOCH`
-and the audit entry's `unix_timestamp` stay absolute.
+supported writers are serial files or standard output/error, concurrent
+files, syslog, and HTTP(S) endpoints. The formatted audit timestamps, the
+concurrent audit file names and the `TIME`, `TIME_DAY`, `TIME_HOUR`,
+`TIME_MIN`, `TIME_MON`, `TIME_SEC`, `TIME_WDAY` and `TIME_YEAR` variables use
+the process local time zone, as in Go Coraza: the zone named by `TZ` at
+startup, or the one `/etc/localtime` records. The JSON `unix_timestamp`, the
+OCSF `time`, `start_time` and `metadata.logged_time`, and `TIME_EPOCH` remain
+absolute epoch values.
 
 `SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
 WAF is built with that writer rejected, never silently replaced by another one.
