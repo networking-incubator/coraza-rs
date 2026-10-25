@@ -722,7 +722,7 @@ impl Transaction {
                         AuditFile {
                             size: self
                                 .files_sizes
-                                .get(&name)
+                                .get(filename)
                                 .first()
                                 .and_then(|size| size.parse().ok())
                                 .unwrap_or(0),
@@ -1915,6 +1915,41 @@ payload\r\n\
         assert_eq!(
             tx.get_variable(RuleVariable::FilesSizes, Some("LEGACY.TXT")).as_deref(),
             Some("7")
+        );
+    }
+
+    #[test]
+    fn audit_files_report_sizes_for_non_utf8_filenames() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let config = WafConfig {
+            request_body_access: true,
+            upload_dir: upload_dir.path().to_string_lossy().into_owned(),
+            audit_log_parts: crate::types::parse_audit_log_parts("AJZ").unwrap(),
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("audit-file-sizes", Arc::new(config));
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"raw\"; filename=\"\xff.bin\"\r\n\
+\r\n\
+123456\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
+\r\n\
+12\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body), None);
+
+        let log = tx.audit_log();
+        let files = log.transaction.request.files.unwrap();
+        let raw = files.iter().find(|file| file.name == "\u{fffd}.bin").unwrap();
+        // Only the size lookup uses the raw bytes; the name stays the lossy text view.
+        assert_eq!(raw.size, 6);
+        assert_eq!(
+            files.iter().find(|file| file.name == "ok.txt").map(|file| file.size),
+            Some(2)
         );
     }
 
