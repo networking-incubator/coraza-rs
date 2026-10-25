@@ -29,9 +29,10 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use regex::Regex;
@@ -366,7 +367,7 @@ fn go_quote(text: &str) -> String {
 
 /// Callback used to emit rules with the `log` action.
 #[derive(Clone)]
-pub(crate) struct ErrorLog(std::sync::Arc<ErrorLogCallback>);
+pub(crate) struct ErrorLog(Arc<ErrorLogCallback>);
 
 /// Thread-safe callback invoked for each matching logged rule.
 type ErrorLogCallback = dyn Fn(&MatchedRule) + Send + Sync;
@@ -374,7 +375,7 @@ type ErrorLogCallback = dyn Fn(&MatchedRule) + Send + Sync;
 impl ErrorLog {
     /// Wrap a callback for sharing across transactions.
     pub(crate) fn new(log: impl Fn(&MatchedRule) + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(log))
+        Self(Arc::new(log))
     }
 
     /// Invoke the callback for a matched rule.
@@ -928,8 +929,98 @@ pub(crate) struct AuditLogger {
     format: AuditLogFormat,
     /// `SecAuditLogRelevantStatus`, if set
     relevant_status: Option<Regex>,
-    /// Writer selected from `SecAuditLogType` and `SecAuditLog`.
-    writer: Writer,
+    /// How the writer is built when first needed, validated without opening it.
+    plan: WriterPlan,
+    /// The opened writer, shared so a write never holds the activation lock.
+    writer: RwLock<Option<Arc<Writer>>>,
+}
+
+/// How to build the audit writer once, without opening or connecting anything yet.
+#[derive(Debug)]
+enum WriterPlan {
+    /// Nowhere: without `SecAuditLog`, as in Go Coraza
+    Discard,
+    /// One after the other, into one file or stream
+    Serial {
+        /// File path or standard stream.
+        target: SerialTarget,
+        /// Permission bits for a created file.
+        file_mode: u32,
+    },
+    /// One file each, under `dir`, listed in an index
+    Concurrent {
+        /// Append-only index path.
+        index: String,
+        /// Root directory containing dated entry directories.
+        dir: PathBuf,
+        /// Permission bits for created directories.
+        dir_mode: u32,
+        /// Permission bits for each created entry.
+        file_mode: u32,
+    },
+    /// One message each, to syslog
+    Syslog {
+        /// Configured target.
+        target: String,
+        /// Deadline for connecting, `None` for no deadline.
+        connect_timeout: Option<Duration>,
+        /// Deadline for each write, `None` for no deadline.
+        write_timeout: Option<Duration>,
+    },
+    /// One POST each, to an HTTP endpoint
+    #[cfg(feature = "https-audit")]
+    Https {
+        /// Configured target.
+        target: String,
+    },
+}
+
+/// Where a serial audit writer sends its entries.
+#[derive(Debug)]
+enum SerialTarget {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+    /// A file opened for append.
+    File(String),
+}
+
+impl WriterPlan {
+    /// Open the planned writer, creating files and connecting sockets as needed.
+    fn open(&self, _format: AuditLogFormat) -> io::Result<Writer> {
+        Ok(match self {
+            Self::Discard => Writer::Discard,
+            Self::Serial { target, file_mode } => Writer::Serial(Mutex::new(match target {
+                SerialTarget::Stdout => Box::new(io::stdout()),
+                SerialTarget::Stderr => Box::new(io::stderr()),
+                SerialTarget::File(path) => Box::new(open_append(path, *file_mode).map_err(io::Error::other)?),
+            })),
+            Self::Concurrent {
+                index,
+                dir,
+                dir_mode,
+                file_mode,
+            } => Writer::Concurrent {
+                index: Mutex::new(open_append(index, *file_mode).map_err(io::Error::other)?),
+                dir: dir.clone(),
+                dir_mode: *dir_mode,
+                file_mode: *file_mode,
+            },
+            Self::Syslog {
+                target,
+                connect_timeout,
+                write_timeout,
+            } => Writer::Syslog(Mutex::new(
+                Syslog::connect(target, *connect_timeout, *write_timeout)
+                    .map_err(|error| io::Error::other(format!("syslog dial failure: {error}")))?,
+            )),
+            #[cfg(feature = "https-audit")]
+            Self::Https { target } => {
+                Writer::Https(https::HttpsWriter::open(target, _format).map_err(io::Error::other)?)
+            },
+        })
+    }
 }
 
 /// Where audit log entries go.
@@ -969,104 +1060,23 @@ impl fmt::Debug for Writer {
     }
 }
 
-impl AuditLogger {
-    /// Create a logger that discards audit entries.
-    pub(crate) fn discard() -> Self {
-        Self {
-            format: AuditLogFormat::Native,
-            relevant_status: None,
-            writer: Writer::Discard,
-        }
-    }
-
-    /// Opens the audit log `config` describes: its file is created if missing.
-    ///
-    /// # Errors
-    ///
-    /// If the file or syslog can't be opened, `SecAuditLogRelevantStatus` isn't a
-    /// regular expression, the writer is `HTTPS` and the `https-audit` feature is
-    /// disabled or the target isn't a valid URI.
-    pub(crate) fn open(config: &WafConfig) -> Result<Self, String> {
-        let relevant_status = match config.audit_log_relevant_status.as_str() {
-            "" => None,
-            pattern => {
-                Some(Regex::new(pattern).map_err(|e| format!("invalid SecAuditLogRelevantStatus {pattern:?}: {e}"))?)
-            },
-        };
-        let target = config.audit_log.as_str();
-        if config.audit_log_type == AuditLogType::Concurrent
-            && !target.is_empty()
-            && config.audit_log_storage_dir.is_empty()
-        {
-            return Err("SecAuditLogStorageDir is required for concurrent audit logs".to_owned());
-        }
-        let writer = match (config.audit_log_type, target) {
+impl Writer {
+    /// Write one formatted entry to this writer.
+    fn write(&self, formatted: &str, entry: &AuditLog) -> io::Result<()> {
+        match self {
+            Self::Discard => Ok(()),
             #[cfg(feature = "https-audit")]
-            (AuditLogType::Https, target) => Writer::Https(https::HttpsWriter::open(target, config.audit_log_format)?),
-            #[cfg(not(feature = "https-audit"))]
-            (AuditLogType::Https, _) => {
-                return Err(
-                    "audit log type HTTPS is not supported in this build; enable the \"https-audit\" crate feature"
-                        .to_owned(),
-                );
-            },
-            (AuditLogType::Syslog, target) => Writer::Syslog(Mutex::new(
-                Syslog::connect(target).map_err(|e| format!("syslog dial failure: {e}"))?,
-            )),
-            (_, "") => Writer::Discard,
-            (AuditLogType::Serial, "/dev/stdout") => Writer::Serial(Mutex::new(Box::new(io::stdout()))),
-            (AuditLogType::Serial, "/dev/stderr") => Writer::Serial(Mutex::new(Box::new(io::stderr()))),
-            (AuditLogType::Serial, path) => {
-                Writer::Serial(Mutex::new(Box::new(open_append(path, config.audit_log_file_mode)?)))
-            },
-            (AuditLogType::Concurrent, path) => Writer::Concurrent {
-                index: Mutex::new(open_append(path, config.audit_log_file_mode)?),
-                dir: PathBuf::from(&config.audit_log_storage_dir),
-                dir_mode: config.audit_log_dir_mode,
-                file_mode: config.audit_log_file_mode,
-            },
-        };
-        Ok(Self {
-            format: config.audit_log_format,
-            relevant_status,
-            writer,
-        })
-    }
-
-    /// Whether a `RelevantOnly` audit engine logs a transaction: one where a rule with
-    /// `auditlog` matched (`audited`) is logged unless its `status` falls outside
-    /// `SecAuditLogRelevantStatus`; any other only if its status falls inside it.
-    pub(crate) fn is_relevant(&self, audited: bool, status: &str) -> bool {
-        match &self.relevant_status {
-            Some(relevant) => relevant.is_match(status),
-            None => audited,
-        }
-    }
-
-    /// Writes `entry`.
-    ///
-    /// # Errors
-    ///
-    /// If writing fails.
-    pub(crate) fn write(&self, entry: &AuditLog) -> io::Result<()> {
-        let formatted = entry.format(self.format);
-        if formatted.is_empty() {
-            return Ok(());
-        }
-        match &self.writer {
-            Writer::Discard => Ok(()),
-            #[cfg(feature = "https-audit")]
-            Writer::Https(https) => https.write(&formatted),
-            Writer::Syslog(syslog) => syslog
+            Self::Https(https) => https.write(formatted),
+            Self::Syslog(syslog) => syslog
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .send(&formatted, entry.transaction.is_interrupted),
-            Writer::Serial(output) => {
+                .send(formatted, entry.transaction.is_interrupted),
+            Self::Serial(output) => {
                 let mut output = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 writeln!(output, "{formatted}")?;
                 output.flush()
             },
-            Writer::Concurrent {
+            Self::Concurrent {
                 index,
                 dir,
                 dir_mode,
@@ -1119,6 +1129,162 @@ impl AuditLogger {
     }
 }
 
+impl AuditLogger {
+    /// Create a logger that discards audit entries.
+    pub(crate) fn discard() -> Self {
+        Self {
+            format: AuditLogFormat::Native,
+            relevant_status: None,
+            plan: WriterPlan::Discard,
+            writer: RwLock::new(None),
+        }
+    }
+
+    /// Build the audit log `config` describes without opening or connecting its writer.
+    ///
+    /// The target syntax is validated here; files and sockets are only created or
+    /// connected by [`AuditLogger::activate`].
+    ///
+    /// # Errors
+    ///
+    /// If `SecAuditLogRelevantStatus` isn't a regular expression, the storage directory
+    /// of a concurrent log is missing, or the writer is `HTTPS` and the `https-audit`
+    /// feature is disabled or the target isn't a valid URI.
+    pub(crate) fn prepare(config: &WafConfig) -> Result<Self, String> {
+        let relevant_status = match config.audit_log_relevant_status.as_str() {
+            "" => None,
+            pattern => {
+                Some(Regex::new(pattern).map_err(|e| format!("invalid SecAuditLogRelevantStatus {pattern:?}: {e}"))?)
+            },
+        };
+        let target = config.audit_log.as_str();
+        if config.audit_log_type == AuditLogType::Concurrent
+            && !target.is_empty()
+            && config.audit_log_storage_dir.is_empty()
+        {
+            return Err("SecAuditLogStorageDir is required for concurrent audit logs".to_owned());
+        }
+        let plan = match (config.audit_log_type, target) {
+            #[cfg(feature = "https-audit")]
+            (AuditLogType::Https, target) => {
+                https::validate_target(target)?;
+                WriterPlan::Https {
+                    target: target.to_owned(),
+                }
+            },
+            #[cfg(not(feature = "https-audit"))]
+            (AuditLogType::Https, _) => {
+                return Err(
+                    "audit log type HTTPS is not supported in this build; enable the \"https-audit\" crate feature"
+                        .to_owned(),
+                );
+            },
+            (AuditLogType::Syslog, target) => WriterPlan::Syslog {
+                target: target.to_owned(),
+                connect_timeout: config.audit_log_connect_timeout,
+                write_timeout: config.audit_log_write_timeout,
+            },
+            (_, "") => WriterPlan::Discard,
+            (AuditLogType::Serial, "/dev/stdout") => WriterPlan::Serial {
+                target: SerialTarget::Stdout,
+                file_mode: config.audit_log_file_mode,
+            },
+            (AuditLogType::Serial, "/dev/stderr") => WriterPlan::Serial {
+                target: SerialTarget::Stderr,
+                file_mode: config.audit_log_file_mode,
+            },
+            (AuditLogType::Serial, path) => WriterPlan::Serial {
+                target: SerialTarget::File(path.to_owned()),
+                file_mode: config.audit_log_file_mode,
+            },
+            (AuditLogType::Concurrent, path) => WriterPlan::Concurrent {
+                index: path.to_owned(),
+                dir: PathBuf::from(&config.audit_log_storage_dir),
+                dir_mode: config.audit_log_dir_mode,
+                file_mode: config.audit_log_file_mode,
+            },
+        };
+        Ok(Self {
+            format: config.audit_log_format,
+            relevant_status,
+            plan,
+            writer: RwLock::new(None),
+        })
+    }
+
+    /// Open or connect the planned writer once; later calls are no-ops.
+    ///
+    /// A failed attempt leaves the logger unopened, so the next call retries.
+    ///
+    /// # Errors
+    ///
+    /// If the file, syslog socket or HTTP client cannot be opened.
+    pub(crate) fn activate(&self) -> io::Result<()> {
+        let activated = self
+            .writer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if activated {
+            return Ok(());
+        }
+        let mut slot = self.writer.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Ok(());
+        }
+        *slot = Some(Arc::new(self.plan.open(self.format)?));
+        drop(slot);
+        Ok(())
+    }
+
+    /// Build and activate the audit log `config` describes, creating its file if missing.
+    ///
+    /// # Errors
+    ///
+    /// If [`AuditLogger::prepare`] or [`AuditLogger::activate`] fails.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "kept as the eager prepare+activate constructor for tests")
+    )]
+    pub(crate) fn open(config: &WafConfig) -> Result<Self, String> {
+        let logger = Self::prepare(config)?;
+        logger.activate().map_err(|error| error.to_string())?;
+        Ok(logger)
+    }
+
+    /// Whether a `RelevantOnly` audit engine logs a transaction: one where a rule with
+    /// `auditlog` matched (`audited`) is logged unless its `status` falls outside
+    /// `SecAuditLogRelevantStatus`; any other only if its status falls inside it.
+    pub(crate) fn is_relevant(&self, audited: bool, status: &str) -> bool {
+        match &self.relevant_status {
+            Some(relevant) => relevant.is_match(status),
+            None => audited,
+        }
+    }
+
+    /// Writes `entry`, activating the writer first if needed.
+    ///
+    /// # Errors
+    ///
+    /// If the writer cannot be activated or writing fails.
+    pub(crate) fn write(&self, entry: &AuditLog) -> io::Result<()> {
+        let formatted = entry.format(self.format);
+        if formatted.is_empty() {
+            return Ok(());
+        }
+        self.activate()?;
+        let writer = self
+            .writer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(writer) = writer else {
+            return Err(io::Error::other("audit log writer is not activated"));
+        };
+        writer.write(&formatted, entry)
+    }
+}
+
 /// A connection to syslog, as Go's `log/syslog` dials it with facility `local0` and tag
 /// `com.coraza.waf`.
 struct Syslog {
@@ -1128,6 +1294,10 @@ struct Syslog {
     target: String,
     /// Whether it is the local syslog, which takes a shorter header
     local: bool,
+    /// Deadline for reconnecting a TCP socket, `None` for no deadline.
+    connect_timeout: Option<Duration>,
+    /// Deadline for each write, `None` for no deadline.
+    write_timeout: Option<Duration>,
 }
 
 /// Socket types supported by the Go-compatible syslog target syntax.
@@ -1145,6 +1315,18 @@ enum SyslogSocket {
 }
 
 impl SyslogSocket {
+    /// Apply `timeout` to writes on this socket; `None` restores the default.
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Udp(socket) => socket.set_write_timeout(timeout),
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+            #[cfg(unix)]
+            Self::UnixStream(stream) => stream.set_write_timeout(timeout),
+            #[cfg(unix)]
+            Self::UnixDatagram(socket) => socket.set_write_timeout(timeout),
+        }
+    }
+
     /// Write one already-framed syslog message to this socket.
     fn write_frame(&mut self, framed: &[u8]) -> io::Result<()> {
         match self {
@@ -1162,7 +1344,10 @@ impl Syslog {
     /// Connects to `target` as Go Coraza reads it: `scheme://address`, where the scheme
     /// is `udp`, `tcp`, `unix` or `unixgram`; an address alone, over TCP; or, empty, the
     /// local syslog.
-    fn connect(target: &str) -> io::Result<Self> {
+    ///
+    /// `connect_timeout` bounds a TCP connection attempt; `write_timeout` is applied to
+    /// the connected socket.
+    fn connect(target: &str, connect_timeout: Option<Duration>, write_timeout: Option<Duration>) -> io::Result<Self> {
         let unsupported =
             |network: &str| io::Error::new(io::ErrorKind::Unsupported, format!("unsupported network {network:?}"));
         let (network, address) = match target.split_once("://") {
@@ -1171,7 +1356,7 @@ impl Syslog {
         };
         let socket = match (network, address) {
             #[cfg(unix)]
-            (_, "") => return Self::connect_local(target),
+            (_, "") => return Self::connect_local(target, connect_timeout, write_timeout),
             ("udp" | "udp4" | "udp6", address) => {
                 let socket = std::net::UdpSocket::bind(if address.starts_with('[') {
                     "[::]:0"
@@ -1181,7 +1366,7 @@ impl Syslog {
                 socket.connect(address)?;
                 SyslogSocket::Udp(socket)
             },
-            ("tcp" | "tcp4" | "tcp6", address) => SyslogSocket::Tcp(std::net::TcpStream::connect(address)?),
+            ("tcp" | "tcp4" | "tcp6", address) => SyslogSocket::Tcp(connect_tcp(address, connect_timeout)?),
             #[cfg(unix)]
             ("unix", path) => SyslogSocket::UnixStream(std::os::unix::net::UnixStream::connect(path)?),
             #[cfg(unix)]
@@ -1192,16 +1377,23 @@ impl Syslog {
             },
             (network, _) => return Err(unsupported(network)),
         };
+        socket.set_write_timeout(write_timeout)?;
         Ok(Self {
             socket,
             target: target.to_owned(),
             local: false,
+            connect_timeout,
+            write_timeout,
         })
     }
 
     /// The local syslog, at the first of Go's known socket paths that answers.
     #[cfg(unix)]
-    fn connect_local(target: &str) -> io::Result<Self> {
+    fn connect_local(
+        target: &str,
+        connect_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
         let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no local syslog");
         for path in ["/dev/log", "/var/run/syslog", "/var/run/log"] {
             let datagram =
@@ -1216,10 +1408,13 @@ impl Syslog {
                     },
                 },
             };
+            socket.set_write_timeout(write_timeout)?;
             return Ok(Self {
                 socket,
                 target: target.to_owned(),
                 local: true,
+                connect_timeout,
+                write_timeout,
             });
         }
         Err(last_error)
@@ -1242,12 +1437,35 @@ impl Syslog {
             format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
         };
         if self.socket.write_frame(framed.as_bytes()).is_err() {
-            let target = self.target.clone();
-            *self = Self::connect(&target)?;
+            *self = Self::connect(&self.target, self.connect_timeout, self.write_timeout)?;
             self.socket.write_frame(framed.as_bytes())?;
         }
         Ok(())
     }
+}
+
+/// Connects to a TCP syslog address, bounding the whole attempt when `timeout` is set.
+///
+/// DNS resolution is not bounded. Go's `net.DialTimeout` includes it, but bounding it
+/// needs a resolver thread; the deadline starts once addresses are known.
+fn connect_tcp(address: &str, timeout: Option<Duration>) -> io::Result<std::net::TcpStream> {
+    use std::net::{TcpStream, ToSocketAddrs as _};
+    let Some(timeout) = timeout else {
+        return TcpStream::connect(address);
+    };
+    let deadline = Instant::now() + timeout;
+    let mut last_error = io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out");
+    for address in address.to_socket_addrs()? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// This host's name, as the kernel has it; `localhost` if unknown.
@@ -1322,14 +1540,7 @@ mod https {
         /// writer errors, so a target that cannot be posted to would silently
         /// lose entries.
         pub(super) fn open(target: &str, format: AuditLogFormat) -> Result<Self, String> {
-            let uri = target
-                .parse::<ureq::http::Uri>()
-                .map_err(|error| format!("invalid HTTPS audit log target {target:?}: {error}"))?;
-            if !is_http_target(&uri) {
-                return Err(format!(
-                    "invalid HTTPS audit log target {target:?}: expected an absolute http:// or https:// URL with a host and a valid port"
-                ));
-            }
+            validate_target(target)?;
             Ok(Self::with_exchange(target, format, Box::new(UreqExchange::new())))
         }
 
@@ -1363,6 +1574,20 @@ mod https {
                 Err(io::Error::other(format!("unexpected status code {status}")))
             }
         }
+    }
+
+    /// Whether `target` is an absolute `http` or `https` URL with a host and a valid
+    /// explicit port, as Go Coraza's HTTPS writer requires.
+    pub(super) fn validate_target(target: &str) -> Result<(), String> {
+        let uri = target
+            .parse::<ureq::http::Uri>()
+            .map_err(|error| format!("invalid HTTPS audit log target {target:?}: {error}"))?;
+        if !is_http_target(&uri) {
+            return Err(format!(
+                "invalid HTTPS audit log target {target:?}: expected an absolute http:// or https:// URL with a host and a valid port"
+            ));
+        }
+        Ok(())
     }
 
     /// Whether `uri` is an absolute `http` or `https` URL with a host and a valid
@@ -1740,7 +1965,9 @@ fn index_field(value: &str) -> String {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "audit log tests use fixed temporary paths")]
 mod tests {
-    use super::{AuditLog, AuditLogger, AuditTransaction, Syslog, index_field, safe_file_component, write_new};
+    use super::{
+        AuditLog, AuditLogger, AuditTransaction, Syslog, connect_tcp, index_field, safe_file_component, write_new,
+    };
     use crate::{
         actions::RuleMetadata,
         collection::MatchData,
@@ -1956,11 +2183,65 @@ mod tests {
             Ok(message)
         });
 
-        let mut syslog = Syslog::connect(&target).unwrap();
+        let mut syslog = Syslog::connect(&target, None, None).unwrap();
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         syslog.send("reconnected", false).unwrap();
 
         let message = server.join().unwrap().unwrap();
         assert!(message.ends_with(b"reconnected\n"));
+    }
+
+    #[test]
+    fn tcp_connect_uses_the_configured_deadline() {
+        use std::{net::TcpListener, time::Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let stream = connect_tcp(&target, Some(Duration::from_secs(1))).unwrap();
+        drop(stream);
+    }
+
+    #[test]
+    fn tcp_syslog_write_times_out_against_a_peer_that_does_not_read() {
+        use std::{
+            io,
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("tcp://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            // Accept and never read: the peer's receive window fills, so a payload
+            // larger than the socket buffers cannot be written.
+            let (_connection, _) = listener.accept().unwrap();
+            assert!(stop_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        });
+
+        let mut syslog = Syslog::connect(
+            &target,
+            Some(Duration::from_millis(200)),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = syslog.send(&"x".repeat(16 * 1024 * 1024), false);
+        let elapsed = started.elapsed();
+        assert!(stop_tx.send(()).is_ok());
+        server.join().unwrap();
+
+        assert!(result.is_err(), "a blocked write must fail instead of hanging");
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::BrokenPipe
+            ),
+            "{error}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 }

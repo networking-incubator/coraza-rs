@@ -1330,12 +1330,12 @@
         ]
       },
       "DURATION": {
-        "state": "accepted_without_effect",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/waf.go:283",
         "fixtures": [],
-        "differences": [
-          "Registered in the VARIABLES table (coraza/src/types/variables.rs:302) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:283 and never updates it, so a rule matching 0 hits in Go and misses here."
-        ]
+        "differences": []
       },
       "ENV": {
         "state": "implemented",
@@ -1402,12 +1402,12 @@
         ]
       },
       "FULL_REQUEST_LENGTH": {
-        "state": "accepted_without_effect",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/waf.go:275",
         "fixtures": [],
-        "differences": [
-          "Registered in the VARIABLES table (coraza/src/types/variables.rs:269) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:275 and never updates it, so a rule matching 0 hits in Go and misses here."
-        ]
+        "differences": []
       },
       "GEO": {
         "state": "accepted_without_effect",
@@ -1506,12 +1506,12 @@
         ]
       },
       "MULTIPART_DATA_AFTER": {
-        "state": "accepted_without_effect",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
-        "differences": [
-          "No storage in Rust. Go initializes the collection as a compatibility placeholder; no producer was established."
-        ]
+        "differences": []
       },
       "MULTIPART_DATA_BEFORE": {
         "state": "accepted_without_effect",
@@ -2106,12 +2106,12 @@
         "differences": []
       },
       "URLENCODED_ERROR": {
-        "state": "accepted_without_effect",
+        "state": "implemented",
+        "producer": "coraza/src/transaction/variables.rs:variable_storage!",
+        "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/corazawaf/waf.go:272",
         "fixtures": [],
-        "differences": [
-          "Registered in the VARIABLES table (coraza/src/types/variables.rs:331) so rules compile, but variable_storage! has no arm (coraza/src/transaction/variables.rs:171), so it never yields a value. Go initializes it to 0 at internal/corazawaf/waf.go:272 and never updates it, so a rule matching 0 hits in Go and misses here."
-        ]
+        "differences": []
       },
       "USERID": {
         "state": "accepted_without_effect",

@@ -27,7 +27,7 @@ use std::sync::{
 
 use crate::{
     audit_log::{AuditLogger, ErrorLog},
-    config::WafConfig,
+    config::{UploadKeepFiles, WafConfig},
     rules::RuleGroup,
     transaction::Transaction,
 };
@@ -71,8 +71,8 @@ impl Waf {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid limits, incompatible upload settings, or audit
-    /// logging configuration and writer errors.
+    /// Returns an error for invalid limits, incompatible upload settings, or invalid
+    /// audit logging configuration. Audit writers are not opened here.
     pub fn new(config: WafConfig) -> Result<Self, ConfigError> {
         Self::with_rules(config, RuleGroup::new(), None)
     }
@@ -84,6 +84,10 @@ impl Waf {
     /// SecLang parser carry the `case_sensitive_args_keys` mode their key selectors were
     /// compiled under, and a configuration with a different mode is rejected so compiled
     /// selectors and transaction maps cannot disagree.
+    ///
+    /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
+    /// [`Waf::new_transaction`] opens them, so a candidate policy can be compiled and
+    /// discarded without creating files or connecting.
     pub(crate) fn with_rules(
         config: WafConfig,
         rules: RuleGroup,
@@ -99,13 +103,28 @@ impl Waf {
                 config.case_sensitive_args_keys
             )));
         }
-        let audit_logger = AuditLogger::open(&config).map_err(ConfigError)?;
+        let audit_logger = AuditLogger::prepare(&config).map_err(ConfigError)?;
         Ok(Self {
             config: Arc::new(config),
             rules: Arc::new(rules),
             audit_logger: Arc::new(audit_logger),
             error_log,
         })
+    }
+
+    /// Open the audit writer, if one is configured, without creating a transaction.
+    ///
+    /// Idempotent and thread-safe: the first successful call opens the writer and later
+    /// calls return `Ok(())` without opening it again. A failed call leaves it unopened,
+    /// so a later call retries.
+    ///
+    /// # Errors
+    ///
+    /// If the configured audit writer cannot be opened or connected.
+    pub fn activate(&self) -> Result<(), ConfigError> {
+        self.audit_logger
+            .activate()
+            .map_err(|error| ConfigError(error.to_string()))
     }
 
     /// Create a transaction with a process-unique identifier.
@@ -115,7 +134,13 @@ impl Waf {
     }
 
     /// Create a transaction with a caller-supplied identifier.
+    ///
+    /// Activates the audit writer first, as Go Coraza initializes its writer lazily.
+    /// The constructor is infallible, so an activation failure is recorded nowhere here
+    /// and surfaces from [`Transaction::finish`] when the entry is written.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
+        // Best effort: a failure stays observable from `Transaction::finish`.
+        drop(self.audit_logger.activate());
         let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
         if let Some(error_log) = &self.error_log {
@@ -181,7 +206,7 @@ fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
     if config.argument_limit == 0 {
         return Err(ConfigError("argument limit must be greater than 0".to_owned()));
     }
-    if config.upload_keep_files && config.upload_dir.is_empty() {
+    if config.upload_keep_files != UploadKeepFiles::Off && config.upload_dir.is_empty() {
         return Err(ConfigError(
             "upload directory is required when uploaded files are kept".to_owned(),
         ));
@@ -193,7 +218,73 @@ fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
 #[expect(clippy::unwrap_used, reason = "WAF tests use fixed valid configurations")]
 mod tests {
     use super::Waf;
-    use crate::config::WafConfig;
+    use crate::{
+        config::WafConfig,
+        types::{AuditEngineStatus, AuditLogType},
+    };
+
+    fn audit_file_config(path: &std::path::Path) -> WafConfig {
+        WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log: path.to_string_lossy().into_owned(),
+            ..WafConfig::default()
+        }
+    }
+
+    #[test]
+    fn activation_is_explicit_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let waf = Waf::new(audit_file_config(&path)).unwrap();
+
+        // Construction validates the target without creating it.
+        assert!(!path.exists());
+        waf.activate().unwrap();
+        assert!(path.exists());
+        waf.activate().unwrap();
+    }
+
+    #[test]
+    fn new_transaction_activates_the_audit_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let waf = Waf::new(audit_file_config(&path)).unwrap();
+        assert!(!path.exists());
+
+        drop(waf.new_transaction_with_id("activates-on-create"));
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activating_twice_connects_a_syslog_writer_once() {
+        use std::{io, os::unix::net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("syslog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let waf = Waf::new(WafConfig {
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: format!("unix://{}", socket.display()),
+            ..WafConfig::default()
+        })
+        .unwrap();
+
+        listener.set_nonblocking(true).unwrap();
+        let waiting = listener.accept();
+        assert!(
+            matches!(&waiting, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "{waiting:?}"
+        );
+        drop(waiting);
+        listener.set_nonblocking(false).unwrap();
+
+        waf.activate().unwrap();
+        drop(listener.accept().unwrap());
+        waf.activate().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "activation connected twice");
+    }
 
     #[test]
     fn validates_request_body_memory_limit_against_the_body_limit() {
