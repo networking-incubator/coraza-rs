@@ -3831,7 +3831,7 @@ v\r\n\
         let mut parser = crate::seclang::Parser::new();
         parser
             .from_string(
-                "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^USER$/,pass\"\n\
+                "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^user$/,pass\"\n\
                  SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"",
             )
             .unwrap();

@@ -533,7 +533,7 @@ fn valid_rule_target(target: &str) -> bool {
     let Some(pattern) = key.strip_prefix('/').and_then(|key| key.strip_suffix('/')) else {
         return true;
     };
-    !pattern.is_empty() && regex::RegexBuilder::new(pattern).case_insensitive(true).build().is_ok()
+    !pattern.is_empty() && regex::Regex::new(pattern).is_ok()
 }
 
 /// Parses an inclusive rule id range.
