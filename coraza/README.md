@@ -21,8 +21,11 @@ path, for example `SecAuditLog https://collector.example/audit`.
 
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
 supported writers are serial files or standard output/error, concurrent files,
-syslog, and HTTP(S) endpoints. Audit timestamps are UTC, while Go Coraza uses
-the process local time zone.
+syslog, and HTTP(S) endpoints. Audit timestamps, audit file names and the
+`TIME`, `TIME_DAY`, `TIME_HOUR`, `TIME_MIN`, `TIME_MON`, `TIME_SEC`, `TIME_WDAY`
+and `TIME_YEAR` variables use the process local time zone, as in Go Coraza: the
+zone named by `TZ` at startup, or the one `/etc/localtime` records. `TIME_EPOCH`
+and the audit entry's `unix_timestamp` stay absolute.
 
 `SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
 WAF is built with that writer rejected, never silently replaced by another one.

@@ -42,7 +42,7 @@ use crate::{
     collection::MatchData,
     config::WafConfig,
     types::{AuditLogFormat, AuditLogPart, AuditLogParts, AuditLogType},
-    utils::time::UtcTime,
+    utils::time::LocalTime,
 };
 
 /// Next process-local suffix for concurrent audit log filenames.
@@ -1073,8 +1073,7 @@ impl AuditLogger {
                 file_mode,
             } => {
                 let tx = &entry.transaction;
-                let seconds = u64::try_from(tx.unix_timestamp / 1_000_000_000).unwrap_or_default();
-                let at = UtcTime::from_unix(seconds);
+                let at = LocalTime::from_unix(tx.unix_timestamp / 1_000_000_000);
                 let day = format!("{:04}{:02}{:02}", at.year, at.month, at.day);
                 let minute = format!("{day}-{:02}{:02}", at.hour, at.minute);
                 let entry_dir = dir.join(&day).join(&minute);
@@ -1233,35 +1232,14 @@ impl Syslog {
         let priority = 16 * 8 + if error { 3 } else { 6 };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        let at = UtcTime::from_unix(now);
+            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+        let at = LocalTime::from_unix(now);
         let tag = format!("com.coraza.waf[{}]", std::process::id());
         let newline = if message.ends_with('\n') { "" } else { "\n" };
         let framed = if self.local {
-            const MONTHS: [&str; 12] = [
-                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-            ];
-            let month_index = at
-                .month
-                .checked_sub(1)
-                .and_then(|month| usize::try_from(month).ok())
-                .unwrap_or_default();
-            let month = MONTHS.get(month_index).copied().unwrap_or("Jan");
-            format!(
-                "<{priority}>{} {:>2} {:02}:{:02}:{:02} {tag}: {message}{newline}",
-                month, at.day, at.hour, at.minute, at.second
-            )
+            format!("<{priority}>{} {tag}: {message}{newline}", at.syslog_stamp())
         } else {
-            format!(
-                "<{priority}>{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z {} {tag}: {message}{newline}",
-                at.year,
-                at.month,
-                at.day,
-                at.hour,
-                at.minute,
-                at.second,
-                hostname()
-            )
+            format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
         };
         if self.socket.write_frame(framed.as_bytes()).is_err() {
             let target = self.target.clone();
@@ -1899,14 +1877,18 @@ mod tests {
         logger.write(&entry).unwrap();
         logger.write(&entry).unwrap();
 
-        let day = storage.join("20231114").join("20231114-2213");
-        let mut files = std::fs::read_dir(day)
+        // Go names the entry's directory and file after the local time of its instant.
+        let at = crate::utils::time::LocalTime::from_unix(1_700_000_000);
+        let day = format!("{:04}{:02}{:02}", at.year, at.month, at.day);
+        let minute = format!("{day}-{:02}{:02}", at.hour, at.minute);
+        let mut files = std::fs::read_dir(storage.join(day).join(&minute))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         files.sort();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|name| name.contains("-transaction-")));
+        assert!(files.iter().all(|name| name.starts_with(&minute)));
         assert_eq!(std::fs::read_to_string(index).unwrap().lines().count(), 6);
     }
 
