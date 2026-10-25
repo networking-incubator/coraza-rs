@@ -207,12 +207,17 @@ impl BodyProcessor {
     }
 
     /// Detect a body processor from a content type, if present.
+    ///
+    /// Go trims the header value and prefix-matches both media types, ignoring case
+    /// (`internal/corazawaf/transaction.go:411-416`), so parameters, a malformed
+    /// suffix, and invalid bytes never suppress the selection. Matching a parsed
+    /// MIME value instead would skip bodies that a prefix-matching backend such as
+    /// PHP's `sapi_read_post_data` still parses.
     pub(super) fn for_content_type(content_type: &[u8]) -> Option<Self> {
-        let content_type = std::str::from_utf8(content_type).ok()?.trim();
-        let media_type = content_type.split(';').next()?.trim();
-        if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        let content_type = trim_leading_space(content_type);
+        if starts_with_ignore_ascii_case(content_type, b"application/x-www-form-urlencoded") {
             Some(Self::UrlEncoded)
-        } else if media_type.eq_ignore_ascii_case("multipart/form-data") {
+        } else if starts_with_ignore_ascii_case(content_type, b"multipart/form-data") {
             Some(Self::Multipart)
         } else {
             None
@@ -229,6 +234,28 @@ impl BodyProcessor {
             Self::Xml => "XML",
         }
     }
+}
+
+/// Return `value` without the leading whitespace `strings.TrimSpace` removes.
+///
+/// A prefix match only looks at the start, so trailing whitespace is irrelevant.
+/// Bytes that are not valid UTF-8 are data, as they are for Go's rune decoder, so
+/// they are never trimmed and stop the scan.
+fn trim_leading_space(value: &[u8]) -> &[u8] {
+    let valid_up_to = match std::str::from_utf8(value) {
+        Ok(_) => value.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let valid = std::str::from_utf8(value.get(..valid_up_to).unwrap_or_default()).unwrap_or_default();
+    let start = valid_up_to.saturating_sub(valid.trim_start().len());
+    value.get(start..).unwrap_or_default()
+}
+
+/// Whether `value` starts with `prefix`, ignoring ASCII case.
+fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 #[expect(
