@@ -19,6 +19,13 @@ SecAuditLogParts ABFHKZ
 For `SecAuditLogType HTTPS`, `SecAuditLog` is the endpoint URL instead of a
 path, for example `SecAuditLog https://collector.example/audit`.
 
+Parsing and compiling a policy does not activate its audit resources:
+`Parser::compile` validates the configuration and returns a `Waf` without
+creating files or connecting sockets, so a candidate policy can be discarded
+safely. `Waf::activate` opens the writer explicitly and is idempotent; the
+first `Waf::new_transaction` also activates it, so existing embedders keep the
+same behavior. `Parser::into_waf` is an alias for `Parser::compile`.
+
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
 supported writers are serial files or standard output/error, concurrent
 files, syslog, and HTTP(S) endpoints. The formatted audit timestamps, the
@@ -45,11 +52,29 @@ an endpoint with a public-CA certificate or terminate TLS at a local proxy.
 Redirects are followed as in Go Coraza, except that a 307 or 308 response fails
 the write instead of re-POSTing the entry.
 
-Call `Transaction::process_logging` after response processing when the caller
-needs to observe audit writer errors. Dropping a transaction runs the logging
-phase automatically and ignores writer errors. `Parser::on_error_log` provides
-a synchronous callback for matched rules with the `log` action; use
-`MatchedRule::error_log` to format the Coraza-compatible line.
+Call `Transaction::finish` after response processing when the caller needs to
+observe the terminal outcome. It runs the logging phase and writes the audit
+entry at most once: a successful write makes later calls return `Ok(())`
+without writing again, while a failed write is retried by a later call and the
+failure is returned. `Transaction::process_logging` remains as an alias.
+Dropping a transaction calls `finish` and ignores its error.
+`Parser::on_error_log` provides a synchronous callback for matched rules with
+the `log` action; use `MatchedRule::error_log` to format the Coraza-compatible
+line.
+
+`finish` also removes temporary upload files unless `SecUploadKeepFiles` keeps
+them: `On` keeps all files and `RelevantOnly` keeps them only when a matched
+rule has the `log` action enabled, excluding `nolog`. A removal failure is
+returned from `finish`, as Go Coraza's `Close` does. The default, `Off`, deletes
+every temporary file.
+
+`WafConfig::audit_log_connect_timeout` and `audit_log_write_timeout` are opt-in
+deadlines for the syslog writer, with no SecLang directive, so the default
+remains Go's unbounded behavior. The connect deadline covers TCP targets and
+their reconnect; the write deadline covers TCP, UDP, and Unix sockets where the
+platform supports a write deadline. File writes have no deadline, because a
+regular file write cannot time out, and neither Go nor this crate adds one.
+HTTPS keeps its one-second whole-request timeout regardless of these settings.
 
 The audit parts control which headers, bodies, files, and rule details are
 retained and written. Body capture is bounded by the configured request and

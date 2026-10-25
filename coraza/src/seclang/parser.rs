@@ -55,8 +55,8 @@ use winnow::{
 
 use crate::{
     audit_log::{ErrorLog, MatchedRule},
-    config::WafConfig,
-    operators::{Datasets, OperatorContext},
+    config::{UploadKeepFiles, WafConfig},
+    operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
     rules::{Rule, RuleGroup},
     seclang::{
         CompileError, parse_actions,
@@ -149,6 +149,9 @@ struct DirectiveOptions<'a> {
     /// Datasets defined so far
     datasets: &'a mut Datasets,
 
+    /// Operator factories registered on the parser
+    custom_operators: &'a CustomOperators,
+
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
@@ -206,6 +209,9 @@ pub struct Parser {
     /// Datasets defined by `SecDataset` so far
     datasets: Datasets,
 
+    /// Operator factories registered by the embedder, consulted before built-ins
+    custom_operators: CustomOperators,
+
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
@@ -229,6 +235,7 @@ impl Parser {
             rules: RuleGroup::new(),
             default_actions: DefaultActions::default(),
             datasets: Datasets::new(),
+            custom_operators: CustomOperators::new(),
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -246,18 +253,41 @@ impl Parser {
         &mut self.waf_config
     }
 
+    /// Register an operator factory under `name`, matched case-insensitively.
+    ///
+    /// A registered name is looked up before the built-in operators when a `SecRule`
+    /// operator is compiled, so an embedder can add or override an operator.
+    pub fn register_operator(&mut self, name: &str, factory: CustomOperatorFactory) {
+        self.custom_operators.insert(name.to_owned(), factory);
+    }
+
     /// Number of rules compiled so far.
     pub fn rule_count(&self) -> usize {
         self.rules.count()
     }
 
+    /// Consume the parser and build a WAF without activating its audit resources.
+    ///
+    /// Files are not created and sockets are not connected: the audit writer is opened
+    /// by [`Waf::activate`] or by the first [`Waf::new_transaction`]. This is the entry
+    /// point for validating a candidate policy before deciding to use it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parsed configuration is invalid for WAF construction.
+    pub fn compile(self) -> Result<Waf, ConfigError> {
+        Waf::with_rules(self.waf_config, self.rules, self.error_log)
+    }
+
     /// Consume the parser and build a WAF from its configuration and compiled rules.
+    ///
+    /// Alias for [`Parser::compile`]: the audit writer opens on the first transaction.
     ///
     /// # Errors
     ///
     /// Returns an error when the parsed configuration is invalid for WAF construction.
     pub fn into_waf(self) -> Result<Waf, ConfigError> {
-        Waf::with_rules(self.waf_config, self.rules, self.error_log)
+        self.compile()
     }
 
     /// Set a callback that receives each rule with the `log` action when it matches.
@@ -498,6 +528,7 @@ impl Parser {
                 rules: &mut self.rules,
                 default_actions: &mut self.default_actions,
                 datasets: &mut self.datasets,
+                custom_operators: &self.custom_operators,
                 skip_failed: &mut self.skip_failed,
             }),
         };
@@ -677,7 +708,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
     let context = OperatorContext {
         base_dir: options.config_dir,
         datasets: options.datasets,
-        custom: None,
+        custom: (!options.custom_operators.is_empty()).then_some(options.custom_operators),
     };
     let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
     options
@@ -1098,12 +1129,16 @@ fn directive_sec_upload_file_mode(options: &mut DirectiveOptions<'_>) -> Result<
     Ok(())
 }
 
-/// `SecUploadKeepFiles` [On|Off]
+/// `SecUploadKeepFiles` [On|Off|RelevantOnly]
 ///
 /// Controls whether uploaded files are kept after transaction.
 fn directive_sec_upload_keep_files(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    let keep = parse_boolean(&options.opts)?;
-    options.waf_config.upload_keep_files = keep;
+    options.waf_config.upload_keep_files = match options.opts.to_ascii_lowercase().as_str() {
+        "on" => UploadKeepFiles::On,
+        "off" => UploadKeepFiles::Off,
+        "relevantonly" => UploadKeepFiles::RelevantOnly,
+        _ => return Err(format!("expected On, Off, or RelevantOnly, got: {}", options.opts)),
+    };
     Ok(())
 }
 
@@ -1223,8 +1258,9 @@ fn directive_sec_audit_log_storage_dir(options: &mut DirectiveOptions<'_>) -> Re
 /// `SecIgnoreRuleCompilationErrors` On|Off
 ///
 /// With `On`, later directives that fail are skipped, as with
-/// [`Parser::skip_failed_directives`]. Go Coraza records the setting but doesn't act on
-/// it.
+/// [`Parser::skip_failed_directives`]. Go Coraza acts on it for `SecRule`: a rule that
+/// fails to compile is skipped and its error logged
+/// (`internal/seclang/directives.go:186-206`, v3.8.1).
 fn directive_sec_ignore_rule_compilation_errors(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     *options.skip_failed = parse_boolean(&options.opts)?;
     Ok(())
@@ -1315,6 +1351,75 @@ mod tests {
     fn test_parse_empty_string() {
         let mut parser = Parser::new();
         assert!(parser.from_string("").is_ok());
+    }
+
+    #[test]
+    fn compile_does_not_create_the_audit_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut parser = Parser::new();
+        parser
+            .from_string(&format!("SecAuditEngine On\nSecAuditLog {}", path.to_string_lossy()))
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        assert!(!path.exists(), "compiling activated the audit writer");
+        waf.activate().unwrap();
+        assert!(path.exists(), "activation did not open the audit writer");
+    }
+
+    #[cfg(feature = "https-audit")]
+    #[test]
+    fn compile_does_not_connect_an_https_audit_target() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut parser = Parser::new();
+        parser
+            .from_string(&format!(
+                "SecAuditEngine On\nSecAuditLogType HTTPS\nSecAuditLog http://{}/audit",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "compiling connected to the HTTPS audit target"
+        );
+        drop(waf);
+    }
+
+    #[test]
+    fn registered_custom_operator_compiles_and_evaluates() {
+        use crate::{
+            operators::{Operator, Outputs},
+            transaction::Transaction,
+        };
+
+        struct Equals(String);
+        impl Operator for Equals {
+            fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+                input == self.0.as_bytes()
+            }
+        }
+
+        let mut parser = Parser::new();
+        parser.register_operator(
+            "equals",
+            std::sync::Arc::new(|argument: &str| {
+                let operator: Box<dyn Operator> = Box::new(Equals(argument.to_owned()));
+                Ok(operator)
+            }),
+        );
+        parser
+            .from_string("SecRule ARGS:q \"@equals yes\" \"id:1,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("custom-operator");
+        tx.add_get_argument("q", "yes");
+        tx.process_request_headers();
+
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
     }
 
     #[test]
@@ -1859,14 +1964,24 @@ SecWebAppId production
 
     #[test]
     fn test_sec_upload_keep_files() {
+        use crate::config::UploadKeepFiles;
+
         let mut parser = Parser::new();
         let result = parser.from_string("SecUploadKeepFiles On");
         assert!(result.is_ok(), "{result:?}");
-        assert!(parser.config().upload_keep_files);
+        assert_eq!(parser.config().upload_keep_files, UploadKeepFiles::On);
 
         let mut parser = Parser::new();
-        assert!(parser.from_string("SecUploadKeepFiles Off").is_ok());
-        assert!(!parser.config().upload_keep_files);
+        assert!(parser.from_string("SecUploadKeepFiles off").is_ok());
+        assert_eq!(parser.config().upload_keep_files, UploadKeepFiles::Off);
+
+        let mut parser = Parser::new();
+        assert!(parser.from_string("SecUploadKeepFiles RelevantOnly").is_ok());
+        assert_eq!(parser.config().upload_keep_files, UploadKeepFiles::RelevantOnly);
+
+        let mut parser = Parser::new();
+        let error = parser.from_string("SecUploadKeepFiles Always").unwrap_err();
+        assert!(error.message.contains("expected On, Off, or RelevantOnly"), "{error}");
     }
 
     #[test]

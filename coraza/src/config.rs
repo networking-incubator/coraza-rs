@@ -57,6 +57,19 @@ pub enum DetectorInspectionAction {
     FailClosed,
 }
 
+/// Whether uploaded files are kept after the transaction ends (`SecUploadKeepFiles`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UploadKeepFiles {
+    /// Delete temporary files, the default.
+    #[default]
+    Off,
+    /// Keep every temporary file.
+    On,
+    /// Keep temporary files only when a matched rule has the `log` action enabled
+    /// (excluding `nolog`), as Go Coraza's `hasLogRelevantMatchedRules` decides.
+    RelevantOnly,
+}
+
 /// Configuration for a WAF instance.
 ///
 /// A plain set of settings, built with struct-update syntax over [`Default`].
@@ -164,6 +177,24 @@ pub struct WafConfig {
     /// Directory of `Concurrent` audit logs; empty when unset (`SecAuditLogStorageDir`).
     pub audit_log_storage_dir: String,
 
+    /// Deadline for connecting a TCP syslog audit writer; `None` (the default) waits
+    /// indefinitely, as Go Coraza does.
+    ///
+    /// There is no SecLang directive for this. It applies to `SecAuditLogType Syslog`
+    /// targets with a `tcp` scheme, including the reconnect after a failed write. DNS
+    /// resolution is not bounded. File and HTTPS writers ignore it: file writes never
+    /// connect, and HTTPS keeps its one-second whole-request budget.
+    pub audit_log_connect_timeout: Option<std::time::Duration>,
+
+    /// Deadline for one audit log write; `None` (the default) waits indefinitely, as Go
+    /// Coraza does.
+    ///
+    /// There is no SecLang directive for this. It applies to syslog writes over TCP,
+    /// UDP and, where the platform supports socket write deadlines, Unix sockets. File
+    /// writes have no deadline, as a regular file write cannot time out. HTTPS keeps its
+    /// one-second whole-request budget.
+    pub audit_log_write_timeout: Option<std::time::Duration>,
+
     /// Path of the debug log, for the embedder: the library writes none; empty when
     /// unset (`SecDebugLog`).
     pub debug_log: String,
@@ -219,8 +250,9 @@ pub struct WafConfig {
     /// Permission bits for stored uploaded files, e.g. `0o600` (`SecUploadFileMode`).
     pub upload_file_mode: u32,
 
-    /// Whether uploaded files are kept after the transaction ends (`SecUploadKeepFiles`).
-    pub upload_keep_files: bool,
+    /// Whether uploaded files are kept after the transaction ends
+    /// (`SecUploadKeepFiles`).
+    pub upload_keep_files: UploadKeepFiles,
 }
 
 impl Default for WafConfig {
@@ -257,6 +289,8 @@ impl Default for WafConfig {
             audit_log_dir_mode: 0o755,
             audit_log_file_mode: 0o644,
             audit_log_storage_dir: String::new(),
+            audit_log_connect_timeout: None,
+            audit_log_write_timeout: None,
             debug_log: String::new(),
             collection_timeout: 3600,
             debug_log_level: 0,
@@ -271,7 +305,7 @@ impl Default for WafConfig {
             upload_dir: String::new(),
             upload_file_limit: 100,
             upload_file_mode: 0o600,
-            upload_keep_files: false,
+            upload_keep_files: UploadKeepFiles::Off,
         }
     }
 }
@@ -303,7 +337,9 @@ mod tests {
         assert!(!config.request_body_access);
         assert!(!config.response_body_access);
         assert_eq!(config.upload_file_mode, 0o600);
-        assert!(!config.upload_keep_files);
+        assert_eq!(config.upload_keep_files, UploadKeepFiles::Off);
+        assert_eq!(config.audit_log_connect_timeout, None);
+        assert_eq!(config.audit_log_write_timeout, None);
         assert_eq!(
             config.audit_log_parts,
             [

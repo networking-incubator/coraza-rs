@@ -52,7 +52,7 @@ use crate::{
         AuditTransaction, ErrorLog, mime_type_of,
     },
     collection::{Map, MatchData, Single},
-    config::{DetectorInspectionAction, WafConfig},
+    config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
     operators::Macro,
     rules::{RuleGroup, VariableException},
     transformations::text_of,
@@ -72,6 +72,14 @@ struct ComputedVariables {
     request_basename: Single,
     /// The raw query string.
     query_string: Single,
+    /// Whether URL decoding failed.
+    urlencoded_error: Single,
+    /// Total request length.
+    full_request_length: Single,
+    /// Multipart data after the closing boundary; always zero.
+    multipart_data_after: Single,
+    /// Time spent in the transaction; always zero.
+    duration: Single,
     /// Whether the request URI could not be parsed.
     uri_parse_error: Single,
     /// Transaction start time as `hh:mm:ss`.
@@ -170,6 +178,10 @@ pub struct Transaction {
     audit_response_body: Vec<u8>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
+    /// Whether the audit entry was written successfully, so a later `finish` is a no-op.
+    audit_written: bool,
+    /// Whether temporary upload cleanup already ran, successfully or not.
+    uploads_closed: bool,
     /// A disruptive action applied while the engine is on.
     interruption: Option<Interruption>,
     /// The first disruptive action that would apply in detection-only mode.
@@ -392,6 +404,8 @@ impl Transaction {
             config,
             rules,
             last_phase: None,
+            audit_written: false,
+            uploads_closed: false,
             interruption: None,
             would_be_interruption: None,
             skip: 0,
@@ -443,6 +457,10 @@ impl Transaction {
                 request_filename: Single::new(RuleVariable::RequestFilename),
                 request_basename: Single::new(RuleVariable::RequestBasename),
                 query_string: Single::new(RuleVariable::QueryString),
+                urlencoded_error: flag(RuleVariable::UrlencodedError),
+                full_request_length: flag(RuleVariable::FullRequestLength),
+                multipart_data_after: flag(RuleVariable::MultipartDataAfter),
+                duration: flag(RuleVariable::Duration),
                 uri_parse_error: flag(RuleVariable::URIParseError),
                 time: text(
                     RuleVariable::Time,
@@ -627,21 +645,62 @@ impl Transaction {
         self.interruption.clone()
     }
 
-    /// Run logging rules and write this transaction's audit entry once.
+    /// Run the terminal logging phase and temporary upload cleanup once, returning the
+    /// stored terminal outcome.
     ///
-    /// Call this after response processing when the caller needs to observe write errors.
-    /// Dropping a transaction also runs the logging phase and ignores any write error.
+    /// The logging phase and the audit write happen at most once per transaction: after a
+    /// successful write, later calls return `Ok(())` without writing again. A failed write
+    /// is not stored as success, so a later call retries it; the first failure is returned
+    /// from the call that saw it. Temporary upload files are removed in the same call,
+    /// unless [`WafConfig::upload_keep_files`] keeps them, and a removal failure is
+    /// returned here, as Go Coraza's `Close` does.
+    ///
+    /// [`WafConfig::upload_keep_files`]: crate::config::WafConfig::upload_keep_files
     ///
     /// # Errors
     ///
-    /// Returns an error if the configured audit writer fails.
-    pub fn process_logging(&mut self) -> std::io::Result<()> {
-        if self.last_phase == Some(RulePhase::Logging) {
-            return Ok(());
+    /// Returns an error if the configured audit writer fails, or if a temporary upload
+    /// file cannot be removed.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        let mut outcome = Ok(());
+        if !self.audit_written {
+            match self.write_audit_log() {
+                Ok(()) => self.audit_written = true,
+                Err(error) => outcome = Err(error),
+            }
         }
-        self.last_phase = Some(RulePhase::Logging);
-        if self.rule_engine != RuleEngineStatus::Off {
-            self.run_phase(RulePhase::Logging);
+        if !self.uploads_closed {
+            // Report the first removal failure once; retrying cannot restore a file.
+            self.uploads_closed = true;
+            if let Err(error) = self.close_uploads()
+                && outcome.is_ok()
+            {
+                outcome = Err(error);
+            }
+        }
+        outcome
+    }
+
+    /// Run logging rules and write this transaction's audit entry once.
+    ///
+    /// Alias for [`Transaction::finish`], kept for callers that only need the logging
+    /// outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured audit writer fails, or if a temporary upload
+    /// file cannot be removed.
+    pub fn process_logging(&mut self) -> std::io::Result<()> {
+        self.finish()
+    }
+
+    /// Evaluate logging rules once and write the audit entry when one is due.
+    fn write_audit_log(&mut self) -> std::io::Result<()> {
+        if self.last_phase != Some(RulePhase::Logging) {
+            self.last_phase = Some(RulePhase::Logging);
+            if self.rule_engine != RuleEngineStatus::Off {
+                self.run_phase(RulePhase::Logging);
+            }
         }
 
         let Some(logger) = self.audit_logger.clone() else {
@@ -667,6 +726,34 @@ impl Transaction {
             logger.write(&self.audit_log())?;
         }
         Ok(())
+    }
+
+    /// Remove temporary upload files unless the configured retention policy keeps them.
+    ///
+    /// Go Coraza keeps them with `On`, or with `RelevantOnly` when a matched rule has the
+    /// `log` action enabled, excluding `nolog`
+    /// (`internal/corazawaf/transaction.go:1712-1730`, v3.8.1).
+    fn close_uploads(&mut self) -> std::io::Result<()> {
+        let keep = match self.config.upload_keep_files {
+            UploadKeepFiles::Off => false,
+            UploadKeepFiles::On => true,
+            UploadKeepFiles::RelevantOnly => self.matched_rules.iter().any(|matched| matched.rule.log),
+        };
+        if keep {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for path in std::mem::take(&mut self.uploaded_paths) {
+            if let Err(error) = std::fs::remove_file(&path)
+                && first_error.is_none()
+            {
+                first_error = Some(std::io::Error::other(format!(
+                    "removing temporary file {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Build this transaction's audit entry using the current audit parts.
@@ -1153,11 +1240,10 @@ impl Transaction {
             key.eq_ignore_ascii_case("content-type") && self.response_headers.first("content-type").is_none();
         self.response_headers.add(key, value);
         if first_content_type {
-            self.response_content_type.set("");
-            if let Ok(value) = std::str::from_utf8(value) {
-                self.response_content_type
-                    .set(value.split(';').next().unwrap_or(value).trim());
-            }
+            // Go keeps the raw bytes before the first `;`, with no trimming and no
+            // UTF-8 requirement (`internal/corazawaf/transaction.go:451-455`, v3.8.1).
+            let end = value.iter().position(|&byte| byte == b';').unwrap_or(value.len());
+            self.response_content_type.set(value.get(..end).unwrap_or(value));
         }
     }
 
@@ -1671,13 +1757,8 @@ const fn unhex(byte: u8) -> u8 {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            drop(self.process_logging());
-        }
-        if self.config.upload_keep_files {
-            return;
-        }
-        for path in &self.uploaded_paths {
-            drop(std::fs::remove_file(path));
+            // Best effort: the terminal outcome is observable through `finish`.
+            drop(self.finish());
         }
     }
 }
@@ -1693,7 +1774,7 @@ mod tests {
     };
     use crate::{
         Waf,
-        config::{DetectorInspectionAction, WafConfig},
+        config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
         operators::Outputs,
         rules::VariableSpec,
         types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
@@ -2461,7 +2542,7 @@ value";
         let config = WafConfig {
             request_body_access: true,
             upload_dir: upload_dir.path().to_string_lossy().into_owned(),
-            upload_keep_files: true,
+            upload_keep_files: UploadKeepFiles::On,
             ..WafConfig::default()
         };
         let mut tx = Transaction::with_config("kept-multipart-upload", Arc::new(config));
@@ -3591,6 +3672,28 @@ v\r\n\
     }
 
     #[test]
+    fn response_content_type_keeps_the_raw_bytes_before_the_first_semicolon() {
+        // Go's AddResponseHeader does `name, _, _ := strings.Cut(value, ";")` and sets
+        // `name` unchanged (`internal/corazawaf/transaction.go:451-455`, v3.8.1), so a
+        // leading space and non-UTF-8 bytes survive.
+        let mut tx = Transaction::new("response-content-type-bytes");
+        tx.add_response_header("Content-Type", b" text/plain; charset=utf-8");
+        assert_eq!(tx.response_content_type.get_bytes(), b" text/plain", "no trimming");
+
+        let mut tx = Transaction::new("response-content-type-semicolon");
+        tx.add_response_header("Content-Type", b"text/plain;charset=utf-8;boundary=x");
+        assert_eq!(tx.response_content_type.get_bytes(), b"text/plain");
+
+        let mut tx = Transaction::new("response-content-type-no-semicolon");
+        tx.add_response_header("Content-Type", b"text/plain");
+        assert_eq!(tx.response_content_type.get_bytes(), b"text/plain");
+
+        let mut tx = Transaction::new("response-content-type-non-utf8");
+        tx.add_response_header("Content-Type", b"text/\xff; charset=utf-8");
+        assert_eq!(tx.response_content_type.get_bytes(), b"text/\xff");
+    }
+
+    #[test]
     fn response_body_limit_reject_records_detection_only_and_processes_partial_body() {
         let config = WafConfig {
             rule_engine: RuleEngineStatus::DetectionOnly,
@@ -4369,6 +4472,102 @@ v\r\n\
             tx.get_variable(RuleVariable::TX, Some("logged")).as_deref(),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn finish_writes_the_audit_entry_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.json");
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log: path.to_string_lossy().into_owned(),
+            audit_log_format: crate::types::AuditLogFormat::Json,
+            ..WafConfig::default()
+        };
+        parser.from_string("SecAction \"id:209,phase:1,pass\"").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("finish-once");
+        tx.process_request_headers();
+
+        tx.finish().unwrap();
+        tx.finish().unwrap();
+        drop(tx);
+
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finish_retries_a_failed_audit_write_instead_of_reporting_success() {
+        // /dev/full accepts the open and fails every write, so a later `finish` that
+        // returned the stored success would be observable as a passing test.
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log: "/dev/full".to_owned(),
+            ..WafConfig::default()
+        };
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("finish-retry");
+
+        assert!(tx.finish().is_err(), "the first write fails");
+        assert!(
+            tx.finish().is_err(),
+            "a failed write must be retried instead of reported as success"
+        );
+    }
+
+    #[test]
+    fn finish_reports_a_temporary_upload_cleanup_failure() {
+        let mut tx = Transaction::new("cleanup-failure");
+        tx.uploaded_paths
+            .push(std::env::temp_dir().join(format!("coraza-missing-upload-{}", std::process::id())));
+
+        let error = tx.finish().unwrap_err();
+        assert!(error.to_string().contains("removing temporary file"), "{error}");
+    }
+
+    #[test]
+    fn relevant_only_uploads_are_kept_only_after_a_logged_match() {
+        for (actions, kept) in [(",log", true), (",nolog", false)] {
+            let upload_dir = tempfile::tempdir().unwrap();
+            let mut parser = crate::seclang::Parser::new();
+            *parser.config_mut() = WafConfig {
+                request_body_access: true,
+                upload_dir: upload_dir.path().to_string_lossy().into_owned(),
+                upload_keep_files: UploadKeepFiles::RelevantOnly,
+                ..WafConfig::default()
+            };
+            parser
+                .from_string(&format!(
+                    "SecRule ARGS:field \"@streq payload\" \"id:210,phase:2,pass{actions}\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id(format!("relevant-upload-{kept}"));
+            tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+            tx.process_request_headers();
+            let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"field\"\r\n\
+\r\n\
+payload\r\n\
+--boundary\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"file.txt\"\r\n\
+\r\n\
+content\r\n\
+--boundary--";
+            assert_eq!(tx.process_request_body(body), None, "{actions}");
+            let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
+
+            tx.finish().unwrap();
+            assert_eq!(std::path::Path::new(&path).exists(), kept, "{actions}");
+            drop(tx);
+            assert_eq!(std::path::Path::new(&path).exists(), kept, "{actions}");
+            if kept {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -5460,6 +5659,48 @@ v\r\n\
         assert!(tx.inspection_incomplete());
         assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
+    }
+
+    #[test]
+    fn fresh_transaction_initializes_the_variables_go_defaults_to_zero() {
+        // The defaults Go Coraza sets on a new transaction
+        // (internal/corazawaf/waf.go:270-284 in v3.8.1).
+        let variables = [
+            ("FILES_COMBINED_SIZE", RuleVariable::FilesCombinedSize),
+            ("URLENCODED_ERROR", RuleVariable::UrlencodedError),
+            ("URI_PARSE_ERROR", RuleVariable::URIParseError),
+            ("ARGUMENTS_LIMIT_REACHED", RuleVariable::ArgumentsLimitReached),
+            ("FULL_REQUEST_LENGTH", RuleVariable::FullRequestLength),
+            ("MULTIPART_DATA_AFTER", RuleVariable::MultipartDataAfter),
+            (
+                "MULTIPART_DUPLICATE_PART_HEADER",
+                RuleVariable::MultipartDuplicatePartHeader,
+            ),
+            ("MULTIPART_INVALID_QUOTING", RuleVariable::MultipartInvalidQuoting),
+            ("OUTBOUND_DATA_ERROR", RuleVariable::OutboundDataError),
+            ("REQBODY_ERROR", RuleVariable::ReqbodyError),
+            ("REQBODY_PROCESSOR_ERROR", RuleVariable::ReqbodyProcessorError),
+            ("REQUEST_BODY_LENGTH", RuleVariable::RequestBodyLength),
+            ("DURATION", RuleVariable::Duration),
+        ];
+
+        for (index, (name, variable)) in variables.into_iter().enumerate() {
+            let tx = Transaction::new(format!("default-zero-{index}"));
+            assert_eq!(tx.get_variable(variable, None).as_deref(), Some("0"), "{name}");
+
+            let rule_id = 700 + i32::try_from(index).unwrap();
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string(&format!("SecRule {name} \"@eq 0\" \"id:{rule_id},phase:1,pass\""))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id(format!("default-zero-rule-{index}"));
+            assert!(tx.process_request_headers().is_none(), "{name}");
+            assert!(
+                tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id),
+                "{name} did not match @eq 0"
+            );
+        }
     }
 
     #[test]
