@@ -228,19 +228,22 @@ impl Transaction {
             }
 
             for (name, value) in &part.headers {
-                self.multipart_part_headers
-                    .add(&part.name, format!("{}: {value}", canonical_header_name(name)));
+                self.multipart_part_headers.add_bytes(
+                    &part.name,
+                    format!("{}: {}", canonical_header_name(name), text_of(value)),
+                );
             }
-            self.multipart_name.add(&part.name, &part.name);
+            self.multipart_name.add_bytes(&part.name, &part.name);
             if let Some(filename) = &part.filename {
-                self.multipart_filename.add(&part.name, filename);
+                self.multipart_filename.add_bytes(&part.name, filename);
             }
             if let Some(filename) = &part.alt_filename {
-                self.multipart_filename.add(&part.name, filename);
+                self.multipart_filename.add_bytes(&part.name, filename);
             }
             if let Some(encoding) = &part.filename_encoding {
-                self.multipart_filename_charset.add(&part.name, &encoding.charset);
-                self.multipart_filename_language.add(&part.name, &encoding.language);
+                self.multipart_filename_charset.add_bytes(&part.name, &encoding.charset);
+                self.multipart_filename_language
+                    .add_bytes(&part.name, &encoding.language);
             }
             if part.malformed_filename {
                 self.multipart_strict_error.set("1");
@@ -268,7 +271,7 @@ impl Transaction {
                 }
                 self.files_names.add("", &part.name);
             } else {
-                self.add_post_argument(part.name.as_bytes(), part.data);
+                self.add_post_argument(&part.name, part.data);
             }
         }
 
@@ -1516,6 +1519,90 @@ pub(super) fn publish_json_arguments(tx: &mut Transaction, arguments: &JsonArgum
     });
 }
 
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "multipart tests use fixed fixtures")]
+mod multipart_tests {
+    use crate::transaction::Transaction;
+
+    /// Process `body` as `multipart/form-data` and return the transaction.
+    fn process(body: &[u8]) -> Transaction {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-byte-names");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(body), None);
+        tx
+    }
+
+    #[test]
+    fn field_names_that_are_not_utf8_are_distinct_keys() {
+        // Go Coraza v3.8.1 `p.FormName()` returns the raw parameter bytes, so
+        // these are two `ARGS_POST` keys, not one.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"\xff\"\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"\xfe\"\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.len(), 2);
+        assert_eq!(tx.args_post.first(b"\xff"), Some(&b"one"[..]));
+        assert_eq!(tx.args_post.first(b"\xfe"), Some(&b"two"[..]));
+        // The lossy text view is not a key: it matches neither byte name.
+        assert!(tx.args_post.first("\u{fffd}").is_none());
+        assert_eq!(tx.multipart_name.first(b"\xff"), Some(&b"\xff"[..]));
+        assert_eq!(tx.multipart_name.first(b"\xfe"), Some(&b"\xfe"[..]));
+    }
+
+    #[test]
+    fn file_part_names_that_are_not_utf8_are_distinct_keys() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"\xff\"; filename=\"a.txt\"\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"\xfe\"; filename=\"b.txt\"\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let tx = process(body);
+
+        assert_eq!(tx.files_names.value_count(), 2);
+        assert_eq!(tx.files_names.first(""), Some(&b"\xff"[..]));
+        assert_eq!(tx.files_names.values("").nth(1), Some(&b"\xfe"[..]));
+        assert_eq!(tx.multipart_name.first(b"\xff"), Some(&b"\xff"[..]));
+        assert_eq!(tx.multipart_name.first(b"\xfe"), Some(&b"\xfe"[..]));
+        assert_eq!(tx.multipart_filename.first(b"\xff"), Some(&b"a.txt"[..]));
+        assert_eq!(tx.multipart_filename.first(b"\xfe"), Some(&b"b.txt"[..]));
+    }
+
+    #[test]
+    fn utf8_field_names_and_duplicates_are_unchanged() {
+        let body = "--b\r\n\
+Content-Disposition: form-data; name=\"na\u{ef}me\"\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"na\u{ef}me\"\r\n\
+\r\n\
+two\r\n\
+--b--"
+            .as_bytes();
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.len(), 1);
+        assert_eq!(
+            tx.args_post.values("na\u{ef}me").collect::<Vec<_>>(),
+            [b"one".as_slice(), b"two".as_slice()]
+        );
+    }
+}
 
 #[cfg(test)]
 mod json_tests {
