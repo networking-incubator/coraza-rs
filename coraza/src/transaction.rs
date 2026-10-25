@@ -57,7 +57,7 @@ use crate::{
     rules::{RuleGroup, VariableException},
     transformations::text_of,
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
-    utils::time::UtcTime,
+    utils::time::LocalTime,
 };
 
 /// URI derivatives and start-time values, boxed so `Transaction` stays small.
@@ -367,7 +367,7 @@ impl Transaction {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let at = UtcTime::from_unix(epoch);
+        let at = LocalTime::from_unix(i64::try_from(epoch).unwrap_or(i64::MAX));
 
         Self {
             rule_engine: config.rule_engine,
@@ -676,7 +676,7 @@ impl Transaction {
     )]
     pub fn audit_log(&self) -> AuditLog {
         let elapsed = self.started.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let at = UtcTime::from_unix(elapsed.as_secs());
+        let at = LocalTime::from_unix(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
         let mut transaction = AuditTransaction {
             timestamp: format!(
                 "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -5061,6 +5061,21 @@ v\r\n\
         assert!((1..=12).contains(&value(RuleVariable::TimeMon).parse::<u8>().unwrap()));
         assert!((0..=6).contains(&value(RuleVariable::TimeWday).parse::<u8>().unwrap()));
         assert!(value(RuleVariable::TimeYear).parse::<u32>().unwrap() >= 2024);
+
+        // The calendar fields are the process local time of the instant `TIME_EPOCH`
+        // dates, in Go's layouts: zero-padded time, unpadded day, month, weekday and year.
+        let at = crate::utils::time::LocalTime::from_unix(epoch.parse().unwrap());
+        assert_eq!(
+            value(RuleVariable::Time),
+            format!("{:02}:{:02}:{:02}", at.hour, at.minute, at.second)
+        );
+        assert_eq!(value(RuleVariable::TimeDay), at.day.to_string());
+        assert_eq!(value(RuleVariable::TimeHour), format!("{:02}", at.hour));
+        assert_eq!(value(RuleVariable::TimeMin), format!("{:02}", at.minute));
+        assert_eq!(value(RuleVariable::TimeMon), at.month.to_string());
+        assert_eq!(value(RuleVariable::TimeSec), format!("{:02}", at.second));
+        assert_eq!(value(RuleVariable::TimeWday), at.weekday.to_string());
+        assert_eq!(value(RuleVariable::TimeYear), at.year.to_string());
 
         let mut parser = crate::seclang::Parser::new();
         parser

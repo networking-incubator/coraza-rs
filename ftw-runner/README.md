@@ -98,6 +98,6 @@ complete Coraza compatibility.
 
 Audit log HTTPS output is not implemented. Audit and FTW behavior should be
 verified against the target Coraza and CRS revisions before relying on it for
-production policy decisions. Audit timestamps use UTC; Go Coraza uses the
-process local time zone. The FTW server is a test adapter, not a production
-HTTP connector.
+production policy decisions. Audit timestamps use the process local time zone,
+as in Go Coraza. The FTW server is a test adapter, not a production HTTP
+connector.
