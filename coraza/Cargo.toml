@@ -16,6 +16,7 @@ fastrand = "2"
 hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 ipnet = "2.9"
+jsonschema = { version = "0.58", default-features = false, optional = true }
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = "0.11"
 mime = "0.3"
@@ -35,6 +36,10 @@ sha2 = "0.11"
 async-server = ["dep:base64", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio"]
 # `SecAuditLogType HTTPS` writer, via ureq's blocking client with rustls.
 https-audit = ["dep:ureq"]
+# `@inspectFile` and `@rbl`, which execute a local program and resolve DNS.
+host-operators = []
+# `@validateSchema`, which compiles JSON Schema documents.
+validate-schema = ["dep:jsonschema"]
 
 [[example]]
 name = "ftw_server_async"

@@ -25,25 +25,37 @@
 //! these operators during request-phase evaluation.
 
 pub mod detection;
+#[cfg(feature = "host-operators")]
+pub mod inspect_file;
 pub mod ip;
 mod macros;
 mod pattern;
+#[cfg(feature = "host-operators")]
+pub mod rbl;
 mod simple;
+#[cfg(feature = "validate-schema")]
+pub mod validate_schema;
 pub mod validation;
 
 use std::{collections::BTreeMap, path::Path};
 
 pub use detection::{DetectSQLi, DetectXSS, detect_sqli, detect_xss};
+#[cfg(feature = "host-operators")]
+pub use inspect_file::{InspectFile, inspect_file};
 pub use ip::{IpMatch, IpMatchFromDataset, IpMatchFromFile, ip_match, ip_match_from_dataset, ip_match_from_file};
 pub use macros::{Macro, MacroError};
 pub use pattern::{
     Pm, PmFromDataset, PmFromFile, RestPath, Rx, StrMatch, Within, pm, pm_from_dataset, pm_from_file, rest_path, rx,
     strmatch, within,
 };
+#[cfg(feature = "host-operators")]
+pub use rbl::{Rbl, rbl};
 pub use simple::{
     BeginsWith, Contains, EndsWith, Eq, Ge, Gt, Le, Lt, StrEq, begins_with, contains, ends_with, eq, ge, gt, le, lt,
     streq,
 };
+#[cfg(feature = "validate-schema")]
+pub use validate_schema::{ValidateSchema, validate_schema};
 pub use validation::{
     NoMatch, UnconditionalMatch, ValidateByteRange, ValidateNid, ValidateUrlEncoding, ValidateUtf8Encoding, no_match,
     unconditional_match, validate_byte_range, validate_nid, validate_url_encoding, validate_utf8_encoding,
@@ -66,7 +78,10 @@ pub enum OperatorOutcome {
 }
 
 /// An operator evaluates one transaction value without changing the transaction.
-pub trait Operator {
+///
+/// Operators are shared across a WAF's threads, so an implementation must be
+/// `Send` and `Sync`; every built-in operator is.
+pub trait Operator: Send + Sync {
     /// Whether `input` matches this operator's configured parameter.
     fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool;
 
@@ -89,13 +104,31 @@ pub trait Operator {
 /// Named lists used by the `...FromDataset` operators.
 pub type Datasets = BTreeMap<String, Vec<String>>;
 
+/// Builds one embedder-supplied operator from its SecLang argument.
+pub type CustomOperatorFactory = std::sync::Arc<dyn Fn(&str) -> Result<Box<dyn Operator>, String> + Send + Sync>;
+
+/// Embedder-supplied operator factories, keyed by SecLang name.
+pub type CustomOperators = BTreeMap<String, CustomOperatorFactory>;
+
 /// Inputs needed when an operator reads a configured file or dataset.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct OperatorContext<'a> {
     /// Base directory for relative operator file paths.
     pub base_dir: &'a Path,
     /// Named operator datasets.
     pub datasets: &'a Datasets,
+    /// Operator factories registered by the embedder, consulted before the built-in names.
+    pub custom: Option<&'a CustomOperators>,
+}
+
+impl std::fmt::Debug for OperatorContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorContext")
+            .field("base_dir", &self.base_dir)
+            .field("datasets", &self.datasets)
+            .field("custom", &self.custom.map(CustomOperators::keys))
+            .finish()
+    }
 }
 
 impl Default for OperatorContext<'_> {
@@ -104,7 +137,19 @@ impl Default for OperatorContext<'_> {
         Self {
             base_dir: Path::new(""),
             datasets: &EMPTY_DATASETS,
+            custom: None,
         }
+    }
+}
+
+/// Print a custom operator's name; the concrete type belongs to the embedder.
+///
+/// [`OperatorEnum`] is cloneable but trait objects are not, so a registered
+/// operator is shared through an [`Arc`](std::sync::Arc) instead of the
+/// factory's `Box`.
+impl std::fmt::Debug for dyn Operator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CustomOperator")
     }
 }
 
@@ -213,6 +258,17 @@ pub enum OperatorEnum {
     UnconditionalMatch(UnconditionalMatch),
     /// Unconditional non-match.
     NoMatch(NoMatch),
+    /// An operator registered by an embedder's [`CustomOperatorFactory`].
+    Custom(std::sync::Arc<dyn Operator>),
+    /// Runs an external program over each value.
+    #[cfg(feature = "host-operators")]
+    InspectFile(InspectFile),
+    /// Looks an address up in a DNS blocklist.
+    #[cfg(feature = "host-operators")]
+    Rbl(Rbl),
+    /// Validates a JSON document against a JSON Schema.
+    #[cfg(feature = "validate-schema")]
+    ValidateSchema(ValidateSchema),
 }
 
 impl OperatorEnum {
@@ -232,6 +288,17 @@ impl OperatorEnum {
     /// Returns an error for an unknown operator, invalid argument, missing dataset,
     /// or unreadable operator file.
     pub fn with_context(name: &str, argument: &str, context: &OperatorContext<'_>) -> Result<Self, String> {
+        if let Some(factory) = context.custom.and_then(|custom| {
+            custom
+                .iter()
+                .find(|(custom_name, _)| custom_name.eq_ignore_ascii_case(name))
+                .map(|(_name, factory)| factory)
+        }) {
+            return factory(argument)
+                .map(|operator| Self::Custom(operator.into()))
+                .map_err(|error| format!("custom operator {name}: {error}"));
+        }
+
         match name.to_ascii_lowercase().as_str() {
             "rx" => rx(argument).map(Self::Rx).map_err(|error| error.to_string()),
             "restpath" => rest_path(argument).map(Self::RestPath),
@@ -270,6 +337,12 @@ impl OperatorEnum {
             "validatenid" => validate_nid(argument).map(Self::ValidateNid),
             "unconditionalmatch" | "geolookup" => Ok(Self::UnconditionalMatch(unconditional_match())),
             "nomatch" => Ok(Self::NoMatch(no_match())),
+            #[cfg(feature = "host-operators")]
+            "inspectfile" => Ok(Self::InspectFile(inspect_file(argument))),
+            #[cfg(feature = "host-operators")]
+            "rbl" => rbl(argument).map(Self::Rbl),
+            #[cfg(feature = "validate-schema")]
+            "validateschema" => validate_schema(context.base_dir, argument).map(Self::ValidateSchema),
             _ => Err(format!("unknown operator: {name}")),
         }
     }
@@ -309,6 +382,13 @@ impl OperatorEnum {
             Self::ValidateNid(operator) => operator.evaluate_outcome(tx, input, out),
             Self::UnconditionalMatch(operator) => operator.evaluate_outcome(tx, input, out),
             Self::NoMatch(operator) => operator.evaluate_outcome(tx, input, out),
+            Self::Custom(operator) => operator.evaluate_outcome(tx, input, out),
+            #[cfg(feature = "host-operators")]
+            Self::InspectFile(operator) => operator.evaluate_outcome(tx, input, out),
+            #[cfg(feature = "host-operators")]
+            Self::Rbl(operator) => operator.evaluate_outcome(tx, input, out),
+            #[cfg(feature = "validate-schema")]
+            Self::ValidateSchema(operator) => operator.evaluate_outcome(tx, input, out),
         }
     }
 }
@@ -356,11 +436,47 @@ impl_operator_from! {
     NoMatch => NoMatch,
 }
 
+#[cfg(feature = "host-operators")]
+impl_operator_from! {
+    InspectFile => InspectFile,
+    Rbl => Rbl,
+}
+
+#[cfg(feature = "validate-schema")]
+impl_operator_from! {
+    ValidateSchema => ValidateSchema,
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "operator tests use fixed valid parameters")]
 mod tests {
-    use super::{Datasets, OperatorContext, OperatorEnum, Outputs};
+    use super::{CustomOperatorFactory, CustomOperators, Datasets, Operator, OperatorContext, OperatorEnum, Outputs};
     use crate::transaction::Transaction;
+
+    /// Custom operator used here: matches only the exact argument.
+    #[derive(Debug)]
+    struct Exact(String);
+
+    impl Operator for Exact {
+        fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+            input == self.0.as_bytes()
+        }
+    }
+
+    fn exact_factory(argument: &str) -> Result<Box<dyn Operator>, String> {
+        if argument.is_empty() {
+            return Err("missing argument".to_owned());
+        }
+        Ok(Box::new(Exact(argument.to_owned())))
+    }
+
+    fn custom_context<'a>(custom: &'a CustomOperators, datasets: &'a Datasets) -> OperatorContext<'a> {
+        OperatorContext {
+            base_dir: std::path::Path::new(""),
+            datasets,
+            custom: Some(custom),
+        }
+    }
 
     #[test]
     fn operator_names_are_case_insensitive() {
@@ -410,6 +526,7 @@ mod tests {
         let context = OperatorContext {
             base_dir: std::path::Path::new(""),
             datasets: &datasets,
+            custom: None,
         };
         let tx = Transaction::new("operator-test");
 
@@ -433,6 +550,7 @@ mod tests {
         let context = OperatorContext {
             base_dir: &temp_dir,
             datasets: &datasets,
+            custom: None,
         };
         let tx = Transaction::new("operator-test");
         let phrase_name = phrase_path.file_name().unwrap().to_str().unwrap();
@@ -479,5 +597,100 @@ mod tests {
         if let Some(VariableCollection::Map(args)) = args {
             assert_eq!(args.values("id").collect::<Vec<_>>(), [b"same".as_slice(), b"42"]);
         }
+    }
+
+    #[test]
+    fn custom_factories_are_consulted_before_built_in_names() {
+        let mut custom = CustomOperators::new();
+        custom.insert("contains".to_owned(), std::sync::Arc::new(exact_factory));
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+        let tx = Transaction::new("operator-test");
+
+        let operator = OperatorEnum::with_context("contains", "needle", &context).unwrap();
+        assert!(
+            matches!(operator, OperatorEnum::Custom(_)),
+            "a registered name returns the custom variant"
+        );
+        // The built-in `contains` would match both inputs.
+        assert!(operator.evaluate(&tx, b"needle", &mut Outputs::default()));
+        assert!(!operator.evaluate(&tx, b"a needle here", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn custom_names_are_matched_case_insensitively() {
+        let mut custom = CustomOperators::new();
+        custom.insert("ExactOp".to_owned(), std::sync::Arc::new(exact_factory));
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+        let operator = OperatorEnum::with_context("exactop", "value", &context).unwrap();
+        assert!(operator.evaluate(&Transaction::new("operator-test"), b"value", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn an_unregistered_name_falls_through_to_the_built_in_lookup() {
+        let mut custom = CustomOperators::new();
+        custom.insert("exactop".to_owned(), std::sync::Arc::new(exact_factory));
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+
+        assert!(matches!(
+            OperatorEnum::with_context("contains", "needle", &context).unwrap(),
+            OperatorEnum::Contains(_)
+        ));
+        assert_eq!(
+            OperatorEnum::with_context("noSuchOp", "", &context).unwrap_err(),
+            "unknown operator: noSuchOp"
+        );
+    }
+
+    #[test]
+    fn custom_factory_errors_keep_their_message() {
+        let mut custom = CustomOperators::new();
+        custom.insert("exactop".to_owned(), std::sync::Arc::new(exact_factory));
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+
+        assert_eq!(
+            OperatorEnum::with_context("exactop", "", &context).unwrap_err(),
+            "custom operator exactop: missing argument"
+        );
+    }
+
+    #[test]
+    fn the_default_context_registers_no_custom_operators() {
+        assert!(OperatorContext::default().custom.is_none());
+    }
+
+    #[test]
+    fn context_debug_lists_custom_names() {
+        let mut custom = CustomOperators::new();
+        let factory: CustomOperatorFactory = std::sync::Arc::new(exact_factory);
+        custom.insert("exactop".to_owned(), factory);
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+        assert!(format!("{context:?}").contains("exactop"));
+        let operator = OperatorEnum::with_context("exactop", "value", &context).unwrap();
+        assert!(format!("{operator:?}").contains("CustomOperator"));
+    }
+
+    #[cfg(not(feature = "host-operators"))]
+    #[test]
+    fn host_operator_names_are_unknown_without_the_feature() {
+        for name in ["inspectFile", "rbl"] {
+            assert_eq!(
+                OperatorEnum::with_context(name, "argument", &OperatorContext::default()).unwrap_err(),
+                format!("unknown operator: {name}")
+            );
+        }
+    }
+
+    #[cfg(not(feature = "validate-schema"))]
+    #[test]
+    fn validate_schema_is_unknown_without_the_feature() {
+        assert_eq!(
+            OperatorEnum::with_context("validateSchema", "schema.json", &OperatorContext::default()).unwrap_err(),
+            "unknown operator: validateSchema"
+        );
     }
 }

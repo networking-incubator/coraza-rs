@@ -677,6 +677,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
     let context = OperatorContext {
         base_dir: options.config_dir,
         datasets: options.datasets,
+        custom: None,
     };
     let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
     options

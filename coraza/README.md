@@ -56,6 +56,24 @@ retained and written. Body capture is bounded by the configured request and
 response body limits. Review the selected parts and storage permissions before
 enabling audit logging for sensitive traffic.
 
+## Operators
+
+The default build compiles the built-in operators. Three upstream operators
+are behind crate features, and without the feature the name is rejected when
+the `SecRule` is compiled, never silently mapped to another operator:
+
+- `host-operators` adds `@inspectFile`, which runs a local program, and `@rbl`,
+  which resolves a DNS blocklist. `@rbl` performs the A/AAAA lookup only: it
+  does not read the TXT record, set `TX.httpbl_msg`, or copy the message into
+  capture 0, so an address with a record but no TXT entry matches here where
+  Go reports no match.
+- `validate-schema` adds `@validateSchema`, which compiles its schema per
+  operator instead of sharing Go's content-keyed memoizer.
+
+`Parser::register_operator` registers an embedder factory under a name, matched
+case-insensitively and consulted before the built-in names, so an embedder can
+add or override an operator. A registered operator must be `Send` and `Sync`.
+
 ## FTW integration
 
 The [FTW runner guide](../ftw-runner/README.md) covers the optional go-ftw
