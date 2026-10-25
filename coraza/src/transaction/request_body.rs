@@ -228,10 +228,12 @@ impl Transaction {
             }
 
             for (name, value) in &part.headers {
-                self.multipart_part_headers.add_bytes(
-                    &part.name,
-                    format!("{}: {}", canonical_header_name(name), text_of(value)),
-                );
+                // Go Coraza v3.8.1 `multipart.go:70` stores the header value's raw bytes;
+                // a lossy text view would make distinct invalid-UTF-8 values equal.
+                let mut header = canonical_header_name(name).into_bytes();
+                header.extend_from_slice(b": ");
+                header.extend_from_slice(value);
+                self.multipart_part_headers.add_bytes(&part.name, header);
             }
             self.multipart_name.add_bytes(&part.name, &part.name);
             if let Some(filename) = &part.filename {
@@ -1580,6 +1582,50 @@ two\r\n\
         assert_eq!(tx.multipart_name.first(b"\xfe"), Some(&b"\xfe"[..]));
         assert_eq!(tx.multipart_filename.first(b"\xff"), Some(&b"a.txt"[..]));
         assert_eq!(tx.multipart_filename.first(b"\xfe"), Some(&b"b.txt"[..]));
+    }
+
+    #[test]
+    fn part_header_values_that_are_not_utf8_are_distinct_bytes() {
+        // Go Coraza v3.8.1 `internal/bodyprocessors/multipart.go:70` formats the raw
+        // header value, so these stay two distinct `MULTIPART_PART_HEADERS` values
+        // instead of collapsing into one U+FFFD text view.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"field\"\r\n\
+X: \xff\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"field\"\r\n\
+X: \xfe\r\n\
+\r\n\
+two\r\n\
+--b--";
+        let tx = process(body);
+
+        let x_values: Vec<&[u8]> = tx
+            .multipart_part_headers
+            .values(b"field")
+            .filter(|value| value.starts_with(b"X: "))
+            .collect();
+        assert_eq!(x_values, [b"X: \xff".as_slice(), b"X: \xfe".as_slice()]);
+    }
+
+    #[test]
+    fn part_header_values_keep_their_exact_bytes() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"field\"\r\n\
+x-request: value\r\n\
+\r\n\
+one\r\n\
+--b--";
+        let tx = process(body);
+
+        let x_request: Vec<&[u8]> = tx
+            .multipart_part_headers
+            .values(b"field")
+            .filter(|value| value.starts_with(b"X-Request: "))
+            .collect();
+        assert_eq!(x_request, [b"X-Request: value".as_slice()]);
     }
 
     #[test]
