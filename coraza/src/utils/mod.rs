@@ -22,5 +22,8 @@
 //!
 //! This module contains low-level utilities used throughout the WAF.
 
+pub(crate) mod lowercase;
 pub mod strings;
 pub(crate) mod time;
+
+pub(crate) use lowercase::lowercase_like_go;
