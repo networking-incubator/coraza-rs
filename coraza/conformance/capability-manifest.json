@@ -3579,7 +3579,7 @@
         "go_reference": null,
         "fixtures": [],
         "differences": [
-          "REQUEST_XML:/* now parses as an XPath and selects the document root children, like XML:/* (coraza/src/seclang/variable_parser.rs:184-197). Go's rule parser (internal/seclang/rule_parser.go:119-147) sends REQUEST_XML:/... down its regex path, so REQUEST_XML:/* loses the trailing * and compiles as an empty pattern that selects every XML entry, attribute values included."
+          "REQUEST_XML:/* now parses as a path and selects the parsed XML text entries stored under the literal /* key, like XML:/* (coraza/src/seclang/variable_parser.rs:184-197, coraza/src/transaction/request_body.rs:185-192). The XML processor evaluates no XPath: it flattens the document into attribute values under //@* and text segments under /*. Go's rule parser (internal/seclang/rule_parser.go:119-147) sends REQUEST_XML:/... down its regex path, so REQUEST_XML:/* loses the trailing * and compiles as an empty pattern that selects every XML entry, attribute values included."
         ]
       }
     ],
