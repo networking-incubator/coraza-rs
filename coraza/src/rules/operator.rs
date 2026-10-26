@@ -57,9 +57,10 @@ impl RuleOperator {
     /// Evaluate one value, applying SecLang negation after the operator runs.
     ///
     /// Negation flips [`OperatorOutcome::Matched`] and
-    /// [`OperatorOutcome::NotMatched`]. A skipped inspection stays
-    /// [`OperatorOutcome::NotInspected`], because a negated operator has no
-    /// verdict for the input either.
+    /// [`OperatorOutcome::NotMatched`]. A detector's skipped inspection stays
+    /// [`OperatorOutcome::NotInspected`], because a negated detector has no verdict for
+    /// the input either. A host operator reports `NotMatched` when it cannot run, so its
+    /// negation matches on that failure as Go's does.
     pub(crate) fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
         match self.operator.evaluate_outcome(tx, input, out) {
             OperatorOutcome::Matched if self.negated => OperatorOutcome::NotMatched,

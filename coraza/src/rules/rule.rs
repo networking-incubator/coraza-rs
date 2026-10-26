@@ -207,9 +207,9 @@ impl Rule {
                             matched_values.push(matched);
                         },
                         // A detector skip records the transaction's inspection signal. A
-                        // host operator that could not run is a miss: its cause is a
-                        // resolver, process or resource failure, not over-long detector
-                        // input, so it must not raise that signal.
+                        // host operator reports `NotMatched` for the same failure, so this
+                        // arm stays as defence for an embedder operator whose skip is not
+                        // over-long detector input and must not raise that signal.
                         OperatorOutcome::NotInspected if operator.is_detector() => tx.record_inspection_incomplete(id),
                         OperatorOutcome::NotMatched | OperatorOutcome::NotInspected => {},
                     }

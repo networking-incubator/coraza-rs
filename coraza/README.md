@@ -121,29 +121,35 @@ another operator:
   On Unix an abandoned reader is stopped and joined before the call returns; on
   other platforms a reader a surviving descendant keeps blocked is detached
   instead and holds one descriptor and at most the cap until the last write end
-  closes. The retained output is capped at 1 MiB. An over-cap run, a spawn
-  failure, or a missed deadline reports `OperatorOutcome::NotInspected`, which a
-  rule treats as a miss; `Operator::evaluate` still returns `false`. The value
-  is raw bytes on Unix and converted lossily elsewhere. An empty or
-  whitespace-only program is rejected when the rule loads, where Go accepts it
-  and fails on every value.
+  closes. The retained output is capped at 1 MiB: an over-cap run keeps the
+  collected prefix, and since Go's verdict is only the first output byte, that
+  byte still decides it before the run is abandoned. A spawn failure, a read
+  error, or a missed deadline reports `OperatorOutcome::NotMatched`, because Go
+  returns `false` for every error, so a negated `!@inspectFile` matches on
+  failure exactly as it does in Go. At most 64 runs execute at once in a
+  process; a run above that cap is a plain miss. The value is raw bytes on Unix
+  and converted lossily elsewhere. An empty or whitespace-only program is
+  rejected when the rule loads, where Go accepts it and fails on every value.
 - `rbl` adds `@rbl`, which resolves a DNS blocklist. It queries A/AAAA records
   only: it does not read the TXT record, set `TX.httpbl_msg`, or copy the
   message into capture 0, so an address with a record but no TXT entry matches
   here where Go reports no match. The configured service is trimmed and must be
   non-empty at load, where Go appends it verbatim; the value is decoded lossily
   before it is appended, so invalid UTF-8 reaches the resolver as U+FFFD. A
-  resolver failure is a plain miss, as in Go. Only a lookup past the 500 ms
-  budget, the 64-lookups-in-flight cap, or a failure to spawn the lookup thread
-  reports `NotInspected`; since detector gating, an operator outside the
-  detectors reporting it leaves `TX.inspection_incomplete` clear and never
-  triggers `FailClosed`.
+  resolver failure is a plain miss, as in Go. A lookup past the 500 ms budget,
+  above the 64-lookups-in-flight cap, or a failed lookup-thread spawn reports
+  `NotMatched` too, because Go returns `false` on its timeout; a negated
+  `!@rbl` therefore matches on failure exactly as it does in Go. No
+  host-operator outcome sets `TX.inspection_incomplete` or triggers
+  `FailClosed`.
 - `host-operators` is the umbrella feature that enables `inspect-file` and
   `rbl`.
-- `validate-schema` adds `@validateSchema`, which validates JSON documents. The
-  dialect comes from the schema's `$schema` and defaults to 2020-12 when it has
-  none, as Go's compiler does. `format` is therefore asserted for draft-04/6/7
-  and an annotation from 2019-09 on. The schema path must be relative, contain
+- `validate-schema` adds `@validateSchema`, which validates JSON documents.
+  Go's pinned `kaptinlin/jsonschema` compiler parses `$schema` but never
+  consults it and compiles every schema as 2020-12; this port does the same, so
+  an unknown `$schema` still loads and a draft-07-only keyword shape such as
+  tuple `items` or a boolean `exclusiveMinimum` is a compile error. `format` is
+  therefore always an assertion, as 2020-12 defines it. The schema path must be relative, contain
   no `..` component, name a `.json` file, and canonicalise under the configured
   base directory. The type and size are read from the opened descriptor, and on
   Linux the descriptor's own path is confined again, which catches a symlink
@@ -207,7 +213,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   stores the raw bytes before the first `;` without trimming. Response-body MIME
   selection is an exact comparison, not a case-insensitive one.
 - `TX:0` through `TX:10` are always present and empty on a fresh transaction.
-  `TX:0` through `TX:9` are cleared before every rule. The clear is a deliberate
+  `TX:0` through `TX:9` are cleared before every rule, so `TX:10` persists.
+  This mirrors Go's seed of `TX:0` through `TX:10` and its reset of `TX:0`
+  through `TX:9`, which leaves `TX:10` alone. The clear itself is a deliberate
   deviation: Go's `resetCaptures` exists but only its tests call it, so a Go
   rule can see the previous rule's captures.
 - `percent_decode_lenient` no longer decodes `%+1`: only ASCII hexadecimal

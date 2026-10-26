@@ -25,12 +25,17 @@
 //! verdict: a first output byte of `1` means no match, any other non-empty
 //! output means match.
 //!
-//! Divergences from Go, all of them fail-closed for the rule:
+//! Divergences from Go:
 //!
-//! - A missed deadline, a spawn failure, a failed wait, or output beyond [`OUTPUT_CAP`] reports
-//!   [`OperatorOutcome::NotInspected`] rather than a plain non-match. Rules treat both as not matched; only a
-//!   detector's `NotInspected` sets the transaction's inspection-incomplete signal, so this operator's does not.
+//! - A missed deadline, a spawn failure, a failed wait, or a read error reports [`OperatorOutcome::NotMatched`], as
+//!   Go's `Evaluate` returns `false` for every error. A negated `!@inspectFile` therefore matches on failure, exactly
+//!   as in Go.
+//! - Output beyond [`OUTPUT_CAP`] keeps the collected prefix and applies Go's first-byte verdict to it: the reader
+//!   stops and the run is abandoned, so a program that writes a huge output cannot pin the caller. An over-cap run with
+//!   no output at all is a non-match.
 //! - A non-zero exit status stays a non-match, as in Go.
+//! - The number of runs in flight in a process is capped at [`MAX_IN_FLIGHT`]; a run above that cap reports
+//!   [`OperatorOutcome::NotMatched`] rather than queueing.
 //! - On Unix both streams share one socket, so the combined output keeps the program's write order like Go's
 //!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr.
 //! - On Unix the value is passed as its raw bytes; elsewhere it is converted lossily, because those platforms have no
@@ -38,17 +43,18 @@
 //! - An empty or whitespace-only program is rejected when the rule loads, where Go accepts it and fails on every value.
 //!
 //! Resource bounds: the whole spawn-to-exit window is bounded by
-//! [`COMMAND_TIMEOUT`], the retained output is capped at [`OUTPUT_CAP`], and a
-//! single reader thread per stream is used. When a run is abandoned the readers
-//! are stopped before the call returns, so a descendant that survives the kill
-//! cannot pin a thread and a descriptor: on Unix the read end is shut down and
-//! the reader polls a stop flag every [`READ_POLL`], and the call joins it.
-//! Elsewhere a read on a pipe cannot be interrupted, so a reader that a
-//! surviving descendant keeps blocked is detached instead: it holds one
-//! descriptor and never more than the cap, and it ends when the last write end
-//! closes. A killed program is reaped within a short grace; one stuck in
-//! uninterruptible sleep stays a zombie until the process exits rather than
-//! parking the caller past its deadline.
+//! [`COMMAND_TIMEOUT`], the retained output is capped at [`OUTPUT_CAP`], at most
+//! [`MAX_IN_FLIGHT`] runs execute at once in a process, and a single reader
+//! thread per stream is used. When a run is abandoned the readers are stopped
+//! before the call returns, so a descendant that survives the kill cannot pin a
+//! thread and a descriptor: on Unix the read end is shut down, which also makes a
+//! descendant that keeps writing fail with `EPIPE`, the reader polls a stop flag
+//! every [`READ_POLL`], and the call joins it. Elsewhere a read on a pipe
+//! cannot be interrupted, so a reader that a surviving descendant keeps blocked is
+//! detached instead: it holds one descriptor and never more than the cap, and it
+//! ends when the last write end closes. A killed program is reaped within a short
+//! grace; one stuck in uninterruptible sleep stays a zombie until the process exits
+//! rather than parking the caller past its deadline.
 
 use std::{
     borrow::Cow,
@@ -57,7 +63,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::JoinHandle,
@@ -85,6 +91,46 @@ const READER_STACK: usize = 64 * 1024;
 ///
 /// This bounds how long an abandoned reader outlives the call on Unix.
 pub const READ_POLL: Duration = Duration::from_millis(50);
+
+/// Executions allowed to run at once in one process.
+///
+/// A run holds its slot from spawn to reap, so this bounds the programs, reader
+/// threads and descriptors a hostile rule set can pin.
+pub const MAX_IN_FLIGHT: usize = 64;
+
+/// Runs currently executing, process-wide.
+static LIMITER: Limiter = Limiter {
+    in_flight: AtomicUsize::new(0),
+};
+
+/// Counts runs in flight against [`MAX_IN_FLIGHT`].
+struct Limiter {
+    /// Slots currently held.
+    in_flight: AtomicUsize,
+}
+
+/// One reserved run slot, released when dropped.
+struct InFlight<'a> {
+    /// The limiter the slot was taken from.
+    limiter: &'a Limiter,
+}
+
+impl Limiter {
+    /// Reserve a slot, or report `None` when the cap is already reached.
+    fn acquire(&self) -> Option<InFlight<'_>> {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(InFlight { limiter: self })
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.limiter.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// How long a killed program gets to die before the reap gives up.
 ///
@@ -149,16 +195,31 @@ fn first_byte_is_verdict(output: &[u8]) -> bool {
 enum Run {
     /// The program exited on its own; the bytes are its combined output.
     Completed(Vec<u8>),
-    /// The program could not be run to completion, so there is no verdict.
-    Skipped,
+    /// The output passed [`OUTPUT_CAP`]; the bytes are the collected prefix.
+    OverCap(Vec<u8>),
+    /// The program could not be run at all.
+    Failed,
 }
 
-/// Map a run onto a verdict, so every skipped run reports an uninspected value.
+/// The output one reader collected before end-of-file or the cap.
+#[derive(Debug)]
+struct ReadOutput {
+    /// The bytes read before the end or the cap.
+    bytes: Vec<u8>,
+    /// Whether reading stopped because the output passed [`OUTPUT_CAP`].
+    over_cap: bool,
+}
+
+/// Map a run onto Go's first-byte verdict.
+///
+/// Go returns `false` on every operational error, so a failed run is a plain
+/// non-match: a negated rule then matches exactly as it does in Go. An over-cap
+/// run still has a first byte whenever it has output, and that byte is the whole
+/// verdict, so the collected prefix decides it.
 fn verdict(run: Run) -> OperatorOutcome {
     match run {
-        Run::Completed(output) if first_byte_is_verdict(&output) => OperatorOutcome::Matched,
-        Run::Completed(_) => OperatorOutcome::NotMatched,
-        Run::Skipped => OperatorOutcome::NotInspected,
+        Run::Completed(output) | Run::OverCap(output) if first_byte_is_verdict(&output) => OperatorOutcome::Matched,
+        Run::Completed(_) | Run::OverCap(_) | Run::Failed => OperatorOutcome::NotMatched,
     }
 }
 
@@ -214,9 +275,12 @@ fn run(path: &str, input: &[u8]) -> Run {
 
 /// Run `path` with the value as its argument, bounded by `timeout`.
 fn run_with_timeout(path: &str, input: &[u8], timeout: Duration) -> Run {
+    let Some(_slot) = LIMITER.acquire() else {
+        return Run::Failed;
+    };
     let deadline = Instant::now() + timeout;
     let Some((mut child, readers)) = spawn_captured(path, &value_argument(input)) else {
-        return Run::Skipped;
+        return Run::Failed;
     };
 
     let expected = readers.len();
@@ -233,7 +297,7 @@ fn run_with_timeout(path: &str, input: &[u8], timeout: Duration) -> Run {
         shutdowns.push(shutdown);
         let Some(worker) = spawn_reader(pipe, is_stderr, Arc::clone(&stop), sender.clone()) else {
             abandon(&mut child, &stop, &shutdowns, &mut workers);
-            return Run::Skipped;
+            return Run::Failed;
         };
         workers.push(worker);
     }
@@ -243,15 +307,22 @@ fn run_with_timeout(path: &str, input: &[u8], timeout: Duration) -> Run {
     let mut stderr = Vec::new();
     for _ in 0..expected {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok((is_stderr, bytes)) = receiver.recv_timeout(remaining) else {
+        let Ok((is_stderr, output)) = receiver.recv_timeout(remaining) else {
             abandon(&mut child, &stop, &shutdowns, &mut workers);
-            return Run::Skipped;
+            return Run::Failed;
         };
-        let Some(bytes) = bytes else {
-            // The cap or a read error leaves no usable verdict.
+        let Some(ReadOutput { bytes, over_cap }) = output else {
+            // A read error or a stop leaves no usable verdict.
             abandon(&mut child, &stop, &shutdowns, &mut workers);
-            return Run::Skipped;
+            return Run::Failed;
         };
+        if over_cap {
+            // Go's verdict is only the first output byte, so the collected
+            // prefix decides it without waiting for the rest. `abandon` shuts
+            // the read end down, so a descendant still writing gets `EPIPE`.
+            abandon(&mut child, &stop, &shutdowns, &mut workers);
+            return Run::OverCap(bytes);
+        }
         if is_stderr {
             stderr = bytes;
         } else {
@@ -263,7 +334,7 @@ fn run_with_timeout(path: &str, input: &[u8], timeout: Duration) -> Run {
     // running, so the exit status needs the same deadline.
     let Some(status) = wait_until(&mut child, deadline) else {
         abandon(&mut child, &stop, &shutdowns, &mut workers);
-        return Run::Skipped;
+        return Run::Failed;
     };
     if !status.success() {
         // Go reports a non-zero exit status as no match.
@@ -365,15 +436,15 @@ fn spawn_captured(path: &str, value: &OsStr) -> Option<(Child, Vec<Captured>)> {
     Some((child, readers))
 }
 
-/// Read `pipe` on a worker thread, reporting `None` when the output is unusable,
-/// beyond [`OUTPUT_CAP`], or stopped.
+/// Read `pipe` on a worker thread, reporting `None` when the output is unusable
+/// or stopped.
 ///
 /// A spawn failure is reported to the caller instead of panicking.
 fn spawn_reader(
     pipe: Box<dyn Read + Send>,
     is_stderr: bool,
     stop: Arc<Stop>,
-    sender: mpsc::Sender<(bool, Option<Vec<u8>>)>,
+    sender: mpsc::Sender<(bool, Option<ReadOutput>)>,
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("coraza-inspect-file".to_owned())
@@ -385,8 +456,12 @@ fn spawn_reader(
         .ok()
 }
 
-/// Read `pipe` to its end, giving up on [`OUTPUT_CAP`], a read error, or a stop.
-fn read_capped(mut pipe: impl Read, stop: &Stop) -> Option<Vec<u8>> {
+/// Read `pipe` to its end or up to [`OUTPUT_CAP`].
+///
+/// `None` reports a read error or a stop. The cap keeps the collected prefix and
+/// sets [`ReadOutput::over_cap`], so the caller can apply Go's first-byte verdict
+/// even when the output is huge.
+fn read_capped(mut pipe: impl Read, stop: &Stop) -> Option<ReadOutput> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -394,10 +469,16 @@ fn read_capped(mut pipe: impl Read, stop: &Stop) -> Option<Vec<u8>> {
             return None;
         }
         match pipe.read(&mut buffer) {
-            Ok(0) => return Some(bytes),
+            Ok(0) => {
+                return Some(ReadOutput { bytes, over_cap: false });
+            },
             Ok(read) => {
-                if bytes.len() + read > OUTPUT_CAP {
-                    return None;
+                let remaining = OUTPUT_CAP.saturating_sub(bytes.len());
+                if read > remaining {
+                    if let Some(chunk) = buffer.get(..remaining) {
+                        bytes.extend_from_slice(chunk);
+                    }
+                    return Some(ReadOutput { bytes, over_cap: true });
                 }
                 let chunk = buffer.get(..read)?;
                 bytes.extend_from_slice(chunk);
@@ -552,7 +633,7 @@ mod tests {
         let program = executable_script(dir.path(), body);
         match run_with_timeout(&program, input, Duration::from_secs(5)) {
             Run::Completed(bytes) => Some(bytes),
-            Run::Skipped => None,
+            Run::OverCap(_) | Run::Failed => None,
         }
     }
 
@@ -562,18 +643,43 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_failure_reports_no_verdict() {
+    fn a_spawn_failure_is_no_match() {
         assert_eq!(
             outcome("/nonexistent/coraza-inspect-file-test", b"value"),
-            OperatorOutcome::NotInspected
+            OperatorOutcome::NotMatched
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_value_that_cannot_be_an_argument_reports_no_verdict() {
+    fn a_value_that_cannot_be_an_argument_is_no_match() {
         // A NUL byte makes exec fail, which must not panic.
-        assert_eq!(outcome("/bin/echo", b"value\0"), OperatorOutcome::NotInspected);
+        assert_eq!(outcome("/bin/echo", b"value\0"), OperatorOutcome::NotMatched);
+    }
+
+    #[test]
+    fn a_negated_rule_matches_when_the_program_cannot_run() {
+        use crate::seclang::Parser;
+
+        // Go's `Evaluate` returns false on a spawn failure and the rule negates
+        // that result, so `!@inspectFile` matches. Observed against Coraza
+        // v3.8.1 with the same missing program.
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS:q \"!@inspectFile /nonexistent/coraza-inspect-file-test\" \"id:961,phase:1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inspect-file-negated");
+        tx.add_get_argument("q", b"value");
+
+        assert!(tx.process_request_headers().is_none(), "pass does not interrupt");
+        assert_eq!(
+            tx.matched_rules().len(),
+            1,
+            "the negated rule must match on the failed run"
+        );
     }
 
     #[cfg(unix)]
@@ -701,8 +807,8 @@ mod tests {
         let path = script(dir.path(), "exec sleep 5");
         assert_eq!(
             verdict(run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_millis(50))),
-            OperatorOutcome::NotInspected,
-            "an overrun reports an uninspected value, not a plain miss"
+            OperatorOutcome::NotMatched,
+            "an overrun is a plain miss, as Go returns false on its deadline"
         );
     }
 
@@ -733,7 +839,7 @@ mod tests {
         let program = executable_script(dir.path(), "exec 1>&- 2>&-\nsleep 5");
         let started = Instant::now();
         let run = run_with_timeout(&program, b"value", Duration::from_millis(100));
-        assert_eq!(verdict(run), OperatorOutcome::NotInspected, "an overrun has no verdict");
+        assert_eq!(verdict(run), OperatorOutcome::NotMatched, "an overrun is a plain miss");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the deadline must bound the exit wait, took {:?}",
@@ -758,8 +864,8 @@ mod tests {
         let run = run_with_timeout(&program, b"value", Duration::from_secs(5));
         assert_eq!(
             verdict(run),
-            OperatorOutcome::NotInspected,
-            "output beyond the cap has no verdict"
+            OperatorOutcome::Matched,
+            "the first output byte is 0, so the huge output still matches"
         );
         assert!(
             started.elapsed() < Duration::from_secs(4),
@@ -782,8 +888,8 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             verdict(run_with_timeout(&program, b"value", Duration::from_millis(100))),
-            OperatorOutcome::NotInspected,
-            "a stalled descendant leaves no verdict"
+            OperatorOutcome::NotMatched,
+            "a stalled descendant leaves no output, so it is a plain miss"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -813,9 +919,8 @@ mod tests {
         // Let the reader block in `read`, then stop it as `abandon` does.
         std::thread::sleep(READ_POLL);
         stop.stop();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
-            None,
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap().is_none(),
             "a stopped reader keeps no output"
         );
         worker.join().unwrap();
@@ -872,20 +977,65 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_run_reports_no_verdict() {
-        assert_eq!(verdict(Run::Skipped), OperatorOutcome::NotInspected);
+    fn a_failed_run_is_no_match() {
+        // Go's `Evaluate` returns false for every error, so a negated rule matches.
+        assert_eq!(verdict(Run::Failed), OperatorOutcome::NotMatched);
     }
 
     #[test]
-    fn the_output_cap_is_enforced() {
+    fn the_output_cap_keeps_the_prefix() {
         let stop = super::Stop::default();
+        let collected = read_capped(std::io::repeat(b'0').take(OUTPUT_CAP as u64), &stop).unwrap();
+        assert_eq!(collected.bytes.len(), OUTPUT_CAP);
+        assert!(!collected.over_cap, "exactly the cap is not over it");
+
+        let collected = read_capped(std::io::repeat(b'0').take(OUTPUT_CAP as u64 + 1), &stop).unwrap();
+        assert_eq!(collected.bytes.len(), OUTPUT_CAP);
+        assert!(collected.over_cap, "output beyond the cap is flagged");
+    }
+
+    #[test]
+    fn an_over_cap_run_still_applies_the_first_byte_verdict() {
         assert_eq!(
-            read_capped(std::io::repeat(b'0').take(OUTPUT_CAP as u64), &stop).map(|bytes| bytes.len()),
-            Some(OUTPUT_CAP)
+            verdict(Run::OverCap(b"0 and a huge tail".to_vec())),
+            OperatorOutcome::Matched
         );
-        assert!(
-            read_capped(std::io::repeat(b'0').take(OUTPUT_CAP as u64 + 1), &stop).is_none(),
-            "output beyond the cap is unusable"
+        assert_eq!(
+            verdict(Run::OverCap(b"1 and a huge tail".to_vec())),
+            OperatorOutcome::NotMatched
         );
+        assert_eq!(verdict(Run::OverCap(Vec::new())), OperatorOutcome::NotMatched);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_over_cap_output_starting_with_zero_matches() {
+        if !sh_available() {
+            return skip("/bin/sh");
+        }
+        // Go keeps the whole output and reads only its first byte, so a `0`
+        // followed by more than the cap must match.
+        let dir = tempfile::tempdir().unwrap();
+        let program = executable_script(
+            dir.path(),
+            "printf '0'\ni=0\nwhile [ \"$i\" -lt 4000 ]; do printf '%0500d' 0; i=$((i+1)); done",
+        );
+        assert!(evaluates(&program, b"value"));
+    }
+
+    #[test]
+    fn the_in_flight_cap_is_enforced_and_released() {
+        use std::sync::atomic::AtomicUsize;
+
+        use super::{Limiter, MAX_IN_FLIGHT};
+
+        let limiter = Limiter {
+            in_flight: AtomicUsize::new(0),
+        };
+        let slots: Vec<_> = (0..MAX_IN_FLIGHT).filter_map(|_| limiter.acquire()).collect();
+        assert_eq!(slots.len(), MAX_IN_FLIGHT, "the cap grants every slot once");
+        assert!(limiter.acquire().is_none(), "runs above the cap are refused");
+        drop(slots);
+        assert!(limiter.acquire().is_some(), "a released slot can be taken again");
     }
 }

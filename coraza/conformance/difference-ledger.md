@@ -39,8 +39,8 @@ must state which side was observed.
 | `raw-0292` | `245ac590dddc9898908c6d974085e33488a08219c48957278145049618d69b38` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0365` | `58c14b7bcbc569d32c0a70b54939c2c97aa53d4cfd68e17f7e933d515bf87527` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0373` | `e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
-| `request-xml-root-selector` | `f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5` | matches every XML entry, attributes included (empty regex) | matches the document's root children, exactly as XML:/* | Observed on both sides for the fixture `<a id="1">x</a>`: Go parses `REQUEST_XML:/*` as an empty regex and selects both XML entries (`//@*` and `/*`); this engine parses it as the XPath `/*` and selects the root children only. |
-| `xml-lowercase-selector` | `f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5` | matches every XML entry, attributes included (empty regex) | matches the document's root children, exactly as XML:/* | Observed on both sides for the fixture `<a id="1">x</a>` with `xml:/*` and `request_xml:/*`: Go matched `REQUEST_XML://@*` (`1`) and `REQUEST_XML:/*` (`x`), because its rule parser enters the path branch only for the exact spellings `XML` and `JSON` (`internal/seclang/rule_parser.go:124`) and sends every other spelling down its regex path; this engine folds the name case before the same guard (`coraza/src/seclang/variable_parser.rs:184-189`), so only `/*` matches. The folded guard also admits lower-case `json:` selectors, which Go's exact check does not. |
+| `request-xml-root-selector` | `f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5` | matches every XML entry, attributes included (empty regex) | matches all text segments stored under `/*`, exactly as XML:/* | Observed on both sides for the fixture `<a id="1">x</a>`: Go's regex path drops the trailing byte of a selector with no closing slash, so `REQUEST_XML:/*` parses as the empty regex and selects both XML entries (`//@*` and `/*`); this engine parses it as the XPath `/*` and selects only the text segments stored under that literal key. Every XML/JSON selector Go's regex path leaves empty collapses the same way, such as `/*`, `/x` and `//`. |
+| `xml-lowercase-selector` | `f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5` | matches every XML entry, attributes included (empty regex) | matches all text segments stored under `/*`, exactly as XML:/* | Observed on both sides for the fixture `<a id="1">x</a>` with `xml:/*` and `request_xml:/*`: Go matched `REQUEST_XML://@*` (`1`) and `REQUEST_XML:/*` (`x`), because its rule parser enters the path branch only for the exact spellings `XML` and `JSON` (`internal/seclang/rule_parser.go:124`) and sends every other spelling down its regex path, where a selector with no closing slash loses its last byte and `/*` becomes the empty regex; this engine folds the name case before the same guard (`coraza/src/seclang/variable_parser.rs:184-189`), so only the text segments stored under `/*` match. The folded guard also admits lower-case `json:` selectors, which Go's exact check does not. |
 
 ## Resolved differences
 
@@ -92,10 +92,18 @@ adding them requires a shared-corpus fixture first.
   No admission decision depends on it on either side.
 - Capture reset before each rule. `TX:0` through `TX:10` are seeded empty on every
   transaction, as Go Coraza does (`internal/corazawaf/waf.go:264-268`), but this
-  engine clears `TX:0` through `TX:9` before every rule. Go's `resetCaptures`
+  engine clears `TX:0` through `TX:9` before every rule, so `TX:10` persists just
+  as it does under Go's reset of `TX:0` through `TX:9`. Go's `resetCaptures`
   (`internal/corazawaf/transaction.go:477`) is only called by its tests, so a Go
   rule can read the previous rule's captures while a Rust rule cannot. This is a
   deliberate deviation with no engine case ID or fixture hash yet.
+- Empty-regex `KeyStr` collapse. Go's rule parser drops the last byte of a
+  regex selector that has no closing slash, so `ARGS://` and `ARGS:/` compile to
+  the empty regex `//` and select every argument, and `!ARGS://` excludes every
+  argument. This engine treats `//` and `/` as literal keys, so they select
+  nothing. This is a pre-existing selector-parser deviation
+  (`coraza/src/seclang/variable_parser.rs::parse_key`) with no engine case ID or
+  fixture hash yet.
 - Detector input bound. The `detectSQLi` and `detectXSS` operators use
   libperfusion's public wrappers, which do not scan inputs longer than 65536 bytes;
   Go Coraza passes any length to libinjection-go. The operators report

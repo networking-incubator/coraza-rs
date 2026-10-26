@@ -39,16 +39,18 @@
 //!   and reports no match when the TXT lookup fails. This port has no DNS dependency, so it performs the A/AAAA lookup
 //!   only: the TXT message and its capture are absent, and a name whose TXT lookup fails matches here where Go reports
 //!   no match.
+//! - A deadline, the in-flight cap or a spawn failure reports [`OperatorOutcome::NotMatched`], as Go returns `false`
+//!   from `Evaluate` on its timeout. A negated `!@rbl` therefore matches on failure, exactly as in Go.
 //!
 //! Resource bounds: the system resolver cannot be cancelled, so each lookup
 //! runs on its own thread with [`LOOKUP_STACK`] of stack and the operator gives
 //! up after [`LOOKUP_TIMEOUT`], abandoning that thread until the resolver
 //! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process; above
 //! that, and when a thread cannot be spawned, the operator reports
-//! [`OperatorOutcome::NotInspected`] instead of queueing or panicking. Rules
-//! treat that as not matched, so it never turns a lookup that could not run
-//! into a match. A resolver failure is not one of those cases: it is an answer
-//! that the value is not listed, so it never raises the signal.
+//! [`OperatorOutcome::NotMatched`] instead of queueing or panicking. A resolver
+//! failure is an answer that the value is not listed, so it is also a plain
+//! miss. No operational failure from this operator raises the detector
+//! inspection signal.
 
 use std::{
     net::ToSocketAddrs as _,
@@ -168,13 +170,13 @@ impl Operator for Rbl {
 
 /// Map a bounded lookup onto a verdict.
 ///
-/// `None` means the lookup never ran to an answer, which is the only case that
-/// reports [`OperatorOutcome::NotInspected`].
+/// `None` means the lookup never ran to an answer. Go's `Evaluate` returns
+/// `false` on its timeout, so that is a plain miss too: a negated rule then
+/// matches on the failure exactly as it does in Go.
 fn verdict(listed: Option<bool>) -> OperatorOutcome {
     match listed {
         Some(true) => OperatorOutcome::Matched,
-        Some(false) => OperatorOutcome::NotMatched,
-        None => OperatorOutcome::NotInspected,
+        Some(false) | None => OperatorOutcome::NotMatched,
     }
 }
 
@@ -297,10 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_without_an_answer_reports_no_verdict() {
+    fn a_lookup_without_an_answer_is_no_match() {
         // The deadline, the in-flight cap and a spawn failure all reach the
-        // operator as `None`, and only that reports `NotInspected`.
-        assert_eq!(verdict(None), OperatorOutcome::NotInspected);
+        // operator as `None`, and Go returns false for each of them.
+        assert_eq!(verdict(None), OperatorOutcome::NotMatched);
         assert_eq!(verdict(Some(true)), OperatorOutcome::Matched);
         assert_eq!(verdict(Some(false)), OperatorOutcome::NotMatched);
     }
@@ -339,6 +341,27 @@ mod tests {
         assert!(
             tx.matched_rules().is_empty(),
             "a not-listed address must not match the rule"
+        );
+    }
+
+    #[test]
+    fn a_negated_rule_matches_when_the_lookup_fails() {
+        // Go's `Evaluate` returns false on a resolver error or its timeout and
+        // the rule negates that result, so `!@rbl` matches. Observed against
+        // Coraza v3.8.1 with the same NUL byte in the value.
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"!@rbl zen.spamhaus.org\" \"id:962,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("rbl-negated");
+        tx.add_get_argument("q", b"192.0.2.1\0");
+
+        assert!(tx.process_request_headers().is_none(), "pass does not interrupt");
+        assert_eq!(
+            tx.matched_rules().len(),
+            1,
+            "the negated rule must match on the failed lookup"
         );
     }
 

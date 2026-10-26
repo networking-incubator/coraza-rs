@@ -148,7 +148,8 @@
           "Registered only with the inspect-file crate feature, which host-operators also enables; the default build rejects the name.",
           "On Unix both streams share one socket, so the combined output keeps the program's write order like Go's CombinedOutput. Non-Unix platforms use separate pipes and read stdout before stderr, which differs only when both carry output.",
           "The program runs directly, without a shell, and the 10 s deadline bounds the program and its exit wait: a killed program is reaped within a short grace, while one stuck in uninterruptible sleep is left to be reaped when the process exits rather than parking the caller.",
-          "Retained output is capped at 1 MiB. An over-cap run, a spawn failure, or a missed deadline reports OperatorOutcome::NotInspected while evaluate still returns false; a non-zero exit status stays a non-match, as in Go.",
+          "Retained output is capped at 1 MiB. An over-cap run keeps the collected prefix and applies Go's first-byte verdict to it, then abandons the run, so a huge output still matches or misses by its first byte. A spawn failure, a read error, or a missed deadline reports OperatorOutcome::NotMatched, as Go returns false for every error, so a negated !@inspectFile matches on failure; a non-zero exit status stays a non-match, as in Go.",
+          "At most 64 runs execute at once in a process; a run above that cap reports NotMatched instead of queueing.",
           "On Unix an abandoned reader is stopped and joined before the call returns. On other platforms a read on a pipe cannot be interrupted, so a reader a surviving descendant keeps blocked is detached and holds one descriptor and at most the cap until the last write end closes.",
           "An empty or whitespace-only program is rejected when the rule loads, where Go accepts it and fails on every value.",
           "The value is passed as raw bytes on Unix and converted lossily elsewhere, because other platforms have no byte path form."
@@ -277,7 +278,7 @@
         "differences": [
           "Registered only with the rbl crate feature, which host-operators also enables; the default build rejects the name.",
           "Only A/AAAA records are queried. Go also reads the TXT record, sets TX.httpbl_msg from its first entry, copies it into capture 0, and reports no match when the TXT lookup fails; without a DNS dependency this port matches on the address record alone.",
-          "A resolver failure is a plain miss, as in Go, where LookupHost returns an error and the rule does not match. Only a lookup past the 500 ms budget, the 64-in-flight cap and a thread-spawn failure report OperatorOutcome::NotInspected; evaluate still returns false, and because only detectors gate the transaction this does not set TX.inspection_incomplete or trigger FailClosed.",
+          "A resolver failure is a plain miss, as in Go, where LookupHost returns an error and the rule does not match. A lookup past the 500 ms budget, above the 64-in-flight cap, or a failed thread spawn is also a plain miss (OperatorOutcome::NotMatched), because Go returns false on its timeout and the rule negates that result; a negated !@rbl therefore matches on failure. No host-operator outcome sets TX.inspection_incomplete or triggers FailClosed.",
           "The configured service is trimmed of surrounding whitespace and must not be empty, so an empty service is rejected when the rule loads; Go appends it verbatim and relies on the TXT lookup to reject the self-resolving name it would build.",
           "The value is decoded with String::from_utf8_lossy before it is appended, where Go appends the raw bytes of its value string, so invalid UTF-8 reaches the resolver as U+FFFD here."
         ]
@@ -380,12 +381,11 @@
         "fixtures": [],
         "differences": [
           "Registered only with the validate-schema crate feature; the default build rejects the name.",
-          "The schema path must be relative, contain no .. component, name a .json file, and canonicalise under the configured base directory. Type and size are read from the opened descriptor, and on Linux the descriptor's own path is confined again, which catches a symlink swapped in before the open. On other platforms the check and the open are two steps, so the schema directory must be writable only by the process' own configuration source. Go reads the path through whatever root filesystem the embedder passed.",
+          "The schema path must be relative, contain no .. component, name a .json file, and canonicalise under the configured base directory. Type and size are read from the opened descriptor, and on Linux the descriptor's own path is confined again, which catches a symlink swapped in before the open; a descriptor path that cannot be canonicalised, such as when /proc is unavailable, is refused. On other platforms the check and the open are two steps, so the schema directory must be writable only by the process' own configuration source. Go reads the path through whatever root filesystem the embedder passed.",
           "A schema file larger than 1 MiB is rejected before it is read, and a non-regular file is rejected.",
           "A schema that fails to compile reports that step without quoting the schema, so a rejected schema cannot echo its contents into a log.",
-          "The dialect comes from the schema's $schema, as Go's compiler does, and a schema without one is compiled as 2020-12.",
+          "Every schema is compiled as 2020-12, as Go's pinned kaptinlin/jsonschema compiler does: it parses $schema but never consults it. An unknown $schema still loads, and a draft-07-only keyword shape such as tuple items or a boolean exclusiveMinimum is a compile error. format is therefore always an assertion, as 2020-12 defines it.",
           "The engine is this crate's jsonschema, not Go's kaptinlin/jsonschema. External $ref targets are disabled, so a reference to another document fails at compile time instead of reading an arbitrary path or URL.",
-          "format is asserted for draft-04, draft-06 and draft-07, which this engine asserts by default, and an annotation from 2019-09 on.",
           "A pattern matcher that cannot complete, such as one that trips the regex engine's backtrack or size limit, counts as a violation, so a pathological pattern fails closed.",
           "Each operator compiles its own schema; Go's memoizer shares one compilation per schema content."
         ]
@@ -3070,7 +3070,7 @@
           "xml-lowercase-selector"
         ],
         "differences": [
-          "REQUEST_XML:/* selects the root children stored under the literal /* key, exactly as XML:/* does, where Go compiles it as an empty regex and selects every XML entry, attribute values included (ledger request-xml-root-selector). The parser folds the variable name case before that path guard, so xml:/* and request_xml:/* also select the root children only, while Go's rule parser enters its path branch only for the exact spellings XML and JSON (internal/seclang/rule_parser.go:124) and sends a lower-case spelling down its regex path (ledger xml-lowercase-selector). The XML processor evaluates no XPath: it flattens attribute values under //@* and text segments under /* (coraza/src/transaction/request_body.rs:185-192). The same folded guard admits lower-case json: selectors, where Go's exact check does not."
+          "REQUEST_XML:/* selects all text segments stored under the literal /* key, exactly as XML:/* does, where Go's regex path drops the trailing byte of a selector with no closing slash, so REQUEST_XML:/* compiles as an empty regex and selects every XML entry, attribute values included (ledger request-xml-root-selector). Every XML/JSON selector Go's regex path leaves empty collapses the same way, such as /*, /x and //. The parser folds the variable name case before that path guard, so xml:/* and request_xml:/* also select the text segments only, while Go's rule parser enters its path branch only for the exact spellings XML and JSON (internal/seclang/rule_parser.go:124) and sends a lower-case spelling down its regex path (ledger xml-lowercase-selector). The XML processor evaluates no XPath: it flattens attribute values under //@* and all text segments under /* (coraza/src/transaction/request_body.rs:185-192). The same folded guard admits lower-case json: selectors, where Go's exact check does not."
         ]
       },
       {

@@ -73,10 +73,10 @@ pub enum OperatorOutcome {
     /// The operator could not inspect the input, so it has no verdict.
     ///
     /// Rules treat this as not matched. Only the detector operators (`detectSQLi` and
-    /// `detectXSS`) turn it into the transaction's inspection-incomplete signal and the
-    /// configured fail-closed action; a host operator (`inspectFile`, `rbl`,
-    /// `validateSchema`) reports a skipped run without making unrelated traffic look
-    /// like over-long detector input.
+    /// `detectXSS`) produce it from a skipped input and turn it into the transaction's
+    /// inspection-incomplete signal and the configured fail-closed action. A host operator
+    /// (`inspectFile`, `rbl`, `validateSchema`) reports [`OperatorOutcome::NotMatched`]
+    /// when it cannot run, because Go returns `false` for every operational error.
     NotInspected,
 }
 
@@ -440,8 +440,9 @@ impl OperatorEnum {
     ///
     /// Only the detectors are bounded by [`libperfusion::MAX_INPUT_LEN`]; their
     /// skipped input is the signal the transaction records and the fail-closed
-    /// policy acts on. Every other operator reports a skipped run for a host or
-    /// resource limitation, which stays a plain miss.
+    /// policy acts on. Every other operator reports a plain
+    /// [`OperatorOutcome::NotMatched`] when it cannot run, so it never raises
+    /// that signal.
     pub(crate) fn is_detector(&self) -> bool {
         matches!(self, Self::DetectSQLi(_) | Self::DetectXSS(_))
     }
