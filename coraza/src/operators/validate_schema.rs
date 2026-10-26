@@ -36,7 +36,11 @@
 //! - Errors name the failing step but never quote the schema, so a rejected schema cannot echo its contents into a log.
 //! - Every schema is compiled as 2020-12, as Go's pinned `kaptinlin/jsonschema` compiler does: it parses `$schema` but
 //!   never consults it. An unknown `$schema` still loads, and a draft-07-only keyword shape such as tuple `items` or a
-//!   boolean `exclusiveMinimum` is a compile error. `format` is therefore always an assertion, as 2020-12 defines it.
+//!   boolean `exclusiveMinimum` is a compile error.
+//! - `format` is not asserted in either engine: Go's compiler keeps `AssertFormat` off (`compiler.go:65`), and 2020-12
+//!   makes `format` an annotation here, so `"format": "email"` accepts `not-an-email`. A schema that declares
+//!   draft-04/6/7 changes nothing, because `$schema` cannot select a dialect; before that dialect pin such a schema did
+//!   assert its formats, so a rule that relied on `format` as a validator now passes those values.
 //! - The engine is this crate's `jsonschema`, not Go's `kaptinlin/jsonschema`, and external `$ref` targets are not
 //!   resolved: the `resolve-file` and `resolve-http` features stay off, so a reference to another document fails at
 //!   compile time instead of reading an arbitrary path or URL.
@@ -475,6 +479,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn format_is_an_annotation_in_every_dialect() {
+        // Go's compiler keeps `AssertFormat` off and 2020-12 makes `format` an
+        // annotation, so an invalid address is no violation whatever `$schema`
+        // declares.
+        for dialect in [
+            "",
+            r#""$schema": "http://json-schema.org/draft-07/schema#","#,
+            r#""$schema": "https://json-schema.org/draft/2020-12/schema","#,
+        ] {
+            let schema = format!(r#"{{{dialect}"type": "string", "format": "email"}}"#);
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("schema.json"), &schema).unwrap();
+            let operator = validate_schema(dir.path(), "schema.json").unwrap();
+            let matched = evaluate(&operator, br#""not-an-email""#);
+            assert!(!matched, "format must not be asserted ({dialect:?}): {schema}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn an_opened_file_outside_the_root_is_rejected() {
@@ -493,6 +516,24 @@ mod tests {
             confirm_opened(&outside_file, &base).unwrap_err(),
             "schema path must stay inside the configured root",
             "a descriptor outside the root must be refused"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_path_that_cannot_be_canonicalised_is_refused() {
+        use super::{canonical_base, confirm_opened};
+
+        // An unnamed temporary file's `/proc/self/fd` link ends in " (deleted)",
+        // so canonicalising the descriptor path fails with ENOENT: the check
+        // must report that failure rather than fall back to accepting the file.
+        let root = tempfile::tempdir().unwrap();
+        let base = canonical_base(root.path()).unwrap();
+        let unnamed = tempfile::tempfile().unwrap();
+        let error = confirm_opened(&unnamed, &base).unwrap_err();
+        assert!(
+            error.starts_with("reading schema from root FS:"),
+            "an unreadable descriptor path must be refused, got {error:?}"
         );
     }
 
