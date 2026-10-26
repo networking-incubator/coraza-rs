@@ -203,7 +203,7 @@ impl Transaction {
         let key = lowercase_like_go(key);
         targets
             .iter()
-            .any(|(removed_variable, exception)| *removed_variable == variable && exception.matches_key(&key))
+            .any(|(removed_variable, exception)| *removed_variable == variable && exception.matches_lowered(&key))
     }
 }
 

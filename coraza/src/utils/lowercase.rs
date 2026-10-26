@@ -26,7 +26,9 @@
 /// Go's simple mapping gives `i`. U+0130 is the only character whose
 /// full mapping expands, and the first character of any full expansion equals the simple
 /// mapping, so taking the first character matches Go for every input. Do not replace this
-/// with `str::to_lowercase`: it widens key comparisons that Go keeps separate.
+/// with `str::to_lowercase`: the full mapping splits U+0130 into two code points, which
+/// stops `İ` from comparing equal to `i` and starts it comparing equal to the two-code-point
+/// sequence Go keeps distinct.
 pub(crate) fn lowercase_like_go(value: &str) -> String {
     value
         .chars()
@@ -34,9 +36,21 @@ pub(crate) fn lowercase_like_go(value: &str) -> String {
         .collect()
 }
 
+/// Append `text` to `out`, lower-cased the way Go's `strings.ToLower` does.
+///
+/// Encodes each lowered character straight into `out`, so collection hot paths avoid the
+/// allocation [`lowercase_like_go`] makes.
+pub(crate) fn push_lowercase_like_go(out: &mut Vec<u8>, text: &str) {
+    for character in text.chars() {
+        let lowered = character.to_lowercase().next().unwrap_or(character);
+        let mut buffer = [0_u8; 4];
+        out.extend_from_slice(lowered.encode_utf8(&mut buffer).as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::lowercase_like_go;
+    use super::{lowercase_like_go, push_lowercase_like_go};
 
     #[test]
     fn folds_u_0130_like_go() {
@@ -44,5 +58,26 @@ mod tests {
         assert_eq!(lowercase_like_go("\u{130}"), "i");
         assert_eq!(lowercase_like_go("X-\u{130}"), "x-i");
         assert_eq!(lowercase_like_go("already"), "already");
+    }
+
+    #[test]
+    fn push_matches_the_string_helper() {
+        for text in [
+            "",
+            "already",
+            "Mixed-ASCII",
+            "\u{130}",
+            "X-\u{130}",
+            "\u{00c4}\u{00df}",
+            "\u{03a3}",
+        ] {
+            let mut pushed = Vec::new();
+            push_lowercase_like_go(&mut pushed, text);
+            assert_eq!(
+                std::str::from_utf8(&pushed),
+                Ok(lowercase_like_go(text).as_str()),
+                "{text:?}"
+            );
+        }
     }
 }

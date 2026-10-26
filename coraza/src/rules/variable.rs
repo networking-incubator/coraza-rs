@@ -86,21 +86,17 @@ impl VariableException {
         }
     }
 
-    /// Check whether the lowered key `key_lower` is excluded.
-    fn matches(&self, key_lower: &str) -> bool {
+    /// Check whether an already-lowered key is excluded.
+    ///
+    /// Callers lower the key exactly once, with [`lowercase_like_go`]: Go runs exception
+    /// regexes against `strings.ToLower(c.Key())` (`internal/corazawaf/transaction.go:684-698`).
+    pub(crate) fn matches_lowered(&self, key_lower: &str) -> bool {
         if let Some(regex) = &self.regex {
-            // Go runs exception regexes against `strings.ToLower(c.Key())`
-            // (`internal/corazawaf/transaction.go:684-698`).
             return regex.is_match(key_lower);
         }
         self.key
             .as_ref()
             .is_some_and(|excluded| excluded.is_empty() || excluded == key_lower)
-    }
-
-    /// Check a key without regard to case, as runtime rule-target exclusions do.
-    pub(crate) fn matches_key(&self, key: &str) -> bool {
-        self.matches(&lowercase_like_go(key))
     }
 }
 
@@ -194,7 +190,10 @@ impl VariableSpec {
                 let key_text = String::from_utf8_lossy(key);
                 let key_lower = has_exceptions.then(|| lowercase_like_go(&key_text));
                 let key_lower = key_lower.as_deref().unwrap_or(&key_text);
-                !self.exceptions.iter().any(|exception| exception.matches(key_lower))
+                !self
+                    .exceptions
+                    .iter()
+                    .any(|exception| exception.matches_lowered(key_lower))
             };
 
             match (collection, &self.key) {
@@ -317,29 +316,28 @@ mod tests {
 
     #[test]
     fn literal_exceptions_lower_keys_like_go() {
-        // Go lowers `İ` to `i` on both sides, so a literal `İ` exception still matches it,
-        // while the two-code-point `i` + U+0307 form stays distinct.
+        // Go lowers `İ` to `i`, so a literal `İ` exception is stored as `i` and still matches
+        // that lowered key, while the two-code-point `i` + U+0307 form stays distinct.
         let exception = VariableException::new_string("\u{130}");
 
-        assert!(exception.matches_key("\u{130}"));
-        assert!(exception.matches_key("I"));
-        assert!(!exception.matches_key("i\u{307}"));
+        assert_eq!(exception.key.as_deref(), Some("i"));
+        assert!(exception.matches_lowered("i"));
+        assert!(!exception.matches_lowered("i\u{307}"));
     }
 
     #[test]
     fn regex_exceptions_match_the_lowered_key() {
         let lower = VariableException::new_regex(Regex::new("^user$").expect("test regex is valid"));
 
-        assert!(lower.matches_key("USER"));
-        assert!(lower.matches_key("user"));
-        assert!(!lower.matches_key("user2"));
-        // U+0130 folds to `i`, as `strings.ToLower` does, so the pattern sees `i`.
+        assert!(lower.matches_lowered("user"));
+        assert!(!lower.matches_lowered("user2"));
+        // Callers fold U+0130 to `i`, as `strings.ToLower` does, so the pattern sees `i`.
         let single = VariableException::new_regex(Regex::new("^i$").expect("test regex is valid"));
-        assert!(single.matches_key("\u{130}"));
+        assert!(single.matches_lowered("i"));
         // Go matches the pattern against the lowered key, so an upper-case pattern never
         // excludes the key it was written for.
         let upper = VariableException::new_regex(Regex::new("^USER$").expect("test regex is valid"));
-        assert!(!upper.matches_key("USER"));
+        assert!(!upper.matches_lowered("user"));
     }
 
     #[test]
