@@ -55,6 +55,7 @@ test:
 	cargo xtask corpus-check
 	cargo xtask tables-check
 	cargo xtask conformance-check
+	cargo xtask go-fixtures-check
 	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
 	cargo test -p coraza --features host-operators,validate-schema $(_NOCAPTURE)
@@ -80,6 +81,7 @@ go-harness-check:
 	if [ -n "$$files" ]; then printf '%s\n' "$$files"; exit 1; fi
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go vet ./...
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go test ./...
+	cargo xtask go-fixtures-check --require-go
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go run ./cmd/checkresolve
 
 coraza-coordinator-check:
@@ -147,25 +149,25 @@ lint:
 
 lint-extra:
 	typos .
-	taplo format --check .
+	taplo format --check '**/*.toml'
 	actionlint -ignore 'specifying action "\$$/.+" in invalid format because ref is missing'
-	shellcheck .hooks/*
+	shellcheck $$(git ls-files '*.sh') .hooks/pre-commit
 
 audit:
 	cargo audit
 	cargo deny check
 	cargo deny --all-features check
 
-# Offline corpus, table and conformance refresh tools are not runtime coverage targets.
+# Offline corpus, table, conformance and Go fixture tools are not runtime coverage targets.
 # llvm-cov sees native test profiles; Envoy WASM callbacks are exercised in the integration job.
 # The default workspace run does not enable the gated operators or the optional host/HTTPS
 # code, so the second run measures coraza with every feature and enforces the same floors.
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
-		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
+		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs|xtask/src/go_fixtures\.rs'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
-		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
+		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs|xtask/src/go_fixtures\.rs'
 	cargo llvm-cov nextest -p coraza --all-features --summary-only \
 		--fail-under-lines 90 --fail-under-regions 80
 
@@ -219,7 +221,7 @@ help:
 	@echo "  test       verify corpus and run all tests"
 	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
 	@echo "  parity-differential   run pinned C/Go corpus and generated-byte parity gates"
-	@echo "  go-harness-check      gofmt, vet, test and resolution-check the Go benchmark module"
+	@echo "  go-harness-check      verify Go fixtures, then gofmt, vet, test and resolution-check the Go benchmark module"
 	@echo "  coraza-coordinator-check  gofmt, vet and test the Coraza benchmark coordinator"
 	@echo "  coraza-parity         validate identities and run the correctness parity gate"
 	@echo "  coraza-bench          run the correctness gate and the paired timing protocol"

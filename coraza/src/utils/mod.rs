@@ -26,4 +26,4 @@ pub(crate) mod lowercase;
 pub mod strings;
 pub(crate) mod time;
 
-pub(crate) use lowercase::lowercase_like_go;
+pub(crate) use lowercase::{lowercase_char, lowercase_like_go, uppercase_char};

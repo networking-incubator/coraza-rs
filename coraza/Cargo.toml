@@ -9,10 +9,13 @@ description = "SecLang rule compilation and request processing for a separate Ru
 
 [dependencies]
 aho-corasick = "1.1"
-base64 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
+base64 = { version = "0.23", default-features = false, features = [
+  "alloc",
+], optional = true }
 http-body-util = { version = "0.1", optional = true }
 glob = { workspace = true }
 fastrand = "2"
+httparse = { version = "1.10", optional = true }
 hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 ipnet = "2.9"
@@ -24,8 +27,16 @@ regex = "1.10"
 serde_json = "1"
 sha1 = "0.11"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"], optional = true }
-ureq = { version = "3.5", default-features = false, features = ["rustls"], optional = true }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "time",
+], optional = true }
+ureq = { version = "3.5", default-features = false, features = [
+  "rustls",
+], optional = true }
 winnow = "1.0.4"
 
 [dev-dependencies]
@@ -33,7 +44,14 @@ base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 sha2 = "0.11"
 
 [features]
-async-server = ["dep:base64", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio"]
+async-server = [
+  "dep:base64",
+  "dep:http-body-util",
+  "dep:httparse",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:tokio",
+]
 # `SecAuditLogType HTTPS` writer, via ureq's blocking client with rustls.
 https-audit = ["dep:ureq"]
 # `@inspectFile`, which runs a local program over each value.

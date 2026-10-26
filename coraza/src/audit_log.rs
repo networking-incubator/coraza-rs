@@ -43,7 +43,7 @@ use crate::{
     collection::MatchData,
     config::WafConfig,
     types::{AuditLogFormat, AuditLogPart, AuditLogParts, AuditLogType},
-    utils::time::LocalTime,
+    utils::{strings::go_quote, time::LocalTime},
 };
 
 /// Next process-local suffix for concurrent audit log filenames.
@@ -354,34 +354,6 @@ fn escape_log_message(text: &str) -> String {
         }
     }
     escaped
-}
-
-/// Quote a string using Go's `strconv.Quote` conventions.
-fn go_quote(text: &str) -> String {
-    let mut quoted = String::with_capacity(text.len() + 2);
-    quoted.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\u{07}' => quoted.push_str("\\a"),
-            '\u{08}' => quoted.push_str("\\b"),
-            '\u{0c}' => quoted.push_str("\\f"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            '\u{0b}' => quoted.push_str("\\v"),
-            character if (character as u32) < 0x20 || character as u32 == 0x7F => {
-                write!(quoted, "\\x{:02x}", character as u32).unwrap_or(());
-            },
-            character if character.is_control() => {
-                write!(quoted, "\\u{:04x}", character as u32).unwrap_or(());
-            },
-            character => quoted.push(character),
-        }
-    }
-    quoted.push('"');
-    quoted
 }
 
 /// Callback used to emit rules with the `log` action.

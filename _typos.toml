@@ -1,20 +1,24 @@
 [files]
 extend-exclude = [
-    "libperfusion/data/sqli_keywords.txt",
-    "libperfusion/data/sqli_keywords_local.txt",
-    "libperfusion/tests/corpus/test-*.txt",
-    # Exact HTML5 entity names and code-point mappings from Go's html package.
-    "coraza/src/transformations/html_entities.rs",
-    # Exact Unicode best-fit mapping data from the Coraza port.
-    "coraza/src/transformations/unicode_bestfit.rs",
-    # Exact HTML entity names and mappings from Go's encoding/xml port.
-    "coraza/src/body_processors/xml/tables.rs",
+  "libperfusion/data/sqli_keywords.txt",
+  "libperfusion/data/sqli_keywords_local.txt",
+  "libperfusion/tests/corpus/test-*.txt",
+  # Exact HTML5 entity names and code-point mappings from Go's html package.
+  "coraza/src/transformations/html_entities.rs",
+  # Exact Unicode best-fit mapping data from the Coraza port.
+  "coraza/src/transformations/unicode_bestfit.rs",
+  # Exact HTML entity names and mappings from Go's encoding/xml port.
+  "coraza/src/body_processors/xml/tables.rs",
+  # Byte-identical Go Coraza v3.8.1 test data: the inputs are the bytes under
+  # test, not prose. Only this UTF-8 case trips the dictionary; the other 28
+  # files stay checked.
+  "coraza/tests/go_operators/validateUtf8Encoding.json",
 ]
 
 [default]
 extend-ignore-re = [
-    '<XML ID="xss"><I><B>&lt;IMG SRC="javas<!-- -->cript:javascript:alert\(1\)"&gt;</B></I></XML><SPAN DATASRC="#xss" DATAFLD="B" DATAFORMATAS="HTML"></SPAN>',
-    'x:ontimer=.*cript\$x:alert\(1\)',
+  '<XML ID="xss"><I><B>&lt;IMG SRC="javas<!-- -->cript:javascript:alert\(1\)"&gt;</B></I></XML><SPAN DATASRC="#xss" DATAFLD="B" DATAFORMATAS="HTML"></SPAN>',
+  'x:ontimer=.*cript\$x:alert\(1\)',
 ]
 
 [default.extend-identifiers]

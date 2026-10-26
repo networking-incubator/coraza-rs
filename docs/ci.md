@@ -13,7 +13,9 @@ This repository uses GitHub Actions to block risky changes early.
   feature set, so the feature-gated operators keep their tests.
 - `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
   integration checks against the pinned Envoy 1.40.0 image.
-- Meta-lint: `make lint-extra`
+- Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
+  shellcheck); the downloaded tools are version- and checksum-pinned, see
+  [Lint tool trust](#lint-tool-trust).
 - Feature matrix: test and lint each feature combo with `cargo-hack`
 
 ### `differential parity`
@@ -31,12 +33,41 @@ the [parity protocol](../libperfusion/tools/parity/PROTOCOL.md).
 
 ### `focused-fuzz`
 
-- Runs short campaigns for raw bytes and SQL/HTML grammar inputs.
+- Runs 60-second libFuzzer campaigns with `-seed=20261007`, `-timeout=5` and
+  per-target `-max_len`: `raw_bytes` (262144), `sql_grammar` (4096) and
+  `html_grammar` (4096) in `libperfusion`; `coraza_variable_list` (4096),
+  `seclang_operator` (4096), `seclang_rule_compilation` (4096),
+  `coraza_uri_parser` (65536), `coraza_json_body` (65536) and
+  `coraza_multipart_body` (65536) in `coraza`.
+- Campaign corpora and crash artifacts are per target under
+  `$RUNNER_TEMP/fuzz/corpus/<target>` and `$RUNNER_TEMP/fuzz/artifacts/<target>`.
+- Each campaign requests 60 seconds of fuzzing for nine targets. Expect roughly
+  10-15 minutes of wall time including the fuzz build, corpus setup and log
+  upload on the CI runner; the 20-minute job timeout is sized for that range.
 - Uploads campaign logs and crash artifacts, including on failure.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
 
 See the [fuzzing guide](../libperfusion/docs/FUZZING.md) for local runs and
 regression promotion.
+
+### Lint tool trust
+
+`make lint-extra` runs `typos`, `taplo`, `actionlint` and `shellcheck`.
+
+- `typos`, `taplo` and `actionlint` are GitHub release binaries in the
+  `meta-lint` job. `.github/workflows/tests.yaml` pins each version and the
+  SHA-256 of the exact release archive; the job downloads the archive, verifies
+  it with `sha256sum --check --strict`, and only then extracts and executes it.
+  A version bump must update both the version and the checksum.
+- `shellcheck` comes from the pinned `ubuntu-24.04` runner image, not from a
+  download in this repository.
+- Rust tools (for example `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`,
+  `cargo-nextest`, `cargo-hack`, `cargo-machete`, `cargo-fuzz`) are installed
+  with `cargo install --version <pinned> --locked`, so their dependency graphs
+  come from the locked crate manifests rather than from floating updates.
+
+Local `make lint-extra` runs use the binaries already on `PATH`; the CI job is
+where downloaded tool integrity is enforced.
 
 ### `Coraza harness`
 
@@ -46,14 +77,41 @@ regression promotion.
   `go.mod`, and commands run with `GOWORK=off GOTOOLCHAIN=local` so an ambient
   workspace or implicit toolchain download cannot change the resolved engine.
 - `coraza-examples`: runs the async FTW example server tests.
+- `tests` also replays Go Coraza's acceptance corpus against this crate:
+  `coraza/tests/go_operators.rs` runs the 29-file operator corpus in
+  `coraza/tests/go_operators`, and `coraza/tests/go_profiles_replay.rs` replays
+  the 49 default-build engine profiles exported into
+  `coraza/tests/go_profiles/profiles.json`. The replay asserts the fixture's
+  Go version, build tags and profile/stage inventory before running.
+- The vendored Go Coraza fixtures are refreshed from the version pinned in
+  `coraza/tests/go_profiles/exporter/go.mod`: bump that `require` version, run
+  `cargo xtask go-fixtures-refresh`, and review the diff, including the
+  `FIXTURE_*` count constants in `coraza/tests/go_operators.rs` and
+  `coraza/tests/go_profiles_replay.rs`. The command needs the pinned module in
+  the Go module cache (`go mod download`). `cargo xtask go-fixtures-check`
+  compares the checked-in operator and profile data bytes with that module and
+  validates the operator and profile inventories against the `OPERATOR_*` and
+  `PROFILE_*` constants: `make test` runs it in lenient mode (it skips without
+  Go), and `make go-harness-check` runs it after its Go tests with
+  `--require-go` so a missing toolchain or a drifted fixture fails there.
+- `cargo xtask go-fixtures-check --provenance` also regenerates
+  `coraza/tests/go_profiles/profiles.json` with the exporter and byte-compares
+  it, so a same-inventory edit to rules or expected results fails. It needs the
+  exporter's pinned Go 1.27.3 toolchain, which the `go-harness` setup does not
+  install (that job runs `GOTOOLCHAIN=local` with an older Go), so it is a
+  manual/pre-release step and not part of `make test` or `make go-harness-check`.
 - `ftw-smoke`: runs the FTW runner in strict conformance mode against the
   checked-in smoke rules and test directory. Exact rule, file, test case and
   stage counts are required, and the manifest must contain no failed, skipped,
   ignored or forced-fail results. The result manifest is uploaded. It needs no
   CRS checkout.
 
-The FTW runner and benchmark module have separate `go.mod` files; neither is
-part of the Cargo workspace.
+Five modules have their own `go.mod` — `ftw-runner`, `benchmarks/coraza/go`,
+`benchmarks/coraza/coordinator`, `coraza/tests/go_profiles/exporter` and
+`xtask/tools` — and none is part of the Cargo workspace. Only
+`benchmarks/coraza/go` is pinned by the `go-harness` job's setup step; the
+exporter requires a newer Go than that job installs, so it is built on demand
+by the fixture regeneration command.
 
 ### `supply-chain`
 

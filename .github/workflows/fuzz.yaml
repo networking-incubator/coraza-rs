@@ -66,6 +66,20 @@ jobs:
           cargo fuzz run coraza_variable_list "$RUNNER_TEMP/fuzz/corpus/coraza_variable_list" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_variable_list/" > "$RUNNER_TEMP/fuzz/coraza_variable_list.log" 2>&1
           tail -n 4 "$RUNNER_TEMP/fuzz/coraza_variable_list.log"
 
+      - name: Run Coraza operator and rule-compilation campaigns
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          RUSTUP_TOOLCHAIN: nightly-2026-10-06
+        working-directory: coraza
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/seclang_operator" "$RUNNER_TEMP/fuzz/artifacts/seclang_operator"
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/seclang_rule_compilation" "$RUNNER_TEMP/fuzz/artifacts/seclang_rule_compilation"
+          export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
+          cargo fuzz run seclang_operator "$RUNNER_TEMP/fuzz/corpus/seclang_operator" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/seclang_operator/" > "$RUNNER_TEMP/fuzz/seclang_operator.log" 2>&1
+          cargo fuzz run seclang_rule_compilation "$RUNNER_TEMP/fuzz/corpus/seclang_rule_compilation" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/seclang_rule_compilation/" > "$RUNNER_TEMP/fuzz/seclang_rule_compilation.log" 2>&1
+          tail -n 4 "$RUNNER_TEMP/fuzz/seclang_operator.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/seclang_rule_compilation.log"
+
       - name: Run Coraza parser campaigns
         env:
           ASAN_OPTIONS: detect_leaks=0

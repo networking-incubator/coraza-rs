@@ -421,6 +421,29 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_sec_rule_accepts_an_unterminated_action_value() {
+        // The last rule of Go's `multipart_error.yaml` profile ends with `msg:'` and no
+        // closing quote, which Go accepts, keeping the quote in the message.
+        let rule = compile_sec_rule(
+            "MULTIPART_STRICT_ERROR \"!@eq 0\" \"id:200003,phase:2,t:none,log,deny,status:400, \
+             msg:'Multipart request body failed strict validation.\"",
+        )
+        .unwrap();
+
+        assert_eq!(rule.metadata().id, 200_003);
+        let msg = rule.metadata().msg.as_ref().map(crate::operators::Macro::as_str);
+        assert_eq!(msg, Some("'Multipart request body failed strict validation."));
+    }
+
+    #[test]
+    fn test_compile_sec_rule_rejects_an_unterminated_action_list() {
+        // Go's `parseActionOperator` requires the action list itself to be quoted
+        let error = compile_sec_rule("ARGS \"@rx attack\" \"id:1,msg:'unclosed").unwrap_err();
+
+        assert!(error.message.contains("invalid actions"), "{}", error.message);
+    }
+
+    #[test]
     fn test_compile_sec_marker_simple() {
         let rule = compile_sec_marker("BEGIN_TESTS").unwrap();
         assert_eq!(rule.metadata().id, 0);

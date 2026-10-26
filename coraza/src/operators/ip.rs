@@ -22,18 +22,48 @@
 
 use std::{net::IpAddr, path::Path, str::FromStr as _};
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 
 use crate::{
     operators::{Datasets, Operator, Outputs},
     transaction::Transaction,
 };
 
+/// Parse an input address the way Go's `net.IPNet.Contains` sees it.
+///
+/// Go applies `net.IP.To4` to the address it tests, so an IPv4-mapped IPv6 address is an
+/// IPv4 address and never fits an IPv6 network.
+fn parse_input(input: &[u8]) -> Option<IpAddr> {
+    let text = std::str::from_utf8(input).ok()?;
+    let ip = text.parse::<IpAddr>().ok()?;
+    Some(ip.to_canonical())
+}
+
+/// Rewrite a parsed network the way Go's `net.IPNet.Contains` sees it.
+///
+/// Go's `networkNumberAndMask` applies `To4` to the network address and, for a mapped one,
+/// keeps only the last 32 bits of the mask. `::ffff:192.0.2.128/124` is therefore
+/// `192.0.2.128/28`, and a mapped network shorter than /96 is an IPv4 `/0`.
+fn canonical_net(net: IpNet) -> IpNet {
+    let IpNet::V6(inner) = net.trunc() else {
+        return net;
+    };
+    let Some(addr) = inner.addr().to_ipv4_mapped() else {
+        return net;
+    };
+    let prefix = inner.prefix_len().saturating_sub(96);
+    let Ok(canonical) = Ipv4Net::new(addr, prefix) else {
+        return net;
+    };
+    IpNet::V4(canonical)
+}
+
 /// IP address matching operator.
 ///
 /// Performs fast IPv4 or IPv6 address matching with support for CIDR notation.
 /// Can match individual IPs or IP ranges. Automatically adds appropriate subnet masks
-/// (/32 for IPv4, /128 for IPv6) when not specified.
+/// (/32 for IPv4, /128 for IPv6) when not specified. Unparsable entries are ignored, as Go's
+/// `newIPMatch` ignores them, so an argument with no valid entry matches nothing.
 ///
 /// # Arguments
 ///
@@ -51,18 +81,13 @@ pub struct IpMatch {
 impl IpMatch {
     /// Creates a new `IpMatch` operator from a comma-separated list of IPs/CIDRs.
     ///
+    /// `10.0.0.0/100` alone yields an operator that matches nothing rather than an error, which
+    /// is what Go's `newIPMatch` does when `net.ParseCIDR` rejects an entry.
+    ///
     /// # Arguments
     ///
     /// * `ips` - Comma-separated list of IP addresses with optional CIDR notation
-    ///
-    /// # Returns
-    ///
-    /// `Ok(IpMatch)` if at least one valid IP/CIDR was parsed, `Err` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no valid IP address or CIDR block is provided.
-    pub fn new(ips: &str) -> Result<Self, String> {
+    pub fn new(ips: &str) -> Self {
         let mut subnets = Vec::new();
 
         for ip_str in ips.split(',') {
@@ -83,22 +108,17 @@ impl IpMatch {
             };
 
             if let Ok(net) = IpNet::from_str(&ip_with_cidr) {
-                subnets.push(net);
+                subnets.push(canonical_net(net));
             }
         }
 
-        if subnets.is_empty() {
-            return Err("no valid IP addresses or CIDR blocks provided".to_owned());
-        }
-
-        Ok(IpMatch { subnets })
+        IpMatch { subnets }
     }
 }
 
 impl Operator for IpMatch {
     fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        // Parse the input IP address
-        let Ok(Ok(ip)) = std::str::from_utf8(input).map(IpAddr::from_str) else {
+        let Some(ip) = parse_input(input) else {
             return false;
         };
 
@@ -118,11 +138,7 @@ impl Operator for IpMatch {
 /// # Arguments
 ///
 /// * `ips` - Comma-separated list of IP addresses with optional CIDR blocks
-///
-/// # Errors
-///
-/// Returns an error when no valid IP address or CIDR block is provided.
-pub fn ip_match(ips: &str) -> Result<IpMatch, String> {
+pub fn ip_match(ips: &str) -> IpMatch {
     IpMatch::new(ips)
 }
 
@@ -145,14 +161,14 @@ impl Operator for IpMatchFromDataset {
 ///
 /// # Errors
 ///
-/// If `datasets` has no dataset `name`, or an empty one, or it holds no valid IP.
+/// If `datasets` has no dataset `name`, or an empty one.
 pub fn ip_match_from_dataset(name: &str, datasets: &Datasets) -> Result<IpMatchFromDataset, String> {
     let items = datasets
         .get(name)
         .filter(|items| !items.is_empty())
         .ok_or_else(|| format!("dataset \"{name}\" not found"))?;
     Ok(IpMatchFromDataset {
-        ips: IpMatch::new(&items.join(","))?,
+        ips: IpMatch::new(&items.join(",")),
     })
 }
 
@@ -193,8 +209,8 @@ impl IpMatchFromFile {
     ///
     /// # Returns
     ///
-    /// `Ok(IpMatchFromFile)` if file was read and at least one valid IP was parsed,
-    /// `Err` if file couldn't be read or no valid IPs were found.
+    /// `Ok(IpMatchFromFile)` if the file was read, even when it holds no valid entry (which
+    /// matches nothing, as in Go), `Err` if the file could not be read.
     ///
     /// # File Format
     ///
@@ -205,7 +221,7 @@ impl IpMatchFromFile {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be read or contains no valid addresses.
+    /// Returns an error when the file cannot be read.
     pub fn new(file_path: impl AsRef<Path>) -> Result<Self, String> {
         let file_path = file_path.as_ref();
         let content = std::fs::read_to_string(file_path)
@@ -233,12 +249,8 @@ impl IpMatchFromFile {
             };
 
             if let Ok(net) = IpNet::from_str(&ip_with_cidr) {
-                subnets.push(net);
+                subnets.push(canonical_net(net));
             }
-        }
-
-        if subnets.is_empty() {
-            return Err(format!("No valid IP addresses found in {}", file_path.display()));
         }
 
         Ok(Self { subnets })
@@ -248,7 +260,7 @@ impl IpMatchFromFile {
 impl Operator for IpMatchFromFile {
     fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
         // Parse input IP address
-        let Ok(Ok(ip)) = std::str::from_utf8(input).map(IpAddr::from_str) else {
+        let Some(ip) = parse_input(input) else {
             return false;
         };
 
@@ -274,18 +286,76 @@ pub fn ip_match_from_file(file_path: impl AsRef<Path>) -> Result<IpMatchFromFile
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "operator tests use fixed valid inputs")]
 mod tests {
-    use super::{Datasets, Operator as _, Outputs, ip_match, ip_match_from_dataset};
+    use super::{Datasets, Operator as _, Outputs, ip_match, ip_match_from_dataset, ip_match_from_file};
     use crate::transaction::Transaction;
 
     #[test]
-    fn matches_ipv4_and_ipv6_networks_and_rejects_invalid_input() {
+    fn matches_ipv4_and_ipv6_networks() {
         let tx = Transaction::new("operator-test");
-        let operator = ip_match("192.168.1.0/24, ::1").unwrap();
+        let operator = ip_match("192.168.1.0/24, ::1");
         assert!(operator.evaluate(&tx, b"192.168.1.10", &mut Outputs::default()));
         assert!(operator.evaluate(&tx, b"::1", &mut Outputs::default()));
         assert!(!operator.evaluate(&tx, b"192.168.2.10", &mut Outputs::default()));
         assert!(!operator.evaluate(&tx, b"\xff", &mut Outputs::default()));
-        assert!(ip_match("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn skips_unparsable_entries_like_go() {
+        let tx = Transaction::new("operator-test");
+        // Go's newIPMatch drops an entry net.ParseCIDR rejects; an IPv4 /100 is one.
+        let invalid = ip_match("10.0.0.0/100");
+        assert!(!invalid.evaluate(&tx, b"10.10.10.11", &mut Outputs::default()));
+        assert!(!ip_match("").evaluate(&tx, b"10.10.10.11", &mut Outputs::default()));
+
+        // A valid entry next to unparsable ones keeps matching.
+        let mixed = ip_match("192.168.1.0/24, 10.0.0.0/100, not-an-ip");
+        assert!(mixed.evaluate(&tx, b"192.168.1.10", &mut Outputs::default()));
+        assert!(!mixed.evaluate(&tx, b"10.10.10.11", &mut Outputs::default()));
+        assert!(!mixed.evaluate(&tx, b"203.0.113.1", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn skips_unparsable_file_entries_like_go() {
+        let tx = Transaction::new("operator-test");
+        let dir = tempfile::tempdir().unwrap();
+
+        let mixed = dir.path().join("mixed.dat");
+        std::fs::write(&mixed, "192.168.1.0/24\n10.0.0.0/100\nnot-an-ip\n").unwrap();
+        let operator = ip_match_from_file(&mixed).unwrap();
+        assert!(operator.evaluate(&tx, b"192.168.1.10", &mut Outputs::default()));
+        assert!(!operator.evaluate(&tx, b"10.10.10.11", &mut Outputs::default()));
+
+        let invalid = dir.path().join("invalid.dat");
+        std::fs::write(&invalid, "10.0.0.0/100\n").unwrap();
+        assert!(
+            !ip_match_from_file(&invalid)
+                .unwrap()
+                .evaluate(&tx, b"10.10.10.11", &mut Outputs::default())
+        );
+
+        assert!(ip_match_from_file(dir.path().join("missing.dat")).is_err());
+    }
+
+    #[test]
+    fn canonicalizes_ipv4_mapped_ipv6_like_go() {
+        let tx = Transaction::new("operator-test");
+        // Go's Contains applies To4 to the tested address, so a mapped address is an IPv4
+        // address and does not fit an IPv6 network.
+        let v6 = ip_match("0:0::/80");
+        assert!(!v6.evaluate(&tx, b"0000:0000:0000:0000:0000:ffff:ffff:ffff", &mut Outputs::default()));
+        assert!(v6.evaluate(&tx, b"0000:0000:0000:0000:0000:0000:0000:0009", &mut Outputs::default()));
+
+        // A mapped network is the IPv4 network of its last 32 bits: /124 is /28.
+        let mapped = ip_match("::ffff:192.0.2.128/124");
+        assert!(mapped.evaluate(&tx, b"::ffff:192.0.2.143", &mut Outputs::default()));
+        assert!(mapped.evaluate(&tx, b"192.0.2.143", &mut Outputs::default()));
+        assert!(!mapped.evaluate(&tx, b"192.0.2.127", &mut Outputs::default()));
+        assert!(!mapped.evaluate(&tx, b"::1", &mut Outputs::default()));
+
+        // An IPv4 network contains the mapped form of its members.
+        let v4 = ip_match("192.0.2.0/24");
+        assert!(v4.evaluate(&tx, b"::ffff:192.0.2.1", &mut Outputs::default()));
+        assert!(!v4.evaluate(&tx, b"::ffff:192.0.3.1", &mut Outputs::default()));
     }
 
     #[test]
@@ -296,6 +366,9 @@ mod tests {
         let operator = ip_match_from_dataset("private", &datasets).unwrap();
         assert!(operator.evaluate(&tx, b"10.1.2.3", &mut Outputs::default()));
         assert!(!operator.evaluate(&tx, b"192.0.2.1", &mut Outputs::default()));
+        datasets.insert("invalid".to_owned(), vec!["10.0.0.0/100".to_owned()]);
+        let operator = ip_match_from_dataset("invalid", &datasets).unwrap();
+        assert!(!operator.evaluate(&tx, b"10.1.2.3", &mut Outputs::default()));
         assert!(ip_match_from_dataset("missing", &datasets).is_err());
     }
 }

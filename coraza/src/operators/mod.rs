@@ -369,7 +369,7 @@ impl OperatorEnum {
                 .map_err(|error| error.to_string()),
             "detectsqli" => Ok(Self::DetectSQLi(detect_sqli())),
             "detectxss" => Ok(Self::DetectXSS(detect_xss())),
-            "ipmatch" => ip_match(argument).map(Self::IpMatch),
+            "ipmatch" => Ok(Self::IpMatch(ip_match(argument))),
             "ipmatchfromfile" | "ipmatchf" => {
                 ip_match_from_file(context.base_dir.join(argument)).map(Self::IpMatchFromFile)
             },

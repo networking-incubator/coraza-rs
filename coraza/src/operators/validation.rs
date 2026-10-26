@@ -98,6 +98,8 @@ pub fn no_match() -> NoMatch {
 pub struct ValidateByteRange {
     /// Bitmap of valid bytes (256 possible byte values).
     valid_bytes: Box<[bool; 256]>,
+    /// The argument was empty, which Go's factory turns into `unconditionalMatch`.
+    unconditional: bool,
 }
 
 impl ValidateByteRange {
@@ -105,7 +107,8 @@ impl ValidateByteRange {
     ///
     /// # Arguments
     ///
-    /// * `ranges` - Comma-separated list like "10,13,32-126"
+    /// * `ranges` - Comma-separated list like "10,13,32-126"; an empty list matches every input, as Go's
+    ///   `newValidateByteRange` returns `unconditionalMatch` for it.
     ///
     /// # Returns
     ///
@@ -116,9 +119,9 @@ impl ValidateByteRange {
     /// Returns an error if a byte value or range endpoint is outside 0 to 255.
     pub fn new(ranges: &str) -> Result<Self, String> {
         if ranges.is_empty() {
-            // Empty range means allow all bytes (unconditional match for violations = always false)
             return Ok(ValidateByteRange {
-                valid_bytes: Box::new([true; 256]),
+                valid_bytes: Box::new([false; 256]),
+                unconditional: true,
             });
         }
 
@@ -162,12 +165,16 @@ impl ValidateByteRange {
 
         Ok(ValidateByteRange {
             valid_bytes: Box::new(valid_bytes),
+            unconditional: false,
         })
     }
 }
 
 impl Operator for ValidateByteRange {
     fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+        if self.unconditional {
+            return true;
+        }
         if input.is_empty() {
             return false; // Empty input is valid
         }
@@ -416,6 +423,11 @@ mod tests {
         let url = validate_url_encoding();
         assert!(!url.evaluate(&tx, b"/path%20name", &mut Outputs::default()));
         assert!(url.evaluate(&tx, b"/path%2G", &mut Outputs::default()));
+
+        // Go's factory substitutes unconditionalMatch for an empty argument.
+        let empty = validate_byte_range("").unwrap();
+        assert!(empty.evaluate(&tx, b"TestCase", &mut Outputs::default()));
+        assert!(empty.evaluate(&tx, b"", &mut Outputs::default()));
     }
 
     #[test]

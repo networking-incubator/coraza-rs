@@ -184,8 +184,10 @@ pub struct Transaction {
     audit_error: Option<Failure>,
     /// Whether temporary upload cleanup already ran, successfully or not.
     uploads_closed: bool,
-    /// The terminal temporary upload cleanup failure, returned by every later `finish`.
-    cleanup_error: Option<Failure>,
+    /// Whether upload cleanup and the body buffer resets already ran.
+    finalized: bool,
+    /// Finalization failures in the order they occurred, returned by every later `finish`.
+    finalization_errors: Vec<Failure>,
     /// A disruptive action applied while the engine is on.
     interruption: Option<Interruption>,
     /// The first disruptive action that would apply in detection-only mode.
@@ -418,7 +420,8 @@ impl Transaction {
             audit_attempted: false,
             audit_error: None,
             uploads_closed: false,
-            cleanup_error: None,
+            finalized: false,
+            finalization_errors: Vec::new(),
             interruption: None,
             would_be_interruption: None,
             skip: 0,
@@ -599,11 +602,19 @@ impl Transaction {
     }
 
     /// Return counters for the request body bytes this transaction received.
+    ///
+    /// [`Transaction::finish`] releases the request body buffer, so a call after it
+    /// reports `retained` as zero and `spilled` as false while `supplied`, `inspected`
+    /// and `truncated` keep the values recorded during the request body phase.
     pub fn request_body_stats(&self) -> BodyIngestionStats {
         self.request_body_buffer.stats()
     }
 
     /// Return counters for the response body bytes this transaction received.
+    ///
+    /// [`Transaction::finish`] releases the response body buffer, so a call after it
+    /// reports `retained` as zero and `spilled` as false while `supplied`, `inspected`
+    /// and `truncated` keep the values recorded during the response body phase.
     pub fn response_body_stats(&self) -> BodyIngestionStats {
         self.response_body_buffer.stats()
     }
@@ -665,8 +676,8 @@ impl Transaction {
         self.interruption.clone()
     }
 
-    /// Run the terminal logging phase and temporary upload cleanup once, returning the
-    /// stored terminal outcome.
+    /// Run the terminal logging phase, temporary upload cleanup and body buffer release
+    /// once, returning the stored terminal outcome.
     ///
     /// The transaction writes at most one audit entry, and only when one is due, so a
     /// `finish` with nothing to write activates no sink. The audit write is attempted
@@ -675,15 +686,27 @@ impl Transaction {
     /// writer inside the sink still reconnects and re-sends one frame after a write
     /// failure, so that sink may see an entry twice. Temporary upload files are removed
     /// in the same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza
-    /// calls `Close` once, so a removal failure is stored and reported here rather than
-    /// retried.
+    /// calls `Close` once, so every removal failure is stored and reported here rather
+    /// than retried.
+    ///
+    /// Like Go's `Close` (`internal/corazawaf/transaction.go:1739-1745`, v3.8.1), the
+    /// first call also resets the request body buffer and then the response body buffer,
+    /// releasing either spill file. A reset zeroes `retained` and clears `spilled` in
+    /// [`Transaction::request_body_stats`] and [`Transaction::response_body_stats`];
+    /// `supplied`, `inspected` and `truncated` survive so the counters still describe the
+    /// body the transaction saw.
     ///
     /// [`WafConfig::upload_keep_files`]: crate::config::WafConfig::upload_keep_files
     ///
     /// # Errors
     ///
-    /// Returns the stored audit write failure, or the stored temporary upload cleanup
-    /// failure. An audit failure takes precedence when both are stored.
+    /// Returns the stored audit write failure, or a combined finalization failure. Every
+    /// finalization failure is kept, in the order it happened: an I/O failure while
+    /// processing the response body, each temporary upload removal failure, the request
+    /// body buffer reset, then the response body buffer reset. The combined message names
+    /// each failure and starts with `transaction close failed:`, as in Go. An audit failure
+    /// takes precedence when both are stored; [`Transaction::finalization_error`] still
+    /// reports the stored finalization failure in that case.
     pub fn finish(&mut self) -> std::io::Result<()> {
         if !self.audit_attempted {
             self.audit_attempted = true;
@@ -691,27 +714,64 @@ impl Transaction {
                 self.audit_error = Some(Failure::new(&error));
             }
         }
-        if self.cleanup_error.is_none()
-            && let Err(error) = self.close_uploads_once()
-        {
-            self.cleanup_error = Some(Failure::new(&error));
+        if !self.finalized {
+            self.finalized = true;
+            // Go's `Transaction.Close` removes temporary uploads and resets the request
+            // and response body buffers in this order, joining every failure
+            // (`internal/corazawaf/transaction.go:1712-1745`, v3.8.1).
+            if let Err(error) = self.close_uploads_once() {
+                self.finalization_errors.push(Failure::new(&error));
+            }
+            for (step, error) in [
+                ("resetting request body buffer", self.request_body_buffer.reset()),
+                ("resetting response body buffer", self.response_body_buffer.reset()),
+            ] {
+                if let Err(error) = error {
+                    self.finalization_errors.push(Failure::new(&std::io::Error::new(
+                        error.kind(),
+                        format!("{step}: {error}"),
+                    )));
+                }
+            }
         }
-        self.audit_error
-            .as_ref()
-            .or(self.cleanup_error.as_ref())
-            .map_or(Ok(()), |error| Err(error.to_error()))
+        if let Some(error) = self.audit_error.as_ref() {
+            return Err(error.to_error());
+        }
+        self.finalization_failure().map_or(Ok(()), Err)
+    }
+
+    /// The combined finalization failure, or `None` when every step succeeded.
+    fn finalization_failure(&self) -> Option<std::io::Error> {
+        if self.finalization_errors.is_empty() {
+            return None;
+        }
+        let messages = self
+            .finalization_errors
+            .iter()
+            .map(|failure| failure.to_error().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(std::io::Error::other(format!("transaction close failed: {messages}")))
+    }
+
+    /// Return the combined finalization failure stored by [`Transaction::finish`], if any.
+    ///
+    /// [`Transaction::finish`] reports a stored audit write failure in preference to this
+    /// one when both happened, so this accessor is how the finalization failure stays
+    /// observable. Every removal and reset failure is included, in the order it happened.
+    pub fn finalization_error(&self) -> Option<std::io::Error> {
+        self.finalization_failure()
     }
 
     /// Run logging rules and write this transaction's audit entry at most once.
     ///
     /// Alias for [`Transaction::finish`], kept for callers that only need the logging
-    /// outcome. A failed audit write or upload cleanup is stored and not retried by the
-    /// transaction; the syslog writer may still reconnect and re-send one frame.
+    /// outcome. A failed audit write or finalization step is stored and not retried by
+    /// the transaction; the syslog writer may still reconnect and re-send one frame.
     ///
     /// # Errors
     ///
-    /// Returns the stored audit write failure, or the stored temporary upload cleanup
-    /// failure.
+    /// Returns the stored audit write failure, or the combined finalization failure.
     pub fn process_logging(&mut self) -> std::io::Result<()> {
         self.finish()
     }
@@ -750,7 +810,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Remove temporary upload files once, reporting the first removal failure.
+    /// Remove temporary upload files once, reporting every removal failure.
     ///
     /// Go Coraza calls `Close` once, so cleanup is not retried on a later `finish`.
     fn close_uploads_once(&mut self) -> std::io::Result<()> {
@@ -765,7 +825,9 @@ impl Transaction {
     ///
     /// Go Coraza keeps them with `On`, or with `RelevantOnly` when a matched rule has the
     /// `log` action enabled, excluding `nolog`
-    /// (`internal/corazawaf/transaction.go:1712-1730`, v3.8.1).
+    /// (`internal/corazawaf/transaction.go:1712-1730`, v3.8.1). Like Go's joined `Close`
+    /// errors, every removal failure is kept in upload order
+    /// (`internal/corazawaf/transaction.go:1731-1745`).
     fn close_uploads(&mut self) -> std::io::Result<()> {
         let keep = match self.config.upload_keep_files {
             UploadKeepFiles::Off => false,
@@ -775,18 +837,17 @@ impl Transaction {
         if keep {
             return Ok(());
         }
-        let mut first_error = None;
+        let mut messages = Vec::new();
         for path in std::mem::take(&mut self.uploaded_paths) {
-            if let Err(error) = std::fs::remove_file(&path)
-                && first_error.is_none()
-            {
-                first_error = Some(std::io::Error::other(format!(
-                    "removing temporary file {}: {error}",
-                    path.display()
-                )));
+            if let Err(error) = std::fs::remove_file(&path) {
+                messages.push(format!("removing temporary file {}: {error}", path.display()));
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if messages.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(messages.join("\n")))
+        }
     }
 
     /// Build this transaction's audit entry using the current audit parts.
@@ -1641,15 +1702,24 @@ fn valid_userinfo(text: &[u8]) -> bool {
 }
 
 /// Whether a bracketed host is an IPv6 literal, optionally with a non-empty zone.
+///
+/// Go's `netip.ParseAddr` requires a non-empty zone but does not require it to be UTF-8
+/// (`net/netip/netip.go:214-220`). Only the address part is parsed.
 fn valid_ip_literal(hostname: &[u8]) -> bool {
-    let Ok(hostname) = std::str::from_utf8(hostname) else {
+    let (address, zone) = match hostname.iter().position(|&byte| byte == b'%') {
+        Some(percent) => (
+            hostname.get(..percent).unwrap_or_default(),
+            Some(hostname.get(percent.saturating_add(1)..).unwrap_or_default()),
+        ),
+        None => (hostname, None),
+    };
+    if zone.is_some_and(<[u8]>::is_empty) {
+        return false;
+    }
+    let Ok(address) = std::str::from_utf8(address) else {
         return false;
     };
-    match hostname.split_once('%') {
-        Some((address, zone)) if !zone.is_empty() => address.parse::<std::net::Ipv6Addr>().is_ok(),
-        Some(_) => false,
-        None => hostname.parse::<std::net::Ipv6Addr>().is_ok(),
-    }
+    address.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 /// Whether `port` is empty or a colon followed by digits.
@@ -2599,10 +2669,9 @@ field value\r\n\
         tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
         tx.process_request_headers();
 
-        let body = b"--boundary\r\n\
-Content-Disposition: form-data; name=\"field\"\r\n\
-\r\n\
-value";
+        // Go's `NextPart` reads every preamble line, then wraps EOF; that is the
+        // exact error string the processor returns for a body with no delimiter.
+        let body = b"just preamble";
         assert_eq!(tx.process_request_body(body), None);
         assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
         assert_eq!(
@@ -2610,9 +2679,66 @@ value";
             Some("1")
         );
         assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).as_deref(),
+            Some("multipart: NextPart: EOF")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+            Some("MULTIPART: multipart: NextPart: EOF")
+        );
+        assert_eq!(
             tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn multipart_processor_errors_match_go() {
+        // Each content type fails at a different point of Go's multipart processor:
+        // mime.ParseMediaType, the multipart/media-type check, or multipart.NewReader.
+        // Only the media-type check leaves MULTIPART_STRICT_ERROR unset
+        // (`internal/bodyprocessors/multipart.go:22-34`, v3.8.1).
+        for (content_type, expected, strict) in [
+            (b"application/json".as_slice(), "not a multipart body", "0"),
+            (
+                b"multipart/form-data; boundary=b; boundary=c".as_slice(),
+                "mime: duplicate parameter name",
+                "1",
+            ),
+            (
+                b"multipart/form-data; boundary=b; boundary".as_slice(),
+                "mime: invalid media parameter",
+                "1",
+            ),
+            (b"multipart/form-data".as_slice(), "multipart: boundary is empty", "1"),
+        ] {
+            let config = WafConfig {
+                request_body_access: true,
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("multipart-error", Arc::new(config));
+            tx.add_request_header("Content-Type", content_type);
+            tx.set_request_body_processor("MULTIPART");
+            tx.process_request_headers();
+
+            assert_eq!(tx.process_request_body(b"x"), None);
+            assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+            assert_eq!(
+                tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).as_deref(),
+                Some(expected),
+                "{content_type:?}"
+            );
+            assert_eq!(
+                tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+                Some(format!("MULTIPART: {expected}").as_str()),
+                "{content_type:?}"
+            );
+            assert_eq!(
+                tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+                Some(strict),
+                "{content_type:?}"
+            );
+        }
     }
 
     #[test]
@@ -3363,9 +3489,12 @@ payload\r\n\
                 tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
                 Some("1")
             );
-            assert!(
-                tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
-                    .is_some_and(|message| !message.is_empty())
+            let processor_message = tx
+                .get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
+                .unwrap_or_default();
+            assert_eq!(
+                tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+                Some(format!("JSON: {processor_message}").as_str())
             );
             assert_eq!(
                 tx.get_variable(RuleVariable::TX, Some("error_seen")).as_deref(),
@@ -3449,7 +3578,7 @@ payload\r\n\
         assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
         assert!(
             tx.get_variable(RuleVariable::ReqbodyErrorMsg, None)
-                .is_some_and(|message| message.starts_with("XML: malformed xml:"))
+                .is_some_and(|message| message.starts_with("XML: XML syntax error on line 1:"))
         );
         assert_eq!(
             tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
@@ -3457,7 +3586,7 @@ payload\r\n\
         );
         assert!(
             tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
-                .is_some_and(|message| message.starts_with("malformed xml:"))
+                .is_some_and(|message| message.starts_with("XML syntax error on line 1:"))
         );
         assert_eq!(
             tx.get_variable(RuleVariable::TX, Some("xml_error")).as_deref(),
@@ -4196,9 +4325,9 @@ v\r\n\
             tx.get_variable(RuleVariable::ResBodyProcessorError, None).as_deref(),
             Some("1")
         );
-        assert!(
-            tx.get_variable(RuleVariable::ResBodyProcessorErrorMsg, None)
-                .is_some_and(|message| !message.is_empty())
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyProcessorErrorMsg, None).as_deref(),
+            Some("invalid JSON")
         );
     }
 
@@ -4677,6 +4806,178 @@ payload\r\n\
     }
 
     #[test]
+    fn finish_reports_every_upload_removal_failure_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = [dir.path().join("first"), dir.path().join("second")];
+        // The directory is gone, so both removals fail as Go joins them.
+        drop(dir);
+        let mut tx = Transaction::new("cleanup-failures");
+        tx.uploaded_paths.extend(missing.iter().cloned());
+
+        let error = tx.finish().unwrap_err().to_string();
+        assert!(error.starts_with("transaction close failed: "), "{error}");
+        let first = error.find(&missing[0].display().to_string()).unwrap();
+        let second = error.find(&missing[1].display().to_string()).unwrap();
+        assert!(first < second, "removal failures keep their order: {error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finish_reports_a_stored_audit_failure_before_the_finalization_failure() {
+        // /dev/full accepts the open and fails every write.
+        if !std::path::Path::new("/dev/full").exists() {
+            return;
+        }
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log: "/dev/full".to_owned(),
+            ..WafConfig::default()
+        };
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("finish-audit-and-close");
+        let dir = tempfile::tempdir().unwrap();
+        tx.uploaded_paths.push(dir.path().join("missing"));
+        drop(dir);
+
+        let error = tx.finish().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::StorageFull,
+            "the audit failure takes precedence: {error}"
+        );
+        let finalization = tx.finalization_error().unwrap().to_string();
+        assert!(finalization.starts_with("transaction close failed: "), "{finalization}");
+        assert!(finalization.contains("removing temporary file"), "{finalization}");
+        // A later finish still reports the stored audit failure, and the stored
+        // finalization failure is still there.
+        assert_eq!(tx.finish().unwrap_err().kind(), std::io::ErrorKind::StorageFull);
+        assert!(tx.finalization_error().is_some());
+    }
+
+    #[test]
+    fn finish_reports_a_response_body_buffer_accept_failure() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-buffer-accept", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        inject_failure(BufferFailure::Accept);
+        assert_eq!(tx.process_response_body(b"payload").unwrap().status, 500);
+        // A cleanup failure happens after the ingest failure, so it must not be dropped.
+        tx.uploaded_paths
+            .push(std::env::temp_dir().join(format!("coraza-missing-upload-{}", std::process::id())));
+        let error = tx.finish().unwrap_err().to_string();
+        assert!(error.starts_with("transaction close failed: "), "{error}");
+        assert!(error.contains("injected body buffer failure"), "{error}");
+        assert!(error.contains("removing temporary file"), "{error}");
+    }
+
+    #[test]
+    fn finish_reports_every_finalization_failure_in_close_order() {
+        let mut tx = Transaction::new("finalization-order");
+        tx.uploaded_paths
+            .push(std::env::temp_dir().join(format!("coraza-missing-upload-{}", std::process::id())));
+        // Consumed by the first reset, as Go's `Close` resets the request buffer first.
+        inject_failure(BufferFailure::Reset);
+
+        let error = tx.finish().unwrap_err().to_string();
+        assert!(error.starts_with("transaction close failed: "), "{error}");
+        let upload = error.find("removing temporary file").unwrap();
+        let request = error.find("resetting request body buffer").unwrap();
+        assert!(upload < request, "Go reports uploads before buffer resets: {error}");
+
+        let repeated = tx.finish().unwrap_err().to_string();
+        assert_eq!(repeated, error, "a stored finalization failure is reported unchanged");
+    }
+
+    #[test]
+    fn finish_releases_both_body_buffers_and_keeps_the_ingestion_counters() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 16,
+            request_body_in_memory_limit: 2,
+            response_body_access: true,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("finish-buffers", Arc::new(config));
+        tx.process_request_headers();
+        tx.set_request_body_processor("RAW");
+        assert_eq!(tx.process_request_body(b"0123456789"), None);
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        assert_eq!(tx.process_response_body(b"response-bytes"), None);
+
+        let spill = tx.request_body_spill_path().unwrap().to_owned();
+        assert!(spill.exists(), "spill file {spill:?} should exist");
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 10,
+                retained: 10,
+                inspected: 10,
+                truncated: false,
+                spilled: true,
+            }
+        );
+        assert_eq!(tx.response_body_stats().retained, 14);
+
+        tx.finish().unwrap();
+
+        assert!(!spill.exists(), "finish must release the request spill file {spill:?}");
+        assert_eq!(
+            tx.request_body_stats(),
+            BodyIngestionStats {
+                supplied: 10,
+                retained: 0,
+                inspected: 10,
+                truncated: false,
+                spilled: false,
+            }
+        );
+        assert_eq!(
+            tx.response_body_stats(),
+            BodyIngestionStats {
+                supplied: 14,
+                retained: 0,
+                inspected: 14,
+                truncated: false,
+                spilled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn finish_reports_a_body_buffer_reset_failure() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("response-buffer-reset", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+
+        assert_eq!(tx.process_response_body(b"payload"), None);
+        // Go's `Close` resets the request buffer first, so it consumes the injection.
+        inject_failure(BufferFailure::Reset);
+        let error = tx.finish().unwrap_err().to_string();
+        assert!(
+            error.contains("resetting request body buffer: injected body buffer failure"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn relevant_only_uploads_are_kept_only_after_a_logged_match() {
         for (actions, kept) in [(",log", true), (",nolog", false)] {
             let upload_dir = tempfile::tempdir().unwrap();
@@ -5023,6 +5324,63 @@ content\r\n\
                 query: "",
                 parse_error: "1",
             },
+            // Go's parseHost rejects an empty or malformed bracketed literal, a port
+            // after it that is not `:digits`, and an empty zone.
+            Case {
+                target: "http://[]/a",
+                request_uri: "http://[]/a",
+                request_uri_raw: "http://[]/a",
+                filename: "http://[]/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://[::1]x/a",
+                request_uri: "http://[::1]x/a",
+                request_uri_raw: "http://[::1]x/a",
+                filename: "http://[::1]x/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://[fe80::1%25]/a",
+                request_uri: "http://[fe80::1%25]/a",
+                request_uri_raw: "http://[fe80::1%25]/a",
+                filename: "http://[fe80::1%25]/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://[fe80::1%eth0]/a",
+                request_uri: "http://[fe80::1%eth0]/a",
+                request_uri_raw: "http://[fe80::1%eth0]/a",
+                filename: "http://[fe80::1%eth0]/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            // Go's parseAuthority rejects a userinfo containing a space or `[`.
+            Case {
+                target: "http://us er@example.com/a",
+                request_uri: "http://us er@example.com/a",
+                request_uri_raw: "http://us er@example.com/a",
+                filename: "http://us er@example.com/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
+            Case {
+                target: "http://u[ser@example.com/a",
+                request_uri: "http://u[ser@example.com/a",
+                request_uri_raw: "http://u[ser@example.com/a",
+                filename: "http://u[ser@example.com/a",
+                basename: "a",
+                query: "",
+                parse_error: "1",
+            },
             Case {
                 target: "http:/foo",
                 request_uri: "http:/foo",
@@ -5244,6 +5602,19 @@ content\r\n\
         assert_eq!(tx.args_get.len(), 2);
         assert_eq!(tx.args_get.first(b"\xff"), Some(&b"x"[..]));
         assert_eq!(tx.args_get.first(b"\xfe"), Some(&b"y"[..]));
+    }
+
+    #[test]
+    fn process_uri_accepts_non_utf8_ipv6_zone_bytes_like_go() {
+        // Go's parseHost unescapes the zone without a UTF-8 requirement, and
+        // netip.ParseAddr only rejects an empty zone; URL.String then escapes the
+        // raw byte. The pinned oracle accepted this target.
+        let mut tx = Transaction::new("uri-zone-bytes");
+        tx.process_uri(b"http://[fe80::1%25a\x87b]/a", "GET", "HTTP/1.1");
+
+        assert_eq!(tx.computed.uri_parse_error.get_bytes(), b"0");
+        assert_eq!(tx.request_uri.get_bytes(), b"http://[fe80::1%25a%87b]/a");
+        assert_eq!(tx.computed.request_filename.get_bytes(), b"/a");
     }
 
     /// Compile one phase-1 rule and report whether `target` makes it interrupt.

@@ -122,7 +122,9 @@ a budget the pinned Go reference does not enforce. Go Coraza v3.8.1's
 `internal/bodyprocessors/multipart.go` reads parts with Go's
 `mime/multipart.Reader.NextPart` loop. The caller reports a limit as
 `malformed multipart: limit exceeded: ...` and sets `MULTIPART_STRICT_ERROR`,
-so rule 200003 interrupts a body Go would process. These are hardening limits,
+so rule 200003 interrupts a body Go would process. As in Go's loop, the parts
+read before the limit are still published to `ARGS_POST`, `FILES` and the
+multipart metadata before the error is reported. These are hardening limits,
 not parity claims; no shared-corpus case IDs exist yet.
 
 - Boundary length: 1024 bytes. Go has no boundary-length check in
