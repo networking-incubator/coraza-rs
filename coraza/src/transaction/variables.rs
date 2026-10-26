@@ -325,8 +325,9 @@ impl Transaction {
         {
             let mut captures = outputs.take_captures();
             if let Some((index, value)) = captures.next() {
+                // Go resets captures 0-9 to empty before a new match sets them.
                 for index in 0..10 {
-                    self.tx.remove(&index.to_string());
+                    self.set_tx_variable(&index.to_string(), "");
                 }
                 self.set_tx_variable(&index.to_string(), value);
                 for (index, value) in captures {

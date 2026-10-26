@@ -256,7 +256,9 @@ impl Parser {
     /// Register an operator factory under `name`, matched case-insensitively.
     ///
     /// A registered name is looked up before the built-in operators when a `SecRule`
-    /// operator is compiled, so an embedder can add or override an operator.
+    /// operator is compiled, so an embedder can add or override an operator. It applies
+    /// only to rules compiled after the call: rules already compiled keep the operator
+    /// they resolved.
     pub fn register_operator(&mut self, name: &str, factory: CustomOperatorFactory) {
         self.custom_operators.insert(name.to_owned(), factory);
     }
@@ -1366,6 +1368,17 @@ mod tests {
         assert!(!path.exists(), "compiling activated the audit writer");
         waf.activate().unwrap();
         assert!(path.exists(), "activation did not open the audit writer");
+    }
+
+    #[test]
+    fn compile_rejects_a_bad_syslog_audit_target() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecAuditEngine On\nSecAuditLogType Syslog\nSecAuditLog unix://")
+            .unwrap();
+
+        let error = parser.compile().unwrap_err();
+        assert!(error.to_string().contains("invalid syslog target"), "{error}");
     }
 
     #[cfg(feature = "https-audit")]
