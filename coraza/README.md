@@ -216,7 +216,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   lowered like Go, so `ARGS_PATH:UserId` becomes `userid` and, under
   `case_sensitive_args_keys`, no longer selects a stored `UserId`.
 - Count-mode `MATCHED_VAR_NAME` reports Go's compile-time key instead of an
-  empty string: `&ARGS:/re/` reports `/re/`, lowered for variables outside the
+  empty string, qualified by the variable as Go's `matchVariable` does:
+  `&ARGS:/re/` reports `ARGS:/re/` and `&REQUEST_HEADERS:X-Foo` reports
+  `REQUEST_HEADERS:x-foo`, because the key is lowered for variables outside the
   case-sensitive selector set.
 - `RESPONSE_CONTENT_TYPE` keeps the last `Content-Type` header, as Go does, and
   stores the raw bytes before the first `;` without trimming. Response-body MIME

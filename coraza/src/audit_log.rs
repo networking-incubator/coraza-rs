@@ -1334,35 +1334,62 @@ impl AuditLogger {
     /// [`ACTIVATION_CONNECT_TIMEOUT`], so one failing attempt cannot park a request
     /// thread for the kernel's SYN timeout.
     ///
+    /// The activation gate is only tried, never waited for: a concurrent explicit
+    /// activation may be inside an unbounded dial, and a request thread must not join it.
+    ///
     /// # Errors
     ///
-    /// If an activation is due and fails, or a previous failure is still inside its
-    /// retry backoff.
+    /// If an activation is due and fails, a previous failure is still inside its retry
+    /// backoff, or another activation is in progress before this logger has a writer.
+    /// The last case reports [`io::ErrorKind::WouldBlock`], so the caller's audit write is
+    /// not attempted instead of waiting for an activation that may take an unbounded dial.
     pub(crate) fn ensure_activated(&self) -> io::Result<()> {
-        {
-            let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.writer.is_some() {
-                return Ok(());
-            }
-            if let Some(failure) = &state.failure
-                && Self::in_backoff(&state)
-            {
-                return Err(failure.to_error());
-            }
+        if let Some(result) = self.activated_or_in_backoff() {
+            return result;
         }
-        let _gate = self.gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        {
-            let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.writer.is_some() {
-                return Ok(());
-            }
-            if let Some(failure) = &state.failure
-                && Self::in_backoff(&state)
-            {
-                return Err(failure.to_error());
-            }
+        let _gate = match self.gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return self.activation_in_progress(),
+        };
+        if let Some(result) = self.activated_or_in_backoff() {
+            return result;
         }
         self.install(true)
+    }
+
+    /// `Some` when no attempt is needed now: a writer exists, or a failure is inside its
+    /// retry backoff.
+    fn activated_or_in_backoff(&self) -> Option<io::Result<()>> {
+        let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = if state.writer.is_some() {
+            Some(Ok(()))
+        } else if let Some(failure) = &state.failure
+            && Self::in_backoff(&state)
+        {
+            Some(Err(failure.to_error()))
+        } else {
+            None
+        };
+        drop(state);
+        result
+    }
+
+    /// The result for a caller that found the activation gate busy.
+    fn activation_in_progress(&self) -> io::Result<()> {
+        let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = if state.writer.is_some() {
+            Ok(())
+        } else if let Some(failure) = &state.failure {
+            Err(failure.to_error())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "audit log activation is in progress",
+            ))
+        };
+        drop(state);
+        result
     }
 
     /// Whether a failed activation may not be retried yet.
@@ -1533,7 +1560,8 @@ struct Syslog {
     target: String,
     /// Whether it is the local syslog, which takes a shorter header
     local: bool,
-    /// Deadline for reconnecting a TCP socket, `None` for no deadline.
+    /// Deadline for a TCP connection attempt. `None` only on an explicit initial dial,
+    /// which may leave it unbounded; every reconnect stores the internal default instead.
     connect_timeout: Option<Duration>,
     /// Deadline for each write, `None` for no deadline.
     write_timeout: Option<Duration>,
@@ -1584,8 +1612,10 @@ impl Syslog {
     /// is `udp`, `tcp`, `unix` or `unixgram`; an address alone, over TCP; or, empty, the
     /// local syslog.
     ///
-    /// `connect_timeout` bounds a TCP connection attempt; `write_timeout` is applied to
-    /// the connected socket.
+    /// `connect_timeout` bounds a TCP connection attempt and is stored for reconnects;
+    /// `write_timeout` is applied to the connected socket. An explicit caller may pass
+    /// `None`, but [`Self::send`] reconnects with [`ACTIVATION_CONNECT_TIMEOUT`] when the
+    /// stored deadline is unset, so a dropped socket cannot block a request thread.
     fn connect(target: &str, connect_timeout: Option<Duration>, write_timeout: Option<Duration>) -> io::Result<Self> {
         let unsupported =
             |network: &str| io::Error::new(io::ErrorKind::Unsupported, format!("unsupported network {network:?}"));
@@ -1677,7 +1707,10 @@ impl Syslog {
             format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
         };
         if self.socket.write_frame(framed.as_bytes()).is_err() {
-            *self = Self::connect(&self.target, self.connect_timeout, self.write_timeout)?;
+            // A reconnect happens on the request path, so it is always bounded even when
+            // the explicit initial dial was not; the new socket stores that deadline.
+            let connect_timeout = connect_deadline(self.connect_timeout, true);
+            *self = Self::connect(&self.target, connect_timeout, self.write_timeout)?;
             self.socket.write_frame(framed.as_bytes())?;
         }
         Ok(())
@@ -2242,6 +2275,93 @@ mod tests {
         );
     }
 
+    /// Run `run` on another thread, giving up after `timeout` instead of hanging the suite.
+    fn within<T: Send + 'static>(timeout: std::time::Duration, run: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(sender.send(run()));
+        });
+        receiver.recv_timeout(timeout).ok()
+    }
+
+    #[test]
+    fn a_held_gate_does_not_block_an_installed_writer() {
+        let logger = std::sync::Arc::new(AuditLogger::discard());
+        logger.ensure_activated().unwrap();
+        let gate = logger.gate.lock().unwrap();
+        let started = std::time::Instant::now();
+        let result = within(std::time::Duration::from_secs(1), {
+            let logger = std::sync::Arc::clone(&logger);
+            move || logger.ensure_activated()
+        });
+        assert!(
+            result.is_some(),
+            "an installed writer must not wait for the activation gate"
+        );
+        let result = result.unwrap();
+        let elapsed = started.elapsed();
+        drop(gate);
+
+        assert!(result.is_ok());
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_held_gate_without_a_writer_reports_would_block() {
+        let logger = std::sync::Arc::new(AuditLogger::discard());
+        let gate = logger.gate.lock().unwrap();
+        let started = std::time::Instant::now();
+        let result = within(std::time::Duration::from_secs(1), {
+            let logger = std::sync::Arc::clone(&logger);
+            move || logger.ensure_activated()
+        });
+        assert!(
+            result.is_some(),
+            "ensure_activated must not wait for the activation gate"
+        );
+        let result = result.unwrap();
+        let elapsed = started.elapsed();
+        let attempts = logger.attempts();
+        drop(gate);
+
+        assert!(result.is_err(), "no writer and a busy gate cannot succeed");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+        assert!(error.to_string().contains("activation is in progress"), "{error}");
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(attempts, 0, "a caller that lost the gate must not attempt activation");
+    }
+
+    #[test]
+    fn a_held_gate_reports_a_memoised_failure_instead_of_would_block() {
+        let config = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: "unix:///nonexistent/coraza-audit.sock".to_owned(),
+            ..WafConfig::default()
+        };
+        let logger = std::sync::Arc::new(AuditLogger::prepare(&config).unwrap());
+        assert!(logger.ensure_activated().is_err());
+        logger.expire_backoff();
+        let gate = logger.gate.lock().unwrap();
+        let result = within(std::time::Duration::from_secs(1), {
+            let logger = std::sync::Arc::clone(&logger);
+            move || logger.ensure_activated()
+        });
+        assert!(
+            result.is_some(),
+            "ensure_activated must not wait for the activation gate"
+        );
+        let result = result.unwrap();
+        let attempts = logger.attempts();
+        drop(gate);
+
+        assert!(result.is_err(), "the memoised failure is reported, not a new attempt");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        assert_eq!(attempts, 1, "the memoised failure is reused inside a held gate");
+    }
+
     #[test]
     fn activation_backoff_grows_and_caps() {
         let mut backoff = ACTIVATION_RETRY_BACKOFF;
@@ -2508,6 +2628,41 @@ mod tests {
 
         let message = server.join().unwrap().unwrap();
         assert!(message.ends_with(b"reconnected\n"));
+    }
+
+    #[test]
+    fn an_unbounded_explicit_dial_still_reconnects_with_the_internal_deadline() {
+        use std::{
+            net::{Shutdown, TcpListener},
+            time::Duration,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("tcp://{}", listener.local_addr().unwrap());
+        let mut syslog = Syslog::connect(&target, None, None).unwrap();
+        let (connection, _) = listener.accept().unwrap();
+        assert_eq!(
+            syslog.connect_timeout, None,
+            "an explicit activation keeps Go's unbounded initial dial"
+        );
+        connection.shutdown(Shutdown::Both).unwrap();
+        drop(connection);
+
+        // The reset may reach the writer after a frame already fit in the send buffer, so
+        // send until the failure triggers the reconnect; the listener keeps accepting.
+        let mut result = Ok(());
+        for _ in 0..50 {
+            result = syslog.send("reconnect", false);
+            if syslog.connect_timeout.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            syslog.connect_timeout.is_some(),
+            "the writer did not reconnect: {result:?}"
+        );
+        assert_eq!(syslog.connect_timeout, Some(ACTIVATION_CONNECT_TIMEOUT));
     }
 
     #[test]
