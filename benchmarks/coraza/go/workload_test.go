@@ -249,6 +249,19 @@ func TestInvalidBase64Rejected(t *testing.T) {
 	}
 }
 
+// TestEmptyExpectedCaptureRejected rejects an expectation the observation side
+// cannot distinguish from an absent capture.
+func TestEmptyExpectedCaptureRejected(t *testing.T) {
+	value := minimalCase()
+	value["expected"].(map[string]any)["captures"] = []any{
+		map[string]any{"index": 0, "value": map[string]any{"base64": ""}},
+	}
+	_, err := parseCaseForTest(t, value, ".")
+	if err == nil || !strings.Contains(err.Error(), "empty capture") {
+		t.Fatalf("error = %v, want empty capture rejection", err)
+	}
+}
+
 // TestChunkGapRejected rejects chunks that do not cover the body.
 func TestChunkGapRejected(t *testing.T) {
 	value := minimalCase()

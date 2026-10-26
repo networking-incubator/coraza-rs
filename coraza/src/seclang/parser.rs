@@ -271,7 +271,8 @@ impl Parser {
     /// Consume the parser and build a WAF without activating its audit resources.
     ///
     /// Files are not created and sockets are not connected: the audit writer is opened
-    /// by [`Waf::activate`] or by the first [`Waf::new_transaction`]. This is the entry
+    /// by [`Waf::activate`] or by the first
+    /// [`Transaction::finish`](crate::transaction::Transaction::finish). This is the entry
     /// point for validating a candidate policy before deciding to use it.
     ///
     /// # Errors
@@ -283,7 +284,8 @@ impl Parser {
 
     /// Consume the parser and build a WAF from its configuration and compiled rules.
     ///
-    /// Alias for [`Parser::compile`]: the audit writer opens on the first transaction.
+    /// Alias for [`Parser::compile`]: the audit writer opens on the first write or
+    /// [`Waf::activate`].
     ///
     /// # Errors
     ///

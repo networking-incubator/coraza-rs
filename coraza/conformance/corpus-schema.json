@@ -485,7 +485,25 @@
           "minimum": 0
         },
         "value": {
-          "$ref": "#/$defs/bytes"
+          "allOf": [
+            {
+              "$ref": "#/$defs/bytes"
+            },
+            {
+              "not": {
+                "type": "object",
+                "required": [
+                  "base64"
+                ],
+                "properties": {
+                  "base64": {
+                    "const": ""
+                  }
+                }
+              }
+            }
+          ],
+          "description": "Capture bytes. An empty value is rejected: the observation side cannot tell an empty TX slot from an absent capture. Fixture ranges that resolve to zero bytes are rejected by the loaders, not by this schema."
         }
       }
     },
