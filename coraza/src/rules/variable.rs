@@ -113,6 +113,8 @@ pub(crate) struct VariableSpec {
     variable: RuleVariable,
     /// Optional literal or regex key selector.
     key: Option<VariableKey>,
+    /// The selector text reported for count-mode matches, as Go's compile-time `KeyStr`.
+    count_key: String,
     /// Whether to return a count instead of the matching values.
     count: bool,
     /// Keys excluded from the selected values.
@@ -125,6 +127,7 @@ impl VariableSpec {
         Self {
             variable,
             key: None,
+            count_key: String::new(),
             count: false,
             exceptions: Vec::new(),
         }
@@ -134,6 +137,7 @@ impl VariableSpec {
     pub(crate) fn new_string(variable: RuleVariable, key: String) -> Self {
         Self {
             variable,
+            count_key: key.clone(),
             key: Some(VariableKey::String(key)),
             count: false,
             exceptions: Vec::new(),
@@ -141,10 +145,15 @@ impl VariableSpec {
     }
 
     /// Select values whose keys match `regex`.
-    pub(crate) fn new_regex(variable: RuleVariable, regex: Regex) -> Self {
+    ///
+    /// `count_key` is the selector Go reports for a count-mode match: its `KeyStr` keeps the
+    /// surrounding slashes and is lower-cased for every variable outside
+    /// `caseSensitiveVariable` (`internal/corazawaf/rule.go:562-570`).
+    pub(crate) fn new_regex(variable: RuleVariable, regex: Regex, count_key: String) -> Self {
         Self {
             variable,
             key: Some(VariableKey::Regex(regex)),
+            count_key,
             count: false,
             exceptions: Vec::new(),
         }
@@ -197,12 +206,12 @@ impl VariableSpec {
             };
 
             match (collection, &self.key) {
-                (CollectionView::Map(map), _) => self.select(map, |key, value| {
+                (CollectionView::Map(map), _) => self.select(map, false, |key, value| {
                     if keep(key) {
                         record(self.variable, key, value);
                     }
                 }),
-                (CollectionView::Names(variable, map), _) => self.select(map, |key, _| {
+                (CollectionView::Names(variable, map), _) => self.select(map, true, |key, _| {
                     if keep(key) {
                         // Go exposes the raw name bytes as the value, so keep them exact.
                         record(variable, key, key);
@@ -218,11 +227,7 @@ impl VariableSpec {
         }
 
         if self.count {
-            let key = match &self.key {
-                Some(VariableKey::String(key)) => key.clone(),
-                _ => String::new(),
-            };
-            vec![MatchData::new(self.variable, key, count.to_string())]
+            vec![MatchData::new(self.variable, self.count_key.clone(), count.to_string())]
         } else {
             matches
         }
@@ -234,14 +239,44 @@ impl VariableSpec {
     }
 
     /// Visit the map entries selected by this specification, with keys as stored.
-    fn select<'a>(&'a self, map: &'a Map, mut found: impl FnMut(&'a [u8], &'a [u8])) {
+    ///
+    /// `exact` is set for the names views: Go looks a literal names selector up as
+    /// `data[key]`, without folding it (`internal/collections/named.go:129-131`), while
+    /// a value view folds the selector through the map's own key.
+    fn select<'a>(&'a self, map: &'a Map, exact: bool, mut found: impl FnMut(&'a [u8], &'a [u8])) {
         match &self.key {
             Some(VariableKey::Regex(regex)) => map.iter_regex_bytes(regex).for_each(|(key, value)| found(key, value)),
+            Some(VariableKey::String(key)) if !key.is_empty() && exact => {
+                select_exact(map, key, found);
+            },
             Some(VariableKey::String(key)) if !key.is_empty() => {
                 map.iter_key_bytes(key.as_bytes())
                     .for_each(|(stored_key, value)| found(stored_key, value));
             },
             _ => map.iter_bytes().for_each(|(key, value)| found(key, value)),
+        }
+    }
+}
+
+/// Visit the entries a names view stores under the exact selector `key`.
+fn select_exact<'a>(map: &'a Map, key: &str, mut found: impl FnMut(&'a [u8], &'a [u8])) {
+    // `Map::iter_key_bytes` folds the selector, and the parser has already folded a
+    // non-argument selector, so that path is exact whenever folding changes nothing.
+    if lowercase_like_go(key) == key {
+        for (stored, value) in map.iter_key_bytes(key.as_bytes()) {
+            found(stored, value);
+        }
+        return;
+    }
+    // A folded key never contains an upper-case letter, so this selector can only be a
+    // whole lookup key in a case-sensitive map, where the stored key equals it.
+    // shortcut: membership goes through the allocating text view because `Map` has no
+    // exact byte-key lookup; add one there if an upper-case names selector gets hot.
+    if map.entries().contains_key(key) {
+        for (stored, value) in map.iter_bytes() {
+            if stored == key.as_bytes() {
+                found(stored, value);
+            }
         }
     }
 }
@@ -285,7 +320,8 @@ mod tests {
     fn selects_regex_keys() {
         let map = args();
         let regex = Regex::new("us.*").expect("test regex is valid");
-        let matches = VariableSpec::new_regex(RuleVariable::Args, regex).get_matches(Some(CollectionView::Map(&map)));
+        let matches = VariableSpec::new_regex(RuleVariable::Args, regex, "/us.*/".to_owned())
+            .get_matches(Some(CollectionView::Map(&map)));
 
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().all(|matched| matched.key == "user"));
@@ -428,13 +464,75 @@ mod tests {
     }
 
     #[test]
+    fn names_view_literal_selectors_are_exact_lookups() {
+        // `?Id=secret`: a folded map stores the lookup key `id`, so Go's names view
+        // (`data[key]`, `internal/collections/named.go:129-131`) finds the written `Id`
+        // only after it is folded, which it never does.
+        let mut folded = Map::new(RuleVariable::ArgsGet);
+        folded.add("Id", b"secret");
+        let names = |key: &str| {
+            VariableSpec::new_string(RuleVariable::ArgsGetNames, key.to_owned())
+                .get_matches(Some(CollectionView::Names(RuleVariable::ArgsGetNames, &folded)))
+        };
+        assert!(names("Id").is_empty());
+        assert_eq!(names("id").len(), 1);
+
+        // Under `case_sensitive_args_keys` the stored key keeps its spelling, so the
+        // written selector matches and the folded one does not.
+        let mut exact = Map::new_case_sensitive(RuleVariable::ArgsGet);
+        exact.add("Id", b"secret");
+        let names = |key: &str| {
+            VariableSpec::new_string(RuleVariable::ArgsGetNames, key.to_owned())
+                .get_matches(Some(CollectionView::Names(RuleVariable::ArgsGetNames, &exact)))
+        };
+        assert_eq!(names("Id").len(), 1);
+        assert!(names("id").is_empty());
+    }
+
+    #[test]
+    fn names_view_literal_selectors_still_find_lowered_header_names() {
+        // Non-argument selectors are lowered by the parser, so the exact lookup finds
+        // the folded header key; the written spelling is not a lookup key.
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("X-Foo", b"bar");
+
+        let lowered = VariableSpec::new_string(RuleVariable::RequestHeadersNames, "x-foo".to_owned())
+            .get_matches(Some(CollectionView::Names(RuleVariable::RequestHeadersNames, &headers)));
+        let written = VariableSpec::new_string(RuleVariable::RequestHeadersNames, "X-Foo".to_owned())
+            .get_matches(Some(CollectionView::Names(RuleVariable::RequestHeadersNames, &headers)));
+
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(
+            lowered.first().map(|matched| matched.value.as_slice()),
+            Some(&b"X-Foo"[..])
+        );
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn count_mode_reports_the_constructor_selector_text() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add("re1", b"one");
+        let regex = Regex::new("re").expect("test regex is valid");
+        let mut spec = VariableSpec::new_regex(RuleVariable::Args, regex, "/re/".to_owned());
+        spec.set_count(true);
+
+        let matches = spec.get_matches(Some(CollectionView::Map(&map)));
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.first().map(|matched| matched.key.as_str()), Some("/re/"));
+        assert_eq!(matches.first().map(|matched| matched.value.as_slice()), Some(&b"1"[..]));
+    }
+
+    #[test]
     fn regex_selectors_match_the_lossy_key_text_without_merging() {
         let mut args = Map::new_case_sensitive(RuleVariable::Args);
         args.add_bytes(b"id\xff", b"a");
         args.add_bytes(b"id\xfe", b"b");
         let regex = Regex::new("^id").expect("test regex is valid");
 
-        let matches = VariableSpec::new_regex(RuleVariable::Args, regex).get_matches(Some(CollectionView::Map(&args)));
+        let matches = VariableSpec::new_regex(RuleVariable::Args, regex, "/^id/".to_owned())
+            .get_matches(Some(CollectionView::Map(&args)));
 
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().all(|matched| matched.key == "id\u{fffd}"));
@@ -446,7 +544,7 @@ mod tests {
         headers.add_bytes(b"X-Key\xfe", b"b");
         let regex = Regex::new("^x-key").expect("test regex is valid");
 
-        let matches = VariableSpec::new_regex(RuleVariable::RequestHeaders, regex)
+        let matches = VariableSpec::new_regex(RuleVariable::RequestHeaders, regex, "/^x-key/".to_owned())
             .get_matches(Some(CollectionView::Map(&headers)));
 
         assert_eq!(matches.len(), 2);

@@ -72,8 +72,11 @@ pub enum OperatorOutcome {
     NotMatched,
     /// The operator could not inspect the input, so it has no verdict.
     ///
-    /// Rules treat this as not matched and record it on the transaction so an
-    /// embedder can tell a skipped inspection from a benign value.
+    /// Rules treat this as not matched. Only the detector operators (`detectSQLi` and
+    /// `detectXSS`) turn it into the transaction's inspection-incomplete signal and the
+    /// configured fail-closed action; a host operator (`inspectFile`, `rbl`,
+    /// `validateSchema`) reports a skipped run without making unrelated traffic look
+    /// like over-long detector input.
     NotInspected,
 }
 
@@ -431,6 +434,17 @@ impl OperatorEnum {
             Self::ValidateSchema(operator) => operator.evaluate_outcome(tx, input, out),
         }
     }
+
+    /// Whether this operator's [`OperatorOutcome::NotInspected`] means the
+    /// detector skipped an input it is not allowed to scan.
+    ///
+    /// Only the detectors are bounded by [`libperfusion::MAX_INPUT_LEN`]; their
+    /// skipped input is the signal the transaction records and the fail-closed
+    /// policy acts on. Every other operator reports a skipped run for a host or
+    /// resource limitation, which stays a plain miss.
+    pub(crate) fn is_detector(&self) -> bool {
+        matches!(self, Self::DetectSQLi(_) | Self::DetectXSS(_))
+    }
 }
 
 /// Implement conversions from supported operator types to [`OperatorEnum`].
@@ -552,6 +566,33 @@ mod tests {
             OperatorEnum::new("noSuchOp", "").unwrap_err(),
             "unknown operator: noSuchOp"
         );
+    }
+
+    #[test]
+    fn only_the_detectors_own_the_inspection_signal() {
+        assert!(OperatorEnum::new("detectSQLi", "").unwrap().is_detector());
+        assert!(OperatorEnum::new("detectXSS", "").unwrap().is_detector());
+        for name in ["contains", "rx", "unconditionalMatch"] {
+            assert!(!OperatorEnum::new(name, "value").unwrap().is_detector(), "{name}");
+        }
+
+        #[cfg(feature = "inspect-file")]
+        assert!(!OperatorEnum::new("inspectFile", "/bin/true").unwrap().is_detector());
+        #[cfg(feature = "rbl")]
+        assert!(!OperatorEnum::new("rbl", "zen.spamhaus.org").unwrap().is_detector());
+        #[cfg(feature = "validate-schema")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("schema.json"), r#"{"type": "object"}"#).unwrap();
+            let datasets = Datasets::new();
+            let context = OperatorContext {
+                base_dir: dir.path(),
+                datasets: &datasets,
+                custom: None,
+            };
+            let operator = OperatorEnum::with_context("validateSchema", "schema.json", &context).unwrap();
+            assert!(!operator.is_detector());
+        }
     }
 
     #[test]

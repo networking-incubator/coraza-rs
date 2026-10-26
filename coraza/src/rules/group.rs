@@ -27,11 +27,13 @@ use crate::rules::Rule;
 pub(crate) struct RuleGroup {
     /// Top-level rules in directive order.
     rules: Vec<Rule>,
-    /// `case_sensitive_args_keys` the variable parser used for these rules.
+    /// The argument-map mode recorded when these rules were compiled.
     ///
-    /// `None` until a variable list is compiled. `Waf::with_rules` rejects a
-    /// configuration whose setting differs, so compiled selectors and transaction maps
-    /// cannot disagree.
+    /// Key selectors do not depend on it: the variable parser lowers a selector from its
+    /// variable alone (`RuleVariable::has_case_sensitive_selectors`), as Go's
+    /// `caseSensitiveVariable` does. This records only the `case_sensitive_args_keys`
+    /// setting the compiled rules were built under, so `Waf::with_rules` can reject a
+    /// configuration that changed afterwards.
     case_sensitive_args_keys: Option<bool>,
 }
 
@@ -41,10 +43,11 @@ impl RuleGroup {
         Self::default()
     }
 
-    /// Record the key mode for a variable compilation.
+    /// Record the argument-map mode for a variable compilation.
     ///
     /// Returns an error when rules were already compiled under a different mode, so a
-    /// rule set can never silently mix selector modes.
+    /// rule set is never paired with a configuration that would build its argument maps
+    /// the other way. Selectors are compiled independently of this mode.
     pub(crate) fn record_case_sensitive_args_keys(&mut self, case_sensitive_args_keys: bool) -> Result<(), String> {
         match self.case_sensitive_args_keys {
             Some(compiled) if compiled != case_sensitive_args_keys => Err(format!(
@@ -58,7 +61,7 @@ impl RuleGroup {
         }
     }
 
-    /// The key mode these rules were compiled with, if any.
+    /// The argument-map mode recorded at compile time, if any.
     pub(crate) fn compiled_case_sensitive_args_keys(&self) -> Option<bool> {
         self.case_sensitive_args_keys
     }

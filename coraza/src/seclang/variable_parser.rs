@@ -48,8 +48,9 @@ pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
 
 /// Parse variable expressions.
 ///
-/// The argument key mode does not affect compilation: Go compiles every selector regex
-/// as written, and only the transaction's argument maps decide whether keys fold case.
+/// The configured argument key mode does not affect compilation: a selector is lowered
+/// from its variable alone, as Go's `caseSensitiveVariable` decides it, and only the
+/// transaction's argument maps decide whether the keys it is matched against fold case.
 pub(crate) fn parse_variables_in(input: &str) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
     VariableList::parse(input)?.apply_to(&mut variables);
@@ -304,7 +305,13 @@ fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
     }
 
     let mut spec = match key {
-        Some(VariableKey::Regex(regex)) => VariableSpec::new_regex(variable.variable, regex),
+        Some(VariableKey::Regex(regex)) => {
+            let count_key = variable
+                .key
+                .as_deref()
+                .map_or_else(String::new, |key| count_key(variable.variable, key));
+            VariableSpec::new_regex(variable.variable, regex, count_key)
+        },
         Some(VariableKey::String(key)) => VariableSpec::new_string(variable.variable, key),
         None => VariableSpec::new(variable.variable),
     };
@@ -312,26 +319,44 @@ fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
     Ok(Element::Inspect(spec))
 }
 
+/// The selector text Go reports for a count-mode match.
+///
+/// Go's `KeyStr` is the whole written selector, slashes included, lowered for every
+/// variable outside `caseSensitiveVariable` (`internal/corazawaf/rule.go:562-570`); a
+/// literal selector is stored already lowered by [`parse_key`].
+fn count_key(variable: RuleVariable, key: &str) -> String {
+    if variable.has_case_sensitive_selectors() {
+        key.to_owned()
+    } else {
+        lowercase_like_go(key)
+    }
+}
+
 /// Parse a slash-delimited key as a regex, using the variable's key sensitivity.
 ///
 /// Go compiles every selector and exception regex as written, without the
-/// case-insensitive flag. For every variable except the argument collections it first
+/// case-insensitive flag. For every variable outside `caseSensitiveVariable` it first
 /// lower-cases the pattern source with its simple mapping, which changes what escapes and
 /// classes match: `REQUEST_HEADERS:/^\S+$/` becomes `^\s+$` and selects nothing
 /// (`internal/corazawaf/rule.go:575-589`). Argument patterns keep the written source and
 /// run against the folded lookup key, so `ARGS:/^userId$/` never matches even when the
 /// argument is spelled `userId`; selectors and exceptions share that rule
 /// (`internal/corazawaf/rule.go:562`, `internal/corazawaf/transaction.go:684-698`).
+///
+/// A literal key is lowered the same way. Go lowers `KeyStr` before it looks a literal up
+/// (`rule.go:562-570`), which only changes a case-sensitive map such as `ARGS_PATH` under
+/// `coraza.rule.case_sensitive_args_keys`: `ARGS_PATH:UserId` becomes `userid` and no
+/// longer selects the stored `UserId`.
 fn parse_key(variable: RuleVariable, key: &str) -> ParseResult<VariableKey> {
     let Some(pattern) = key
         .strip_prefix('/')
         .and_then(|key| key.strip_suffix('/'))
         .filter(|pattern| !pattern.is_empty())
     else {
-        return Ok(VariableKey::String(key.to_owned()));
+        return Ok(VariableKey::String(count_key(variable, key)));
     };
 
-    let source = if variable.has_case_sensitive_regex_keys() {
+    let source = if variable.has_case_sensitive_selectors() {
         Cow::Borrowed(pattern)
     } else {
         Cow::Owned(lowercase_like_go(pattern))
@@ -510,6 +535,104 @@ mod tests {
         both.sort_unstable();
         assert_eq!(both, ["1", "2"]);
         assert!(matches("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict).is_empty());
+    }
+
+    #[test]
+    fn names_selectors_are_exact_lookups() {
+        let names = |input: &str, variable: RuleVariable, map: &Map| -> Vec<String> {
+            parse_variables_in(input)
+                .expect("test variable expression is valid")
+                .iter()
+                .filter(|spec| spec.variable() == variable)
+                .flat_map(|spec| spec.get_matches(Some(CollectionView::Names(variable, map))))
+                .map(|matched| String::from_utf8_lossy(&matched.value).into_owned())
+                .collect()
+        };
+
+        // `?Id=secret`: the folded map stores the lookup key `id`, and Go's names view is
+        // an exact `data[key]` lookup that never folds the selector
+        // (`internal/collections/named.go:129-131`).
+        let mut folded = Map::new(RuleVariable::ArgsGet);
+        folded.add("Id", b"secret");
+        assert!(names("ARGS_GET_NAMES:Id", RuleVariable::ArgsGetNames, &folded).is_empty());
+        // The names view exposes the stored spelling, as Go's `d.key` does.
+        assert_eq!(names("ARGS_GET_NAMES:id", RuleVariable::ArgsGetNames, &folded), ["Id"]);
+
+        // Under `case_sensitive_args_keys` the stored key keeps its spelling.
+        let mut exact = Map::new_case_sensitive(RuleVariable::ArgsGet);
+        exact.add("Id", b"secret");
+        assert_eq!(names("ARGS_GET_NAMES:Id", RuleVariable::ArgsGetNames, &exact), ["Id"]);
+        assert!(names("ARGS_GET_NAMES:id", RuleVariable::ArgsGetNames, &exact).is_empty());
+
+        // Non-argument selectors are lowered before the exact lookup, so both writings
+        // reach the folded header key, as Go's `KeyStr` does.
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("X-Foo", b"bar");
+        assert_eq!(
+            names(
+                "REQUEST_HEADERS_NAMES:X-Foo",
+                RuleVariable::RequestHeadersNames,
+                &headers
+            ),
+            ["X-Foo"]
+        );
+        assert_eq!(
+            names(
+                "REQUEST_HEADERS_NAMES:x-foo",
+                RuleVariable::RequestHeadersNames,
+                &headers
+            ),
+            ["X-Foo"]
+        );
+    }
+
+    #[test]
+    fn args_path_literals_are_lowered_like_go() {
+        // Go's `caseSensitiveVariable` leaves ARGS_PATH out (`internal/corazawaf/rule.go:548`),
+        // so its literal is lowered even when the map keeps stored keys as written.
+        let mut folded = Map::new(RuleVariable::ArgsPath);
+        folded.add("UserId", b"1");
+        assert_eq!(matches("ARGS_PATH:UserId", RuleVariable::ArgsPath, &folded), ["1"]);
+        assert_eq!(matches("ARGS_PATH:userid", RuleVariable::ArgsPath, &folded), ["1"]);
+
+        let mut exact = Map::new_case_sensitive(RuleVariable::ArgsPath);
+        exact.add("UserId", b"1");
+        assert!(matches("ARGS_PATH:UserId", RuleVariable::ArgsPath, &exact).is_empty());
+        assert!(matches("ARGS_PATH:userid", RuleVariable::ArgsPath, &exact).is_empty());
+
+        // Only an already-lowered stored key is reachable through the lowered selector.
+        let mut lower = Map::new_case_sensitive(RuleVariable::ArgsPath);
+        lower.add("userid", b"2");
+        assert_eq!(matches("ARGS_PATH:userid", RuleVariable::ArgsPath, &lower), ["2"]);
+    }
+
+    #[test]
+    fn count_matches_report_go_key_str() {
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("X-Foo", b"bar");
+        let counted = |input: &str| -> Vec<String> {
+            parse_variables_in(input)
+                .expect("test variable expression is valid")
+                .iter()
+                .flat_map(|spec| spec.get_matches(Some(CollectionView::Map(&headers))))
+                .map(|matched| matched.key)
+                .collect()
+        };
+        // Go reports the compile-time `KeyStr` (`internal/corazawaf/transaction.go:698-704`):
+        // the lowered literal, or the lowered selector with its slashes.
+        assert_eq!(counted("&REQUEST_HEADERS:X-Foo"), ["x-foo"]);
+        assert_eq!(counted("&REQUEST_HEADERS:/^X-FOO$/"), ["/^x-foo$/"]);
+
+        let mut args = Map::new(RuleVariable::Args);
+        args.add("re1", b"one");
+        let counted = parse_variables_in("&ARGS:/re/")
+            .expect("test variable expression is valid")
+            .iter()
+            .flat_map(|spec| spec.get_matches(Some(CollectionView::Map(&args))))
+            .map(|matched| matched.key)
+            .collect::<Vec<_>>();
+        // Argument selectors keep their written case, so `KeyStr` is `/re/`.
+        assert_eq!(counted, ["/re/"]);
     }
 
     #[test]
