@@ -86,7 +86,7 @@ impl Waf {
     /// selectors and transaction maps cannot disagree.
     ///
     /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
-    /// [`Waf::new_transaction`] opens them, so a candidate policy can be compiled and
+    /// [`Transaction::finish`] opens them, so a candidate policy can be compiled and
     /// discarded without creating files or connecting.
     pub(crate) fn with_rules(
         config: WafConfig,
@@ -116,7 +116,8 @@ impl Waf {
     ///
     /// Idempotent and thread-safe: the first successful call opens the writer and later
     /// calls return `Ok(())` without opening it again. This is the only path that retries
-    /// a failed activation; other callers keep reporting the memoised failure.
+    /// a failed activation immediately; internal callers wait for the writer's retry
+    /// backoff before trying again.
     ///
     /// # Errors
     ///
@@ -127,6 +128,17 @@ impl Waf {
             .map_err(|error| ConfigError(error.to_string()))
     }
 
+    /// The audit writer failure from the last activation attempt.
+    ///
+    /// Returns `Some` while the configured sink cannot be opened, and `None` before any
+    /// attempt and after one succeeds. [`Waf::activate`] or the first
+    /// [`Transaction::finish`] attempts activation, so an embedder that never calls either
+    /// sees `None`; a failure reported by `finish` or discarded by `Drop` stays visible
+    /// here until a later attempt succeeds.
+    pub fn activation_error(&self) -> Option<String> {
+        self.audit_logger.activation_error()
+    }
+
     /// Create a transaction with a process-unique identifier.
     pub fn new_transaction(&self) -> Transaction {
         let id = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -135,13 +147,14 @@ impl Waf {
 
     /// Create a transaction with a caller-supplied identifier.
     ///
-    /// Activates the audit writer first, as Go Coraza initializes its writer lazily.
-    /// The constructor is infallible, so an activation failure is memoised and surfaces
-    /// from [`Transaction::finish`] when the entry is written; it is not retried per
-    /// transaction.
+    /// Does not open the audit writer: [`Transaction::finish`] activates it on the first
+    /// write, and [`Waf::activate`] opens it explicitly. Creating a transaction never
+    /// blocks on a sink, so a connector's request path does not pay for a dial.
+    ///
+    /// The constructor is infallible, so an activation failure surfaces from
+    /// [`Transaction::finish`], or through [`Waf::activation_error`]. It is not retried
+    /// per transaction: internal callers wait for the writer's retry backoff.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
-        // Best effort: a memoised failure stays observable from `Transaction::finish`.
-        drop(self.audit_logger.ensure_activated());
         let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
         if let Some(error_log) = &self.error_log {
@@ -246,14 +259,48 @@ mod tests {
     }
 
     #[test]
-    fn new_transaction_activates_the_audit_writer() {
+    fn new_transaction_does_not_open_the_audit_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.log");
         let waf = Waf::new(audit_file_config(&path)).unwrap();
-        assert!(!path.exists());
 
-        drop(waf.new_transaction_with_id("activates-on-create"));
-        assert!(path.exists());
+        let mut transaction = waf.new_transaction_with_id("opens-on-finish");
+        assert!(!path.exists(), "creating a transaction opened the audit writer");
+        assert!(
+            waf.activation_error().is_none(),
+            "creating a transaction attempted activation"
+        );
+
+        transaction.finish().unwrap();
+        assert!(path.exists(), "finish did not open the audit writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_transactions_against_an_unreachable_sink_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("syslog.sock");
+        let waf = Waf::new(WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: format!("unix://{}", socket.display()),
+            ..WafConfig::default()
+        })
+        .unwrap();
+
+        let mut transaction = waf.new_transaction_with_id("no-dial-on-create");
+        assert!(
+            waf.activation_error().is_none(),
+            "creating a transaction dialed the audit sink"
+        );
+
+        let error = transaction.finish().unwrap_err();
+        assert!(error.to_string().contains("syslog dial failure"), "{error}");
+        assert!(
+            waf.activation_error()
+                .is_some_and(|error| error.contains("syslog dial failure")),
+            "finish did not record the activation failure"
+        );
     }
 
     #[cfg(unix)]
@@ -289,7 +336,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn activation_failure_is_memoised_until_an_explicit_retry() {
+    fn activation_failure_is_memoised_until_its_backoff_passes() {
         use std::os::unix::net::UnixListener;
 
         let dir = tempfile::tempdir().unwrap();
@@ -304,21 +351,37 @@ mod tests {
 
         let mut before = waf.new_transaction_with_id("before-listener");
         assert!(before.finish().is_err(), "activation has no socket to connect");
+        let failure = waf.activation_error().unwrap();
 
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut memoised = waf.new_transaction_with_id("memoised-failure");
-        assert!(memoised.finish().is_err());
+        assert!(
+            memoised
+                .finish()
+                .is_err_and(|error| error.to_string().contains("syslog dial failure")),
+            "a transaction inside the backoff must reuse the memoised failure"
+        );
         assert!(
             listener.accept().is_err(),
-            "an internal call retried the memoised activation"
+            "a transaction inside the backoff retried the activation"
+        );
+        assert_eq!(
+            waf.activation_error().as_deref(),
+            Some(failure.as_str()),
+            "an internal retry replaced the stored failure"
         );
 
-        listener.set_nonblocking(false).unwrap();
-        waf.activate().unwrap();
+        waf.audit_logger.expire_backoff();
+        let mut retried = waf.new_transaction_with_id("after-backoff");
+        retried.finish().unwrap();
         let (connection, _) = listener.accept().unwrap();
-        let mut after = waf.new_transaction_with_id("after-explicit-retry");
-        after.finish().unwrap();
+        assert!(
+            waf.activation_error().is_none(),
+            "a successful retry must clear the stored failure"
+        );
+
+        waf.activate().unwrap();
         drop(connection);
     }
 
@@ -376,6 +439,31 @@ mod tests {
             };
             assert!(Waf::new(config).is_err(), "{target}");
         }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn rejects_an_empty_syslog_target() {
+        // An empty target selects the local syslog, which only exists on Unix; accepting it
+        // here would build a WAF whose every audit write fails.
+        let config = WafConfig {
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: String::new(),
+            ..WafConfig::default()
+        };
+        assert!(Waf::new(config).is_err());
+    }
+
+    #[test]
+    fn an_activation_failure_keeps_its_error_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("audit.log");
+        let waf = Waf::new(audit_file_config(&path)).unwrap();
+
+        let mut transaction = waf.new_transaction_with_id("missing-directory");
+        let error = transaction.finish().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        assert!(error.to_string().contains("cannot open audit log"), "{error}");
     }
 
     #[test]

@@ -244,6 +244,18 @@ fn duplicate_case_ids_are_rejected() {
 }
 
 #[test]
+fn an_empty_expected_capture_is_rejected() {
+    let mut case = minimal_case();
+    case["expected"]["captures"] = json!([{"index": 0, "value": {"base64": ""}}]);
+    let error = parse_case_bytes(case.to_string().as_bytes(), Path::new("."))
+        .expect_err("an empty capture cannot be observed, so it must not be expected");
+    assert!(
+        error.to_string().contains("empty capture"),
+        "error must name the unsupported empty capture: {error}"
+    );
+}
+
+#[test]
 fn invalid_base64_is_rejected() {
     let mut case = minimal_case();
     case["request"]["body"] = json!({"base64": "not base64!"});

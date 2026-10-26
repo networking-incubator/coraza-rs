@@ -22,7 +22,7 @@
 
 use std::borrow::Cow;
 
-use super::Transaction;
+use super::{TX_CAPTURE_KEYS, Transaction};
 use crate::{
     collection::{Map, MatchData, Single},
     operators::Outputs,
@@ -325,9 +325,11 @@ impl Transaction {
         {
             let mut captures = outputs.take_captures();
             if let Some((index, value)) = captures.next() {
-                // Go resets captures 0-9 to empty before a new match sets them.
-                for index in 0..10 {
-                    self.set_tx_variable(&index.to_string(), "");
+                // Clear the captures of the value matched previously in this rule. Go leaves
+                // them alone: its `resetCaptures` is only used by its tests, so this is a
+                // deliberate deviation, and the seeded keys make it allocation-free.
+                for key in TX_CAPTURE_KEYS.iter().take(10) {
+                    self.tx.set_index(key, 0, "");
                 }
                 self.set_tx_variable(&index.to_string(), value);
                 for (index, value) in captures {

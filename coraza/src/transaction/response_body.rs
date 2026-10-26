@@ -34,13 +34,17 @@ use crate::types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase};
 )]
 impl Transaction {
     /// Whether the response body matches the configured MIME types or is forced on.
+    ///
+    /// The match is exact: Go uses `stringsutil.InSlice`, which is `slices.Contains`
+    /// (`internal/strings/strings.go:108-110`), so neither case nor whitespace is folded.
     pub fn is_response_body_processable(&self) -> bool {
+        let content_type = self.response_content_type.get();
         self.force_response_body_variable
             || self
                 .config
                 .response_body_mime_types
                 .iter()
-                .any(|mime| mime.eq_ignore_ascii_case(&self.response_content_type.get()))
+                .any(|mime| mime.as_str() == &*content_type)
     }
 
     /// Process an eligible response body and evaluate response-body rules.
