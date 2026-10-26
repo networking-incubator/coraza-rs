@@ -21,30 +21,34 @@
 //! The `@rbl` operator: look an address up in a DNS blocklist.
 //!
 //! Ported from `internal/operators/rbl.go` in Coraza v3.8.1. The query name is
-//! `<value>.<service>`, exactly as Go builds it with
+//! `<value>.<service>`, built the way Go builds it with
 //! `fmt.Sprintf("%s.%s", ipAddr, o.service)`: the address is neither reversed
 //! nor normalised, so an IPv6 value yields a name a blocklist does not publish.
-//! The lookup is bounded by Go's 500ms deadline and any failure is no match.
+//! The lookup is bounded by Go's 500ms deadline and a resolver failure is no
+//! match, as in Go, where `LookupHost` returns an error and the rule does not
+//! match.
 //!
-//! Go then looks up the address's TXT record, stores its first entry in
-//! `TX.httpbl_msg`, copies it into capture 0, and reports no match when the TXT
-//! lookup fails. This port has no DNS dependency, so it performs the A/AAAA
-//! lookup only: the TXT message and its capture are absent, and a name whose TXT
-//! lookup fails matches here where Go reports no match.
+//! Divergences from Go:
+//!
+//! - The configured service is trimmed of surrounding whitespace and must not be empty, so an empty service is rejected
+//!   when the rule loads. Go appends it verbatim and relies on the TXT lookup to reject the self-resolving `<value>.`
+//!   name it would build.
+//! - The value is decoded with `String::from_utf8_lossy` before it is appended, where Go appends the raw bytes of its
+//!   value string, so invalid UTF-8 reaches the resolver as U+FFFD here.
+//! - Go also looks up the address's TXT record, stores its first entry in `TX.httpbl_msg`, copies it into capture 0,
+//!   and reports no match when the TXT lookup fails. This port has no DNS dependency, so it performs the A/AAAA lookup
+//!   only: the TXT message and its capture are absent, and a name whose TXT lookup fails matches here where Go reports
+//!   no match.
 //!
 //! Resource bounds: the system resolver cannot be cancelled, so each lookup
 //! runs on its own thread with [`LOOKUP_STACK`] of stack and the operator gives
 //! up after [`LOOKUP_TIMEOUT`], abandoning that thread until the resolver
 //! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process; above
 //! that, and when a thread cannot be spawned, the operator reports
-//! [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected)
-//! instead of queueing or panicking. Rules treat that as not matched, so it
-//! never turns a lookup that could not run into a match.
-//!
-//! A resolver failure also reports no verdict: std's resolver does not expose
-//! whether a name has no record or the lookup itself failed, and this port does
-//! not guess. Go reports not matched in both cases; [`Rbl::evaluate`] returns
-//! `false` there, so rule evaluation is unchanged.
+//! [`OperatorOutcome::NotInspected`] instead of queueing or panicking. Rules
+//! treat that as not matched, so it never turns a lookup that could not run
+//! into a match. A resolver failure is not one of those cases: it is an answer
+//! that the value is not listed, so it never raises the signal.
 
 use std::{
     net::ToSocketAddrs as _,
@@ -61,20 +65,21 @@ use crate::{
 };
 
 /// Go's `500 * time.Millisecond` budget for the whole lookup in `rbl.go`.
-const LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Stack for one lookup thread.
 ///
-/// The resolver runs libc and NSS modules in this thread, so the size stays
-/// well above the default but far below the multi-megabyte default of a
-/// request thread.
-const LOOKUP_STACK: usize = 512 * 1024;
+/// The resolver runs libc and NSS modules in this thread, and those can need
+/// more than a small stack: 2 `MiB` matches the usual Linux thread default, and
+/// a module that overflows it would abort the whole process rather than fail
+/// the lookup.
+pub const LOOKUP_STACK: usize = 2 * 1024 * 1024;
 
 /// Lookups allowed to run at once in one process.
 ///
 /// Abandoned lookups hold their slot until the resolver returns, so this is the
 /// bound on threads and stack a hostile name set can pin.
-const MAX_IN_FLIGHT: usize = 64;
+pub const MAX_IN_FLIGHT: usize = 64;
 
 /// Lookups currently running, process-wide.
 static LIMITER: Limiter = Limiter {
@@ -150,15 +155,26 @@ impl Operator for Rbl {
     fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> OperatorOutcome {
         let name = self.query_name(&String::from_utf8_lossy(input));
         // Go's `LookupHost` returns every A and AAAA record and errors when the
-        // name has none; `ToSocketAddrs` is the same getaddrinfo lookup.
-        match bounded(LOOKUP_TIMEOUT, move || match (name.as_str(), 0).to_socket_addrs() {
-            Ok(mut addresses) => Answer::Listed(addresses.next().is_some()),
-            Err(_) => Answer::Unavailable,
-        }) {
-            Some(Answer::Listed(true)) => OperatorOutcome::Matched,
-            Some(Answer::Listed(false)) => OperatorOutcome::NotMatched,
-            Some(Answer::Unavailable) | None => OperatorOutcome::NotInspected,
-        }
+        // name has none; `ToSocketAddrs` is the same getaddrinfo lookup, and a
+        // resolver error is "not listed" in Go's rule, so it is no match here.
+        verdict(bounded(LOOKUP_TIMEOUT, move || {
+            match (name.as_str(), 0).to_socket_addrs() {
+                Ok(mut addresses) => addresses.next().is_some(),
+                Err(_) => false,
+            }
+        }))
+    }
+}
+
+/// Map a bounded lookup onto a verdict.
+///
+/// `None` means the lookup never ran to an answer, which is the only case that
+/// reports [`OperatorOutcome::NotInspected`].
+fn verdict(listed: Option<bool>) -> OperatorOutcome {
+    match listed {
+        Some(true) => OperatorOutcome::Matched,
+        Some(false) => OperatorOutcome::NotMatched,
+        None => OperatorOutcome::NotInspected,
     }
 }
 
@@ -169,15 +185,6 @@ impl Operator for Rbl {
 /// Returns an error for an empty service; see [`Rbl::new`].
 pub fn rbl(service: &str) -> Result<Rbl, String> {
     Rbl::new(service)
-}
-
-/// The answer from one bounded lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Answer {
-    /// The resolver answered, and whether the value is listed.
-    Listed(bool),
-    /// The resolver failed, so there is no answer.
-    Unavailable,
 }
 
 /// Run `work` on a worker thread and give up after `timeout`.
@@ -211,11 +218,14 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{Answer, Limiter, MAX_IN_FLIGHT, Rbl, bounded};
+    use super::{LOOKUP_STACK, Limiter, MAX_IN_FLIGHT, Rbl, bounded, verdict};
     use crate::{
+        config::DetectorInspectionAction,
         operators::{Operator as _, OperatorContext, OperatorEnum, OperatorOutcome, Outputs},
+        seclang::Parser,
         transaction::Transaction,
         types::RuleVariable,
+        waf::Waf,
     };
 
     fn operator(service: &str) -> Rbl {
@@ -279,35 +289,68 @@ mod tests {
         assert_eq!(
             bounded(Duration::from_millis(20), || {
                 std::thread::sleep(Duration::from_millis(200));
-                Answer::Listed(true)
+                true
             }),
             None
         );
-        assert_eq!(
-            bounded(Duration::from_secs(1), || Answer::Listed(false)),
-            Some(Answer::Listed(false))
-        );
+        assert_eq!(bounded(Duration::from_secs(1), || false), Some(false));
     }
 
     #[test]
-    fn a_lookup_that_overruns_the_budget_reports_no_verdict() {
-        // The operator's own budget is Go's; this pins the mapping from a
-        // failed bounded call to `NotInspected` through the deadline path only
-        // for a name the resolver rejects without contacting the network.
+    fn a_lookup_without_an_answer_reports_no_verdict() {
+        // The deadline, the in-flight cap and a spawn failure all reach the
+        // operator as `None`, and only that reports `NotInspected`.
+        assert_eq!(verdict(None), OperatorOutcome::NotInspected);
+        assert_eq!(verdict(Some(true)), OperatorOutcome::Matched);
+        assert_eq!(verdict(Some(false)), OperatorOutcome::NotMatched);
+    }
+
+    #[test]
+    fn a_resolver_error_is_no_match() {
+        // A NUL byte cannot be part of a resolver request, so this fails without
+        // reaching the network. Go's `LookupHost` errors here too, and the rule
+        // does not match, so this must not claim an uninspected input.
         let rbl = operator("zen.spamhaus.org");
         assert_eq!(
             rbl.evaluate_outcome(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()),
-            OperatorOutcome::NotInspected
+            OperatorOutcome::NotMatched
         );
         assert!(!rbl.evaluate(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()));
     }
 
     #[test]
-    fn an_unresolvable_name_is_no_match() {
-        // A NUL byte cannot be part of a resolver request, so this fails without
-        // reaching the network.
-        let rbl = operator("zen.spamhaus.org");
-        assert!(!rbl.evaluate(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()));
+    fn the_lookup_thread_gets_a_full_resolver_stack() {
+        // An NSS module that overflows the lookup thread's stack aborts the
+        // process, so the size must not be trimmed for memory.
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        const { assert!(LOOKUP_STACK >= TWO_MIB, "the resolver thread needs at least 2 MiB") };
+    }
+
+    #[test]
+    fn fail_closed_does_not_interrupt_a_resolver_error() {
+        let waf = rbl_waf(DetectorInspectionAction::FailClosed);
+        let mut tx = waf.new_transaction_with_id("rbl-resolver-error");
+        tx.add_get_argument("q", b"192.0.2.1\0");
+
+        assert!(
+            tx.process_request_headers().is_none(),
+            "an address the resolver rejects is not listed, so it must not interrupt"
+        );
+        assert!(
+            tx.matched_rules().is_empty(),
+            "a not-listed address must not match the rule"
+        );
+    }
+
+    #[test]
+    fn a_resolver_error_leaves_the_inspection_signal_unset() {
+        let waf = rbl_waf(DetectorInspectionAction::RecordOnly);
+        let mut tx = waf.new_transaction_with_id("rbl-resolver-error-record-only");
+        tx.add_get_argument("q", b"192.0.2.1\0");
+
+        assert!(tx.process_request_headers().is_none());
+        assert!(!tx.inspection_incomplete());
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
     }
 
     #[test]
@@ -331,14 +374,21 @@ mod tests {
     #[test]
     fn a_bounded_call_returns_as_soon_as_the_work_ends() {
         let started = Instant::now();
-        assert_eq!(
-            bounded(Duration::from_secs(5), || Answer::Listed(true)),
-            Some(Answer::Listed(true))
-        );
+        assert_eq!(bounded(Duration::from_secs(5), || true), Some(true));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a quick lookup must not wait for the deadline"
         );
+    }
+
+    /// Build a WAF whose only rule looks `ARGS:q` up in a blocklist.
+    fn rbl_waf(detector_inspection_action: DetectorInspectionAction) -> Waf {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"@rbl zen.spamhaus.org\" \"id:960,phase:1,pass\"")
+            .unwrap();
+        parser.config_mut().detector_inspection_action = detector_inspection_action;
+        parser.into_waf().unwrap()
     }
 
     #[test]
