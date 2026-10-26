@@ -50,18 +50,16 @@ type CompileResult<T> = Result<T, CompileError>;
 /// configuration without `SecDefaultAction`.
 #[cfg(test)]
 pub(crate) fn compile_sec_rule(input: &str) -> CompileResult<Rule> {
-    compile_sec_rule_in(input, &OperatorContext::default(), &DefaultActions::default(), false)
+    compile_sec_rule_in(input, &OperatorContext::default(), &DefaultActions::default())
 }
 
 /// Compiles the arguments of a `SecRule` directive (`VARIABLES OPERATOR ACTIONS`, without
 /// `SecRule`) into a rule, creating the operator in `context` and merging the actions
-/// with `defaults`. `case_sensitive_args_keys` selects the key regex mode, as the
-/// transaction collections do.
+/// with `defaults`.
 pub(crate) fn compile_sec_rule_in(
     input: &str,
     context: &OperatorContext<'_>,
     defaults: &DefaultActions,
-    case_sensitive_args_keys: bool,
 ) -> CompileResult<Rule> {
     let RuleArguments {
         variables: vars,
@@ -70,7 +68,7 @@ pub(crate) fn compile_sec_rule_in(
     } = RuleArguments::parse(input)?;
 
     // Parse variables
-    let variable_specs = parse_variables_in(vars, case_sensitive_args_keys)
+    let variable_specs = parse_variables_in(vars)
         .map_err(|error| CompileError::new(format!("failed to parse variables '{vars}': {error}")))?;
 
     // Parse operator
@@ -462,20 +460,15 @@ mod tests {
         defaults.add("phase:1,log,auditlog,deny,status:403").unwrap();
         let context = OperatorContext::default();
 
-        let rule = compile_sec_rule_in(
-            "ARGS \"@contains attack\" \"id:1,phase:1,block\"",
-            &context,
-            &defaults,
-            false,
-        )
-        .unwrap();
+        let rule =
+            compile_sec_rule_in("ARGS \"@contains attack\" \"id:1,phase:1,block\"", &context, &defaults).unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
         assert_eq!(names, ["deny"]);
         assert!(rule.metadata().log);
         assert!(rule.metadata().audit_log);
         assert_eq!(rule.metadata().status, 403);
 
-        let rule = compile_sec_rule_in("ARGS \"@contains attack\" \"id:2\"", &context, &defaults, false).unwrap();
+        let rule = compile_sec_rule_in("ARGS \"@contains attack\" \"id:2\"", &context, &defaults).unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
         assert_eq!(names, ["pass"]);
         assert!(rule.metadata().log);

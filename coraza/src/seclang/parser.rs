@@ -716,12 +716,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
-    let rule = compile_sec_rule_in(
-        &options.opts,
-        &context,
-        options.default_actions,
-        case_sensitive_args_keys,
-    );
+    let rule = compile_sec_rule_in(&options.opts, &context, options.default_actions);
     add_rule(options, rule)
 }
 
@@ -841,7 +836,7 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
-    let variables = VariableList::parse(variables, case_sensitive_args_keys).map_err(|e| e.message)?;
+    let variables = VariableList::parse(variables).map_err(|e| e.message)?;
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
@@ -872,7 +867,7 @@ fn directive_sec_rule_update_target_by_tag(options: &mut DirectiveOptions<'_>) -
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
-    let variables = VariableList::parse(variables, case_sensitive_args_keys).map_err(|e| e.message)?;
+    let variables = VariableList::parse(variables).map_err(|e| e.message)?;
 
     options
         .rules
