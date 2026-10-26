@@ -14,6 +14,10 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    # `borrow-or-share`, reached through `jsonschema`'s dependency tree, is
+    # MIT-0. Only `cargo deny --all-features check` encounters it; the
+    # feature-less `make audit` run does not, so removing it would fail the
+    # all-features check.
     "MIT-0",
     "Unicode-3.0",
     "Unlicense",
