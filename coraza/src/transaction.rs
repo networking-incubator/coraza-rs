@@ -2146,18 +2146,31 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
     }
 
     #[test]
-    fn args_regex_key_selector_folds_case_in_default_mode() {
+    fn args_regex_key_selector_keeps_written_case_in_default_mode() {
         let mut parser = crate::seclang::Parser::new();
         parser
             .from_string("SecRule ARGS:/^userId$/ \"@contains attack\" \"id:176,phase:1,deny,status:403\"")
             .unwrap();
         let waf = parser.into_waf().unwrap();
 
-        for supplied in ["USERID", "UserId"] {
-            let mut tx = waf.new_transaction_with_id("args-regex-default");
+        // Go compiles the argument pattern as written and matches it against the folded
+        // key, so a mixed-case pattern never matches: even `userId` is stored as `userid`.
+        for supplied in ["USERID", "UserId", "userId", "userid"] {
+            let mut tx = waf.new_transaction_with_id("args-regex-default-miss");
             tx.add_get_argument(supplied, b"an attack");
+            assert_eq!(tx.process_request_headers(), None, "{supplied}");
+        }
 
-            assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(176));
+        // A lower-cased pattern does select every spelling, because the map folds the key.
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule ARGS:/^userid$/ \"@contains attack\" \"id:178,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        for supplied in ["USERID", "UserId"] {
+            let mut tx = waf.new_transaction_with_id("args-regex-default-hit");
+            tx.add_get_argument(supplied, b"an attack");
+            assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(178));
             assert_eq!(
                 tx.matched_rules()
                     .first()

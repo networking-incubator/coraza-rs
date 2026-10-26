@@ -22,7 +22,7 @@
 
 use std::{borrow::Cow, str::FromStr as _};
 
-use regex::RegexBuilder;
+use regex::Regex;
 use winnow::{
     combinator::{alt, eof, not, opt, repeat, terminated},
     error::EmptyError,
@@ -40,19 +40,19 @@ use crate::{
 /// The result of parsing a variable expression.
 type ParseResult<T> = Result<T, CompileError>;
 
-/// Parse variable expressions such as `ARGS|ARGS:id|&TX:score` in the default key mode.
+/// Parse variable expressions such as `ARGS|ARGS:id|&TX:score`.
 #[cfg(test)]
 pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
-    parse_variables_in(input, false)
+    parse_variables_in(input)
 }
 
-/// Parse variable expressions, compiling key regexes for the given argument key mode.
+/// Parse variable expressions.
 ///
-/// `case_sensitive_args_keys` mirrors [`crate::config::WafConfig::case_sensitive_args_keys`],
-/// so regex selectors and maps agree on whether argument keys fold case.
-pub(crate) fn parse_variables_in(input: &str, case_sensitive_args_keys: bool) -> ParseResult<Vec<VariableSpec>> {
+/// The argument key mode does not affect compilation: Go compiles every selector regex
+/// as written, and only the transaction's argument maps decide whether keys fold case.
+pub(crate) fn parse_variables_in(input: &str) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
-    VariableList::parse(input, case_sensitive_args_keys)?.apply_to(&mut variables);
+    VariableList::parse(input)?.apply_to(&mut variables);
     Ok(variables)
 }
 
@@ -61,7 +61,7 @@ pub(crate) struct VariableList(Vec<Element>);
 
 impl VariableList {
     /// Parse all expressions in a variable list.
-    pub(crate) fn parse(input: &str, case_sensitive_args_keys: bool) -> ParseResult<Self> {
+    pub(crate) fn parse(input: &str) -> ParseResult<Self> {
         if input.is_empty() {
             return Err(CompileError::new("empty variable specification".to_owned()));
         }
@@ -75,7 +75,7 @@ impl VariableList {
             .collect::<ParseResult<Vec<_>>>()?;
         parsed
             .into_iter()
-            .map(|variable| build_element(&variable, case_sensitive_args_keys))
+            .map(|variable| build_element(&variable))
             .collect::<ParseResult<Vec<_>>>()
             .map(Self)
     }
@@ -290,18 +290,11 @@ enum Element {
 }
 
 /// Build a selector or exclusion from one parsed expression.
-fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> ParseResult<Element> {
+fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
     let key = variable
         .key
         .as_deref()
-        .map(|key| {
-            parse_key(
-                variable.variable,
-                key,
-                case_sensitive_args_keys,
-                variable.markers.is_negation,
-            )
-        })
+        .map(|key| parse_key(variable.variable, key))
         .transpose()?;
 
     if variable.markers.is_negation {
@@ -321,21 +314,15 @@ fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> P
 
 /// Parse a slash-delimited key as a regex, using the variable's key sensitivity.
 ///
-/// Go compiles selector regexes without the case-insensitive flag. For every variable
-/// except the argument collections it first lower-cases the pattern source with its simple
-/// mapping, which changes what escapes and classes match: `REQUEST_HEADERS:/^\S+$/` becomes
-/// `^\s+$` and selects nothing (`internal/corazawaf/rule.go:586`). Argument selectors keep
-/// the written source and fold case only while their map folds it, because the regex runs
-/// against the lower-cased lookup keys. Argument *exceptions* are different: Go compiles
-/// them as written and matches them against the lowered key
-/// (`internal/corazawaf/rule.go:629-640`, `internal/corazawaf/transaction.go:684-698`), so
-/// `!ARGS:/^Foo$/` excludes nothing.
-fn parse_key(
-    variable: RuleVariable,
-    key: &str,
-    case_sensitive_args_keys: bool,
-    is_exclusion: bool,
-) -> ParseResult<VariableKey> {
+/// Go compiles every selector and exception regex as written, without the
+/// case-insensitive flag. For every variable except the argument collections it first
+/// lower-cases the pattern source with its simple mapping, which changes what escapes and
+/// classes match: `REQUEST_HEADERS:/^\S+$/` becomes `^\s+$` and selects nothing
+/// (`internal/corazawaf/rule.go:575-589`). Argument patterns keep the written source and
+/// run against the folded lookup key, so `ARGS:/^userId$/` never matches even when the
+/// argument is spelled `userId`; selectors and exceptions share that rule
+/// (`internal/corazawaf/rule.go:562`, `internal/corazawaf/transaction.go:684-698`).
+fn parse_key(variable: RuleVariable, key: &str) -> ParseResult<VariableKey> {
     let Some(pattern) = key
         .strip_prefix('/')
         .and_then(|key| key.strip_suffix('/'))
@@ -344,14 +331,12 @@ fn parse_key(
         return Ok(VariableKey::String(key.to_owned()));
     };
 
-    let (source, case_insensitive) = if variable.has_case_sensitive_regex_keys() {
-        (Cow::Borrowed(pattern), !is_exclusion && !case_sensitive_args_keys)
+    let source = if variable.has_case_sensitive_regex_keys() {
+        Cow::Borrowed(pattern)
     } else {
-        (Cow::Owned(lowercase_like_go(pattern)), false)
+        Cow::Owned(lowercase_like_go(pattern))
     };
-    RegexBuilder::new(&source)
-        .case_insensitive(case_insensitive)
-        .build()
+    Regex::new(&source)
         .map(VariableKey::Regex)
         .map_err(|error| CompileError::new(format!("invalid regex pattern '{source}': {error}")))
 }
@@ -367,11 +352,7 @@ mod tests {
     }
 
     fn matches(input: &str, variable: RuleVariable, map: &Map) -> Vec<String> {
-        matches_in(input, variable, map, false)
-    }
-
-    fn matches_in(input: &str, variable: RuleVariable, map: &Map, case_sensitive_args_keys: bool) -> Vec<String> {
-        parse_variables_in(input, case_sensitive_args_keys)
+        parse_variables_in(input)
             .expect("test variable expression is valid")
             .iter()
             .filter(|spec| spec.variable() == variable)
@@ -405,16 +386,18 @@ mod tests {
             matches("REQUEST_HEADERS:/^x-forwarded/", RuleVariable::RequestHeaders, &headers),
             ["1.2.3.4"]
         );
-        // The default mode folds argument key selectors like the argument maps fold lookups.
-        assert_eq!(matches("ARGS:/^Foo$/", RuleVariable::Args, &args), ["1", "2"]);
-        assert_eq!(matches_in("ARGS:/^foo$/", RuleVariable::Args, &args, false), ["1", "2"]);
+        // Go compiles the argument pattern as written and runs it against the folded key,
+        // so `^Foo$` never matches the folded `foo`; a lower-cased pattern matches both
+        // spellings.
+        assert!(matches("ARGS:/^Foo$/", RuleVariable::Args, &args).is_empty());
+        assert_eq!(matches("ARGS:/^foo$/", RuleVariable::Args, &args), ["1", "2"]);
 
         let mut strict = Map::new_case_sensitive(RuleVariable::Args);
         strict.add("Foo", b"1");
         strict.add("foo", b"2");
-        assert_eq!(matches_in("ARGS:/^Foo$/", RuleVariable::Args, &strict, true), ["1"]);
-        assert_eq!(matches_in("ARGS:/^foo$/", RuleVariable::Args, &strict, true), ["2"]);
-        assert!(matches_in("ARGS:/^FOO$/", RuleVariable::Args, &strict, true).is_empty());
+        assert_eq!(matches("ARGS:/^Foo$/", RuleVariable::Args, &strict), ["1"]);
+        assert_eq!(matches("ARGS:/^foo$/", RuleVariable::Args, &strict), ["2"]);
+        assert!(matches("ARGS:/^FOO$/", RuleVariable::Args, &strict).is_empty());
     }
 
     #[test]
@@ -423,35 +406,18 @@ mod tests {
         args.add("USERID", b"value");
 
         // Lowercasing the pattern source would turn `\S` into `\s`, which cannot match.
-        assert_eq!(
-            matches_in("ARGS:/^user\\Sd$/", RuleVariable::Args, &args, false),
-            ["value"]
-        );
+        assert_eq!(matches("ARGS:/^user\\Sd$/", RuleVariable::Args, &args), ["value"]);
     }
 
     #[test]
-    fn non_argument_regex_keys_are_lowered_in_both_modes() {
+    fn non_argument_regex_keys_are_lowered() {
         let mut headers = Map::new(RuleVariable::RequestHeaders);
         headers.add("X-Trace", b"value");
 
         // Go lower-cases the pattern source instead of enabling case-insensitive matching,
-        // so a lower-cased literal still selects the header in either key mode.
+        // so a lower-cased literal still selects the header.
         assert_eq!(
-            matches_in(
-                "REQUEST_HEADERS:/^X-TRACE$/",
-                RuleVariable::RequestHeaders,
-                &headers,
-                false
-            ),
-            ["value"]
-        );
-        assert_eq!(
-            matches_in(
-                "REQUEST_HEADERS:/^X-TRACE$/",
-                RuleVariable::RequestHeaders,
-                &headers,
-                true
-            ),
+            matches("REQUEST_HEADERS:/^X-TRACE$/", RuleVariable::RequestHeaders, &headers),
             ["value"]
         );
     }
@@ -504,21 +470,21 @@ mod tests {
     }
 
     #[test]
-    fn argument_regex_keys_keep_their_case_in_strict_mode() {
+    fn argument_regex_keys_keep_their_written_case() {
         let mut strict = Map::new_case_sensitive(RuleVariable::Args);
         strict.add("userXd", b"1");
         strict.add("userxd", b"2");
 
-        // Go leaves the argument pattern as written (`internal/corazawaf/rule.go:548`), so
+        // Go leaves the argument pattern as written (`internal/corazawaf/rule.go:562`), so
         // `\S` keeps its meaning and both spellings of the non-space character match.
-        let mut non_space = matches_in("ARGS:/^user\\Sd$/", RuleVariable::Args, &strict, true);
+        let mut non_space = matches("ARGS:/^user\\Sd$/", RuleVariable::Args, &strict);
         non_space.sort_unstable();
         assert_eq!(non_space, ["1", "2"]);
         // `\W` still means non-word, so it cannot match the upper-case `X`.
-        assert!(matches_in("ARGS:/^user\\Wd$/", RuleVariable::Args, &strict, true).is_empty());
+        assert!(matches("ARGS:/^user\\Wd$/", RuleVariable::Args, &strict).is_empty());
         // An upper-case class stays upper-case.
-        assert!(matches_in("ARGS:/^[A-Z]+$/", RuleVariable::Args, &strict, true).is_empty());
-        assert_eq!(matches_in("ARGS:/^userXd$/", RuleVariable::Args, &strict, true), ["1"]);
+        assert!(matches("ARGS:/^[A-Z]+$/", RuleVariable::Args, &strict).is_empty());
+        assert_eq!(matches("ARGS:/^userXd$/", RuleVariable::Args, &strict), ["1"]);
     }
 
     #[test]
@@ -540,10 +506,10 @@ mod tests {
         // Go runs the exception regex against the lowered key, so a written `^Foo$` never
         // excludes the stored `Foo`, while `^foo$` excludes both spellings
         // (`internal/corazawaf/transaction.go:689`).
-        let mut both = matches_in("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &strict, true);
+        let mut both = matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &strict);
         both.sort_unstable();
         assert_eq!(both, ["1", "2"]);
-        assert!(matches_in("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict, true).is_empty());
+        assert!(matches("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &strict).is_empty());
     }
 
     #[test]
@@ -614,29 +580,22 @@ mod tests {
     }
 
     #[test]
-    fn request_xml_selector_selects_the_root_children_in_both_key_modes() {
+    fn request_xml_selector_selects_the_root_children() {
         let mut xml = Map::new(RuleVariable::RequestXML);
         xml.add("/*", b"superuser & guest");
         xml.add("//@*", b"admin");
 
         // Go marks REQUEST_XML selectable (`internal/variables/variables.go:594`), so the
-        // selector compiles in either key mode, and the name is case-insensitive.
+        // selector compiles, and the name is case-insensitive.
         for selector in ["REQUEST_XML:/*", "request_xml:/*", "Request_Xml:/*"] {
-            assert_eq!(
-                parse_variables_in(selector, true).map(|variables| variables.len()),
-                Ok(1)
-            );
+            assert_eq!(parse_variables_in(selector).map(|variables| variables.len()), Ok(1));
             assert_eq!(matches(selector, RuleVariable::RequestXML, &xml), ["superuser & guest"]);
-            assert_eq!(
-                matches_in(selector, RuleVariable::RequestXML, &xml, true),
-                ["superuser & guest"]
-            );
         }
 
         // Selectability does not depend on the key mode, but single-value collections stay
-        // unselectable in both.
+        // unselectable.
         assert!(parse_variables("REQUEST_XML:foo").is_ok());
-        assert!(parse_variables_in("REQUEST_URI:foo", true).is_err());
+        assert!(parse_variables_in("REQUEST_URI:foo").is_err());
     }
 
     #[test]
