@@ -177,13 +177,17 @@ pub struct WafConfig {
     /// Directory of `Concurrent` audit logs; empty when unset (`SecAuditLogStorageDir`).
     pub audit_log_storage_dir: String,
 
-    /// Deadline for connecting a TCP syslog audit writer; `None` (the default) waits
-    /// indefinitely, as Go Coraza does.
+    /// Deadline for connecting a TCP syslog audit writer; `None` (the default) leaves the
+    /// explicit [`activate`](crate::Waf::activate) dial unbounded, as Go Coraza does.
     ///
-    /// There is no SecLang directive for this. It applies to `SecAuditLogType Syslog`
-    /// targets with a `tcp` scheme, including the reconnect after a failed write. DNS
-    /// resolution is not bounded. File and HTTPS writers ignore it: file writes never
-    /// connect, and HTTPS keeps its one-second whole-request budget.
+    /// There is no SecLang directive for this. The internal activation path, used by a
+    /// [`Transaction::finish`](crate::transaction::Transaction::finish) that writes an
+    /// entry, is bounded deliberately: without a configured deadline it applies five
+    /// seconds, because an unbounded dial to a blackholed peer parks a request thread for
+    /// the kernel's SYN timeout. The deadline applies to `SecAuditLogType Syslog` targets
+    /// with a `tcp` scheme, including the reconnect after a failed write. DNS resolution
+    /// is not bounded. File and HTTPS writers ignore it: file writes never connect, and
+    /// HTTPS keeps its one-second whole-request budget.
     pub audit_log_connect_timeout: Option<std::time::Duration>,
 
     /// Deadline for one audit log write; `None` (the default) waits indefinitely, as Go

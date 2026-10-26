@@ -87,8 +87,8 @@ impl Waf {
     /// their variable alone, independently of the mode.
     ///
     /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
-    /// [`Transaction::finish`] opens them, so a candidate policy can be compiled and
-    /// discarded without creating files or connecting.
+    /// [`Transaction::finish`] that writes an entry opens them, so a candidate policy can
+    /// be compiled and discarded without creating files or connecting.
     pub(crate) fn with_rules(
         config: WafConfig,
         rules: RuleGroup,
@@ -118,25 +118,28 @@ impl Waf {
     /// Idempotent and thread-safe: the first successful call opens the writer and later
     /// calls return `Ok(())` without opening it again. This is the only path that retries
     /// a failed activation immediately; internal callers wait for the writer's retry
-    /// backoff before trying again.
+    /// backoff before trying again. A syslog dial the configuration leaves unbounded
+    /// stays unbounded here, unlike the internal path, which bounds it.
     ///
     /// # Errors
     ///
-    /// If the configured audit writer cannot be opened or connected.
-    pub fn activate(&self) -> Result<(), ConfigError> {
-        self.audit_logger
-            .activate()
-            .map_err(|error| ConfigError(error.to_string()))
+    /// Returns the writer's own [`std::io::Error`], with its kind, when the configured
+    /// audit writer cannot be opened or connected. A dial failure is not a configuration
+    /// error: those are reported by [`Waf::new`] and [`Parser::compile`].
+    ///
+    /// [`Parser::compile`]: crate::seclang::Parser::compile
+    pub fn activate(&self) -> std::io::Result<()> {
+        self.audit_logger.activate()
     }
 
-    /// The audit writer failure from the last activation attempt.
+    /// The audit writer failure from the last activation attempt, with its error kind.
     ///
     /// Returns `Some` while the configured sink cannot be opened, and `None` before any
     /// attempt and after one succeeds. [`Waf::activate`] or the first
-    /// [`Transaction::finish`] attempts activation, so an embedder that never calls either
-    /// sees `None`; a failure reported by `finish` or discarded by `Drop` stays visible
-    /// here until a later attempt succeeds.
-    pub fn activation_error(&self) -> Option<String> {
+    /// [`Transaction::finish`] that writes an entry attempts activation, so an embedder
+    /// that never calls either sees `None`; a failure reported by `finish` or discarded by
+    /// `Drop` stays visible here until a later attempt succeeds.
+    pub fn activation_error(&self) -> Option<(std::io::ErrorKind, String)> {
         self.audit_logger.activation_error()
     }
 
@@ -149,12 +152,14 @@ impl Waf {
     /// Create a transaction with a caller-supplied identifier.
     ///
     /// Does not open the audit writer: [`Transaction::finish`] activates it on the first
-    /// write, and [`Waf::activate`] opens it explicitly. Creating a transaction never
-    /// blocks on a sink, so a connector's request path does not pay for a dial.
+    /// entry it writes, and [`Waf::activate`] opens it explicitly. Creating a transaction
+    /// never blocks on a sink, so a connector's request path does not pay for a dial.
     ///
     /// The constructor is infallible, so an activation failure surfaces from
-    /// [`Transaction::finish`], or through [`Waf::activation_error`]. It is not retried
-    /// per transaction: internal callers wait for the writer's retry backoff.
+    /// [`Transaction::finish`], or through [`Waf::activation_error`]. The transaction
+    /// layer does not retry it: internal callers wait for the writer's growing retry
+    /// backoff, and the syslog writer reconnects and re-sends a frame after a write
+    /// failure.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
         let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
@@ -299,7 +304,7 @@ mod tests {
         assert!(error.to_string().contains("syslog dial failure"), "{error}");
         assert!(
             waf.activation_error()
-                .is_some_and(|error| error.contains("syslog dial failure")),
+                .is_some_and(|(_, error)| error.contains("syslog dial failure")),
             "finish did not record the activation failure"
         );
     }
@@ -368,8 +373,8 @@ mod tests {
             "a transaction inside the backoff retried the activation"
         );
         assert_eq!(
-            waf.activation_error().as_deref(),
-            Some(failure.as_str()),
+            waf.activation_error(),
+            Some(failure),
             "an internal retry replaced the stored failure"
         );
 
@@ -465,6 +470,93 @@ mod tests {
         let error = transaction.finish().unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
         assert!(error.to_string().contains("cannot open audit log"), "{error}");
+
+        // The explicit path reports the same dial failure as an I/O error, not as a
+        // configuration error, and the memoised copy keeps the kind.
+        assert_eq!(waf.activate().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            waf.activation_error().map(|(kind, _)| kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_failure_costs_one_bounded_attempt_per_window() {
+        use std::time::{Duration, Instant};
+
+        // TEST-NET-1 is not routable, so an unbounded dial would wait for the kernel's SYN
+        // timeout. A host without a default route fails at once, which is equally fine: the
+        // attempt must be bounded, not slow.
+        let waf = Waf::new(WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: "tcp://192.0.2.1:9".to_owned(),
+            ..WafConfig::default()
+        })
+        .unwrap();
+
+        let started = Instant::now();
+        let mut first = waf.new_transaction_with_id("bounded-dial");
+        assert!(first.finish().is_err(), "an unroutable peer cannot connect");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "the internal dial was not bounded: {elapsed:?}"
+        );
+        assert_eq!(waf.audit_logger.attempts(), 1);
+
+        let started = Instant::now();
+        let mut second = waf.new_transaction_with_id("inside-the-window");
+        assert!(second.finish().is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an attempt inside the window waited: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            waf.audit_logger.attempts(),
+            1,
+            "an attempt inside the window dialed again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_finish_calls_attempt_once_per_window() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("syslog.sock");
+        let waf = Arc::new(
+            Waf::new(WafConfig {
+                audit_engine: AuditEngineStatus::On,
+                audit_log_type: AuditLogType::Syslog,
+                audit_log: format!("unix://{}", socket.display()),
+                ..WafConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let waf = Arc::clone(&waf);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    waf.new_transaction_with_id(format!("concurrent-{index}")).finish()
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            assert!(thread.join().unwrap().is_err(), "no listener is bound");
+        }
+        assert_eq!(
+            waf.audit_logger.attempts(),
+            1,
+            "concurrent finishes dialed more than once in one window"
+        );
     }
 
     #[test]
