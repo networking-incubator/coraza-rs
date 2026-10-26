@@ -378,7 +378,7 @@ impl OperatorEnum {
             "unconditionalmatch" | "geolookup" => Ok(Self::UnconditionalMatch(unconditional_match())),
             "nomatch" => Ok(Self::NoMatch(no_match())),
             #[cfg(feature = "inspect-file")]
-            "inspectfile" => Ok(Self::InspectFile(inspect_file(argument))),
+            "inspectfile" => inspect_file(argument).map(Self::InspectFile),
             #[cfg(feature = "rbl")]
             "rbl" => rbl(argument).map(Self::Rbl),
             #[cfg(feature = "validate-schema")]

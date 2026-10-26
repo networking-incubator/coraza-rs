@@ -31,17 +31,26 @@
 //! - The schema path is confined to the configured base directory: it must be relative, must contain no `..` component,
 //!   and its canonical form must stay under the canonical base directory. Go reads it through `fs.ReadFile` with
 //!   whatever root filesystem the embedder passed, which is permissive by default. A multi-tenant deployment cannot
-//!   rely on that.
+//!   rely on that. See "Confinement" below for the window this leaves.
 //! - A schema file larger than [`SCHEMA_CAP`] is rejected instead of read.
 //! - Errors name the failing step but never quote the schema, so a rejected schema cannot echo its contents into a log.
-//! - The dialect is pinned to JSON Schema 2020-12, which Go's compiler implements. A `$schema` in the document still
-//!   selects its own dialect.
+//! - The dialect comes from the schema's `$schema`, as Go's compiler does, and a schema without one is compiled as
+//!   2020-12. `format` is therefore an assertion for draft-04/6/7, which this engine asserts by default, and an
+//!   annotation from 2019-09 on.
 //! - The engine is this crate's `jsonschema`, not Go's `kaptinlin/jsonschema`, and external `$ref` targets are not
 //!   resolved: the `resolve-file` and `resolve-http` features stay off, so a reference to another document fails at
 //!   compile time instead of reading an arbitrary path or URL.
-//! - `format` is an annotation, not an assertion, as 2020-12 specifies.
 //! - `pattern` uses `fancy-regex`, whose backtracking and size limits turn a match that cannot complete into a
 //!   violation rather than a pass, so a pathological pattern fails closed.
+//!
+//! Confinement: the check and the open are two steps, so a process that can
+//! rewrite the schema path between them is not stopped on every platform. The
+//! file's type and size are read from the opened descriptor rather than from the
+//! path, and on Linux the descriptor's own path is confined as well, which
+//! defeats a symlink swapped in before the open. Elsewhere a writer inside the
+//! configured root can still win that window, so loading must not race an
+//! untrusted writer there: keep the schema directory writable only by the
+//! process' own configuration source.
 //!
 //! `shortcut:` each operator compiles its own schema, where Go shares one
 //! compilation per schema content through its memoizer; upgrade if rules
@@ -49,6 +58,7 @@
 
 use std::{
     ffi::OsStr,
+    fs::File,
     io::Read as _,
     path::{Component, Path, PathBuf},
 };
@@ -62,8 +72,8 @@ use crate::{
     types::{RulePhase, RuleVariable},
 };
 
-/// Largest schema file accepted, checked before the file is read.
-const SCHEMA_CAP: u64 = 1024 * 1024;
+/// Largest schema file accepted, checked on the opened file before it is read.
+pub const SCHEMA_CAP: u64 = 1024 * 1024;
 
 /// Validates JSON documents against a compiled JSON Schema.
 #[derive(Debug, Clone)]
@@ -104,7 +114,13 @@ impl ValidateSchema {
 
         let base = canonical_base(base_dir)?;
         let path = resolve_under(&base, relative)?;
-        let metadata = std::fs::metadata(&path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+        let file = File::open(&path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+        confirm_opened(&file, &base)?;
+        // Everything below reads the opened descriptor, not the path, so the
+        // size and type cannot be raced once the file is open.
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("reading schema from root FS: {error}"))?;
         if !metadata.is_file() {
             return Err("reading schema from root FS: not a regular file".to_owned());
         }
@@ -112,11 +128,11 @@ impl ValidateSchema {
             return Err(format!("schema file is larger than {SCHEMA_CAP} bytes"));
         }
 
-        let bytes = read_schema(&path)?;
+        let bytes = read_schema(file)?;
         let schema: Value =
             serde_json::from_slice(&bytes).map_err(|error| format!("validating schema as JSON: {error}"))?;
         // The compiler's own message quotes the offending schema fragment.
-        let Ok(validator) = jsonschema::draft202012::new(&schema) else {
+        let Ok(validator) = jsonschema::options().build(&schema) else {
             return Err("compiling JSON schema failed".to_owned());
         };
         Ok(Self { validator })
@@ -141,13 +157,12 @@ pub fn validate_schema(base_dir: &Path, argument: &str) -> Result<ValidateSchema
     ValidateSchema::new(base_dir, argument)
 }
 
-/// Read at most [`SCHEMA_CAP`] bytes from `path`.
+/// Read at most [`SCHEMA_CAP`] bytes from the opened `file`.
 ///
-/// The metadata check in [`ValidateSchema::new`] rejects an oversized file
-/// before this runs; the bounded read closes the gap for a file that grows in
-/// between, so a schema cannot exhaust memory through that race.
-fn read_schema(path: &Path) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+/// The caller rejects an oversized file from the descriptor's metadata first;
+/// the bounded read closes the gap for a file that grows afterwards, so a
+/// schema cannot exhaust memory through that race.
+fn read_schema(file: File) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     file.take(SCHEMA_CAP + 1)
         .read_to_end(&mut bytes)
@@ -156,6 +171,35 @@ fn read_schema(path: &Path) -> Result<Vec<u8>, String> {
         return Err(format!("schema file is larger than {SCHEMA_CAP} bytes"));
     }
     Ok(bytes)
+}
+
+/// Confirm that the opened `file` lies under the canonical `base`.
+///
+/// The descriptor's own path is confined, so a symlink swapped in between the
+/// path check and the open is caught. Without `/proc` there is no descriptor
+/// path to check, and the module's confinement note applies.
+#[cfg(target_os = "linux")]
+fn confirm_opened(file: &File, base: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+
+    let descriptor = Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
+    if let Ok(real) = std::fs::canonicalize(&descriptor)
+        && !real.starts_with(base)
+    {
+        return Err("schema path must stay inside the configured root".to_owned());
+    }
+    Ok(())
+}
+
+/// No descriptor-path check exists on this platform; see the Linux form and the
+/// module's confinement note.
+#[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature matches the Linux form, which reports a confinement escape"
+)]
+fn confirm_opened(_file: &File, _base: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// The canonical form of the configured root.
@@ -371,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn the_dialect_is_draft_2020_12() {
+    fn a_schema_without_a_dialect_is_2020_12() {
         // `dependentRequired` is a 2020-12 keyword: a document without a
         // `$schema` is compiled as 2020-12, so it is enforced.
         let (_dir, operator) = load(r#"{"dependentRequired": {"name": ["age"]}}"#);
@@ -382,6 +426,59 @@ mod tests {
         assert!(
             !evaluate(&operator, VALID),
             "a document that satisfies the dependency must not match"
+        );
+    }
+
+    #[test]
+    fn a_draft_07_schema_selects_its_own_dialect() {
+        // Tuple `items` is draft-07 and refused by 2020-12, so this schema only
+        // loads if the declared dialect is honoured, as Go's validator does.
+        let (_dir, operator) = load(
+            r#"{
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "array",
+                "items": [{"type": "string"}, {"type": "number"}]
+            }"#,
+        );
+        assert!(
+            !evaluate(&operator, br#"["name", 1]"#),
+            "a document that matches the tuple must not match"
+        );
+        assert!(evaluate(&operator, b"[1, 2]"), "a wrong tuple type must match");
+    }
+
+    #[test]
+    fn an_unknown_dialect_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"$schema": "https://example.invalid/nonexistent-dialect", "type": "object"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_schema(dir.path(), "schema.json").unwrap_err(),
+            "compiling JSON schema failed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_opened_file_outside_the_root_is_rejected() {
+        use super::confirm_opened;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("schema.json"), SCHEMA).unwrap();
+        std::fs::write(outside.path().join("schema.json"), SCHEMA).unwrap();
+        let base = super::canonical_base(root.path()).unwrap();
+
+        let inside = std::fs::File::open(base.join("schema.json")).unwrap();
+        confirm_opened(&inside, &base).unwrap();
+        let outside_file = std::fs::File::open(outside.path().join("schema.json")).unwrap();
+        assert_eq!(
+            confirm_opened(&outside_file, &base).unwrap_err(),
+            "schema path must stay inside the configured root",
+            "a descriptor outside the root must be refused"
         );
     }
 
