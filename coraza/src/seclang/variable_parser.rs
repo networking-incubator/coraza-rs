@@ -34,6 +34,7 @@ use crate::{
     rules::{VariableKey, VariableSpec},
     seclang::CompileError,
     types::RuleVariable,
+    utils::lowercase_like_go,
 };
 
 /// The result of parsing a variable expression.
@@ -184,15 +185,17 @@ fn written_variable<'i>(input: &mut &'i [u8]) -> winnow::Result<WrittenVariable<
         Some(_)
             if name.eq_ignore_ascii_case(b"XML")
                 || name.eq_ignore_ascii_case(b"JSON")
-                || name.eq_ignore_ascii_case(b"REQUEST_XML")
-                || name.eq_ignore_ascii_case(b"RESPONSE_XML") =>
+                || name.eq_ignore_ascii_case(b"REQUEST_XML") =>
         {
-            // `REQUEST_XML` and `RESPONSE_XML` are aliases of `XML`, so an XPath selector
-            // such as `/*` must parse as a path. Go exposes both as selectable
-            // (`internal/variables/variables.go:592`, `:594`) but sends
-            // `REQUEST_XML:/*` down its regex parser, where the trailing `*` is dropped
-            // and an empty pattern selects every XML entry. Parsing it as a path selects
-            // the document root children, exactly as `XML:/*` does.
+            // `REQUEST_XML` is the alias of `XML`, so an XPath selector such as `/*` must
+            // parse as a path. Go exposes the alias as selectable
+            // (`internal/variables/variables.go:594`, `RequestXML // CanBeSelected`) but
+            // sends `REQUEST_XML:/*` down its regex parser, where the trailing `*` is
+            // dropped and an empty pattern selects every XML entry. Parsing it as a path
+            // selects the document root children, exactly as `XML:/*` does.
+            //
+            // `RESPONSE_XML` stays out: it is never populated, so the path branch would
+            // only turn valid selectors such as `RESPONSE_XML:/a\|b/` into compile errors.
             let path = terminated(take_till(0.., b'|'), opt(b'|')).parse_next(input)?;
             WrittenKey::Path(path)
         },
@@ -291,7 +294,14 @@ fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> P
     let key = variable
         .key
         .as_deref()
-        .map(|key| parse_key(variable.variable, key, case_sensitive_args_keys))
+        .map(|key| {
+            parse_key(
+                variable.variable,
+                key,
+                case_sensitive_args_keys,
+                variable.markers.is_negation,
+            )
+        })
         .transpose()?;
 
     if variable.markers.is_negation {
@@ -312,12 +322,20 @@ fn build_element(variable: &ParsedVariable, case_sensitive_args_keys: bool) -> P
 /// Parse a slash-delimited key as a regex, using the variable's key sensitivity.
 ///
 /// Go compiles selector regexes without the case-insensitive flag. For every variable
-/// except the argument collections it first lower-cases the pattern source, which changes
-/// what escapes and classes match: `REQUEST_HEADERS:/^\S+$/` becomes `^\s+$` and selects
-/// nothing (`internal/corazawaf/rule.go:586`). Argument selectors keep the written source
-/// and fold case only while their map folds it, because the regex runs against the
-/// lower-cased lookup keys.
-fn parse_key(variable: RuleVariable, key: &str, case_sensitive_args_keys: bool) -> ParseResult<VariableKey> {
+/// except the argument collections it first lower-cases the pattern source with its simple
+/// mapping, which changes what escapes and classes match: `REQUEST_HEADERS:/^\S+$/` becomes
+/// `^\s+$` and selects nothing (`internal/corazawaf/rule.go:586`). Argument selectors keep
+/// the written source and fold case only while their map folds it, because the regex runs
+/// against the lower-cased lookup keys. Argument *exceptions* are different: Go compiles
+/// them as written and matches them against the lowered key
+/// (`internal/corazawaf/rule.go:629-640`, `internal/corazawaf/transaction.go:684-698`), so
+/// `!ARGS:/^Foo$/` excludes nothing.
+fn parse_key(
+    variable: RuleVariable,
+    key: &str,
+    case_sensitive_args_keys: bool,
+    is_exclusion: bool,
+) -> ParseResult<VariableKey> {
     let Some(pattern) = key
         .strip_prefix('/')
         .and_then(|key| key.strip_suffix('/'))
@@ -327,11 +345,9 @@ fn parse_key(variable: RuleVariable, key: &str, case_sensitive_args_keys: bool) 
     };
 
     let (source, case_insensitive) = if variable.has_case_sensitive_regex_keys() {
-        // The argument collections keep the written source; the regex folds case exactly
-        // while the argument map folds it too.
-        (Cow::Borrowed(pattern), !case_sensitive_args_keys)
+        (Cow::Borrowed(pattern), !is_exclusion && !case_sensitive_args_keys)
     } else {
-        (Cow::Owned(pattern.to_lowercase()), false)
+        (Cow::Owned(lowercase_like_go(pattern)), false)
     };
     RegexBuilder::new(&source)
         .case_insensitive(case_insensitive)
@@ -389,7 +405,7 @@ mod tests {
             matches("REQUEST_HEADERS:/^x-forwarded/", RuleVariable::RequestHeaders, &headers),
             ["1.2.3.4"]
         );
-        // The default mode folds argument key regexes like the argument maps fold lookups.
+        // The default mode folds argument key selectors like the argument maps fold lookups.
         assert_eq!(matches("ARGS:/^Foo$/", RuleVariable::Args, &args), ["1", "2"]);
         assert_eq!(matches_in("ARGS:/^foo$/", RuleVariable::Args, &args, false), ["1", "2"]);
 
@@ -436,6 +452,20 @@ mod tests {
                 &headers,
                 true
             ),
+            ["value"]
+        );
+    }
+
+    #[test]
+    fn non_argument_regex_keys_lower_u_0130_like_go() {
+        let mut headers = Map::new(RuleVariable::RequestHeaders);
+        headers.add("\u{130}", b"value");
+
+        // Go lowers the pattern source with its simple mapping, so `^İ$` becomes `^i$` and
+        // matches the folded key. Rust's full mapping would keep `i` + U+0307 and match
+        // nothing.
+        assert_eq!(
+            matches("REQUEST_HEADERS:/^\u{130}$/", RuleVariable::RequestHeaders, &headers),
             ["value"]
         );
     }
@@ -497,8 +527,12 @@ mod tests {
         args.add("Foo", b"1");
         args.add("foo", b"2");
 
-        // Default mode folds the exception regex, so it excludes every spelling.
-        assert!(matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &args).is_empty());
+        // Go compiles the exception as written and runs it against the folded key, so
+        // `^Foo$` excludes nothing even though the map folds `Foo` to `foo`.
+        let mut none = matches("ARGS|!ARGS:/^Foo$/", RuleVariable::Args, &args);
+        none.sort_unstable();
+        assert_eq!(none, ["1", "2"]);
+        assert!(matches("ARGS|!ARGS:/^foo$/", RuleVariable::Args, &args).is_empty());
 
         let mut strict = Map::new_case_sensitive(RuleVariable::Args);
         strict.add("Foo", b"1");
@@ -543,16 +577,13 @@ mod tests {
     fn accepts_xml_and_json_paths() {
         assert_eq!(parsed("XML:/*|JSON:a.b").len(), 2);
         assert_eq!(parsed("REQUEST_XML:/*").len(), 1);
-        assert_eq!(parsed("RESPONSE_XML:/*").len(), 1);
 
         // Names parse case-insensitively, so every spelling must take the path branch.
         // `/*` only survives it: the generic key parser reads it as an unterminated regex.
         assert_eq!(parsed("xml:/*|json:a.b").len(), 2);
         assert_eq!(parsed("Request_Xml:/*").len(), 1);
-        assert_eq!(parsed("response_xml:/*").len(), 1);
-        assert_eq!(parsed("Response_Xml:/*").len(), 1);
 
-        // The guard covers only those four names: another variable, however cased, still
+        // The guard covers only those three names: another variable, however cased, still
         // reaches the generic key parser, including pipes inside its regex.
         let mut args = Map::new(RuleVariable::Args);
         args.add("id_1", b"1");
@@ -561,26 +592,25 @@ mod tests {
     }
 
     #[test]
-    fn response_xml_selector_selects_the_root_children() {
+    fn response_xml_selectors_keep_the_generic_key_parser() {
         let mut xml = Map::new(RuleVariable::ResponseXML);
-        xml.add("/*", b"superuser & guest");
+        xml.add("a|b", b"regex");
+        xml.add("aa", b"literal");
 
-        // Go marks RESPONSE_XML selectable (`internal/variables/variables.go:592`), so the
-        // XPath selector compiles in either key mode, and the name is case-insensitive.
-        for selector in ["RESPONSE_XML:/*", "response_xml:/*", "Response_Xml:/*"] {
-            assert_eq!(
-                parse_variables_in(selector, true).map(|variables| variables.len()),
-                Ok(1)
-            );
-            assert_eq!(
-                matches(selector, RuleVariable::ResponseXML, &xml),
-                ["superuser & guest"]
-            );
-            assert_eq!(
-                matches_in(selector, RuleVariable::ResponseXML, &xml, true),
-                ["superuser & guest"]
-            );
-        }
+        // `RESPONSE_XML` is never populated (`internal/variables/variables.go:592`, "Not
+        // Implemented yet"), so it keeps the generic parser. A regex with an escaped pipe
+        // stays intact instead of being cut into a path plus a stray variable name.
+        assert_eq!(
+            matches("RESPONSE_XML:/a\\|b/", RuleVariable::ResponseXML, &xml),
+            ["regex"]
+        );
+        // A quoted key keeps its literal text, quotes stripped.
+        assert_eq!(
+            matches("RESPONSE_XML:'aa'", RuleVariable::ResponseXML, &xml),
+            ["literal"]
+        );
+        // `/*` is therefore not a path for this variable; the generic parser rejects it.
+        assert!(parse_variables("RESPONSE_XML:/*").is_err());
     }
 
     #[test]

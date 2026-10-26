@@ -23,9 +23,11 @@
 //! Provides key-value storage with optional case-insensitive keys.
 //! Multiple values per key are supported.
 //!
-//! Keys are byte strings, as they are in Go, so decoded names stay distinct even when they
-//! are not valid UTF-8. Text interfaces use the lossy view described on [`Map::iter`]; they
-//! never decide which entries exist.
+//! Keys are byte strings, so decoded names stay distinct even when they are not valid
+//! UTF-8. This is a deliberate deviation from Go, whose `strings.ToLower` folds every invalid
+//! byte through `unicode.ToLower(RuneError)` and merges `X\xff` and `X\xfe` into one entry.
+//! Text interfaces use the lossy view described on [`Map::iter`]; they never decide which
+//! entries exist.
 
 use std::{borrow::Cow, collections::HashMap, hash::Hash};
 
@@ -197,8 +199,9 @@ fn lower_bytes(key: &[u8]) -> Vec<u8> {
 /// Appends `text` to `out`, lower-cased the way Go folds collection keys.
 fn push_lowercase(out: &mut Vec<u8>, text: &str) {
     // Go's `strings.ToLower` is the simple mapping, not Rust's full one, so both the
-    // stored keys and the lookups go through the shared helper.
-    out.extend_from_slice(crate::utils::lowercase_like_go(text).as_bytes());
+    // stored keys and the lookups go through the shared helper. This path runs per key, so
+    // it writes in place instead of allocating a `String`.
+    crate::utils::lowercase::push_lowercase_like_go(out, text);
 }
 
 impl Map {
@@ -637,6 +640,9 @@ mod tests {
 
     #[test]
     fn case_insensitive_maps_preserve_invalid_bytes() {
+        // Deliberate deviation from Go: `strings.ToLower` folds both invalid bytes through
+        // `unicode.ToLower(RuneError)`, so Go merges these into one `x\u{fffd}` entry. Byte
+        // identity keeps them apart here.
         let mut map = Map::new(RuleVariable::RequestHeaders);
         map.add_bytes(b"X\xff", b"ff");
         map.add_bytes(b"X\xfe", b"fe");
@@ -644,6 +650,8 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.first(b"x\xff"), Some(&b"ff"[..]));
         assert_eq!(map.first(b"x\xfe"), Some(&b"fe"[..]));
+        // Only the lossy text projection merges them.
+        assert_eq!(map.entries().len(), 1);
     }
 
     /// The doc example of `collection::map::Map`, before it became internal.
