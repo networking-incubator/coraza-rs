@@ -96,7 +96,8 @@ matched rule messages in the format expected by go-ftw. Hyper rejects some raw
 request-target forms before they reach the WAF, so FTW results do not represent
 complete Coraza compatibility.
 
-Audit log HTTPS output is not implemented. Audit and FTW behavior should be
+Audit log HTTPS output requires the crate's `https-audit` feature, which the
+FTW server example does not enable. Audit and FTW behavior should be
 verified against the target Coraza and CRS revisions before relying on it for
 production policy decisions. Formatted audit timestamps use the process local
 time zone, as in Go Coraza. The FTW server is a test adapter, not a production

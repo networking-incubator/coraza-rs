@@ -21,10 +21,14 @@ path, for example `SecAuditLog https://collector.example/audit`.
 
 Parsing and compiling a policy does not activate its audit resources:
 `Parser::compile` validates the configuration and returns a `Waf` without
-creating files or connecting sockets, so a candidate policy can be discarded
-safely. `Waf::activate` opens the writer explicitly and is idempotent; the
-first `Waf::new_transaction` also activates it, so existing embedders keep the
-same behavior. `Parser::into_waf` is an alias for `Parser::compile`.
+creating or connecting audit files or sockets, so a candidate policy can be
+discarded safely. Parsing does still create and immediately remove one probe
+file in `SecUploadDir` to check that the directory is writable, as Go Coraza
+does. `Waf::activate` opens the writer explicitly, retries a failed activation,
+and is idempotent; the first `Waf::new_transaction` also activates it, so
+existing embedders keep the same behavior. A transaction's activation failure
+is memoised and surfaces from `Transaction::finish`, not retried per
+transaction. `Parser::into_waf` is an alias for `Parser::compile`.
 
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
 supported writers are serial files or standard output/error, concurrent
@@ -53,28 +57,30 @@ Redirects are followed as in Go Coraza, except that a 307 or 308 response fails
 the write instead of re-POSTing the entry.
 
 Call `Transaction::finish` after response processing when the caller needs to
-observe the terminal outcome. It runs the logging phase and writes the audit
-entry at most once: a successful write makes later calls return `Ok(())`
-without writing again, while a failed write is retried by a later call and the
-failure is returned. `Transaction::process_logging` remains as an alias.
-Dropping a transaction calls `finish` and ignores its error.
-`Parser::on_error_log` provides a synchronous callback for matched rules with
-the `log` action; use `MatchedRule::error_log` to format the Coraza-compatible
-line.
+observe the terminal outcome. It writes the audit entry at most once: a
+successful write makes later calls return `Ok(())` without writing again, and a
+failed write is stored and returned by this and every later call; it is never
+retried. `Transaction::process_logging` remains as an alias, so it also removes
+temporary upload files and returns their cleanup errors. Dropping a transaction
+calls `finish` and ignores its error. `Parser::on_error_log` provides a
+synchronous callback for matched rules with the `log` action; use
+`MatchedRule::error_log` to format the Coraza-compatible line.
 
 `finish` also removes temporary upload files unless `SecUploadKeepFiles` keeps
 them: `On` keeps all files and `RelevantOnly` keeps them only when a matched
 rule has the `log` action enabled, excluding `nolog`. A removal failure is
-returned from `finish`, as Go Coraza's `Close` does. The default, `Off`, deletes
-every temporary file.
+returned from `finish`, as Go Coraza's `Close` does, and cleanup is not retried
+on a later call. The default, `Off`, deletes every temporary file.
 
 `WafConfig::audit_log_connect_timeout` and `audit_log_write_timeout` are opt-in
 deadlines for the syslog writer, with no SecLang directive, so the default
 remains Go's unbounded behavior. The connect deadline covers TCP targets and
 their reconnect; the write deadline covers TCP, UDP, and Unix sockets where the
-platform supports a write deadline. File writes have no deadline, because a
-regular file write cannot time out, and neither Go nor this crate adds one.
-HTTPS keeps its one-second whole-request timeout regardless of these settings.
+platform supports a write deadline. DNS resolution is bounded by neither
+deadline: a resolver that never answers keeps the writer call blocked. File
+writes have no deadline, because a regular file write cannot time out, and
+neither Go nor this crate adds one. HTTPS keeps its one-second whole-request
+timeout regardless of these settings.
 
 The audit parts control which headers, bodies, files, and rule details are
 retained and written. Body capture is bounded by the configured request and
@@ -84,20 +90,60 @@ enabling audit logging for sensitive traffic.
 ## Operators
 
 The default build compiles the built-in operators. Three upstream operators
-are behind crate features, and without the feature the name is rejected when
-the `SecRule` is compiled, never silently mapped to another operator:
+live behind the `inspect-file`, `rbl` and `validate-schema` crate features,
+with `host-operators` as the umbrella for the first two. Without its feature
+the name is rejected when the `SecRule` is compiled, never silently mapped to
+another operator:
 
-- `host-operators` adds `@inspectFile`, which runs a local program, and `@rbl`,
-  which resolves a DNS blocklist. `@rbl` performs the A/AAAA lookup only: it
-  does not read the TXT record, set `TX.httpbl_msg`, or copy the message into
-  capture 0, so an address with a record but no TXT entry matches here where
-  Go reports no match.
-- `validate-schema` adds `@validateSchema`, which compiles its schema per
-  operator instead of sharing Go's content-keyed memoizer.
+- `inspect-file` adds `@inspectFile`, which runs a local program with the
+  inspected value as its only argument. A first output byte other than `1`
+  matches, a non-zero exit status does not. On Unix both streams share one
+  socket, so the combined output keeps the program's write order like Go's
+  `CombinedOutput`; other platforms use separate pipes and read stdout before
+  stderr. The 10-second deadline also bounds the exit wait, killing and reaping
+  a program that overruns it, and the retained output is capped at 1 MiB. An
+  over-cap run, a spawn failure, or a missed deadline reports
+  `OperatorOutcome::NotInspected`, which a rule treats as a miss;
+  `Operator::evaluate` still returns `false`. The value is raw bytes on Unix
+  and converted lossily elsewhere.
+- `rbl` adds `@rbl`, which resolves a DNS blocklist. It queries A/AAAA records
+  only: it does not read the TXT record, set `TX.httpbl_msg`, or copy the
+  message into capture 0, so an address with a record but no TXT entry matches
+  here where Go reports no match. A resolver failure, a lookup past the 500 ms
+  budget, and the 64-lookups-in-flight cap report `NotInspected` instead of a
+  plain miss. An empty or whitespace-only service is rejected at load time,
+  where Go accepts it.
+- `host-operators` is the umbrella feature that enables `inspect-file` and
+  `rbl`.
+- `validate-schema` adds `@validateSchema`, which validates JSON documents. The
+  schema path must be relative, contain no `..` component, and canonicalise
+  under the configured base directory; files over 1 MiB and non-regular files
+  are rejected, and a compile error never quotes the schema. The dialect is
+  pinned to 2020-12 while a document `$schema` still selects its own draft, the
+  engine is this crate's `jsonschema` rather than Go's, external `$ref` targets
+  are disabled, and `format` is an annotation only. A `pattern` that cannot
+  complete counts as a violation. Each operator compiles its own schema
+  instead of sharing Go's content-keyed memoizer.
 
 `Parser::register_operator` registers an embedder factory under a name, matched
 case-insensitively and consulted before the built-in names, so an embedder can
-add or override an operator. A registered operator must be `Send` and `Sync`.
+add or override an operator. Registering the same name again replaces the
+earlier factory. A registered operator must be `Send` and `Sync`.
+
+## Migrating from the previous API
+
+- `WafConfig::upload_keep_files` is an `UploadKeepFiles` (`Off`, `On`,
+  `RelevantOnly`) instead of a `bool`.
+- `WafConfig` has new `audit_log_connect_timeout` and `audit_log_write_timeout`
+  fields; both default to `None`.
+- `Transaction::process_logging` now removes temporary uploads and returns
+  their cleanup errors, like `finish`, and the audit write is attempted at most
+  once instead of being retried.
+- `Operator` now requires `Send + Sync`.
+- `OperatorContext` has a new `custom` field for registered operators, and
+  `OperatorEnum` has a new `Custom(Registered)` variant.
+- `CustomOperators` is now a struct with `insert`, `get`, `keys`, and
+  `is_empty`, not a bare map.
 
 ## FTW integration
 
