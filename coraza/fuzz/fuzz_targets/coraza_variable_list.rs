@@ -107,13 +107,24 @@ mod types {
     pub(crate) use coraza::types::RuleVariable;
 }
 
+/// The crate's folding helper is `pub(crate)`, so the shim keeps a copy of the
+/// one-line simple mapping: U+0130 folds to `i`, as Go's `strings.ToLower` does.
+mod utils {
+    pub(crate) fn lowercase_like_go(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| character.to_lowercase().next().unwrap_or(character))
+            .collect()
+    }
+}
+
 #[allow(unfulfilled_lint_expectations)]
 #[path = "../../src/seclang/variable_parser.rs"]
 mod variable_parser;
 
 fuzz_target!(|data: &[u8]| {
     let input = String::from_utf8_lossy(data);
-    let outcome = variable_parser::parse_variables_in(&input, false).map(|specs| {
+    let outcome = variable_parser::parse_variables_in(&input).map(|specs| {
         specs
             .iter()
             .map(rules::VariableSpec::fingerprint)
