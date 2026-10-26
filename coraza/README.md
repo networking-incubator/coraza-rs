@@ -112,24 +112,28 @@ another operator:
 
 - `inspect-file` adds `@inspectFile`, which runs a local program with the
   inspected value as its only argument. A first output byte other than `1`
-  matches, a non-zero exit status does not. On Unix both streams share one
-  socket, so the combined output keeps the program's write order like Go's
-  `CombinedOutput`; other platforms use separate pipes and read stdout before
-  stderr. The 10-second deadline bounds the program and its exit wait: a killed
-  program is reaped within a short grace, and one stuck in uninterruptible sleep
-  is left to be reaped when the process exits rather than parking the caller.
-  On Unix an abandoned reader is stopped and joined before the call returns; on
-  other platforms a reader a surviving descendant keeps blocked is detached
-  instead and holds one descriptor and at most the cap until the last write end
-  closes. The retained output is capped at 1 MiB: an over-cap run keeps the
-  collected prefix, and since Go's verdict is only the first output byte, that
-  byte still decides it before the run is abandoned. A spawn failure, a read
-  error, or a missed deadline reports `OperatorOutcome::NotMatched`, because Go
-  returns `false` for every error, so a negated `!@inspectFile` matches on
-  failure exactly as it does in Go. At most 64 runs execute at once in a
-  process; a run above that cap is a plain miss. The value is raw bytes on Unix
-  and converted lossily elsewhere. An empty or whitespace-only program is
-  rejected when the rule loads, where Go accepts it and fails on every value.
+  matches; for a run that stays within the 1 MiB output cap, a non-zero exit
+  status does not. On Unix both streams share one socket, so the combined output
+  keeps the program's write order like Go's `CombinedOutput`; other platforms
+  use separate pipes and read stdout before stderr, so an over-cap verdict can
+  be decided from stderr there. The 10-second deadline bounds the program and
+  its exit wait: a killed program is reaped within a short grace, and one stuck
+  in uninterruptible sleep is left to be reaped when the process exits rather
+  than parking the caller. On Unix an abandoned reader is stopped and joined
+  before the call returns; on other platforms a reader a surviving descendant
+  keeps blocked is detached instead and holds one descriptor and at most the cap
+  until the last write end closes. The retained output is capped at 1 MiB: an
+  over-cap run keeps the collected prefix, and since Go's verdict is only the
+  first output byte, that byte still decides it before the run is abandoned. The
+  exit status is not consulted for an over-cap run, so a program that writes
+  more than the cap and then exits non-zero matches here, where Go reads the
+  whole output and returns false. A spawn failure, a read error, or a missed
+  deadline reports `OperatorOutcome::NotMatched`, because Go returns `false` for
+  every error, so a negated `!@inspectFile` matches on failure exactly as it does
+  in Go. At most 64 runs execute at once in a process; a run above that cap is a
+  plain miss. The value is raw bytes on Unix and converted lossily elsewhere. An
+  empty or whitespace-only program is rejected when the rule loads, where Go
+  accepts it and fails on every value.
 - `rbl` adds `@rbl`, which resolves a DNS blocklist. It queries A/AAAA records
   only: it does not read the TXT record, set `TX.httpbl_msg`, or copy the
   message into capture 0, so an address with a record but no TXT entry matches
@@ -149,7 +153,12 @@ another operator:
   consults it and compiles every schema as 2020-12; this port does the same, so
   an unknown `$schema` still loads and a draft-07-only keyword shape such as
   tuple `items` or a boolean `exclusiveMinimum` is a compile error. `format` is
-  therefore always an assertion, as 2020-12 defines it. The schema path must be relative, contain
+  not asserted in either engine: Go leaves the compiler's `AssertFormat` off
+  (`compiler.go:65`) and 2020-12 makes `format` an annotation, so
+  `"format": "email"` accepts `not-an-email` whatever `$schema` declares. A
+  schema that declares draft-04/6/7 used to assert its formats, because the old
+  code let `$schema` select the draft, so a rule that relied on `format` as a
+  validator now accepts those values. The schema path must be relative, contain
   no `..` component, name a `.json` file, and canonicalise under the configured
   base directory. The type and size are read from the opened descriptor, and on
   Linux the descriptor's own path is confined again, which catches a symlink
@@ -220,6 +229,12 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   rule can see the previous rule's captures.
 - `percent_decode_lenient` no longer decodes `%+1`: only ASCII hexadecimal
   digits are accepted, as Go's `fromHex` does.
+- `@validateSchema` no longer asserts `format` for a schema that declares
+  draft-04/6/7. Every schema is compiled as 2020-12, where `format` is an
+  annotation, as Go's pinned compiler already treats it (`AssertFormat` off), so
+  `"format": "email"` now accepts `not-an-email` even under a draft-07
+  `$schema`. A rule that used `format` as a validator must check the value with
+  another operator.
 - `Transaction::process_logging` now removes temporary uploads and returns their
   cleanup errors, like `finish`, and the transaction attempts the audit write at
   most once instead of retrying it. The syslog writer still reconnects and

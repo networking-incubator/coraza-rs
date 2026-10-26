@@ -98,12 +98,13 @@ adding them requires a shared-corpus fixture first.
   rule can read the previous rule's captures while a Rust rule cannot. This is a
   deliberate deviation with no engine case ID or fixture hash yet.
 - Empty-regex `KeyStr` collapse. Go's rule parser drops the last byte of a
-  regex selector that has no closing slash, so `ARGS://` and `ARGS:/` compile to
-  the empty regex `//` and select every argument, and `!ARGS://` excludes every
-  argument. This engine treats `//` and `/` as literal keys, so they select
-  nothing. This is a pre-existing selector-parser deviation
-  (`coraza/src/seclang/variable_parser.rs::parse_key`) with no engine case ID or
-  fixture hash yet.
+  regex selector that has no closing slash, so `ARGS://` compiles to the empty
+  regex `//` and selects every argument through `FindRegex`, while `ARGS:/`
+  becomes an empty `KeyStr` and selects every argument through Go's `FindAll`
+  arm; `!ARGS://` excludes every argument. This engine treats `//` and `/` as
+  literal keys, so they select nothing. This is a pre-existing selector-parser
+  deviation (`coraza/src/seclang/variable_parser.rs::parse_key`) with no engine
+  case ID or fixture hash yet.
 - Detector input bound. The `detectSQLi` and `detectXSS` operators use
   libperfusion's public wrappers, which do not scan inputs longer than 65536 bytes;
   Go Coraza passes any length to libinjection-go. The operators report

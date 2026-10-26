@@ -32,12 +32,15 @@
 //!   as in Go.
 //! - Output beyond [`OUTPUT_CAP`] keeps the collected prefix and applies Go's first-byte verdict to it: the reader
 //!   stops and the run is abandoned, so a program that writes a huge output cannot pin the caller. An over-cap run with
-//!   no output at all is a non-match.
-//! - A non-zero exit status stays a non-match, as in Go.
+//!   no output at all is a non-match, and the exit status is not consulted once the cap is passed: a program that
+//!   writes more than the cap and then exits non-zero still matches by its first byte here, where Go reads the whole
+//!   output and returns false on the failing status.
+//! - A non-zero exit status stays a non-match for a run that stays within [`OUTPUT_CAP`], as in Go.
 //! - The number of runs in flight in a process is capped at [`MAX_IN_FLIGHT`]; a run above that cap reports
 //!   [`OperatorOutcome::NotMatched`] rather than queueing.
 //! - On Unix both streams share one socket, so the combined output keeps the program's write order like Go's
-//!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr.
+//!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr, so an
+//!   over-cap verdict can be decided from stderr there, where Go reads the combined first byte.
 //! - On Unix the value is passed as its raw bytes; elsewhere it is converted lossily, because those platforms have no
 //!   byte path form.
 //! - An empty or whitespace-only program is rejected when the rule loads, where Go accepts it and fails on every value.
@@ -109,6 +112,25 @@ struct Limiter {
     in_flight: AtomicUsize,
 }
 
+// A test's own in-flight cap, so a saturated limiter stays on its thread.
+#[cfg(test)]
+thread_local! {
+    // Per-thread override of [`MAX_IN_FLIGHT`].
+    static TEST_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The in-flight cap for the calling thread.
+///
+/// Tests lower it on their own thread, so a saturated cap cannot disturb the
+/// runs of the parallel test threads.
+fn in_flight_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_IN_FLIGHT
+}
+
 /// One reserved run slot, released when dropped.
 struct InFlight<'a> {
     /// The limiter the slot was taken from.
@@ -118,7 +140,7 @@ struct InFlight<'a> {
 impl Limiter {
     /// Reserve a slot, or report `None` when the cap is already reached.
     fn acquire(&self) -> Option<InFlight<'_>> {
-        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= in_flight_cap() {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -584,27 +606,14 @@ mod tests {
 
     /// Write a `#!/bin/sh` script and return its path.
     ///
-    /// A temp script is run as `sh <path>` rather than executed directly: the
-    /// script is then only read, which keeps the test independent of exec
-    /// permissions and of the parallel harness.
+    /// Tests run it as `sh <path>` and never execute it directly: a file that
+    /// another test thread still holds open for writing makes `execve` fail
+    /// with `ETXTBSY`, and this process forks for many of its tests. Running
+    /// the script only reads it, which is also independent of exec permissions.
     #[cfg(unix)]
     fn script(dir: &Path, body: &str) -> String {
         let path = dir.join("inspect.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        path.to_str().unwrap().to_owned()
-    }
-
-    /// Write an executable `#!/bin/sh` script and return its path.
-    ///
-    /// Executable scripts are the only way to receive the inspected value as
-    /// `$1`: `sh <path>` would pass the script path instead.
-    #[cfg(unix)]
-    fn executable_script(dir: &Path, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let path = dir.join("inspect-exec.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path.to_str().unwrap().to_owned()
     }
 
@@ -626,15 +635,21 @@ mod tests {
         evaluates("/bin/sh", path.as_bytes())
     }
 
-    /// Run an executable `body` script and return its completed output.
+    /// Run `program` with `input` as its only argument and return its output.
     #[cfg(unix)]
-    fn output_of_script(body: &str, input: &[u8]) -> Option<Vec<u8>> {
-        let dir = tempfile::tempdir().unwrap();
-        let program = executable_script(dir.path(), body);
-        match run_with_timeout(&program, input, Duration::from_secs(5)) {
+    fn output_of(program: &str, input: &[u8]) -> Option<Vec<u8>> {
+        match run_with_timeout(program, input, Duration::from_secs(5)) {
             Run::Completed(bytes) => Some(bytes),
             Run::OverCap(_) | Run::Failed => None,
         }
+    }
+
+    /// Run `body` through `sh <path>` and return its completed output.
+    #[cfg(unix)]
+    fn output_of_script(body: &str) -> Option<Vec<u8>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), body);
+        output_of("/bin/sh", path.as_bytes())
     }
 
     #[test]
@@ -695,13 +710,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_value_is_one_argument_and_is_never_shell_expanded() {
-        if !sh_available() {
-            return skip("/bin/sh");
+        if !shell_available() {
+            return skip("/bin/sh or /bin/echo");
         }
+        // `echo` joins separate operands with single spaces, so these exact bytes
+        // show one argument, and the literal `$(id)` shows no shell ran over it.
         let value = b"; $(id)\nsecond line";
         assert_eq!(
-            output_of_script("printf '%s|%s' \"$#\" \"$1\"", value),
-            Some(b"1|; $(id)\nsecond line".to_vec()),
+            output_of("/bin/echo", value),
+            Some(b"; $(id)\nsecond line\n".to_vec()),
             "the value must arrive as a single, unexpanded argument"
         );
     }
@@ -709,20 +726,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_value_bytes_reach_the_program_unchanged() {
-        if !sh_available() {
-            return skip("/bin/sh");
+        if !shell_available() {
+            return skip("/bin/sh or /bin/echo");
         }
-        let dir = tempfile::tempdir().unwrap();
-        let captured = dir.path().join("captured");
-        let program = executable_script(dir.path(), &format!("printf '%s' \"$1\" > '{}'", captured.display()));
-        let value = b"a\xffb";
-        assert!(matches!(
-            run_with_timeout(&program, value, Duration::from_secs(5)),
-            Run::Completed(_)
-        ));
         assert_eq!(
-            std::fs::read(&captured).unwrap(),
-            value.to_vec(),
+            output_of("/bin/echo", b"a\xffb"),
+            Some(b"a\xffb\n".to_vec()),
             "the argument must be byte-exact"
         );
     }
@@ -772,10 +781,7 @@ mod tests {
         }
         // Go's CombinedOutput reads one pipe, so the stderr byte comes first
         // and the verdict is "no match". Reading stdout first would flip it.
-        assert_eq!(
-            output_of_script("printf '1' >&2\nprintf '0'", b"value"),
-            Some(b"10".to_vec())
-        );
+        assert_eq!(output_of_script("printf '1' >&2\nprintf '0'"), Some(b"10".to_vec()));
         assert!(!evaluates_script("printf '1' >&2\nprintf '0'"));
     }
 
@@ -836,9 +842,9 @@ mod tests {
         // End-of-file arrives at once, so the exit wait must use the deadline
         // too; otherwise this parks a request thread for the whole sleep.
         let dir = tempfile::tempdir().unwrap();
-        let program = executable_script(dir.path(), "exec 1>&- 2>&-\nsleep 5");
+        let path = script(dir.path(), "exec 1>&- 2>&-\nsleep 5");
         let started = Instant::now();
-        let run = run_with_timeout(&program, b"value", Duration::from_millis(100));
+        let run = run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_millis(100));
         assert_eq!(verdict(run), OperatorOutcome::NotMatched, "an overrun is a plain miss");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -856,12 +862,12 @@ mod tests {
         // The descendant inherits the shared socket and keeps writing after the
         // program exits, so only the cap ends the read.
         let dir = tempfile::tempdir().unwrap();
-        let program = executable_script(
+        let path = script(
             dir.path(),
             "( i=0; while [ \"$i\" -lt 4000 ]; do printf '%0500d' 0; i=$((i+1)); done ) &\nexit 0",
         );
         let started = Instant::now();
-        let run = run_with_timeout(&program, b"value", Duration::from_secs(5));
+        let run = run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_secs(5));
         assert_eq!(
             verdict(run),
             OperatorOutcome::Matched,
@@ -884,10 +890,10 @@ mod tests {
         // the shut-down read end can end the read. `run_with_timeout` joins its
         // readers, so returning at all proves the reader stopped.
         let dir = tempfile::tempdir().unwrap();
-        let program = executable_script(dir.path(), "( exec sleep 5 ) &\nexit 0");
+        let path = script(dir.path(), "( exec sleep 5 ) &\nexit 0");
         let started = Instant::now();
         assert_eq!(
-            verdict(run_with_timeout(&program, b"value", Duration::from_millis(100))),
+            verdict(run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_millis(100))),
             OperatorOutcome::NotMatched,
             "a stalled descendant leaves no output, so it is a plain miss"
         );
@@ -1015,12 +1021,30 @@ mod tests {
         }
         // Go keeps the whole output and reads only its first byte, so a `0`
         // followed by more than the cap must match.
+        assert!(evaluates_script(
+            "printf '0'\ni=0\nwhile [ \"$i\" -lt 4000 ]; do printf '%0500d' 0; i=$((i+1)); done"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exhausted_in_flight_cap_misses_without_spawning() {
+        use super::{TEST_CAP, run_with_timeout};
+
+        if !sh_available() {
+            return skip("/bin/sh");
+        }
         let dir = tempfile::tempdir().unwrap();
-        let program = executable_script(
-            dir.path(),
-            "printf '0'\ni=0\nwhile [ \"$i\" -lt 4000 ]; do printf '%0500d' 0; i=$((i+1)); done",
-        );
-        assert!(evaluates(&program, b"value"));
+        let marker = dir.path().join("spawned");
+        let path = script(dir.path(), &format!("touch '{}'", marker.display()));
+
+        // This thread's cap only: the parallel tests keep the real one.
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let run = run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_secs(5));
+        TEST_CAP.with(|cap| cap.set(None));
+
+        assert!(matches!(run, Run::Failed), "a refused run is a plain miss");
+        assert!(!marker.exists(), "a refused run must not spawn the program");
     }
 
     #[test]
