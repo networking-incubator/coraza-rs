@@ -88,15 +88,17 @@ impl ParsedAction {
 ///
 /// - Keys are lowercased and trimmed
 /// - Values are trimmed and quotes removed
-/// - Unclosed quotes result in an error
+/// - As in Go Coraza, which only warns about it, a quote left open runs to the end of the line; the value then keeps
+///   its opening quote, so a comma inside it doesn't separate
 pub(crate) fn parse_actions(input: &str) -> ParseResult<Vec<ParsedAction>> {
     if input.trim().is_empty() {
         return Ok(Vec::new());
     }
-    // Any text is an action list but for one with a quote left open
+    // The grammar accepts every non-empty line; report a failure instead of panicking on
+    // hostile input if one ever slips through.
     action_list
         .parse(input)
-        .map_err(|_error| CompileError::new(format!("unclosed quotes in action line: {input}")))
+        .map_err(|_error| CompileError::new(format!("invalid action line: {input}")))
 }
 
 /// `KEY[:VALUE]` actions separated by commas.
@@ -124,11 +126,19 @@ fn segment<'i, const N: usize>(separators: [char; N]) -> impl Parser<&'i str, &'
     repeat::<_, _, (), _, _>(0.., alt((unquoted, quoted, escaped))).take()
 }
 
-/// `'...'`, in which a backslash escapes the closing quote.
+/// `'...'`, in which a backslash escapes the closing quote. A quote left open takes the
+/// rest of the line, as in Go Coraza: the value keeps its opening quote, which
+/// [`ParsedAction::new`] then leaves alone.
 fn quoted<'i>(input: &mut &'i str) -> winnow::Result<&'i str, EmptyError> {
+    alt((('\'', quote_body, '\'').take(), ('\'', quote_body).take())).parse_next(input)
+}
+
+/// Text up to the closing quote, escapes kept.
+fn quote_body<'i>(input: &mut &'i str) -> winnow::Result<&'i str, EmptyError> {
     let unescaped = take_till(1.., |c| matches!(c, '\\' | '\''));
-    let inside = repeat::<_, _, (), _, _>(0.., alt((unescaped, escaped)));
-    ('\'', inside, '\'').take().parse_next(input)
+    repeat::<_, _, (), _, _>(0.., alt((unescaped, escaped)))
+        .take()
+        .parse_next(input)
 }
 
 /// Backslashes and the character after them, which they escape: as in Go Coraza, a
@@ -208,12 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unclosed_quotes() {
-        let result = parse_actions("msg:'unclosed");
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.message.contains("unclosed quotes"));
-        }
+    fn test_parse_unterminated_quote_runs_to_end_of_line() {
+        // As in Go Coraza, which warns about the quote left open instead of rejecting it:
+        // the value keeps that quote, as its closing one is missing.
+        let actions = parse_actions("msg:'Multipart request body failed strict validation.").unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].key, "msg");
+        assert_eq!(actions[0].value, "'Multipart request body failed strict validation.");
+    }
+
+    #[test]
+    fn test_parse_unterminated_quote_keeps_commas() {
+        let actions = parse_actions("id:1,msg:'a,b,deny").unwrap();
+        let pairs: Vec<_> = actions.iter().map(|a| (a.key.as_str(), a.value.as_str())).collect();
+        assert_eq!(pairs, [("id", "1"), ("msg", "'a,b,deny")]);
     }
 
     #[test]
@@ -258,8 +276,11 @@ mod tests {
 
     #[test]
     fn test_parse_escaped_backslash_still_escapes() {
-        // As in Go Coraza, the quote after `\\` is escaped, so the value's is left open
-        assert!(parse_actions("msg:'a\\\\',deny").is_err());
+        // As in Go Coraza, the quote after `\\` is escaped, so its value is left open and
+        // runs to the end of the line, commas included
+        let actions = parse_actions("msg:'a\\\\',deny").unwrap();
+        let pairs: Vec<_> = actions.iter().map(|a| (a.key.as_str(), a.value.as_str())).collect();
+        assert_eq!(pairs, [("msg", "'a\\\\',deny")]);
     }
 
     #[test]

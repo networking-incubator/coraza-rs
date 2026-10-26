@@ -10,7 +10,18 @@ type-complexity-threshold = 200
 msrv = "1.99"
 stack-size-threshold = 16384
 avoid-breaking-exported-api = false
-doc-valid-idents = ["Coraza", "OWASP", "CRS", "WAF", "ModSecurity", "SecLang", "IPv4", "IPv6", "gRPC", "regex"]
+doc-valid-idents = [
+  "Coraza",
+  "OWASP",
+  "CRS",
+  "WAF",
+  "ModSecurity",
+  "SecLang",
+  "IPv4",
+  "IPv6",
+  "gRPC",
+  "regex",
+]
 # No methods are banned yet; add entries here as concrete needs arise
 # (mirrors praxis's pattern, but this is a library, not a proxy, so their
 # thread::sleep/stdin bans don't apply out of the box).

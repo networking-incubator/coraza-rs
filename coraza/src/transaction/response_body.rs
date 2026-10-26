@@ -26,7 +26,10 @@ use super::{
     request_body::{publish_json_arguments, read_json_body},
     variables::BodyProcessor,
 };
-use crate::types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase};
+use crate::{
+    audit_log::Failure,
+    types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
+};
 
 #[expect(
     clippy::multiple_inherent_impl,
@@ -77,7 +80,8 @@ impl Transaction {
                         }
                     }
                 }
-                if self.response_body_buffer.accept(body).is_err() {
+                if let Err(error) = self.response_body_buffer.accept(body) {
+                    self.finalization_errors.push(Failure::new(&error));
                     ingest_error = true;
                 }
             }
@@ -90,7 +94,10 @@ impl Transaction {
             self.audit_response_body.clear();
             match self.response_body_buffer.contiguous() {
                 Ok(retained) => self.audit_response_body.extend_from_slice(&retained),
-                Err(_) => ingest_error = true,
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    ingest_error = true;
+                },
             }
         }
 
@@ -112,14 +119,16 @@ impl Transaction {
                 length
             });
             self.response_body_buffer = buffer;
-            if let Ok(length) = inspected {
-                self.response_body_buffer.set_inspected(length);
-            } else {
-                self.outbound_data_error.set("1");
-                self.interrupt(0, "deny", 500, "");
-                if self.interruption.is_some() {
-                    return self.interruption.clone();
-                }
+            match inspected {
+                Ok(length) => self.response_body_buffer.set_inspected(length),
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    self.outbound_data_error.set("1");
+                    self.interrupt(0, "deny", 500, "");
+                    if self.interruption.is_some() {
+                        return self.interruption.clone();
+                    }
+                },
             }
         }
 

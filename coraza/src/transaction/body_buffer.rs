@@ -39,6 +39,8 @@ pub(super) enum BufferFailure {
     Accept,
     /// Fail the next `contiguous`.
     Replay,
+    /// Fail the next `reset`.
+    Reset,
 }
 
 #[cfg(test)]
@@ -210,12 +212,35 @@ impl BodyBuffer {
         Ok(())
     }
 
-    /// Drop retained bytes and the spill file, keeping the recorded counters.
+    /// Drop retained bytes and the spill file, keeping the supplied and inspected counts.
     fn discard(&mut self) {
         self.memory.clear();
         self.memory.shrink_to_fit();
         self.spill = None;
         self.length = 0;
+    }
+
+    /// Drop retained bytes and remove the spill file, reporting a removal failure.
+    ///
+    /// Mirrors Go's `BodyBuffer.Reset`, which closes and removes its temporary file and
+    /// returns that error. Like Go, the reset zeroes `length`, so `retained` falls to
+    /// zero and `spilled` clears; `supplied`, `inspected` and `truncated` stay unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spill file cannot be closed and removed.
+    pub(super) fn reset(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if take_injected_failure(BufferFailure::Reset) {
+            return Err(io::Error::other("injected body buffer failure"));
+        }
+        self.memory.clear();
+        self.memory.shrink_to_fit();
+        self.length = 0;
+        match self.spill.take() {
+            Some(file) => file.close(),
+            None => Ok(()),
+        }
     }
 
     /// Return all retained bytes as one contiguous slice.

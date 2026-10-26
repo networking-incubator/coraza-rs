@@ -100,7 +100,13 @@ impl CompiledAction {
             "drop" => tx.interrupt(rule.id, "drop", rule.status, ""),
             "redirect" => {
                 let data = Macro::new(&self.argument).map_or_else(|_| self.argument.clone(), |value| value.expand(tx));
-                let status = if rule.status == 0 { 302 } else { rule.status };
+                // Go's `redirect.go` only honors a status a client can redirect with;
+                // any other value falls back to 302.
+                let status = if matches!(rule.status, 301 | 302 | 303 | 307) {
+                    rule.status
+                } else {
+                    302
+                };
                 tx.interrupt(rule.id, "redirect", status, &data);
             },
             "allow" => tx.allow(&self.argument),
@@ -652,5 +658,37 @@ mod tests {
     fn redirect_accepts_the_written_target_without_macro_parsing() {
         let mut metadata = RuleMetadata::new();
         assert!(compile_action("redirect", "%{unfinished", &mut metadata).is_ok());
+    }
+
+    #[test]
+    fn redirect_uses_only_client_redirect_statuses() {
+        for (configured, expected) in [
+            (None, 302),
+            (Some(301), 301),
+            (Some(302), 302),
+            (Some(303), 303),
+            (Some(307), 307),
+            (Some(401), 302),
+            (Some(500), 302),
+        ] {
+            let status = configured.map_or_else(String::new, |status| format!(",status:{status}"));
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRule REQUEST_URI \"@rx ^/redirect$\" \
+                     \"phase:1,id:1{status},redirect:https://www.example.com\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction();
+            tx.process_uri("/redirect", "GET", "HTTP/1.1");
+            tx.process_request_headers();
+
+            assert_eq!(
+                tx.interruption().map(|interruption| interruption.status),
+                Some(expected),
+                "configured status {configured:?}"
+            );
+        }
     }
 }

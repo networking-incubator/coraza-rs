@@ -30,7 +30,7 @@ use std::{
 use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyProcessor};
 use crate::{
     body_processors::{multipart, xml},
-    transformations::{text_of, url_decode},
+    transformations::url_decode,
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
 };
 
@@ -111,10 +111,18 @@ impl Transaction {
             // Without a selected processor there is nothing to replay the buffer for;
             // audit capture above reads the retained bytes independently.
             if self.request_body_processor.is_some() {
+                // Go reads a body that reached the limit as a partial body instead of a
+                // malformed one (`internal/bodyprocessors/multipart.go`'s
+                // `flagUnexpectedEOF`, and `WriteRequestBody`'s `>=` check). The limit
+                // counters say whether that happened; INBOUND_DATA_ERROR also covers
+                // ingest and replay I/O failures, which do not cut the body.
+                let stats = self.request_body_stats();
+                let truncated =
+                    stats.truncated || stats.supplied >= u64::try_from(self.request_body_limit).unwrap_or(0);
                 let mut buffer = std::mem::take(&mut self.request_body_buffer);
                 let inspected = buffer.contiguous().map(|body| {
                     let length = body.len();
-                    self.inspect_request_body(&body);
+                    self.inspect_request_body(&body, truncated);
                     length
                 });
                 self.request_body_buffer = buffer;
@@ -135,7 +143,10 @@ impl Transaction {
     }
 
     /// Store and parse the body with the selected processor.
-    fn inspect_request_body(&mut self, body: &[u8]) {
+    ///
+    /// `truncated` reports that the body limit discarded supplied bytes, which makes a
+    /// multipart body that ends mid-part a partial body rather than a malformed one.
+    fn inspect_request_body(&mut self, body: &[u8], truncated: bool) {
         let Some(processor) = self.request_body_processor else {
             return;
         };
@@ -153,7 +164,7 @@ impl Transaction {
                 }
             },
             BodyProcessor::Multipart => {
-                if let Err(message) = self.process_multipart_body(body) {
+                if let Err(message) = self.process_multipart_body(body, truncated) {
                     self.reqbody_error.set("1");
                     self.reqbody_error_msg.set(format!("MULTIPART: {message}"));
                     self.reqbody_processor_error.set("1");
@@ -192,24 +203,28 @@ impl Transaction {
                     }
                 },
                 Err(message) => {
-                    let error = format!("malformed xml: {message}");
+                    // Go stores the processor's own error unchanged, which for XML is
+                    // `encoding/xml`'s `XML syntax error on line N: ...`
+                    // (`internal/corazawaf/transaction.go:1780-1786`, v3.8.1).
                     self.reqbody_error.set("1");
-                    self.reqbody_error_msg.set(format!("XML: {error}"));
+                    self.reqbody_error_msg.set(format!("XML: {message}"));
                     self.reqbody_processor_error.set("1");
-                    self.reqbody_processor_error_msg.set(error);
+                    self.reqbody_processor_error_msg.set(message);
                 },
             },
         }
     }
 
     /// Populate multipart fields, metadata, and temporary upload files.
-    fn process_multipart_body(&mut self, body: &[u8]) -> Result<(), String> {
-        let content_type = self
-            .request_headers
-            .first("content-type")
-            .map(|value| text_of(value).into_owned())
-            .unwrap_or_default();
-        let parts = multipart::parse(&content_type, body).inspect_err(|_| self.multipart_strict_error.set("1"))?;
+    fn process_multipart_body(&mut self, body: &[u8], truncated: bool) -> Result<(), String> {
+        let content_type = self.request_headers.first("content-type").unwrap_or_default().to_vec();
+        let (parts, failure) = multipart::parse(&content_type, body, truncated);
+        // Go's `NextPart` loop sets the strict error as soon as a part fails, but it
+        // has already published the parts before it (`internal/bodyprocessors/multipart.go:52-70`,
+        // v3.8.1), so publishing continues here and the error is reported afterwards.
+        if failure.as_ref().is_some_and(|failure| failure.strict) {
+            self.multipart_strict_error.set("1");
+        }
         let upload_dir = if self.config.upload_dir.is_empty() {
             std::env::temp_dir()
         } else {
@@ -230,16 +245,21 @@ impl Transaction {
             for (name, value) in &part.headers {
                 // Go Coraza v3.8.1 `multipart.go:70` stores the header value's raw bytes;
                 // a lossy text view would make distinct invalid-UTF-8 values equal.
-                let mut header = canonical_header_name(name).into_bytes();
+                let mut header = multipart::canonical_header_name(name).into_bytes();
                 header.extend_from_slice(b": ");
                 header.extend_from_slice(value);
                 self.multipart_part_headers.add_bytes(&part.name, header);
             }
             self.multipart_name.add_bytes(&part.name, &part.name);
-            if let Some(filename) = &part.filename {
+            // Go publishes only non-empty filenames, while a `filename*` that decoded to
+            // nothing still contributes its charset and language
+            // (`internal/bodyprocessors/multipart.go:88-105`, v3.8.1).
+            let filename = part.filename.as_deref().filter(|filename| !filename.is_empty());
+            let alt_filename = part.alt_filename.as_deref().filter(|filename| !filename.is_empty());
+            if let Some(filename) = filename {
                 self.multipart_filename.add_bytes(&part.name, filename);
             }
-            if let Some(filename) = &part.alt_filename {
+            if let Some(filename) = alt_filename {
                 self.multipart_filename.add_bytes(&part.name, filename);
             }
             if let Some(encoding) = &part.filename_encoding {
@@ -256,7 +276,10 @@ impl Transaction {
                 .checked_add(size)
                 .ok_or_else(|| "multipart size overflow".to_owned())?;
 
-            if let Some(filename) = &part.filename {
+            // Go promotes `altFilename` when the primary filename is empty and treats a
+            // part with no non-empty filename as a field, which is what an empty file
+            // input sends (`internal/bodyprocessors/multipart.go:106-115`, v3.8.1).
+            if let Some(filename) = filename.or(alt_filename) {
                 if self.uploaded_paths.len() >= self.config.upload_file_limit {
                     self.multipart_strict_error.set("1");
                     continue;
@@ -267,7 +290,7 @@ impl Transaction {
                 self.uploaded_paths.push(path);
                 self.files.add("", filename);
                 self.files_sizes.set_index(filename, 0, size.to_string());
-                if let Some(alt_filename) = &part.alt_filename {
+                if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
                     self.files.add("", alt_filename);
                     self.files_sizes.set_index(alt_filename, 0, size.to_string());
                 }
@@ -278,7 +301,10 @@ impl Transaction {
         }
 
         self.files_combined_size.set(total_size.to_string());
-        Ok(())
+        match failure {
+            Some(failure) => Err(failure.message),
+            None => Ok(()),
+        }
     }
 
     /// Select a request body processor, retaining its name even when this slice does not
@@ -298,26 +324,6 @@ fn save_to_temp(upload_dir: &Path, data: &[u8]) -> Result<PathBuf, String> {
     file.write_all(data).map_err(|error| format!("I/O error: {error}"))?;
     let (_, path) = file.keep().map_err(|error| format!("I/O error: {}", error.error))?;
     Ok(path)
-}
-
-/// Format a valid MIME header name as Go's canonical header key.
-fn canonical_header_name(name: &str) -> String {
-    let is_token = |character: char| character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character);
-    if !name.chars().all(is_token) {
-        return name.to_owned();
-    }
-    let mut starts_word = true;
-    name.chars()
-        .map(|character| {
-            let character = if starts_word {
-                character.to_ascii_uppercase()
-            } else {
-                character.to_ascii_lowercase()
-            };
-            starts_word = character == '-';
-            character
-        })
-        .collect()
 }
 
 /// Parses URLENCODED pairs in order, preserving decoded name and value bytes.
@@ -1528,14 +1534,361 @@ mod multipart_tests {
 
     /// Process `body` as `multipart/form-data` and return the transaction.
     fn process(body: &[u8]) -> Transaction {
+        let tx = process_with_rules(body, "SecRequestBodyAccess On");
+        assert!(tx.interruption().is_none());
+        tx
+    }
+
+    /// Process `body` as `multipart/form-data` under `rules` and return the transaction.
+    fn process_with_rules(body: &[u8], rules: &str) -> Transaction {
         let mut parser = crate::seclang::Parser::new();
-        parser.from_string("SecRequestBodyAccess On").unwrap();
+        parser.from_string(rules).unwrap();
         let waf = parser.into_waf().unwrap();
         let mut tx = waf.new_transaction_with_id("multipart-byte-names");
         tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
         tx.process_request_headers();
+        tx.process_request_body(body);
+        tx
+    }
+
+    /// Process `body` under the profile's `ProcessPartial` limit and return the transaction.
+    fn process_partial(body: &[u8]) -> Transaction {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRequestBodyLimit 150\n\
+                 SecRequestBodyLimitAction ProcessPartial",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-partial");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=a");
+        tx.process_request_headers();
         assert_eq!(tx.process_request_body(body), None);
         tx
+    }
+
+    #[test]
+    fn a_folded_filename_line_publishes_the_file_and_is_detected() {
+        // Go's `textproto` folds the leading-space line into the Content-Disposition
+        // value, so Go's `NextPart` loop sees `filename="shell.php"` and publishes it
+        // in `FILES`. Without folding no part was published and the rule below missed.
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"u\";\r\n filename=\"shell.php\"\r\nContent-Type: application/octet-stream\r\n\r\nPAYLOAD\r\n--b--\r\n";
+        let tx = process_with_rules(
+            body,
+            "SecRequestBodyAccess On\n\
+             SecRule FILES \"@rx shell\" \"id:1,phase:2,deny,status:403\"",
+        );
+
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.files.first(""), Some(&b"shell.php"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b"u"[..]));
+        assert_eq!(tx.multipart_filename.first(b"u"), Some(&b"shell.php"[..]));
+        assert_eq!(tx.args_post.first(b"u"), None);
+        assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(403));
+    }
+
+    #[test]
+    fn a_bare_lf_header_end_does_not_swallow_a_crlf_blank_line_in_the_body() {
+        // The headers end with `\n\n` while the body holds `\r\n\r\n`. Picking the
+        // later separator dropped everything before it from the field value and the
+        // saved upload.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"field\"\n\
+\n\
+ATTACK\r\n\r\nTAIL\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"x.txt\"\n\
+\n\
+ATTACK\r\n\r\nTAIL\r\n\
+--b--\r\n";
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.first(b"field"), Some(&b"ATTACK\r\n\r\nTAIL"[..]));
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.files_names.first(""), Some(&b"upload"[..]));
+        let path = tx
+            .get_variable(crate::types::RuleVariable::FilesTmpNames, Some(""))
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"ATTACK\r\n\r\nTAIL");
+    }
+
+    #[test]
+    fn a_mixed_delimiter_ending_is_a_body_error() {
+        // Go fixes the line ending at the first delimiter, so a later delimiter with the
+        // other one fails after the part before it was published
+        // (`mime/multipart/multipart.go`, `isBoundaryDelimiterLine`, go1.27.3).
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\none\r\n--b\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--b--\r\n";
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.first(b"a"), Some(&b"one"[..]));
+        assert_eq!(tx.args_post.first(b"b"), None);
+        assert_eq!(tx.reqbody_error.get(), "1");
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(
+            tx.reqbody_processor_error_msg.get(),
+            r#"multipart: expecting a new Part; got line "--b\n""#
+        );
+    }
+
+    #[test]
+    fn a_backslashed_plain_filename_reaches_files_after_coraza_unquoting() {
+        // Go Coraza's `unquoteIfQuoted` drops every backslash in the plain `filename`
+        // reading, so the alternate filename in `FILES` is `C:devx.txt`
+        // (`internal/bodyprocessors/multipart.go`, v3.8.1).
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"f\"; filename=\"C:\\dev\\x.txt\"; filename*=utf-8''a.txt\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+
+        let files: Vec<&[u8]> = tx.files.values("").collect();
+        assert_eq!(files, [b"a.txt".as_slice(), b"C:devx.txt"]);
+        let filenames: Vec<&[u8]> = tx.multipart_filename.values(b"f").collect();
+        assert_eq!(filenames, [b"a.txt".as_slice(), b"C:devx.txt"]);
+        assert_eq!(tx.files_names.first(""), Some(&b"f"[..]));
+    }
+
+    #[test]
+    fn a_part_before_an_invalid_part_is_published_before_the_body_error() {
+        // Go publishes each part as `NextPart` returns it, so the error on the second
+        // part leaves the first one in `ARGS_POST` (`internal/bodyprocessors/multipart.go:52-70`).
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"ok\"\r\n\
+\r\n\
+GOOD\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"bad\"\r\n\
+Bad Header\r\n\
+\r\n\
+P\r\n\
+--b--\r\n";
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.first(b"ok"), Some(&b"GOOD"[..]));
+        assert_eq!(tx.args_post.first(b"bad"), None);
+        assert_eq!(tx.reqbody_error.get(), "1");
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(
+            tx.reqbody_processor_error_msg.get(),
+            r#"malformed MIME header: missing colon: "Bad Header""#
+        );
+    }
+
+    #[test]
+    fn a_repeated_filename_parameter_has_no_name_and_fails_strict_validation() {
+        // Exact part from Go's `multipart_filename_star.yaml` profile.
+        let body = b"\n----0000\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"safe.jpg\"; filename=\"shell.php\"\n\
+\n\
+file content\n\
+----0000--\n";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-repeated-filename");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=--0000");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(body), None);
+
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(tx.multipart_duplicate_part_header.get(), "1");
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.files.value_count(), 0);
+        assert_eq!(tx.multipart_filename.value_count(), 0);
+        // A rejected Content-Disposition leaves no usable name, so Go's `FormName`
+        // returns "" and the field lands in `ARGS_POST[""]`
+        // (`mime/multipart/multipart.go:76-111`).
+        assert_eq!(tx.args_post.first(b"upload"), None);
+        assert_eq!(tx.args_post.first(b""), Some(&b"file content"[..]));
+    }
+
+    #[test]
+    fn an_empty_filename_is_a_field_and_a_non_empty_filename_star_promotes_the_part() {
+        // What a browser sends for an empty file input: Go promotes `altFilename`, and a
+        // part whose effective filename is still empty is a field
+        // (`internal/bodyprocessors/multipart.go:106-115`, v3.8.1).
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"f\"; filename=\"\"\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b"f"), Some(&b"DATA"[..]));
+        assert_eq!(tx.files.value_count(), 0);
+        assert_eq!(tx.files_names.value_count(), 0);
+        assert_eq!(tx.files_tmp_names.value_count(), 0);
+        assert_eq!(tx.multipart_filename.value_count(), 0);
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+
+        // A non-empty `filename*` is the effective filename, so the part is a file.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"f\"; filename=\"\"; filename*=utf-8''shell.php\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.value_count(), 0);
+        assert_eq!(tx.files.first(""), Some(&b"shell.php"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b"f"[..]));
+        assert_eq!(tx.multipart_filename.first(b"f"), Some(&b"shell.php"[..]));
+        assert_eq!(tx.multipart_filename_charset.first(b"f"), Some(&b"utf-8"[..]));
+
+        // A `filename*` that decodes to nothing keeps the part a field, and still
+        // publishes the charset and language Go records for it.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"f\"; filename=\"\"; filename*=utf-8''\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b"f"), Some(&b"DATA"[..]));
+        assert_eq!(tx.files.value_count(), 0);
+        assert_eq!(tx.multipart_filename.value_count(), 0);
+        assert_eq!(tx.multipart_filename_charset.first(b"f"), Some(&b"utf-8"[..]));
+    }
+
+    #[test]
+    fn only_form_data_keeps_the_part_name() {
+        // Go's `Part.FormName` returns the name only for a `form-data` disposition
+        // (`mime/multipart/multipart.go:76-86`). `originFileName` does not check the
+        // media type, so the filename still reaches `FILES` under the empty name.
+        let body = b"--b\r\n\
+Content-Disposition: attachment; name=\"f\"; filename=\"x.txt\"\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.value_count(), 0);
+        assert_eq!(tx.files.first(""), Some(&b"x.txt"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b""[..]));
+        assert_eq!(tx.multipart_name.first(b""), Some(&b""[..]));
+        assert_eq!(tx.multipart_filename.first(b""), Some(&b"x.txt"[..]));
+
+        // Without a filename it is an anonymous field.
+        let body = b"--b\r\nContent-Disposition: attachment; name=\"f\"\r\n\r\nDATA\r\n--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b""), Some(&b"DATA"[..]));
+        assert_eq!(tx.args_post.first(b"f"), None);
+
+        // The media type is lowercased first, as Go does.
+        let body = b"--b\r\nContent-Disposition: Form-Data; name=\"f\"\r\n\r\nDATA\r\n--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b"f"), Some(&b"DATA"[..]));
+    }
+
+    #[test]
+    fn a_content_disposition_name_with_a_space_is_an_anonymous_field() {
+        // Go's header map keeps this name raw (`noCanon`), so `Header.Get` finds no
+        // Content-Disposition and the part is still published as an anonymous field
+        // (`internal/bodyprocessors/multipart.go:182`, v3.8.1).
+        let body = b"--b\r\n\
+Content-Disposition : form-data; name=\"f\"; filename=\"x.txt\"\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b""), Some(&b"DATA"[..]));
+        assert_eq!(tx.files.value_count(), 0);
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+    }
+
+    #[test]
+    fn non_canonical_part_header_names_are_distinct_keys() {
+        // A header name with a space is kept raw (`canonicalMIMEHeaderKey`'s `noCanon`
+        // path), so these two names differ only in case are still distinct keys and
+        // neither repeats the other.
+        let body = b"--b\r\n\
+Content- Disposition: one\r\n\
+content- disposition: two\r\n\
+Content-Disposition: form-data; name=\"f\"\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.args_post.first(b"f"), Some(&b"DATA"[..]));
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.multipart_duplicate_part_header.get(), "0");
+        let headers: Vec<&[u8]> = tx.multipart_part_headers.values(b"f").collect();
+        assert!(
+            headers.contains(&b"Content- Disposition: one".as_slice()),
+            "{headers:?}"
+        );
+        assert!(
+            headers.contains(&b"content- disposition: two".as_slice()),
+            "{headers:?}"
+        );
+
+        // A repeated canonical name is still a duplicate.
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"f\"\r\n\
+Content-Disposition: form-data; name=\"f\"\r\n\
+\r\n\
+DATA\r\n\
+--b--\r\n";
+        let tx = process(body);
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(tx.multipart_duplicate_part_header.get(), "1");
+    }
+
+    #[test]
+    fn an_inbound_data_error_alone_does_not_make_a_body_partial() {
+        // INBOUND_DATA_ERROR also reports ingest and replay I/O failures, which do not
+        // cut the body, so only the limit counters decide whether a body is partial.
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nv";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-io-error");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+        tx.inbound_data_error.set("1");
+
+        tx.inspect_request_body(body, false);
+        assert_eq!(tx.reqbody_error.get(), "1");
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+
+        // The same body read as a partial one keeps the part and no error.
+        let mut tx = waf.new_transaction_with_id("multipart-partial");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+        tx.inspect_request_body(body, true);
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.args_post.first(b"q"), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn a_body_cut_by_process_partial_keeps_inspecting_parts() {
+        let file_body = b"--a\n\
+Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\n\
+Content-Type: text/plain\n\
+\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
+--a--\n";
+        let tx = process_partial(file_body);
+
+        assert_eq!(tx.inbound_data_error.get(), "1");
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.files.first(""), Some(&b"x.txt"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b"f"[..]));
+
+        let field_body = b"--a\n\
+Content-Disposition: form-data; name=\"t\"\n\
+\n\
+BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
+--a--\n";
+        let tx = process_partial(field_body);
+
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.args_post.first(b"t"), Some(b"B".repeat(104).as_slice()));
     }
 
     #[test]
@@ -1560,6 +1913,31 @@ two\r\n\
         assert!(tx.args_post.first("\u{fffd}").is_none());
         assert_eq!(tx.multipart_name.first(b"\xff"), Some(&b"\xff"[..]));
         assert_eq!(tx.multipart_name.first(b"\xfe"), Some(&b"\xfe"[..]));
+    }
+
+    #[test]
+    fn rfc_2231_values_reach_arguments_and_files() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name*0=long; name*1=name\r\n\
+\r\n\
+one\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"plain\"; name*=utf-8''extended\r\n\
+\r\n\
+two\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename*=utf-8''%FF%2Etxt\r\n\
+\r\n\
+file\r\n\
+--b--";
+        let tx = process(body);
+
+        assert_eq!(tx.args_post.first(b"longname"), Some(&b"one"[..]));
+        assert_eq!(tx.args_post.first(b"extended"), Some(&b"two"[..]));
+        assert_eq!(tx.args_post.first(b"plain"), None);
+        assert_eq!(tx.files.first(""), Some(&b"\xff.txt"[..]));
+        assert_eq!(tx.multipart_filename.first(b"upload"), Some(&b"\xff.txt"[..]));
+        assert_eq!(tx.multipart_filename_charset.first(b"upload"), Some(&b"utf-8"[..]));
     }
 
     #[test]
@@ -1608,6 +1986,33 @@ two\r\n\
             .filter(|value| value.starts_with(b"X: "))
             .collect();
         assert_eq!(x_values, [b"X: \xff".as_slice(), b"X: \xfe".as_slice()]);
+    }
+
+    #[test]
+    fn part_header_names_with_a_space_reach_part_headers() {
+        // Go's textproto keeps a space inside a header name, so CRS 922130 sees the raw
+        // `Content- Disposition:` part header of test 922130-4. A trailing space is kept
+        // raw too (`canonicalMIMEHeaderKey`'s `noCanon` path, go.dev/issue/34540).
+        let body = b"--b\r\n\
+Content- Disposition: form-data; name=\"file\"; filename=\"1.php\"\r\n\
+Content-Disposition: form-data; name=\"post\"\r\n\
+Content-Type : text/plain\r\n\
+\r\n\
+one\r\n\
+--b--";
+        let tx = process(body);
+
+        let headers: Vec<&[u8]> = tx.multipart_part_headers.values(b"post").collect();
+        assert_eq!(
+            headers,
+            [
+                b"Content- Disposition: form-data; name=\"file\"; filename=\"1.php\"".as_slice(),
+                b"Content-Disposition: form-data; name=\"post\"".as_slice(),
+                b"Content-Type : text/plain".as_slice(),
+            ]
+        );
+        // Distinct header names, as Go's header map, so no duplicate-header flag.
+        assert_eq!(tx.multipart_strict_error.get_bytes(), b"0");
     }
 
     #[test]

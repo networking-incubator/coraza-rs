@@ -20,25 +20,28 @@
 
 //! Simple byte-oriented transformations.
 
-use crate::{transformations::TransformationResult, utils::strings::x2c};
+use crate::{
+    transformations::TransformationResult,
+    utils::{lowercase_char, strings::x2c, uppercase_char},
+};
 
 /// ASCII whitespace bytes trimmed by these transformations.
 const TRIM_SPACES: &[u8] = b" \t\n\r\x0c\x0b";
 
-/// Converts UTF-8 text to lowercase and preserves malformed input bytes.
+/// Converts UTF-8 text to lowercase the way Go's `strings.ToLower` does.
 ///
-/// Valid UTF-8 segments use Unicode lowercase rules. Invalid byte sequences
-/// are copied unchanged.
+/// Valid UTF-8 uses Go's simple case mapping. Each byte that is not part of a
+/// valid UTF-8 sequence becomes U+FFFD, as Go's rune iteration does.
 pub fn lowercase(input: &[u8]) -> TransformationResult {
     let transformed = map_case(input, true);
     let changed = transformed.as_slice() != input;
     (transformed, changed, None)
 }
 
-/// Converts UTF-8 text to uppercase and preserves malformed input bytes.
+/// Converts UTF-8 text to uppercase the way Go's `strings.ToUpper` does.
 ///
-/// Valid UTF-8 segments use Unicode uppercase rules. Invalid byte sequences
-/// are copied unchanged.
+/// Valid UTF-8 uses Go's simple case mapping. Each byte that is not part of a
+/// valid UTF-8 sequence becomes U+FFFD, as Go's rune iteration does.
 pub fn uppercase(input: &[u8]) -> TransformationResult {
     let transformed = map_case(input, false);
     let changed = transformed.as_slice() != input;
@@ -354,24 +357,22 @@ fn starts_with_at(input: &[u8], offset: usize, needle: &[u8]) -> bool {
         .is_some_and(|candidate| candidate == needle)
 }
 
-/// Maps valid UTF-8 segments and copies malformed bytes unchanged.
+/// Maps valid UTF-8 with Go's simple case mapping and malformed bytes to U+FFFD.
 fn map_case(input: &[u8], lowercase: bool) -> Vec<u8> {
     let mut transformed = Vec::with_capacity(input.len());
     for_each_utf8(input, |item| match item {
         Ok(character) => {
-            if lowercase {
-                for mapped in character.to_lowercase() {
-                    let mut buffer = [0; 4];
-                    transformed.extend_from_slice(mapped.encode_utf8(&mut buffer).as_bytes());
-                }
+            let mapped = if lowercase {
+                lowercase_char(character)
             } else {
-                for mapped in character.to_uppercase() {
-                    let mut buffer = [0; 4];
-                    transformed.extend_from_slice(mapped.encode_utf8(&mut buffer).as_bytes());
-                }
-            }
+                uppercase_char(character)
+            };
+            let mut buffer = [0; 4];
+            transformed.extend_from_slice(mapped.encode_utf8(&mut buffer).as_bytes());
         },
-        Err(byte) => transformed.push(byte),
+        // Go's strings.ToLower and strings.ToUpper iterate runes, so each byte
+        // outside a valid UTF-8 sequence contributes one U+FFFD.
+        Err(_) => transformed.extend_from_slice("\u{FFFD}".as_bytes()),
     });
     transformed
 }
@@ -439,16 +440,39 @@ mod tests {
     };
 
     #[test]
-    fn case_mapping_preserves_malformed_bytes_and_maps_unicode() {
+    fn case_mapping_uses_go_simple_mapping_and_replaces_malformed_bytes() {
         let (lower, lower_changed, lower_error) = lowercase(b"TEST \xff \xc3\x84");
-        assert_eq!(lower, b"test \xff \xc3\xa4");
+        assert_eq!(lower, b"test \xef\xbf\xbd \xc3\xa4");
         assert!(lower_changed);
         assert_eq!(lower_error, None);
 
+        // Go's simple uppercase leaves `ß` and `ﬃ` alone, unlike Rust's full mapping.
         let (upper, upper_changed, upper_error) = uppercase(b"gro\xc3\x9f");
-        assert_eq!(upper, b"GROSS");
+        assert_eq!(upper, b"GRO\xc3\x9f");
         assert!(upper_changed);
         assert_eq!(upper_error, None);
+        assert_eq!(uppercase(b"Stra\xc3\x9fe").0, b"STRA\xc3\x9fE");
+        assert_eq!(uppercase(b"\xef\xac\x83").0, b"\xef\xac\x83");
+    }
+
+    #[test]
+    fn case_mapping_matches_go_for_turkish_and_greek() {
+        // U+0130 lower-cases to `i` with the simple mapping, not `i` + U+0307.
+        assert_eq!(lowercase(b"\xc4\xb0").0, b"i");
+        // Greek capital sigma lower-cases to sigma, never final sigma.
+        assert_eq!(lowercase(b"\xce\x9f\xce\xa3").0, b"\xce\xbf\xcf\x83");
+        assert_eq!(lowercase(b"\xcf\x82").0, b"\xcf\x82");
+        assert_eq!(uppercase(b"\xcf\x82").0, b"\xce\xa3");
+    }
+
+    #[test]
+    fn case_mapping_replaces_each_malformed_byte_like_go() {
+        assert_eq!(lowercase(b"\xe2\x82").0, b"\xef\xbf\xbd\xef\xbf\xbd");
+        assert_eq!(uppercase(b"A\xffB").0, b"A\xef\xbf\xbdB");
+        let (untouched, changed, error) = lowercase(b"already");
+        assert_eq!(untouched, b"already");
+        assert!(!changed);
+        assert_eq!(error, None);
     }
 
     #[test]

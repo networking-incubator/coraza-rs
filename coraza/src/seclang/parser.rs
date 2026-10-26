@@ -829,8 +829,10 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
 /// `SecRuleUpdateTargetById` ID|RANGE... "VARIABLES"
 ///
 /// Adds VARIABLES to the rules with the given ids or in the given inclusive ranges, as
-/// if appended to each rule's own: `!ARGS:id` excludes a key. A single id must name a
-/// rule defined earlier.
+/// if appended to each rule's own: `!ARGS:id` excludes a key. An id or range that names
+/// no rule defined earlier is ignored, as in Go Coraza's update path, where
+/// `SecRuleUpdateTargetById 13-15 16 18 "!ARGS:t2"` applies to whatever of 13 to 16
+/// exists.
 fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     let (ids, variables) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateTargetById ID \"VARIABLES\"")?;
@@ -842,17 +844,12 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
-        let mut found = false;
         for rule in options
             .rules
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
             variables.apply_to(rule.variables_mut());
-            found = true;
-        }
-        if !found && range.start() == range.end() {
-            return Err(format!("rule {} not found", range.start()));
         }
     }
     Ok(())
@@ -2260,6 +2257,23 @@ SecWebAppId production
         let rule = parser.rules.find_by_id(1).unwrap();
         assert!(!rule.metadata().log);
         assert_eq!(rule.actions().first().map(|action| action.name.as_str()), Some("pass"));
+    }
+
+    #[test]
+    fn test_update_target_by_id_ignores_missing_rules() {
+        // The Go profile `SecRuleUpdateTarget.yaml` updates `13-15 16 18`, where 18 is
+        // never defined: the ranges and ids that name no rule are no-ops there.
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS:t2 \"@rx bbb\" \"id:16,phase:1,log\"\n\
+                 SecRuleUpdateTargetById 13-15 16 18 \"!ARGS:t2\"\n\
+                 SecRuleUpdateTargetById 99 \"ARGS:t1\"",
+            )
+            .unwrap();
+
+        assert_eq!(parser.rule_count(), 1);
+        assert!(parser.rules.find_by_id(99).is_none());
     }
 
     #[test]

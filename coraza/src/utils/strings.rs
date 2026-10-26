@@ -20,6 +20,8 @@
 
 //! Byte-oriented string helpers for Coraza rule processing.
 
+use std::fmt::Write as _;
+
 /// Returns true if `byte` is an ASCII hexadecimal digit.
 #[inline]
 pub const fn valid_hex(byte: u8) -> bool {
@@ -80,6 +82,73 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+/// Quote a string using Go's `strconv.Quote` conventions.
+pub(crate) fn go_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        push_go_quoted(&mut quoted, character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Quote `bytes` as Go's `%q` quotes a string: valid UTF-8 text is escaped like
+/// [`go_quote`], and a byte that is not valid UTF-8 becomes `\xNN`.
+pub(crate) fn go_quote_bytes(bytes: &[u8]) -> String {
+    let mut quoted = String::with_capacity(bytes.len() + 2);
+    quoted.push('"');
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                for character in text.chars() {
+                    push_go_quoted(&mut quoted, character);
+                }
+                break;
+            },
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if let Ok(text) = std::str::from_utf8(rest.get(..valid).unwrap_or_default()) {
+                    for character in text.chars() {
+                        push_go_quoted(&mut quoted, character);
+                    }
+                }
+                let invalid = error.error_len().unwrap_or_else(|| rest.len().saturating_sub(valid));
+                let end = valid.saturating_add(invalid);
+                for byte in rest.get(valid..end).unwrap_or_default() {
+                    write!(quoted, "\\x{byte:02x}").unwrap_or(());
+                }
+                rest = rest.get(end..).unwrap_or_default();
+            },
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Append `character` to `quoted` as Go's `strconv.Quote` escapes it.
+fn push_go_quoted(quoted: &mut String, character: char) {
+    match character {
+        '"' => quoted.push_str("\\\""),
+        '\\' => quoted.push_str("\\\\"),
+        '\u{07}' => quoted.push_str("\\a"),
+        '\u{08}' => quoted.push_str("\\b"),
+        '\u{0c}' => quoted.push_str("\\f"),
+        '\n' => quoted.push_str("\\n"),
+        '\r' => quoted.push_str("\\r"),
+        '\t' => quoted.push_str("\\t"),
+        '\u{0b}' => quoted.push_str("\\v"),
+        character if (character as u32) < 0x20 || character as u32 == 0x7F => {
+            write!(quoted, "\\x{:02x}", character as u32).unwrap_or(());
+        },
+        character if character.is_control() => {
+            write!(quoted, "\\u{:04x}", character as u32).unwrap_or(());
+        },
+        character => quoted.push(character),
     }
 }
 

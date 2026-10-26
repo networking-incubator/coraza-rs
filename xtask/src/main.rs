@@ -26,6 +26,7 @@
 
 mod conformance;
 mod corpus;
+mod go_fixtures;
 mod lint_license;
 mod tables;
 
@@ -54,6 +55,10 @@ enum Command {
     CorpusCheck,
     /// Refresh fixtures and the SQL oracle from the pinned Go module version.
     CorpusRefresh,
+    /// Verify the vendored Go Coraza operator and profile fixtures.
+    GoFixturesCheck(go_fixtures::CheckArgs),
+    /// Refresh the vendored Go Coraza operator and profile fixtures.
+    GoFixturesRefresh,
     /// Check local libperfusion table data against its semantic hashes.
     TablesCheck,
     /// Refresh libperfusion's local tables from a libinjection C checkout.
@@ -75,6 +80,8 @@ fn main() {
         Command::LintLicense(args) => lint_license::run(args),
         Command::CorpusCheck => corpus::check_or_exit(),
         Command::CorpusRefresh => corpus::refresh_or_exit(),
+        Command::GoFixturesCheck(args) => go_fixtures::check_or_exit(&args),
+        Command::GoFixturesRefresh => go_fixtures::refresh_or_exit(),
         Command::TablesCheck => tables::check_or_exit(),
         Command::TablesRefresh(args) => tables::refresh_or_exit(&args),
         Command::ConformanceCheck => conformance::check_or_exit(),
