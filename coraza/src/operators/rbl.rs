@@ -314,14 +314,17 @@ mod tests {
     fn the_lookup_sets_no_txt_message_or_capture() {
         let rbl = operator("zen.spamhaus.org");
         let mut tx = Transaction::new("rbl");
+        // A fresh transaction starts with Go's empty TX:0..TX:9, so use a
+        // sentinel to show the lookup neither resets nor writes capture 0.
+        tx.set_tx_variable("0", "sentinel");
         let mut out = Outputs::new(true);
         assert!(!rbl.evaluate(&tx, b"192.0.2.1\0", &mut out));
         tx.store_operator_outputs(&mut out);
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("httpbl_msg")), None);
         assert_eq!(
-            tx.get_variable(RuleVariable::TX, Some("0")),
-            None,
-            "capture 0 must stay unset"
+            tx.get_variable(RuleVariable::TX, Some("0")).as_deref(),
+            Some("sentinel"),
+            "capture 0 must stay untouched"
         );
     }
 
