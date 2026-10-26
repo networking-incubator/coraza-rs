@@ -87,8 +87,11 @@
         "go_reference": "internal/operators/inspect_file.go",
         "fixtures": [],
         "differences": [
-          "Registered only with the host-operators crate feature; the default build rejects the name.",
-          "The program runs directly, without a shell, and stdout bytes precede stderr bytes in the combined output where Go interleaves both streams; the first-byte verdict is the same whenever the program writes to one stream."
+          "Registered only with the inspect-file crate feature, which host-operators also enables; the default build rejects the name.",
+          "On Unix both streams share one socket, so the combined output keeps the program's write order like Go's CombinedOutput. Non-Unix platforms use separate pipes and read stdout before stderr, which differs only when both carry output.",
+          "The program runs directly, without a shell, and the 10 s deadline also bounds the exit wait: a program that does not exit is killed and reaped.",
+          "Retained output is capped at 1 MiB. An over-cap run, a spawn failure, or a missed deadline reports OperatorOutcome::NotInspected while evaluate still returns false; a non-zero exit status stays a non-match, as in Go.",
+          "The value is passed as raw bytes on Unix and converted lossily elsewhere, because other platforms have no byte path form."
         ]
       },
       "ipMatch": {
@@ -166,9 +169,10 @@
         "go_reference": "internal/operators/rbl.go",
         "fixtures": [],
         "differences": [
-          "Registered only with the host-operators crate feature; the default build rejects the name.",
-          "The lookup is a std::net::ToSocketAddrs A/AAAA query bounded by a 500ms worker-thread wait. Go additionally reads the TXT record, sets TX.httpbl_msg from its first entry, copies it into capture 0, and reports no match when the TXT lookup fails; without a DNS dependency this port matches on the address record alone.",
-          "An empty service is rejected at compile time because Go relies on the TXT lookup to reject the self-resolving name it would build."
+          "Registered only with the rbl crate feature, which host-operators also enables; the default build rejects the name.",
+          "Only A/AAAA records are queried. Go also reads the TXT record, sets TX.httpbl_msg from its first entry, copies it into capture 0, and reports no match when the TXT lookup fails; without a DNS dependency this port matches on the address record alone.",
+          "A resolver failure, a lookup past the 500 ms budget, and the 64-in-flight cap report OperatorOutcome::NotInspected instead of a plain non-match; evaluate still returns false, so rule evaluation is unchanged.",
+          "An empty or whitespace-only service is rejected when the rule loads, where Go accepts it and relies on the TXT lookup to reject the self-resolving name it would build."
         ]
       },
       "restPath": {
@@ -229,6 +233,13 @@
         "fixtures": [],
         "differences": [
           "Registered only with the validate-schema crate feature; the default build rejects the name.",
+          "The schema path must be relative, contain no .. component, and canonicalise under the configured base directory. Go reads it through whatever root filesystem the embedder passed.",
+          "A schema file larger than 1 MiB is rejected before it is read, and a non-regular file is rejected.",
+          "A schema that fails to compile reports that step without quoting the schema, so a rejected schema cannot echo its contents into a log.",
+          "The dialect is pinned to JSON Schema 2020-12; a $schema in the document still selects its own draft.",
+          "The engine is this crate's jsonschema, not Go's kaptinlin/jsonschema. External $ref targets are disabled, so a reference to another document fails at compile time instead of reading an arbitrary path or URL.",
+          "format is an annotation, not an assertion, as 2020-12 specifies.",
+          "A pattern matcher that cannot complete, such as one that trips the regex engine's backtrack or size limit, counts as a violation, so a pathological pattern fails closed.",
           "Each operator compiles its own schema; Go's memoizer shares one compilation per schema content."
         ]
       },
@@ -1235,9 +1246,7 @@
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_keep_files",
         "go_reference": null,
         "fixtures": [],
-        "differences": [
-          "Boolean On/Off only; RelevantOnly is rejected at parse time (coraza/src/seclang/parser.rs:1103-1106). Go implements RelevantOnly as well, keeping temporary files only when a log-relevant rule matched (internal/corazawaf/transaction.go:1516-1531 and 1717-1723)."
-        ]
+        "differences": []
       },
       "SecWebAppId": {
         "state": "accepted_without_effect",
@@ -1951,7 +1960,9 @@
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
         "fixtures": [],
-        "differences": []
+        "differences": [
+          "Selectable but never populated, as in Go (internal/variables/variables.go:592, \"Not Implemented yet\"). Selectors use the generic key parser, so RESPONSE_XML:/* is rejected at compile time where Go accepts it as the literal key *."
+        ]
       },
       "RULE": {
         "state": "implemented",
