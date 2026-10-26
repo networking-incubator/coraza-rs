@@ -471,6 +471,28 @@ fn ledger_rows() -> Vec<(String, String)> {
 }
 
 #[test]
+fn the_xml_selector_fixture_matches_its_ledger_hash() {
+    use sha2::{Digest as _, Sha256};
+
+    // The ledger row is only meaningful if this file still has the bytes both
+    // sides were observed on, so keep the inert XML fixture on a checked path.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/fixtures/request-xml-root-selector.xml");
+    let digest = Sha256::digest(fs::read(&path).unwrap());
+    let mut actual = String::with_capacity(64);
+    for byte in digest {
+        for shift in [4_u32, 0] {
+            if let Some(digit) = char::from_digit((u32::from(byte) >> shift) & 0x0F, 16) {
+                actual.push(digit);
+            }
+        }
+    }
+    assert_eq!(
+        actual, "f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5",
+        "request-xml-root-selector.xml changed without updating the ledger"
+    );
+}
+
+#[test]
 fn ledger_rows_are_pinned() {
     let rows = ledger_rows();
     assert_eq!(rows.len(), REVIEWED_LEDGER.len(), "ledger row count changed");

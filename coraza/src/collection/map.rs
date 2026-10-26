@@ -263,11 +263,26 @@ impl Map {
             .map(|kv| (kv.key.text(), kv.value()))
     }
 
-    /// The keys and values stored under the exact `key` bytes.
+    /// The keys and values stored under `key`, folded the way a keyed lookup folds it.
+    ///
+    /// This is not an exact-byte lookup: a case-insensitive map folds `key` first.
+    /// [`Map::iter_key_exact`] takes the bytes as they are.
     pub(crate) fn iter_key_bytes(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         let lookup = self.lookup_key(key);
         self.data
             .get(lookup.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|kv| (kv.key.as_bytes(), kv.value()))
+    }
+
+    /// The keys and values stored under the exact `key` bytes, without folding.
+    ///
+    /// A case-insensitive map is keyed by the folded bytes and a case-sensitive map by the
+    /// raw bytes, so one exact lookup covers both. Nothing is allocated on this path.
+    pub(crate) fn iter_key_exact(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        self.data
+            .get(key)
             .into_iter()
             .flatten()
             .map(|kv| (kv.key.as_bytes(), kv.value()))
@@ -556,6 +571,19 @@ mod tests {
         assert_eq!(map.entries().into_keys().collect::<Vec<_>>(), ["x-i"]);
         // The two-code-point full mapping stays a distinct key, as it does in Go.
         assert!(map.first("x-i\u{307}").is_none());
+    }
+
+    #[test]
+    fn exact_lookup_does_not_fold() {
+        let mut folded = Map::new(RuleVariable::RequestHeaders);
+        folded.add("X-Foo", "value");
+        assert_eq!(folded.iter_key_exact(b"x-foo").count(), 1);
+        assert_eq!(folded.iter_key_exact(b"X-Foo").count(), 0);
+
+        let mut raw = Map::new_case_sensitive(RuleVariable::Args);
+        raw.add("Id", "value");
+        assert_eq!(raw.iter_key_exact(b"Id").count(), 1);
+        assert_eq!(raw.iter_key_exact(b"id").count(), 0);
     }
 
     #[test]

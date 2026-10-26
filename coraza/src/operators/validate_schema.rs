@@ -34,9 +34,9 @@
 //!   rely on that. See "Confinement" below for the window this leaves.
 //! - A schema file larger than [`SCHEMA_CAP`] is rejected instead of read.
 //! - Errors name the failing step but never quote the schema, so a rejected schema cannot echo its contents into a log.
-//! - The dialect comes from the schema's `$schema`, as Go's compiler does, and a schema without one is compiled as
-//!   2020-12. `format` is therefore an assertion for draft-04/6/7, which this engine asserts by default, and an
-//!   annotation from 2019-09 on.
+//! - Every schema is compiled as 2020-12, as Go's pinned `kaptinlin/jsonschema` compiler does: it parses `$schema` but
+//!   never consults it. An unknown `$schema` still loads, and a draft-07-only keyword shape such as tuple `items` or a
+//!   boolean `exclusiveMinimum` is a compile error. `format` is therefore always an assertion, as 2020-12 defines it.
 //! - The engine is this crate's `jsonschema`, not Go's `kaptinlin/jsonschema`, and external `$ref` targets are not
 //!   resolved: the `resolve-file` and `resolve-http` features stay off, so a reference to another document fails at
 //!   compile time instead of reading an arbitrary path or URL.
@@ -47,10 +47,11 @@
 //! rewrite the schema path between them is not stopped on every platform. The
 //! file's type and size are read from the opened descriptor rather than from the
 //! path, and on Linux the descriptor's own path is confined as well, which
-//! defeats a symlink swapped in before the open. Elsewhere a writer inside the
-//! configured root can still win that window, so loading must not race an
-//! untrusted writer there: keep the schema directory writable only by the
-//! process' own configuration source.
+//! defeats a symlink swapped in before the open; a descriptor path that cannot
+//! be canonicalised, such as when `/proc` is unavailable, is refused. Elsewhere a
+//! writer inside the configured root can still win that window, so loading must
+//! not race an untrusted writer there: keep the schema directory writable only by
+//! the process' own configuration source.
 //!
 //! `shortcut:` each operator compiles its own schema, where Go shares one
 //! compilation per schema content through its memoizer; upgrade if rules
@@ -63,7 +64,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use jsonschema::Validator;
+use jsonschema::{Draft, Validator};
 use serde_json::Value;
 
 use crate::{
@@ -131,8 +132,10 @@ impl ValidateSchema {
         let bytes = read_schema(file)?;
         let schema: Value =
             serde_json::from_slice(&bytes).map_err(|error| format!("validating schema as JSON: {error}"))?;
+        // Go's compiler never reads `$schema`: every schema is 2020-12, so pin the
+        // draft instead of letting this engine auto-detect one.
         // The compiler's own message quotes the offending schema fragment.
-        let Ok(validator) = jsonschema::options().build(&schema) else {
+        let Ok(validator) = jsonschema::options().with_draft(Draft::Draft202012).build(&schema) else {
             return Err("compiling JSON schema failed".to_owned());
         };
         Ok(Self { validator })
@@ -176,16 +179,16 @@ fn read_schema(file: File) -> Result<Vec<u8>, String> {
 /// Confirm that the opened `file` lies under the canonical `base`.
 ///
 /// The descriptor's own path is confined, so a symlink swapped in between the
-/// path check and the open is caught. Without `/proc` there is no descriptor
-/// path to check, and the module's confinement note applies.
+/// path check and the open is caught. A descriptor whose path cannot be
+/// canonicalised, such as one on a platform where `/proc` is not mounted, is
+/// refused rather than accepted unchecked.
 #[cfg(target_os = "linux")]
 fn confirm_opened(file: &File, base: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd as _;
 
     let descriptor = Path::new("/proc/self/fd").join(file.as_raw_fd().to_string());
-    if let Ok(real) = std::fs::canonicalize(&descriptor)
-        && !real.starts_with(base)
-    {
+    let real = std::fs::canonicalize(&descriptor).map_err(|error| format!("reading schema from root FS: {error}"))?;
+    if !real.starts_with(base) {
         return Err("schema path must stay inside the configured root".to_owned());
     }
     Ok(())
@@ -430,35 +433,46 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_07_schema_selects_its_own_dialect() {
-        // Tuple `items` is draft-07 and refused by 2020-12, so this schema only
-        // loads if the declared dialect is honoured, as Go's validator does.
+    fn an_unknown_schema_still_loads_as_2020_12() {
+        // Go's compiler parses `$schema` but never consults it, so an unknown
+        // dialect changes nothing: the 2020-12 keywords are still enforced.
         let (_dir, operator) = load(
+            r#"{
+                "$schema": "https://example.invalid/nonexistent-dialect",
+                "dependentRequired": {"name": ["age"]}
+            }"#,
+        );
+        assert!(
+            evaluate(&operator, br#"{"name": "John"}"#),
+            "an unknown $schema must not disable 2020-12 keywords"
+        );
+        assert!(!evaluate(&operator, VALID), "a satisfied dependency must not match");
+    }
+
+    #[test]
+    fn a_draft_07_only_keyword_shape_is_a_compile_error() {
+        // Go's compiler is hard-wired to 2020-12: tuple `items` and a boolean
+        // `exclusiveMinimum` cannot be decoded and fail the compile step.
+        for schema in [
             r#"{
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "array",
                 "items": [{"type": "string"}, {"type": "number"}]
             }"#,
-        );
-        assert!(
-            !evaluate(&operator, br#"["name", 1]"#),
-            "a document that matches the tuple must not match"
-        );
-        assert!(evaluate(&operator, b"[1, 2]"), "a wrong tuple type must match");
-    }
-
-    #[test]
-    fn an_unknown_dialect_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("schema.json"),
-            r#"{"$schema": "https://example.invalid/nonexistent-dialect", "type": "object"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            validate_schema(dir.path(), "schema.json").unwrap_err(),
-            "compiling JSON schema failed"
-        );
+            r#"{
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "minimum": 5,
+                "exclusiveMinimum": true
+            }"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("schema.json"), schema).unwrap();
+            assert_eq!(
+                validate_schema(dir.path(), "schema.json").unwrap_err(),
+                "compiling JSON schema failed",
+                "{schema} must not load"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

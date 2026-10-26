@@ -260,24 +260,11 @@ impl VariableSpec {
 
 /// Visit the entries a names view stores under the exact selector `key`.
 fn select_exact<'a>(map: &'a Map, key: &str, mut found: impl FnMut(&'a [u8], &'a [u8])) {
-    // `Map::iter_key_bytes` folds the selector, and the parser has already folded a
-    // non-argument selector, so that path is exact whenever folding changes nothing.
-    if lowercase_like_go(key) == key {
-        for (stored, value) in map.iter_key_bytes(key.as_bytes()) {
-            found(stored, value);
-        }
-        return;
-    }
-    // A folded key never contains an upper-case letter, so this selector can only be a
-    // whole lookup key in a case-sensitive map, where the stored key equals it.
-    // shortcut: membership goes through the allocating text view because `Map` has no
-    // exact byte-key lookup; add one there if an upper-case names selector gets hot.
-    if map.entries().contains_key(key) {
-        for (stored, value) in map.iter_bytes() {
-            if stored == key.as_bytes() {
-                found(stored, value);
-            }
-        }
+    // The parser has already folded a selector that Go folds, and the map is keyed by the
+    // folded bytes (case-insensitive) or the raw bytes (case-sensitive), so a single
+    // exact-byte lookup covers both cases and allocates nothing on this path.
+    for (stored, value) in map.iter_key_exact(key.as_bytes()) {
+        found(stored, value);
     }
 }
 
@@ -388,6 +375,41 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches.first().map(|matched| matched.value.as_slice()), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn names_view_literal_selector_is_an_exact_lookup() {
+        // A folded map is keyed by the folded bytes, so the exact selector finds it while
+        // the original spelling does not. Nothing is allocated by the lookup.
+        let mut folded = Map::new(RuleVariable::RequestHeaders);
+        folded.add("X-Foo", "value");
+        let matches = VariableSpec::new_string(RuleVariable::RequestHeadersNames, "x-foo".to_owned())
+            .get_matches(Some(CollectionView::Names(RuleVariable::RequestHeadersNames, &folded)));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches.first().map(|matched| matched.value.as_slice()),
+            Some(&b"X-Foo"[..])
+        );
+        assert!(
+            VariableSpec::new_string(RuleVariable::RequestHeadersNames, "X-Foo".to_owned())
+                .get_matches(Some(CollectionView::Names(RuleVariable::RequestHeadersNames, &folded)))
+                .is_empty()
+        );
+
+        // A case-sensitive map keeps the raw bytes, so the written spelling is the key.
+        let mut raw = Map::new_case_sensitive(RuleVariable::Args);
+        raw.add("Id", "value");
+        assert_eq!(
+            VariableSpec::new_string(RuleVariable::ArgsNames, "Id".to_owned())
+                .get_matches(Some(CollectionView::Names(RuleVariable::ArgsNames, &raw)))
+                .len(),
+            1
+        );
+        assert!(
+            VariableSpec::new_string(RuleVariable::ArgsNames, "id".to_owned())
+                .get_matches(Some(CollectionView::Names(RuleVariable::ArgsNames, &raw)))
+                .is_empty()
+        );
     }
 
     #[test]
