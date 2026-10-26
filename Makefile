@@ -57,6 +57,7 @@ test:
 	cargo xtask conformance-check
 	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
+	cargo test -p coraza --features inspect-file,rbl,validate-schema
 
 conformance-check:
 	cargo xtask conformance-check
@@ -153,6 +154,7 @@ lint-extra:
 audit:
 	cargo audit
 	cargo deny check
+	cargo deny --all-features check
 
 # Offline corpus, table and conformance refresh tools are not runtime coverage targets.
 # llvm-cov sees native test profiles; Envoy WASM callbacks are exercised in the integration job.

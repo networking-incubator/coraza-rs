@@ -56,6 +56,8 @@ part of the Cargo workspace.
 
 - `cargo audit`
 - `cargo deny check`
+- `cargo deny --all-features check`, which also resolves the feature-gated
+  dependencies (`MIT-0` among them)
 
 ### `coverage`
 
