@@ -184,6 +184,8 @@ pub struct Transaction {
     audit_error: Option<Failure>,
     /// Whether temporary upload cleanup already ran, successfully or not.
     uploads_closed: bool,
+    /// The terminal temporary upload cleanup failure, returned by every later `finish`.
+    cleanup_error: Option<Failure>,
     /// A disruptive action applied while the engine is on.
     interruption: Option<Interruption>,
     /// The first disruptive action that would apply in detection-only mode.
@@ -334,6 +336,13 @@ pub struct Transaction {
     inspection_incomplete: bool,
 }
 
+/// The `TX` capture keys, `"0"` through `"10"`.
+///
+/// Go seeds all eleven on every transaction (`internal/corazawaf/waf.go:264-268`,
+/// v3.8.1), so they stay present and a rule that reads a missing capture still sees an
+/// empty value.
+const TX_CAPTURE_KEYS: [&str; 11] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+
 #[expect(
     clippy::multiple_inherent_impl,
     reason = "transaction impl blocks are split across submodules"
@@ -409,6 +418,7 @@ impl Transaction {
             audit_attempted: false,
             audit_error: None,
             uploads_closed: false,
+            cleanup_error: None,
             interruption: None,
             would_be_interruption: None,
             skip: 0,
@@ -513,10 +523,11 @@ impl Transaction {
             },
             inspection_incomplete: false,
         };
-        // Go sets its capture variables to empty on every transaction
-        // (internal/corazawaf/waf.go:264-268 in v3.8.1).
-        for index in 0..=10 {
-            transaction.set_tx_variable(&index.to_string(), "");
+        // Go seeds its capture variables `TX:0`..`TX:10` to empty on every transaction
+        // (`internal/corazawaf/waf.go:264-268` in v3.8.1). Seeding them here means the
+        // per-rule reset below only rewrites existing values.
+        for key in TX_CAPTURE_KEYS {
+            transaction.tx.set_index(key, 0, "");
         }
         transaction
     }
@@ -658,45 +669,44 @@ impl Transaction {
     /// stored terminal outcome.
     ///
     /// The audit write is attempted **at most once**: a write that fails may already
-    /// have touched the sink, so it is never retried. The first failure is stored and
-    /// returned by this and every later call. Temporary upload files are removed in the
-    /// same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza calls
-    /// `Close` once, so a removal failure is reported here rather than retried.
+    /// have touched the sink, so it is never retried. The first audit failure is stored
+    /// and returned by this and every later call. Temporary upload files are removed in
+    /// the same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza calls
+    /// `Close` once, so a removal failure is stored and reported here rather than retried.
     ///
     /// [`WafConfig::upload_keep_files`]: crate::config::WafConfig::upload_keep_files
     ///
     /// # Errors
     ///
-    /// Returns the stored audit write failure, or a temporary upload file that cannot
-    /// be removed.
+    /// Returns the stored audit write failure, or the stored temporary upload cleanup
+    /// failure. An audit failure takes precedence when both are stored.
     pub fn finish(&mut self) -> std::io::Result<()> {
-        let mut outcome = Ok(());
         if !self.audit_attempted {
             self.audit_attempted = true;
             if let Err(error) = self.write_audit_log() {
                 self.audit_error = Some(Failure::new(&error));
             }
         }
-        if let Some(error) = &self.audit_error {
-            outcome = Err(error.to_error());
-        }
-        if let Err(error) = self.close_uploads_once()
-            && outcome.is_ok()
+        if self.cleanup_error.is_none()
+            && let Err(error) = self.close_uploads_once()
         {
-            outcome = Err(error);
+            self.cleanup_error = Some(Failure::new(&error));
         }
-        outcome
+        self.audit_error
+            .as_ref()
+            .or(self.cleanup_error.as_ref())
+            .map_or(Ok(()), |error| Err(error.to_error()))
     }
 
     /// Run logging rules and write this transaction's audit entry at most once.
     ///
     /// Alias for [`Transaction::finish`], kept for callers that only need the logging
-    /// outcome. A failed audit write is stored and never retried.
+    /// outcome. A failed audit write or upload cleanup is stored and never retried.
     ///
     /// # Errors
     ///
-    /// Returns the stored audit write failure, or a temporary upload file that cannot
-    /// be removed.
+    /// Returns the stored audit write failure, or the stored temporary upload cleanup
+    /// failure.
     pub fn process_logging(&mut self) -> std::io::Result<()> {
         self.finish()
     }
@@ -1266,11 +1276,16 @@ impl Transaction {
     }
 
     /// Clear captures and matched values from the rule evaluated previously.
+    ///
+    /// This is a deliberate deviation from Go: `resetCaptures` exists there
+    /// (`internal/corazawaf/transaction.go:477`, v3.8.1) but only its tests call it, so a
+    /// Go rule can read the previous rule's captures. Clearing `TX:0`..`TX:9` before every
+    /// rule keeps one rule's match from leaking into the next. The keys are seeded by the
+    /// constructor, so this rewrite allocates nothing.
     fn reset_matched_vars(&mut self) {
         self.matched_vars.reset();
-        // Go resets TX:0..TX:9 to empty rather than removing them.
-        for index in 0..10 {
-            self.set_tx_variable(&index.to_string(), "");
+        for key in TX_CAPTURE_KEYS.iter().take(10) {
+            self.tx.set_index(key, 0, "");
         }
     }
 
@@ -2310,6 +2325,26 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
                 tx.get_variable(RuleVariable::TX, Some(&index.to_string())).as_deref(),
                 Some("")
             );
+        }
+    }
+
+    #[test]
+    fn capture_reset_rewrites_the_seeded_tx_keys_in_place() {
+        let mut tx = Transaction::new("tx-capture-reset");
+        for key in ["0", "1", "9", "10"] {
+            tx.set_tx_variable(key, "stale");
+        }
+
+        tx.reset_matched_vars();
+
+        let entries = byte_entries(&tx, RuleVariable::TX);
+        assert_eq!(entries.len(), 11, "the reset must not add or drop TX keys");
+        for (key, value) in entries {
+            if key == b"10" {
+                assert_eq!(value, b"stale".to_vec(), "TX:10 is seeded but not a reset target");
+            } else {
+                assert!(value.is_empty(), "TX:{} was not cleared", String::from_utf8_lossy(&key));
+            }
         }
     }
 
@@ -4518,6 +4553,25 @@ v\r\n\
     }
 
     #[test]
+    fn response_body_mime_types_match_exactly() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("mime-exact", Arc::new(config));
+        tx.add_response_header("Content-Type", b"text/plain");
+        assert!(tx.is_response_body_processable());
+
+        // Go compares with `stringsutil.InSlice` (`slices.Contains`), so neither case nor
+        // whitespace is folded.
+        tx.add_response_header("Content-Type", b"TEXT/PLAIN");
+        assert!(!tx.is_response_body_processable());
+        tx.add_response_header("Content-Type", b" text/plain");
+        assert!(!tx.is_response_body_processable());
+    }
+
+    #[test]
     fn finish_writes_the_audit_entry_once_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.json");
@@ -4603,13 +4657,18 @@ payload\r\n\
     }
 
     #[test]
-    fn finish_reports_a_temporary_upload_cleanup_failure() {
+    fn finish_stores_a_temporary_upload_cleanup_failure() {
         let mut tx = Transaction::new("cleanup-failure");
         tx.uploaded_paths
             .push(std::env::temp_dir().join(format!("coraza-missing-upload-{}", std::process::id())));
 
         let error = tx.finish().unwrap_err();
         assert!(error.to_string().contains("removing temporary file"), "{error}");
+        let repeated = tx.finish().unwrap_err();
+        assert!(
+            repeated.to_string().contains("removing temporary file"),
+            "a cleanup failure must stay terminal: {repeated}"
+        );
     }
 
     #[test]

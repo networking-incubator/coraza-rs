@@ -49,6 +49,12 @@ use crate::{
 /// Next process-local suffix for concurrent audit log filenames.
 static NEXT_AUDIT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How long an internal caller waits before retrying a failed audit activation.
+///
+/// A failed sink may recover without an explicit [`AuditLogger::activate`], so the
+/// first write after this delay tries again instead of failing for the WAF's lifetime.
+const ACTIVATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
 /// A transaction's audit log entry.
 #[derive(Debug, Clone, Default)]
 pub struct AuditLog {
@@ -961,13 +967,16 @@ impl Failure {
     }
 }
 
-/// The writer slot and the last activation failure.
+/// The writer slot, the last activation failure and its retry deadline.
 #[derive(Debug, Default)]
 struct ActivationState {
     /// The opened writer, shared so a write never holds an activation lock.
     writer: Option<Arc<Writer>>,
-    /// A failure memoised until an explicit [`AuditLogger::activate`] retries.
+    /// The last activation failure, cleared by a successful attempt.
     failure: Option<Failure>,
+    /// Earliest time an internal caller may retry after `failure`; `None` when any
+    /// internal caller may try again.
+    retry_at: Option<Instant>,
 }
 
 /// How to build the audit writer once, without opening or connecting anything yet.
@@ -1031,7 +1040,7 @@ impl WriterPlan {
             Self::Serial { target, file_mode } => Writer::Serial(Mutex::new(match target {
                 SerialTarget::Stdout => Box::new(io::stdout()),
                 SerialTarget::Stderr => Box::new(io::stderr()),
-                SerialTarget::File(path) => Box::new(open_append(path, *file_mode).map_err(io::Error::other)?),
+                SerialTarget::File(path) => Box::new(open_append(path, *file_mode)?),
             })),
             Self::Concurrent {
                 index,
@@ -1039,7 +1048,7 @@ impl WriterPlan {
                 dir_mode,
                 file_mode,
             } => Writer::Concurrent {
-                index: Mutex::new(open_append(index, *file_mode).map_err(io::Error::other)?),
+                index: Mutex::new(open_append(index, *file_mode)?),
                 dir: dir.clone(),
                 dir_mode: *dir_mode,
                 file_mode: *file_mode,
@@ -1048,10 +1057,12 @@ impl WriterPlan {
                 target,
                 connect_timeout,
                 write_timeout,
-            } => Writer::Syslog(Mutex::new(
-                Syslog::connect(target, *connect_timeout, *write_timeout)
-                    .map_err(|error| io::Error::other(format!("syslog dial failure: {error}")))?,
-            )),
+            } => {
+                // Keep the dial error's kind, like the file and index paths above.
+                let syslog = Syslog::connect(target, *connect_timeout, *write_timeout)
+                    .map_err(|error| io::Error::new(error.kind(), format!("syslog dial failure: {error}")))?;
+                Writer::Syslog(Mutex::new(syslog))
+            },
             #[cfg(feature = "https-audit")]
             Self::Https { target } => {
                 Writer::Https(https::HttpsWriter::open(target, format).map_err(io::Error::other)?)
@@ -1257,8 +1268,9 @@ impl AuditLogger {
 
     /// Open or connect the planned writer once, retrying a memoised failure.
     ///
-    /// Explicit activation is the only retry path: after a failure, internal callers
-    /// keep reporting the memoised error until this method is called again.
+    /// Explicit activation is the only path that retries immediately: after a failure,
+    /// internal callers keep reporting the memoised error until
+    /// [`ACTIVATION_RETRY_BACKOFF`] has passed.
     ///
     /// # Errors
     ///
@@ -1271,19 +1283,21 @@ impl AuditLogger {
         self.install()
     }
 
-    /// Open the writer if it was never activated, reporting a memoised failure without
-    /// trying again.
+    /// Open the writer if it was never activated, retrying a failure after its backoff.
     ///
     /// # Errors
     ///
-    /// If a previous activation failed or a new attempt fails.
+    /// If an activation is due and fails, or a previous failure is still inside its
+    /// retry backoff.
     pub(crate) fn ensure_activated(&self) -> io::Result<()> {
         {
             let state = self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.writer.is_some() {
                 return Ok(());
             }
-            if let Some(failure) = &state.failure {
+            if let Some(failure) = &state.failure
+                && Self::in_backoff(&state)
+            {
                 return Err(failure.to_error());
             }
         }
@@ -1293,11 +1307,18 @@ impl AuditLogger {
             if state.writer.is_some() {
                 return Ok(());
             }
-            if let Some(failure) = &state.failure {
+            if let Some(failure) = &state.failure
+                && Self::in_backoff(&state)
+            {
                 return Err(failure.to_error());
             }
         }
         self.install()
+    }
+
+    /// Whether a failed activation may not be retried yet.
+    fn in_backoff(state: &ActivationState) -> bool {
+        state.retry_at.is_some_and(|retry_at| Instant::now() < retry_at)
     }
 
     /// Open the planned writer outside the state lock; the activation gate is held.
@@ -1308,15 +1329,36 @@ impl AuditLogger {
             Ok(writer) => {
                 state.writer = Some(Arc::new(writer));
                 state.failure = None;
+                state.retry_at = None;
                 drop(state);
                 Ok(())
             },
             Err(error) => {
                 state.failure = Some(Failure::new(&error));
+                state.retry_at = Instant::now().checked_add(ACTIVATION_RETRY_BACKOFF);
                 drop(state);
                 Err(error)
             },
         }
+    }
+
+    /// The failure from the last activation attempt, unless a later attempt succeeded.
+    pub(crate) fn activation_error(&self) -> Option<String> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+    }
+
+    /// Allow the next internal activation attempt immediately, as if the backoff passed.
+    #[cfg(test)]
+    pub(crate) fn expire_backoff(&self) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_at = None;
     }
 
     /// The opened writer, if activation succeeded.
@@ -1350,7 +1392,7 @@ impl AuditLogger {
         }
     }
 
-    /// Write `entry`, activating the writer first if it was never activated.
+    /// Write `entry`, activating the writer first if it is not open.
     ///
     /// # Errors
     ///
@@ -1370,10 +1412,17 @@ impl AuditLogger {
 
 /// Validate a syslog target's syntax without dialing it.
 ///
-/// An empty target selects the local syslog, and a target without `scheme://` is a TCP
-/// address, as [`Syslog::connect`] reads it. Only syntax is checked: reachability is
-/// deferred to activation.
+/// An empty target selects the local syslog, which only exists on Unix, and a target
+/// without `scheme://` is a TCP address, as [`Syslog::connect`] reads it. Only syntax is
+/// checked: reachability is deferred to activation.
 fn validate_syslog_target(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return if cfg!(unix) {
+            Ok(())
+        } else {
+            Err("invalid syslog target \"\": the local syslog is only available on Unix".to_owned())
+        };
+    }
     let Some((network, address)) = target.split_once("://") else {
         return Ok(());
     };
@@ -2014,7 +2063,10 @@ mod https {
 }
 
 /// Open `path` for append, creating it with `mode` when needed.
-fn open_append(path: &str, mode: u32) -> Result<File, String> {
+///
+/// The error keeps its kind so a caller can tell a missing directory from a permission
+/// failure; the message names the path.
+fn open_append(path: &str, mode: u32) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -2023,7 +2075,7 @@ fn open_append(path: &str, mode: u32) -> Result<File, String> {
     let _ = mode;
     options
         .open(path)
-        .map_err(|e| format!("cannot open audit log {path}: {e}"))
+        .map_err(|error| io::Error::new(error.kind(), format!("cannot open audit log {path}: {error}")))
 }
 
 /// Recursively create `dir` with the configured permission bits.

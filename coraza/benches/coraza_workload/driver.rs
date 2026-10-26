@@ -1224,6 +1224,14 @@ fn parse_expected_captures(
             )));
         }
         let value = resolve_bytes(required(object, "value", &item_context)?, corpus_root, &item_context)?;
+        // The observation side cannot tell an empty capture from an absent one: `read_captures`
+        // drops empty slots because Go seeds TX 0..10 with empty strings. Rejecting an empty
+        // expectation keeps that limitation from silently matching or masking a regression.
+        if value.bytes.is_empty() {
+            return Err(DriverError::Load(format!(
+                "{item_context} value is empty; an empty capture cannot be distinguished from an absent one"
+            )));
+        }
         captures.push(ExpectedCapture {
             index,
             value: value.bytes,
@@ -1937,13 +1945,11 @@ pub(crate) fn outcome_document(case: &Case, outcome: &Outcome) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    // The Go transaction seeds TX 0..10 with empty strings and cannot tell an
-    // empty slot from an explicitly cleared capture, so empty captures are
-    // omitted from the shared document on both sides.
+    // `read_captures` already drops empty slots: the Go transaction seeds TX 0..10 with
+    // empty strings and cannot tell an empty slot from an explicitly cleared capture.
     let captures = outcome
         .captures
         .iter()
-        .filter(|capture| !capture.value.is_empty())
         .map(|capture| {
             json!({
                 "index": capture.index,
