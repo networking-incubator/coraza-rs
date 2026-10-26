@@ -115,8 +115,8 @@ impl Waf {
     /// Open the audit writer, if one is configured, without creating a transaction.
     ///
     /// Idempotent and thread-safe: the first successful call opens the writer and later
-    /// calls return `Ok(())` without opening it again. A failed call leaves it unopened,
-    /// so a later call retries.
+    /// calls return `Ok(())` without opening it again. This is the only path that retries
+    /// a failed activation; other callers keep reporting the memoised failure.
     ///
     /// # Errors
     ///
@@ -136,11 +136,12 @@ impl Waf {
     /// Create a transaction with a caller-supplied identifier.
     ///
     /// Activates the audit writer first, as Go Coraza initializes its writer lazily.
-    /// The constructor is infallible, so an activation failure is recorded nowhere here
-    /// and surfaces from [`Transaction::finish`] when the entry is written.
+    /// The constructor is infallible, so an activation failure is memoised and surfaces
+    /// from [`Transaction::finish`] when the entry is written; it is not retried per
+    /// transaction.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
-        // Best effort: a failure stays observable from `Transaction::finish`.
-        drop(self.audit_logger.activate());
+        // Best effort: a memoised failure stays observable from `Transaction::finish`.
+        drop(self.audit_logger.ensure_activated());
         let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
         if let Some(error_log) = &self.error_log {
@@ -284,6 +285,97 @@ mod tests {
         waf.activate().unwrap();
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err(), "activation connected twice");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_failure_is_memoised_until_an_explicit_retry() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("syslog.sock");
+        let waf = Waf::new(WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: format!("unix://{}", socket.display()),
+            ..WafConfig::default()
+        })
+        .unwrap();
+
+        let mut before = waf.new_transaction_with_id("before-listener");
+        assert!(before.finish().is_err(), "activation has no socket to connect");
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut memoised = waf.new_transaction_with_id("memoised-failure");
+        assert!(memoised.finish().is_err());
+        assert!(
+            listener.accept().is_err(),
+            "an internal call retried the memoised activation"
+        );
+
+        listener.set_nonblocking(false).unwrap();
+        waf.activate().unwrap();
+        let (connection, _) = listener.accept().unwrap();
+        let mut after = waf.new_transaction_with_id("after-explicit-retry");
+        after.finish().unwrap();
+        drop(connection);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_activation_opens_one_syslog_connection() {
+        use std::{
+            os::unix::net::UnixListener,
+            sync::{Arc, Barrier},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("syslog.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let waf = Arc::new(
+            Waf::new(WafConfig {
+                audit_log_type: AuditLogType::Syslog,
+                audit_log: format!("unix://{}", socket.display()),
+                ..WafConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let waf = Arc::clone(&waf);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    waf.activate()
+                })
+            })
+            .collect();
+
+        drop(listener.accept().unwrap());
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "concurrent activation opened more than one connection"
+        );
+    }
+
+    #[test]
+    fn rejects_a_syslog_target_go_cannot_dial() {
+        for target in ["tcp://", "udp://", "unix://", "kafka://broker:9092"] {
+            let config = WafConfig {
+                audit_log_type: AuditLogType::Syslog,
+                audit_log: target.to_owned(),
+                ..WafConfig::default()
+            };
+            assert!(Waf::new(config).is_err(), "{target}");
+        }
     }
 
     #[test]

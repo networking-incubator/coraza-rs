@@ -1554,7 +1554,8 @@ fn read_captures(transaction: &Transaction) -> Vec<OutcomeCapture> {
     };
     let mut captures = Vec::new();
     for index in 0..=MAX_CAPTURE_INDEX {
-        if let Some(value) = map.first(index.to_string()) {
+        // Go seeds TX 0..10 with empty strings, so an empty slot is not a capture.
+        if let Some(value) = map.first(index.to_string()).filter(|value| !value.is_empty()) {
             captures.push(OutcomeCapture {
                 index,
                 value: value.to_vec(),

@@ -49,7 +49,7 @@ pub use crate::{actions::RuleMetadata, audit_log::MatchedRule};
 use crate::{
     audit_log::{
         AuditFile, AuditLog, AuditLogger, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse,
-        AuditTransaction, ErrorLog, mime_type_of,
+        AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
     collection::{Map, MatchData, Single},
     config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
@@ -72,9 +72,9 @@ struct ComputedVariables {
     request_basename: Single,
     /// The raw query string.
     query_string: Single,
-    /// Whether URL decoding failed.
+    /// Whether URL decoding failed; always zero, as in Go.
     urlencoded_error: Single,
-    /// Total request length.
+    /// Total request length; always zero, as in Go.
     full_request_length: Single,
     /// Multipart data after the closing boundary; always zero.
     multipart_data_after: Single,
@@ -178,8 +178,10 @@ pub struct Transaction {
     audit_response_body: Vec<u8>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
-    /// Whether the audit entry was written successfully, so a later `finish` is a no-op.
-    audit_written: bool,
+    /// Whether the audit write was attempted; an attempt is never repeated.
+    audit_attempted: bool,
+    /// The terminal audit outcome, returned by every later `finish`.
+    audit_error: Option<Failure>,
     /// Whether temporary upload cleanup already ran, successfully or not.
     uploads_closed: bool,
     /// A disruptive action applied while the engine is on.
@@ -381,7 +383,7 @@ impl Transaction {
             .as_secs();
         let at = LocalTime::from_unix(i64::try_from(epoch).unwrap_or(i64::MAX));
 
-        Self {
+        let mut transaction = Self {
             rule_engine: config.rule_engine,
             request_body_access: config.request_body_access,
             request_body_limit: config.request_body_limit,
@@ -404,7 +406,8 @@ impl Transaction {
             config,
             rules,
             last_phase: None,
-            audit_written: false,
+            audit_attempted: false,
+            audit_error: None,
             uploads_closed: false,
             interruption: None,
             would_be_interruption: None,
@@ -509,7 +512,13 @@ impl Transaction {
                 value
             },
             inspection_incomplete: false,
+        };
+        // Go sets its capture variables to empty on every transaction
+        // (internal/corazawaf/waf.go:264-268 in v3.8.1).
+        for index in 0..=10 {
+            transaction.set_tx_variable(&index.to_string(), "");
         }
+        transaction
     }
 
     /// The transaction ID as text.
@@ -648,48 +657,46 @@ impl Transaction {
     /// Run the terminal logging phase and temporary upload cleanup once, returning the
     /// stored terminal outcome.
     ///
-    /// The logging phase and the audit write happen at most once per transaction: after a
-    /// successful write, later calls return `Ok(())` without writing again. A failed write
-    /// is not stored as success, so a later call retries it; the first failure is returned
-    /// from the call that saw it. Temporary upload files are removed in the same call,
-    /// unless [`WafConfig::upload_keep_files`] keeps them, and a removal failure is
-    /// returned here, as Go Coraza's `Close` does.
+    /// The audit write is attempted **at most once**: a write that fails may already
+    /// have touched the sink, so it is never retried. The first failure is stored and
+    /// returned by this and every later call. Temporary upload files are removed in the
+    /// same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza calls
+    /// `Close` once, so a removal failure is reported here rather than retried.
     ///
     /// [`WafConfig::upload_keep_files`]: crate::config::WafConfig::upload_keep_files
     ///
     /// # Errors
     ///
-    /// Returns an error if the configured audit writer fails, or if a temporary upload
-    /// file cannot be removed.
+    /// Returns the stored audit write failure, or a temporary upload file that cannot
+    /// be removed.
     pub fn finish(&mut self) -> std::io::Result<()> {
         let mut outcome = Ok(());
-        if !self.audit_written {
-            match self.write_audit_log() {
-                Ok(()) => self.audit_written = true,
-                Err(error) => outcome = Err(error),
+        if !self.audit_attempted {
+            self.audit_attempted = true;
+            if let Err(error) = self.write_audit_log() {
+                self.audit_error = Some(Failure::new(&error));
             }
         }
-        if !self.uploads_closed {
-            // Report the first removal failure once; retrying cannot restore a file.
-            self.uploads_closed = true;
-            if let Err(error) = self.close_uploads()
-                && outcome.is_ok()
-            {
-                outcome = Err(error);
-            }
+        if let Some(error) = &self.audit_error {
+            outcome = Err(error.to_error());
+        }
+        if let Err(error) = self.close_uploads_once()
+            && outcome.is_ok()
+        {
+            outcome = Err(error);
         }
         outcome
     }
 
-    /// Run logging rules and write this transaction's audit entry once.
+    /// Run logging rules and write this transaction's audit entry at most once.
     ///
     /// Alias for [`Transaction::finish`], kept for callers that only need the logging
-    /// outcome.
+    /// outcome. A failed audit write is stored and never retried.
     ///
     /// # Errors
     ///
-    /// Returns an error if the configured audit writer fails, or if a temporary upload
-    /// file cannot be removed.
+    /// Returns the stored audit write failure, or a temporary upload file that cannot
+    /// be removed.
     pub fn process_logging(&mut self) -> std::io::Result<()> {
         self.finish()
     }
@@ -726,6 +733,17 @@ impl Transaction {
             logger.write(&self.audit_log())?;
         }
         Ok(())
+    }
+
+    /// Remove temporary upload files once, reporting the first removal failure.
+    ///
+    /// Go Coraza calls `Close` once, so cleanup is not retried on a later `finish`.
+    fn close_uploads_once(&mut self) -> std::io::Result<()> {
+        if self.uploads_closed {
+            return Ok(());
+        }
+        self.uploads_closed = true;
+        self.close_uploads()
     }
 
     /// Remove temporary upload files unless the configured retention policy keeps them.
@@ -1236,12 +1254,12 @@ impl Transaction {
     /// Store a response header value as supplied by the connector.
     pub fn add_response_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
         let value = value.as_ref();
-        let first_content_type =
-            key.eq_ignore_ascii_case("content-type") && self.response_headers.first("content-type").is_none();
+        let content_type = key.eq_ignore_ascii_case("content-type");
         self.response_headers.add(key, value);
-        if first_content_type {
-            // Go keeps the raw bytes before the first `;`, with no trimming and no
-            // UTF-8 requirement (`internal/corazawaf/transaction.go:451-455`, v3.8.1).
+        if content_type {
+            // Go sets this on every `Content-Type` header, so the last one wins. It
+            // keeps the raw bytes before the first `;`, with no trimming and no UTF-8
+            // requirement (`internal/corazawaf/transaction.go:444-457`, v3.8.1).
             let end = value.iter().position(|&byte| byte == b';').unwrap_or(value.len());
             self.response_content_type.set(value.get(..end).unwrap_or(value));
         }
@@ -1250,8 +1268,9 @@ impl Transaction {
     /// Clear captures and matched values from the rule evaluated previously.
     fn reset_matched_vars(&mut self) {
         self.matched_vars.reset();
+        // Go resets TX:0..TX:9 to empty rather than removing them.
         for index in 0..10 {
-            self.tx.remove(&index.to_string());
+            self.set_tx_variable(&index.to_string(), "");
         }
     }
 
@@ -1756,10 +1775,14 @@ const fn unhex(byte: u8) -> u8 {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            // Best effort: the terminal outcome is observable through `finish`.
-            drop(self.finish());
+        if std::thread::panicking() {
+            // Go's deferred `Close` still removes temporary uploads during a panic;
+            // only the audit write is skipped.
+            drop(self.close_uploads_once());
+            return;
         }
+        // Best effort: the terminal outcome is observable through `finish`.
+        drop(self.finish());
     }
 }
 
@@ -2270,7 +2293,10 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
 
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("0")).as_deref(), Some("current"));
         for index in 1..10 {
-            assert_eq!(tx.get_variable(RuleVariable::TX, Some(&index.to_string())), None);
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some(&index.to_string())).as_deref(),
+                Some("")
+            );
         }
     }
 
@@ -3650,7 +3676,7 @@ v\r\n\
     }
 
     #[test]
-    fn response_body_mime_uses_the_first_content_type_header() {
+    fn response_body_mime_uses_the_last_content_type_header() {
         let config = WafConfig {
             response_body_access: true,
             response_body_mime_types: vec!["text/plain".to_owned()],
@@ -3660,14 +3686,18 @@ v\r\n\
         tx.process_request_headers();
         tx.process_request_body(b"");
         tx.add_response_header("Content-Type", "application/json");
-        tx.add_response_header("content-type", "text/plain");
+        tx.add_response_header("content-type", "text/plain; charset=utf-8");
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseContentType, None).as_deref(),
+            Some("text/plain")
+        );
         tx.process_response_headers(200, "HTTP/1.1");
 
-        assert!(!tx.is_response_body_processable());
+        assert!(tx.is_response_body_processable());
         tx.process_response_body(b"body");
         assert_eq!(
             tx.get_variable(RuleVariable::ResponseContentLength, None).as_deref(),
-            Some("")
+            Some("4")
         );
     }
 
@@ -4499,9 +4529,11 @@ v\r\n\
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn finish_retries_a_failed_audit_write_instead_of_reporting_success() {
-        // /dev/full accepts the open and fails every write, so a later `finish` that
-        // returned the stored success would be observable as a passing test.
+    fn finish_reports_a_failed_audit_write_and_does_not_retry_it() {
+        // /dev/full accepts the open and fails every write.
+        if !std::path::Path::new("/dev/full").exists() {
+            return;
+        }
         let mut parser = crate::seclang::Parser::new();
         *parser.config_mut() = WafConfig {
             audit_engine: AuditEngineStatus::On,
@@ -4509,12 +4541,51 @@ v\r\n\
             ..WafConfig::default()
         };
         let waf = parser.into_waf().unwrap();
-        let mut tx = waf.new_transaction_with_id("finish-retry");
+        let mut tx = waf.new_transaction_with_id("finish-at-most-once");
 
-        assert!(tx.finish().is_err(), "the first write fails");
+        let first = tx.finish().unwrap_err();
+        assert_eq!(
+            first.kind(),
+            std::io::ErrorKind::StorageFull,
+            "the write, not activation, must fail: {first}"
+        );
+        let second = tx.finish().unwrap_err();
+        assert_eq!(
+            second.kind(),
+            std::io::ErrorKind::StorageFull,
+            "the stored write failure must stay observable: {second}"
+        );
+    }
+
+    #[test]
+    fn panic_in_a_transaction_still_removes_temporary_uploads() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let config = WafConfig {
+            request_body_access: true,
+            upload_dir: upload_dir.path().to_string_lossy().into_owned(),
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("panic-with-upload", Arc::new(config));
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=boundary");
+        tx.process_request_headers();
+        let body = b"--boundary\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"file.txt\"\r\n\
+\r\n\
+payload\r\n\
+--boundary--";
+        assert_eq!(tx.process_request_body(body), None);
+        let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
+        assert!(std::path::Path::new(&path).exists());
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _tx = tx;
+            std::panic::resume_unwind(Box::new("transaction dropped while panicking"));
+        }));
+
+        assert!(unwound.is_err());
         assert!(
-            tx.finish().is_err(),
-            "a failed write must be retried instead of reported as success"
+            !std::path::Path::new(&path).exists(),
+            "a panic must not leak the temporary upload"
         );
     }
 
@@ -5701,6 +5772,29 @@ content\r\n\
                 "{name} did not match @eq 0"
             );
         }
+    }
+
+    #[test]
+    fn fresh_transaction_initializes_the_go_tx_captures() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule TX:1 \"@rx ^$\" \"id:701,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("tx-default-captures");
+
+        for index in 0..=10 {
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some(&index.to_string())).as_deref(),
+                Some(""),
+                "TX:{index}"
+            );
+        }
+        assert!(tx.process_request_headers().is_none());
+        assert!(
+            tx.matched_rules().iter().any(|matched| matched.rule.id == 701),
+            "TX:1 must be empty on a fresh transaction"
+        );
     }
 
     #[test]
