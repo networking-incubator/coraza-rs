@@ -1009,6 +1009,16 @@ func parseExpectedCaptures(raw json.RawMessage, corpusRoot, context string) ([]e
 		if err != nil {
 			return nil, err
 		}
+		// The observation side cannot tell an empty capture from an absent one: an
+		// empty TX slot is not a capture, because Go seeds TX 0..10 with empty
+		// strings. Rejecting an empty expectation keeps that limitation from
+		// silently matching or masking a regression.
+		if len(value.data) == 0 {
+			return nil, fmt.Errorf(
+				"%s value is empty; an empty capture cannot be distinguished from an absent one",
+				itemContext,
+			)
+		}
 		captures = append(captures, expectedCapture{index: int(index), value: value.data})
 	}
 	return captures, nil

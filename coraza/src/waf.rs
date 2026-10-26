@@ -80,10 +80,11 @@ impl Waf {
     /// Create a WAF from configuration and compiled rules.
     ///
     /// `RuleGroup` is crate-private, so this is the only place a compiled rule set is
-    /// paired with a configuration; embedders cannot bypass it. Rules compiled by the
-    /// SecLang parser carry the `case_sensitive_args_keys` mode their key selectors were
-    /// compiled under, and a configuration with a different mode is rejected so compiled
-    /// selectors and transaction maps cannot disagree.
+    /// paired with a configuration; embedders cannot bypass it. The parser records the
+    /// `case_sensitive_args_keys` mode the rules were compiled under because it selects
+    /// the transaction's argument maps; a configuration with a different mode is rejected
+    /// so those maps cannot disagree with the rule set. Key selectors are compiled from
+    /// their variable alone, independently of the mode.
     ///
     /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
     /// [`Transaction::finish`] opens them, so a candidate policy can be compiled and

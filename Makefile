@@ -57,7 +57,7 @@ test:
 	cargo xtask conformance-check
 	$(MAKE) parity-manifest-check
 	cargo test --workspace $(_NOCAPTURE)
-	cargo test -p coraza --features inspect-file,rbl,validate-schema
+	cargo test -p coraza --features host-operators,validate-schema $(_NOCAPTURE)
 
 conformance-check:
 	cargo xtask conformance-check
@@ -158,12 +158,16 @@ audit:
 
 # Offline corpus, table and conformance refresh tools are not runtime coverage targets.
 # llvm-cov sees native test profiles; Envoy WASM callbacks are exercised in the integration job.
+# The default workspace run does not enable the gated operators or the optional host/HTTPS
+# code, so the second run measures coraza with every feature and enforces the same floors.
 coverage-check:
 	mkdir -p target/llvm-cov
 	cargo llvm-cov nextest --workspace --lcov --output-path target/llvm-cov/lcov.info \
 		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
 	cargo llvm-cov report --summary-only --fail-under-lines 90 --fail-under-regions 80 \
 		--ignore-filename-regex 'envoy-libperfusion/src/lib\.rs|src/main\.rs|xtask/src/corpus\.rs|xtask/src/tables\.rs|xtask/src/conformance\.rs'
+	cargo llvm-cov nextest -p coraza --all-features --summary-only \
+		--fail-under-lines 90 --fail-under-regions 80
 
 fmt:
 	cargo +$(NIGHTLY) fmt --all

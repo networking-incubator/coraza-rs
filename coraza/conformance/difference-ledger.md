@@ -39,6 +39,7 @@ must state which side was observed.
 | `raw-0292` | `245ac590dddc9898908c6d974085e33488a08219c48957278145049618d69b38` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0365` | `58c14b7bcbc569d32c0a70b54939c2c97aa53d4cfd68e17f7e933d515bf87527` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
 | `raw-0373` | `e27f2dcab16bfa5874e2ef0fc3d7702d363446029fdcab9a6d2c64bc8526d373` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
+| `request-xml-root-selector` | `f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5` | matches every XML entry, attributes included (empty regex) | matches the document's root children, exactly as XML:/* | Go parses `REQUEST_XML:/*` as an empty regex and selects both XML entries (`//@*` and `/*`); this engine parses it as the XPath `/*` and selects the root children only. The fixture is `<a id="1">x</a>`. |
 
 ## Resolved differences
 
@@ -88,6 +89,12 @@ adding them requires a shared-corpus fixture first.
 - `SecRequestBodyNoFilesLimit` is accepted, validated and documented as not enforced,
   matching Go Coraza v3.8.1 (`internal/corazawaf/waf.go:120`, corazawaf/coraza#896).
   No admission decision depends on it on either side.
+- Capture reset before each rule. `TX:0` through `TX:10` are seeded empty on every
+  transaction, as Go Coraza does (`internal/corazawaf/waf.go:264-268`), but this
+  engine clears `TX:0` through `TX:9` before every rule. Go's `resetCaptures`
+  (`internal/corazawaf/transaction.go:477`) is only called by its tests, so a Go
+  rule can read the previous rule's captures while a Rust rule cannot. This is a
+  deliberate deviation with no engine case ID or fixture hash yet.
 - Detector input bound. The `detectSQLi` and `detectXSS` operators use
   libperfusion's public wrappers, which do not scan inputs longer than 65536 bytes;
   Go Coraza passes any length to libinjection-go. The operators report

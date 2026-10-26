@@ -28,8 +28,8 @@
 //! Divergences from Go, all of them fail-closed for the rule:
 //!
 //! - A missed deadline, a spawn failure, a failed wait, or output beyond [`OUTPUT_CAP`] reports
-//!   [`OperatorOutcome::NotInspected`] rather than a plain non-match. Rules treat both as not matched; the transaction
-//!   records which one happened.
+//!   [`OperatorOutcome::NotInspected`] rather than a plain non-match. Rules treat both as not matched; only a
+//!   detector's `NotInspected` sets the transaction's inspection-incomplete signal, so this operator's does not.
 //! - A non-zero exit status stays a non-match, as in Go.
 //! - On Unix both streams share one socket, so the combined output keeps the program's write order like Go's
 //!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr.
