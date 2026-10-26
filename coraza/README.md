@@ -25,13 +25,16 @@ creating or connecting audit files or sockets, so a candidate policy can be
 discarded safely. Parsing does still create and immediately remove one probe
 file in `SecUploadDir` to check that the directory is writable, as Go Coraza
 does. `Waf::activate` opens the writer explicitly, retries a failed activation
-immediately, and is idempotent. The first `Transaction::finish` also activates
-it. A failed activation is memoised: `finish` reports it, later transactions
-keep reporting it during a 30-second backoff, and the next attempt after the
-backoff retries. `Waf::new_transaction` never opens a sink, so a connector's
-request path does not pay for a dial. `Waf::activation_error()` returns the
-last failure, and a reported failure keeps the original `io::ErrorKind`.
-`Parser::into_waf` is an alias for `Parser::compile`.
+immediately, and is idempotent. The first `Transaction::finish` that writes an
+entry also activates it. A failed activation is memoised: `finish` reports it,
+later transactions keep reporting it while the retry window is open, and the
+next attempt after the window retries. The window starts at 30 seconds and
+doubles after every failure up to five minutes, so a sink that stays down costs
+at most one attempt per window. `Waf::new_transaction` never opens a sink, so a
+connector's request path does not pay for a dial. `Waf::activation_error()`
+returns the last failure with its `io::ErrorKind`, and `Waf::activate` returns
+the dial error itself with its kind: a writer that cannot be opened is not a
+configuration error. `Parser::into_waf` is an alias for `Parser::compile`.
 
 The supported formats are `Native`, `JSON`, `JSONLegacy`, and `OCSF`. The
 supported writers are serial files or standard output/error, concurrent
@@ -62,12 +65,15 @@ the write instead of re-POSTing the entry.
 Call `Transaction::finish` after response processing when the caller needs to
 observe the terminal outcome. It writes the audit entry at most once: a
 successful write makes later calls return `Ok(())` without writing again, and a
-failed write is stored and returned by this and every later call; it is never
-retried. `Transaction::process_logging` remains as an alias, so it also removes
-temporary upload files and returns their cleanup errors. Dropping a transaction
-calls `finish` and ignores its error. `Parser::on_error_log` provides a
-synchronous callback for matched rules with the `log` action; use
-`MatchedRule::error_log` to format the Coraza-compatible line.
+failed write is stored and returned by this and every later call; the
+transaction layer never retries it. The syslog writer below that layer still
+reconnects and re-sends one frame after a write failure, so such a sink may
+receive an entry twice. `Transaction::process_logging` remains as an alias, so
+it also removes temporary upload files and returns their cleanup errors.
+Dropping a transaction calls `finish` and ignores its error.
+`Parser::on_error_log` provides a synchronous callback for matched rules with
+the `log` action; use `MatchedRule::error_log` to format the
+Coraza-compatible line.
 
 `finish` also removes temporary upload files unless `SecUploadKeepFiles` keeps
 them: `On` keeps all files and `RelevantOnly` keeps them only when a matched
@@ -76,14 +82,20 @@ returned from `finish`, as Go Coraza's `Close` does, and cleanup is not retried
 on a later call. The default, `Off`, deletes every temporary file.
 
 `WafConfig::audit_log_connect_timeout` and `audit_log_write_timeout` are opt-in
-deadlines for the syslog writer, with no SecLang directive, so the default
-remains Go's unbounded behavior. The connect deadline covers TCP targets and
-their reconnect; the write deadline covers TCP, UDP, and Unix sockets where the
-platform supports a write deadline. DNS resolution is bounded by neither
-deadline: a resolver that never answers keeps the writer call blocked. File
-writes have no deadline, because a regular file write cannot time out, and
-neither Go nor this crate adds one. HTTPS keeps its one-second whole-request
-timeout regardless of these settings.
+deadlines for the syslog writer, with no SecLang directive. The connect
+deadline covers TCP targets and their reconnect; the write deadline covers TCP,
+UDP, and Unix sockets where the platform supports a write deadline. DNS
+resolution is bounded by neither deadline: a resolver that never answers keeps
+the writer call blocked. File writes have no deadline, because a regular file
+write cannot time out, and neither Go nor this crate adds one. HTTPS keeps its
+one-second whole-request timeout regardless of these settings.
+
+An unset connect deadline means two different things. `Waf::activate` is the
+explicit path and keeps Go's unbounded dial. Activation triggered by
+`Transaction::finish` is on a request thread, so it applies five seconds when
+no deadline is configured: a blackholed syslog peer would otherwise park that
+thread for the kernel's SYN timeout, about two minutes. This is a deliberate
+safety deviation from Go Coraza, whose dial is unbounded.
 
 The audit parts control which headers, bodies, files, and rule details are
 retained and written. Body capture is bounded by the configured request and
@@ -153,17 +165,29 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 - `WafConfig::upload_keep_files` is an `UploadKeepFiles` (`Off`, `On`,
   `RelevantOnly`) instead of a `bool`.
 - `WafConfig` has new `audit_log_connect_timeout` and `audit_log_write_timeout`
-  fields; both default to `None`.
+  fields; both default to `None`, and an unset connect deadline is bounded for
+  internal activation and unbounded for `Waf::activate`.
 - `Operator` now requires `Send + Sync`.
 - `OperatorContext` has a new `custom` field for registered operators, and
   `OperatorEnum` has a new `Custom(Registered)` variant.
+- `OperatorEnum` also has three feature-gated variants: `InspectFile`
+  (`inspect-file`), `Rbl` (`rbl`) and `ValidateSchema` (`validate-schema`). A
+  match over `OperatorEnum` was already exhaustive over the built-in variants,
+  so it needs the new arms, guarded by the same features.
 - `CustomOperators` is now a struct with `insert`, `get`, `keys`, and
   `is_empty`, not a bare map.
+- `Transaction::finish` is new: it runs the logging phase, writes the audit
+  entry when one is due, removes temporary uploads and returns the stored
+  terminal failure. `Transaction::process_logging` is now an alias for it.
+- `Waf::activate` returns `std::io::Result<()>` and `Waf::activation_error`
+  returns `Option<(std::io::ErrorKind, String)>`, so a sink failure keeps its
+  error kind. It is not a `ConfigError`: only `Waf::new` and `Parser::compile`
+  report configuration errors.
 - `Waf::new` and `Parser::compile` no longer fail when the audit sink cannot be
   opened: they validate it and defer activation to `Waf::activate` or the first
-  `Transaction::finish`. A failed activation is reported by `finish`, retried
-  after a 30-second backoff, and also visible through `Waf::activation_error()`.
-  The reported error keeps its original `io::ErrorKind`.
+  `Transaction::finish` that writes an entry. A failed activation is reported by
+  `finish`, retried after a retry window that starts at 30 seconds and doubles
+  up to five minutes, and also visible through `Waf::activation_error()`.
 
 ### Behavior changes
 
@@ -189,8 +213,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 - `percent_decode_lenient` no longer decodes `%+1`: only ASCII hexadecimal
   digits are accepted, as Go's `fromHex` does.
 - `Transaction::process_logging` now removes temporary uploads and returns their
-  cleanup errors, like `finish`, and the audit write is attempted at most once
-  instead of being retried.
+  cleanup errors, like `finish`, and the transaction attempts the audit write at
+  most once instead of retrying it. The syslog writer still reconnects and
+  re-sends one frame after a write failure.
 
 ## FTW integration
 

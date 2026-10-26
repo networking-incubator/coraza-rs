@@ -7,7 +7,10 @@ This repository uses GitHub Actions to block risky changes early.
 ### `tests`
 
 - Lint: `make lint`
-- Tests: `make test`
+- Tests: `make test` runs the corpus, table, conformance and parity-manifest
+  checks, the workspace tests with default features, and then a second
+  `cargo test -p coraza` pass with the `host-operators,validate-schema` umbrella
+  feature set, so the feature-gated operators keep their tests.
 - `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
   integration checks against the pinned Envoy 1.40.0 image.
 - Meta-lint: `make lint-extra`
@@ -61,9 +64,13 @@ part of the Cargo workspace.
 
 ### `coverage`
 
-- Enforces:
+- Enforces, on two separate reports:
   - line coverage >= 90%
   - region coverage >= 80%
+- The first report is the workspace run with default features. The second is
+  `cargo llvm-cov nextest -p coraza --all-features`, which measures the
+  feature-gated operators and the optional host and HTTPS paths under the same
+  floors; a high default-feature number does not cover them.
 
 ### `msrv`
 

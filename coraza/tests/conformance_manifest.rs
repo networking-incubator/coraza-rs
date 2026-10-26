@@ -40,7 +40,7 @@ const VARIABLES_SOURCE: &str = include_str!("../src/types/variables.rs");
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
 const GO_COMMIT: &str = "d9cc9befc2721fd217ce1660a0e91aca1157221d";
 const EXAMPLE_FIXTURE_SHA: &str = "7dfaa62fe41c266f931e9d05fb8cefd7ecba57c929b11f02af0ef8737fc93c04";
-const REVIEWED_LEDGER: [(&str, &str); 15] = [
+const REVIEWED_LEDGER: [(&str, &str); 16] = [
     (
         "sql-nul-after-hex-prefix",
         "ada05d3c4ccbcb21de99ab1609081812dbe7a37e76a516595d44af97cb6ed02e",
@@ -99,6 +99,10 @@ const REVIEWED_LEDGER: [(&str, &str); 15] = [
     ),
     (
         "request-xml-root-selector",
+        "f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5",
+    ),
+    (
+        "xml-lowercase-selector",
         "f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5",
     ),
 ];
@@ -425,8 +429,7 @@ fn manifest_is_pinned_and_classifies_factories() {
     check_variables(&manifest);
 }
 
-#[test]
-fn ledger_rows_are_pinned() {
+fn ledger_rows() -> Vec<(String, String)> {
     let sha = Regex::new("^[0-9a-f]{64}$").unwrap();
     let mut rows = Vec::new();
     let mut in_table = false;
@@ -464,6 +467,12 @@ fn ledger_rows_are_pinned() {
         assert!(!cells[4].is_empty(), "ledger reason is empty for {case_id}");
         rows.push((case_id.to_owned(), hash.to_owned()));
     }
+    rows
+}
+
+#[test]
+fn ledger_rows_are_pinned() {
+    let rows = ledger_rows();
     assert_eq!(rows.len(), REVIEWED_LEDGER.len(), "ledger row count changed");
     for (case_id, hash) in &rows {
         assert!(
@@ -478,6 +487,43 @@ fn ledger_rows_are_pinned() {
             rows.iter()
                 .any(|(actual_id, actual_hash)| actual_id == case_id && actual_hash == hash),
             "reviewed ledger row {case_id} {hash} is missing"
+        );
+    }
+}
+
+#[test]
+fn reviewed_cases_are_listed_on_the_capability_they_affect() {
+    let manifest = parse_json("capability-manifest.json", MANIFEST);
+    let rows = ledger_rows();
+    let entry = manifest_group(&manifest, "variables")
+        .iter()
+        .find(|entry| {
+            entry
+                .get("names")
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some("REQUEST_XML")))
+        })
+        .unwrap_or_else(|| panic!("manifest has no REQUEST_XML variable entry"));
+    let fixtures = entry
+        .get("fixtures")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("REQUEST_XML has no fixtures array"));
+
+    // A reviewed case that exercises a capability has to be named on its entry, and the
+    // name has to resolve to a reviewed ledger row.
+    for fixture in fixtures {
+        let case_id = fixture
+            .as_str()
+            .unwrap_or_else(|| panic!("REQUEST_XML fixture is not a string"));
+        assert!(
+            rows.iter().any(|(id, _)| id == case_id),
+            "REQUEST_XML lists {case_id}, which is not a ledger row"
+        );
+    }
+    for case_id in ["request-xml-root-selector", "xml-lowercase-selector"] {
+        assert!(
+            fixtures.iter().any(|fixture| fixture.as_str() == Some(case_id)),
+            "REQUEST_XML does not name the reviewed case {case_id}"
         );
     }
 }

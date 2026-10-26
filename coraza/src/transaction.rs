@@ -668,11 +668,15 @@ impl Transaction {
     /// Run the terminal logging phase and temporary upload cleanup once, returning the
     /// stored terminal outcome.
     ///
-    /// The audit write is attempted **at most once**: a write that fails may already
-    /// have touched the sink, so it is never retried. The first audit failure is stored
-    /// and returned by this and every later call. Temporary upload files are removed in
-    /// the same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza calls
-    /// `Close` once, so a removal failure is stored and reported here rather than retried.
+    /// The transaction writes at most one audit entry, and only when one is due, so a
+    /// `finish` with nothing to write activates no sink. The audit write is attempted
+    /// **at most once by the transaction**: the first audit failure is stored and
+    /// returned by this and every later call and is never retried here. The syslog
+    /// writer inside the sink still reconnects and re-sends one frame after a write
+    /// failure, so that sink may see an entry twice. Temporary upload files are removed
+    /// in the same call, unless [`WafConfig::upload_keep_files`] keeps them; Go Coraza
+    /// calls `Close` once, so a removal failure is stored and reported here rather than
+    /// retried.
     ///
     /// [`WafConfig::upload_keep_files`]: crate::config::WafConfig::upload_keep_files
     ///
@@ -701,7 +705,8 @@ impl Transaction {
     /// Run logging rules and write this transaction's audit entry at most once.
     ///
     /// Alias for [`Transaction::finish`], kept for callers that only need the logging
-    /// outcome. A failed audit write or upload cleanup is stored and never retried.
+    /// outcome. A failed audit write or upload cleanup is stored and not retried by the
+    /// transaction; the syslog writer may still reconnect and re-send one frame.
     ///
     /// # Errors
     ///

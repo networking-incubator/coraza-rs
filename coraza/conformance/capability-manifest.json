@@ -3065,8 +3065,13 @@
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
         "go_reference": "internal/variables/variables.go",
-        "fixtures": [],
-        "differences": []
+        "fixtures": [
+          "request-xml-root-selector",
+          "xml-lowercase-selector"
+        ],
+        "differences": [
+          "REQUEST_XML:/* selects the root children stored under the literal /* key, exactly as XML:/* does, where Go compiles it as an empty regex and selects every XML entry, attribute values included (ledger request-xml-root-selector). The parser folds the variable name case before that path guard, so xml:/* and request_xml:/* also select the root children only, while Go's rule parser enters its path branch only for the exact spellings XML and JSON (internal/seclang/rule_parser.go:124) and sends a lower-case spelling down its regex path (ledger xml-lowercase-selector). The XML processor evaluates no XPath: it flattens attribute values under //@* and text segments under /* (coraza/src/transaction/request_body.rs:185-192). The same folded guard admits lower-case json: selectors, where Go's exact check does not."
+        ]
       },
       {
         "names": [

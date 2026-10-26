@@ -55,6 +55,19 @@ static NEXT_AUDIT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 /// first write after this delay tries again instead of failing for the WAF's lifetime.
 const ACTIVATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Longest wait between two internal activation attempts.
+///
+/// The backoff doubles on every failure up to this cap, so a sink that stays down costs
+/// at most one bounded attempt every five minutes.
+const ACTIVATION_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Deadline an internal activation attempt applies when the configuration sets none.
+///
+/// A deliberate safety deviation: Go Coraza's syslog dial is unbounded, so a blackholed
+/// peer parks a request thread for the kernel's SYN timeout (about two minutes). The
+/// explicit [`AuditLogger::activate`] path keeps the unbounded default.
+const ACTIVATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A transaction's audit log entry.
 #[derive(Debug, Clone, Default)]
 pub struct AuditLog {
@@ -968,7 +981,7 @@ impl Failure {
 }
 
 /// The writer slot, the last activation failure and its retry deadline.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ActivationState {
     /// The opened writer, shared so a write never holds an activation lock.
     writer: Option<Arc<Writer>>,
@@ -977,6 +990,34 @@ struct ActivationState {
     /// Earliest time an internal caller may retry after `failure`; `None` when any
     /// internal caller may try again.
     retry_at: Option<Instant>,
+    /// Wait scheduled after the next failure; doubles up to `ACTIVATION_RETRY_BACKOFF_MAX`.
+    backoff: Duration,
+    /// Number of activation attempts, for tests that count attempts per window.
+    #[cfg(test)]
+    attempts: usize,
+}
+
+impl Default for ActivationState {
+    fn default() -> Self {
+        Self {
+            writer: None,
+            failure: None,
+            retry_at: None,
+            backoff: ACTIVATION_RETRY_BACKOFF,
+            #[cfg(test)]
+            attempts: 0,
+        }
+    }
+}
+
+/// The wait scheduled after a failure that followed one of `current`.
+fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(ACTIVATION_RETRY_BACKOFF_MAX)
+}
+
+/// The connect deadline one attempt applies: the configured one, else the internal default.
+fn connect_deadline(configured: Option<Duration>, internal: bool) -> Option<Duration> {
+    configured.or_else(|| internal.then_some(ACTIVATION_CONNECT_TIMEOUT))
 }
 
 /// How to build the audit writer once, without opening or connecting anything yet.
@@ -1032,7 +1073,10 @@ enum SerialTarget {
 
 impl WriterPlan {
     /// Open the planned writer, creating files and connecting sockets as needed.
-    fn open(&self, format: AuditLogFormat) -> io::Result<Writer> {
+    ///
+    /// `internal` selects the connect default: an internal activation attempt bounds a
+    /// syslog dial the configuration left unbounded.
+    fn open(&self, format: AuditLogFormat, internal: bool) -> io::Result<Writer> {
         #[cfg(not(feature = "https-audit"))]
         let _ = format;
         Ok(match self {
@@ -1059,7 +1103,7 @@ impl WriterPlan {
                 write_timeout,
             } => {
                 // Keep the dial error's kind, like the file and index paths above.
-                let syslog = Syslog::connect(target, *connect_timeout, *write_timeout)
+                let syslog = Syslog::connect(target, connect_deadline(*connect_timeout, internal), *write_timeout)
                     .map_err(|error| io::Error::new(error.kind(), format!("syslog dial failure: {error}")))?;
                 Writer::Syslog(Mutex::new(syslog))
             },
@@ -1269,8 +1313,9 @@ impl AuditLogger {
     /// Open or connect the planned writer once, retrying a memoised failure.
     ///
     /// Explicit activation is the only path that retries immediately: after a failure,
-    /// internal callers keep reporting the memoised error until
-    /// [`ACTIVATION_RETRY_BACKOFF`] has passed.
+    /// internal callers keep reporting the memoised error until the backoff has passed.
+    /// A configured connect deadline applies as it does internally; without one, this
+    /// path leaves a syslog dial unbounded, as Go Coraza does.
     ///
     /// # Errors
     ///
@@ -1280,10 +1325,14 @@ impl AuditLogger {
         if self.writer().is_some() {
             return Ok(());
         }
-        self.install()
+        self.install(false)
     }
 
     /// Open the writer if it was never activated, retrying a failure after its backoff.
+    ///
+    /// A syslog dial the configuration left unbounded gets
+    /// [`ACTIVATION_CONNECT_TIMEOUT`], so one failing attempt cannot park a request
+    /// thread for the kernel's SYN timeout.
     ///
     /// # Errors
     ///
@@ -1313,7 +1362,7 @@ impl AuditLogger {
                 return Err(failure.to_error());
             }
         }
-        self.install()
+        self.install(true)
     }
 
     /// Whether a failed activation may not be retried yet.
@@ -1322,20 +1371,26 @@ impl AuditLogger {
     }
 
     /// Open the planned writer outside the state lock; the activation gate is held.
-    fn install(&self) -> io::Result<()> {
-        let opened = self.plan.open(self.format);
+    fn install(&self, internal: bool) -> io::Result<()> {
+        let opened = self.plan.open(self.format, internal);
         let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            state.attempts = state.attempts.saturating_add(1);
+        }
         match opened {
             Ok(writer) => {
                 state.writer = Some(Arc::new(writer));
                 state.failure = None;
                 state.retry_at = None;
+                state.backoff = ACTIVATION_RETRY_BACKOFF;
                 drop(state);
                 Ok(())
             },
             Err(error) => {
                 state.failure = Some(Failure::new(&error));
-                state.retry_at = Instant::now().checked_add(ACTIVATION_RETRY_BACKOFF);
+                state.retry_at = Instant::now().checked_add(state.backoff);
+                state.backoff = next_backoff(state.backoff);
                 drop(state);
                 Err(error)
             },
@@ -1343,13 +1398,15 @@ impl AuditLogger {
     }
 
     /// The failure from the last activation attempt, unless a later attempt succeeded.
-    pub(crate) fn activation_error(&self) -> Option<String> {
+    ///
+    /// The kind is kept so a caller can tell a dial failure from a configuration one.
+    pub(crate) fn activation_error(&self) -> Option<(io::ErrorKind, String)> {
         self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .failure
             .as_ref()
-            .map(|failure| failure.message.clone())
+            .map(|failure| (failure.kind, failure.message.clone()))
     }
 
     /// Allow the next internal activation attempt immediately, as if the backoff passed.
@@ -1359,6 +1416,24 @@ impl AuditLogger {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retry_at = None;
+    }
+
+    /// The number of activation attempts so far.
+    #[cfg(test)]
+    pub(crate) fn attempts(&self) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempts
+    }
+
+    /// The wait the next internal failure will schedule.
+    #[cfg(test)]
+    pub(crate) fn next_backoff_window(&self) -> Duration {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .backoff
     }
 
     /// The opened writer, if activation succeeded.
@@ -2136,7 +2211,9 @@ fn index_field(value: &str) -> String {
 #[expect(clippy::unwrap_used, reason = "audit log tests use fixed temporary paths")]
 mod tests {
     use super::{
-        AuditLog, AuditLogger, AuditTransaction, Syslog, connect_tcp, index_field, safe_file_component, write_new,
+        ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditLog, AuditLogger,
+        AuditTransaction, Syslog, connect_deadline, connect_tcp, index_field, next_backoff, safe_file_component,
+        write_new,
     };
     use crate::{
         actions::RuleMetadata,
@@ -2144,6 +2221,78 @@ mod tests {
         config::WafConfig,
         types::{AuditEngineStatus, AuditLogFormat, AuditLogType, RulePhase, parse_audit_log_parts},
     };
+
+    #[test]
+    fn default_internal_connect_timeout_is_finite() {
+        assert_eq!(connect_deadline(None, true), Some(ACTIVATION_CONNECT_TIMEOUT));
+        assert!(
+            connect_deadline(None, true).is_some_and(|timeout| timeout <= std::time::Duration::from_secs(5)),
+            "an internal dial must never be unbounded"
+        );
+        // The explicit activation path keeps Go's unbounded default, and a configured
+        // deadline wins on both paths.
+        assert_eq!(connect_deadline(None, false), None);
+        assert_eq!(
+            connect_deadline(Some(std::time::Duration::from_millis(7)), false),
+            Some(std::time::Duration::from_millis(7))
+        );
+        assert_eq!(
+            connect_deadline(Some(std::time::Duration::from_millis(7)), true),
+            Some(std::time::Duration::from_millis(7))
+        );
+    }
+
+    #[test]
+    fn activation_backoff_grows_and_caps() {
+        let mut backoff = ACTIVATION_RETRY_BACKOFF;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            seen.push(backoff);
+            backoff = next_backoff(backoff);
+        }
+        assert_eq!(
+            seen,
+            [
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(240),
+                ACTIVATION_RETRY_BACKOFF_MAX,
+                ACTIVATION_RETRY_BACKOFF_MAX,
+            ]
+        );
+        assert_eq!(next_backoff(std::time::Duration::MAX), ACTIVATION_RETRY_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_failed_activation_schedules_an_exponentially_longer_window() {
+        let config = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: "unix:///nonexistent/coraza-audit.sock".to_owned(),
+            ..WafConfig::default()
+        };
+        let logger = AuditLogger::prepare(&config).unwrap();
+        assert_eq!(
+            logger.next_backoff_window(),
+            ACTIVATION_RETRY_BACKOFF,
+            "the first failure schedules the base window"
+        );
+
+        // Each internal failure doubles the window the next failure will schedule; an
+        // explicit activation retries at once, so only the internal path waits.
+        for expected in [
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(240),
+            ACTIVATION_RETRY_BACKOFF_MAX,
+        ] {
+            assert!(logger.ensure_activated().is_err());
+            assert_eq!(logger.next_backoff_window(), expected);
+            logger.expire_backoff();
+        }
+        assert_eq!(logger.attempts(), 4);
+    }
 
     #[test]
     fn concurrent_file_components_reject_paths_and_long_ids() {
@@ -2365,17 +2514,18 @@ mod tests {
     fn tcp_connect_uses_the_configured_deadline() {
         use std::time::{Duration, Instant};
 
-        // TEST-NET-1 is not routed, so the attempt has to wait for its whole budget.
+        // TEST-NET-1 is not routed, so the attempt has to wait for its whole budget. A host
+        // without a default route rejects it at once instead; either way the attempt stays
+        // bounded, so only the upper bound is asserted.
         let started = Instant::now();
         let result = connect_tcp("192.0.2.1:9", Some(Duration::from_millis(10)));
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "a non-routable target must not connect");
         assert!(
-            elapsed >= Duration::from_millis(5),
-            "the deadline was not waited out: {elapsed:?}"
+            elapsed < Duration::from_secs(2),
+            "the deadline was not applied: {elapsed:?}"
         );
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
