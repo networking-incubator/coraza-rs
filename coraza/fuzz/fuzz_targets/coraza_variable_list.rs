@@ -50,7 +50,7 @@ mod rules {
             spec
         }
 
-        pub(crate) fn new_regex(variable: RuleVariable, regex: Regex) -> Self {
+        pub(crate) fn new_regex(variable: RuleVariable, regex: Regex, _count_key: String) -> Self {
             let mut spec = Self::new(variable);
             spec.key = Some(VariableKey::Regex(regex));
             spec
