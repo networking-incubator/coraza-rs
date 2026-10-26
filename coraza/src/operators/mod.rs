@@ -25,22 +25,22 @@
 //! these operators during request-phase evaluation.
 
 pub mod detection;
-#[cfg(feature = "host-operators")]
+#[cfg(feature = "inspect-file")]
 pub mod inspect_file;
 pub mod ip;
 mod macros;
 mod pattern;
-#[cfg(feature = "host-operators")]
+#[cfg(feature = "rbl")]
 pub mod rbl;
 mod simple;
 #[cfg(feature = "validate-schema")]
 pub mod validate_schema;
 pub mod validation;
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 pub use detection::{DetectSQLi, DetectXSS, detect_sqli, detect_xss};
-#[cfg(feature = "host-operators")]
+#[cfg(feature = "inspect-file")]
 pub use inspect_file::{InspectFile, inspect_file};
 pub use ip::{IpMatch, IpMatchFromDataset, IpMatchFromFile, ip_match, ip_match_from_dataset, ip_match_from_file};
 pub use macros::{Macro, MacroError};
@@ -48,7 +48,7 @@ pub use pattern::{
     Pm, PmFromDataset, PmFromFile, RestPath, Rx, StrMatch, Within, pm, pm_from_dataset, pm_from_file, rest_path, rx,
     strmatch, within,
 };
-#[cfg(feature = "host-operators")]
+#[cfg(feature = "rbl")]
 pub use rbl::{Rbl, rbl};
 pub use simple::{
     BeginsWith, Contains, EndsWith, Eq, Ge, Gt, Le, Lt, StrEq, begins_with, contains, ends_with, eq, ge, gt, le, lt,
@@ -105,10 +105,45 @@ pub trait Operator: Send + Sync {
 pub type Datasets = BTreeMap<String, Vec<String>>;
 
 /// Builds one embedder-supplied operator from its SecLang argument.
-pub type CustomOperatorFactory = std::sync::Arc<dyn Fn(&str) -> Result<Box<dyn Operator>, String> + Send + Sync>;
+pub type CustomOperatorFactory = Arc<dyn Fn(&str) -> Result<Box<dyn Operator>, String> + Send + Sync>;
 
-/// Embedder-supplied operator factories, keyed by SecLang name.
-pub type CustomOperators = BTreeMap<String, CustomOperatorFactory>;
+/// Embedder-supplied operator factories, keyed by lower-case SecLang name.
+///
+/// Lookup is case-insensitive: [`insert`](CustomOperators::insert) lower-cases
+/// the name, so registering `MyOp` and then `myop` leaves one entry whose
+/// factory is the later registration. A later registration with the same name
+/// always replaces the earlier one.
+#[derive(Clone, Default)]
+pub struct CustomOperators(BTreeMap<String, CustomOperatorFactory>);
+
+impl CustomOperators {
+    /// Create an empty set of factories.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `factory` under `name`, replacing any factory registered for
+    /// the same name in any letter case, and return the one it replaced.
+    pub fn insert(&mut self, mut name: String, factory: CustomOperatorFactory) -> Option<CustomOperatorFactory> {
+        name.make_ascii_lowercase();
+        self.0.insert(name, factory)
+    }
+
+    /// The factory registered for `name`, matched case-insensitively.
+    pub fn get(&self, name: &str) -> Option<&CustomOperatorFactory> {
+        self.0.get(&name.to_ascii_lowercase())
+    }
+
+    /// Whether no factory is registered.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The registered names, lower-cased and sorted.
+    pub fn keys(&self) -> std::collections::btree_map::Keys<'_, String, CustomOperatorFactory> {
+        self.0.keys()
+    }
+}
 
 /// Inputs needed when an operator reads a configured file or dataset.
 #[derive(Clone, Copy)]
@@ -142,12 +177,22 @@ impl Default for OperatorContext<'_> {
     }
 }
 
-/// Print a custom operator's name; the concrete type belongs to the embedder.
+/// An embedder-supplied operator shared by [`OperatorEnum`].
 ///
 /// [`OperatorEnum`] is cloneable but trait objects are not, so a registered
-/// operator is shared through an [`Arc`](std::sync::Arc) instead of the
-/// factory's `Box`.
-impl std::fmt::Debug for dyn Operator {
+/// operator is shared through an [`Arc`] instead of the factory's `Box`. The
+/// hand-written `Debug` keeps the embedder's type out of the output without
+/// requiring every operator to implement `Debug`.
+#[derive(Clone)]
+pub struct Registered(Arc<dyn Operator>);
+
+impl From<Box<dyn Operator>> for Registered {
+    fn from(operator: Box<dyn Operator>) -> Self {
+        Self(Arc::from(operator))
+    }
+}
+
+impl std::fmt::Debug for Registered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CustomOperator")
     }
@@ -259,12 +304,12 @@ pub enum OperatorEnum {
     /// Unconditional non-match.
     NoMatch(NoMatch),
     /// An operator registered by an embedder's [`CustomOperatorFactory`].
-    Custom(std::sync::Arc<dyn Operator>),
+    Custom(Registered),
     /// Runs an external program over each value.
-    #[cfg(feature = "host-operators")]
+    #[cfg(feature = "inspect-file")]
     InspectFile(InspectFile),
     /// Looks an address up in a DNS blocklist.
-    #[cfg(feature = "host-operators")]
+    #[cfg(feature = "rbl")]
     Rbl(Rbl),
     /// Validates a JSON document against a JSON Schema.
     #[cfg(feature = "validate-schema")]
@@ -288,14 +333,9 @@ impl OperatorEnum {
     /// Returns an error for an unknown operator, invalid argument, missing dataset,
     /// or unreadable operator file.
     pub fn with_context(name: &str, argument: &str, context: &OperatorContext<'_>) -> Result<Self, String> {
-        if let Some(factory) = context.custom.and_then(|custom| {
-            custom
-                .iter()
-                .find(|(custom_name, _)| custom_name.eq_ignore_ascii_case(name))
-                .map(|(_name, factory)| factory)
-        }) {
+        if let Some(factory) = context.custom.and_then(|custom| custom.get(name)) {
             return factory(argument)
-                .map(|operator| Self::Custom(operator.into()))
+                .map(|operator| Self::Custom(Registered::from(operator)))
                 .map_err(|error| format!("custom operator {name}: {error}"));
         }
 
@@ -337,9 +377,9 @@ impl OperatorEnum {
             "validatenid" => validate_nid(argument).map(Self::ValidateNid),
             "unconditionalmatch" | "geolookup" => Ok(Self::UnconditionalMatch(unconditional_match())),
             "nomatch" => Ok(Self::NoMatch(no_match())),
-            #[cfg(feature = "host-operators")]
+            #[cfg(feature = "inspect-file")]
             "inspectfile" => Ok(Self::InspectFile(inspect_file(argument))),
-            #[cfg(feature = "host-operators")]
+            #[cfg(feature = "rbl")]
             "rbl" => rbl(argument).map(Self::Rbl),
             #[cfg(feature = "validate-schema")]
             "validateschema" => validate_schema(context.base_dir, argument).map(Self::ValidateSchema),
@@ -382,10 +422,10 @@ impl OperatorEnum {
             Self::ValidateNid(operator) => operator.evaluate_outcome(tx, input, out),
             Self::UnconditionalMatch(operator) => operator.evaluate_outcome(tx, input, out),
             Self::NoMatch(operator) => operator.evaluate_outcome(tx, input, out),
-            Self::Custom(operator) => operator.evaluate_outcome(tx, input, out),
-            #[cfg(feature = "host-operators")]
+            Self::Custom(operator) => operator.0.evaluate_outcome(tx, input, out),
+            #[cfg(feature = "inspect-file")]
             Self::InspectFile(operator) => operator.evaluate_outcome(tx, input, out),
-            #[cfg(feature = "host-operators")]
+            #[cfg(feature = "rbl")]
             Self::Rbl(operator) => operator.evaluate_outcome(tx, input, out),
             #[cfg(feature = "validate-schema")]
             Self::ValidateSchema(operator) => operator.evaluate_outcome(tx, input, out),
@@ -436,9 +476,13 @@ impl_operator_from! {
     NoMatch => NoMatch,
 }
 
-#[cfg(feature = "host-operators")]
+#[cfg(feature = "inspect-file")]
 impl_operator_from! {
     InspectFile => InspectFile,
+}
+
+#[cfg(feature = "rbl")]
+impl_operator_from! {
     Rbl => Rbl,
 }
 
@@ -674,15 +718,44 @@ mod tests {
         assert!(format!("{operator:?}").contains("CustomOperator"));
     }
 
-    #[cfg(not(feature = "host-operators"))]
     #[test]
-    fn host_operator_names_are_unknown_without_the_feature() {
-        for name in ["inspectFile", "rbl"] {
-            assert_eq!(
-                OperatorEnum::with_context(name, "argument", &OperatorContext::default()).unwrap_err(),
-                format!("unknown operator: {name}")
-            );
-        }
+    fn registering_the_same_name_in_another_case_replaces_the_factory() {
+        let mut custom = CustomOperators::new();
+        custom.insert("ExactOp".to_owned(), std::sync::Arc::new(exact_factory));
+        let first: CustomOperatorFactory = std::sync::Arc::new(|_argument: &str| {
+            let operator: Box<dyn Operator> = Box::new(Exact("second".to_owned()));
+            Ok(operator)
+        });
+        // `insert` reports the factory it replaced.
+        assert!(custom.insert("exactop".to_owned(), first).is_some());
+        assert_eq!(custom.keys().count(), 1, "one entry per name, not per spelling");
+        assert!(custom.get("EXACTOP").is_some(), "lookup ignores case");
+        let datasets = Datasets::new();
+        let context = custom_context(&custom, &datasets);
+        let operator = OperatorEnum::with_context("exactop", "", &context).unwrap();
+        let tx = Transaction::new("operator-test");
+        assert!(
+            operator.evaluate(&tx, b"second", &mut Outputs::default()),
+            "the later registration wins"
+        );
+    }
+
+    #[cfg(not(feature = "inspect-file"))]
+    #[test]
+    fn inspect_file_is_unknown_without_its_feature() {
+        assert_eq!(
+            OperatorEnum::with_context("inspectFile", "argument", &OperatorContext::default()).unwrap_err(),
+            "unknown operator: inspectFile"
+        );
+    }
+
+    #[cfg(not(feature = "rbl"))]
+    #[test]
+    fn rbl_is_unknown_without_its_feature() {
+        assert_eq!(
+            OperatorEnum::with_context("rbl", "argument", &OperatorContext::default()).unwrap_err(),
+            "unknown operator: rbl"
+        );
     }
 
     #[cfg(not(feature = "validate-schema"))]

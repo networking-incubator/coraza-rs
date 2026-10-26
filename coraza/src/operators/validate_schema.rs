@@ -26,11 +26,32 @@
 //! `TX.json_request_body` from phase 2 on, and otherwise from the inspected
 //! value; an empty document is never a violation.
 //!
+//! Divergences from Go:
+//!
+//! - The schema path is confined to the configured base directory: it must be relative, must contain no `..` component,
+//!   and its canonical form must stay under the canonical base directory. Go reads it through `fs.ReadFile` with
+//!   whatever root filesystem the embedder passed, which is permissive by default. A multi-tenant deployment cannot
+//!   rely on that.
+//! - A schema file larger than [`SCHEMA_CAP`] is rejected instead of read.
+//! - Errors name the failing step but never quote the schema, so a rejected schema cannot echo its contents into a log.
+//! - The dialect is pinned to JSON Schema 2020-12, which Go's compiler implements. A `$schema` in the document still
+//!   selects its own dialect.
+//! - The engine is this crate's `jsonschema`, not Go's `kaptinlin/jsonschema`, and external `$ref` targets are not
+//!   resolved: the `resolve-file` and `resolve-http` features stay off, so a reference to another document fails at
+//!   compile time instead of reading an arbitrary path or URL.
+//! - `format` is an annotation, not an assertion, as 2020-12 specifies.
+//! - `pattern` uses `fancy-regex`, whose backtracking and size limits turn a match that cannot complete into a
+//!   violation rather than a pass, so a pathological pattern fails closed.
+//!
 //! `shortcut:` each operator compiles its own schema, where Go shares one
 //! compilation per schema content through its memoizer; upgrade if rules
 //! reference large schemas many times.
 
-use std::path::Path;
+use std::{
+    ffi::OsStr,
+    io::Read as _,
+    path::{Component, Path, PathBuf},
+};
 
 use jsonschema::Validator;
 use serde_json::Value;
@@ -40,6 +61,9 @@ use crate::{
     transaction::Transaction,
     types::{RulePhase, RuleVariable},
 };
+
+/// Largest schema file accepted, checked before the file is read.
+const SCHEMA_CAP: u64 = 1024 * 1024;
 
 /// Validates JSON documents against a compiled JSON Schema.
 #[derive(Debug, Clone)]
@@ -53,28 +77,48 @@ impl ValidateSchema {
     ///
     /// # Errors
     ///
-    /// Returns an error when `argument` is empty, names a file whose extension
-    /// is not `.json`, cannot be read, or does not contain a valid JSON Schema.
+    /// Returns an error when `argument` is empty, escapes `base_dir`, names a
+    /// file whose extension is not `.json`, is larger than [`SCHEMA_CAP`],
+    /// cannot be read, or does not contain a valid JSON Schema.
     pub fn new(base_dir: &Path, argument: &str) -> Result<Self, String> {
         if argument.is_empty() {
             return Err("missing schema file path".to_owned());
         }
 
-        let path = base_dir.join(argument);
-        let extension = path
+        let relative = Path::new(argument);
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return Err("schema path must stay inside the configured root".to_owned());
+        }
+
+        let extension = relative
             .extension()
-            .and_then(std::ffi::OsStr::to_str)
+            .and_then(OsStr::to_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
         if extension != "json" {
             return Err(format!("unsupported schema type: {extension}, only JSON is supported"));
         }
 
-        let bytes = std::fs::read(&path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+        let base = canonical_base(base_dir)?;
+        let path = resolve_under(&base, relative)?;
+        let metadata = std::fs::metadata(&path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+        if !metadata.is_file() {
+            return Err("reading schema from root FS: not a regular file".to_owned());
+        }
+        if metadata.len() > SCHEMA_CAP {
+            return Err(format!("schema file is larger than {SCHEMA_CAP} bytes"));
+        }
+
+        let bytes = read_schema(&path)?;
         let schema: Value =
             serde_json::from_slice(&bytes).map_err(|error| format!("validating schema as JSON: {error}"))?;
-        let validator =
-            jsonschema::validator_for(&schema).map_err(|error| format!("compiling JSON schema: {error}"))?;
+        // The compiler's own message quotes the offending schema fragment.
+        let Ok(validator) = jsonschema::draft202012::new(&schema) else {
+            return Err("compiling JSON schema failed".to_owned());
+        };
         Ok(Self { validator })
     }
 }
@@ -95,6 +139,47 @@ impl Operator for ValidateSchema {
 /// Returns an error for an invalid schema path or schema; see [`ValidateSchema::new`].
 pub fn validate_schema(base_dir: &Path, argument: &str) -> Result<ValidateSchema, String> {
     ValidateSchema::new(base_dir, argument)
+}
+
+/// Read at most [`SCHEMA_CAP`] bytes from `path`.
+///
+/// The metadata check in [`ValidateSchema::new`] rejects an oversized file
+/// before this runs; the bounded read closes the gap for a file that grows in
+/// between, so a schema cannot exhaust memory through that race.
+fn read_schema(path: &Path) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("reading schema from root FS: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(SCHEMA_CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("reading schema from root FS: {error}"))?;
+    if bytes.len() as u64 > SCHEMA_CAP {
+        return Err(format!("schema file is larger than {SCHEMA_CAP} bytes"));
+    }
+    Ok(bytes)
+}
+
+/// The canonical form of the configured root.
+///
+/// An empty root means the process' current directory, which is where the
+/// relative paths of a default operator context already resolve.
+fn canonical_base(base_dir: &Path) -> Result<PathBuf, String> {
+    if base_dir.as_os_str().is_empty() {
+        return std::env::current_dir().map_err(|error| format!("reading schema from root FS: {error}"));
+    }
+    std::fs::canonicalize(base_dir).map_err(|error| format!("reading schema from root FS: {error}"))
+}
+
+/// Resolve `relative` under `base`, refusing anything that leaves it.
+///
+/// The canonical target must stay under the canonical base, which also rejects
+/// a symlink that points outside it.
+fn resolve_under(base: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let path =
+        std::fs::canonicalize(base.join(relative)).map_err(|error| format!("reading schema from root FS: {error}"))?;
+    if !path.starts_with(base) {
+        return Err("schema path must stay inside the configured root".to_owned());
+    }
+    Ok(path)
 }
 
 /// The JSON document stored on the transaction for the current phase.
@@ -119,6 +204,10 @@ fn current_json_body(tx: &Transaction) -> Option<String> {
 }
 
 /// Whether `data` is JSON that satisfies `validator`.
+///
+/// A matcher that cannot complete, such as a `pattern` that trips the regex
+/// engine's backtrack or size limit, counts as a violation, so a pathological
+/// schema fails closed.
 fn is_valid(validator: &Validator, data: &[u8]) -> bool {
     serde_json::from_slice::<Value>(data).is_ok_and(|instance| validator.is_valid(&instance))
 }
@@ -126,7 +215,7 @@ fn is_valid(validator: &Validator, data: &[u8]) -> bool {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "validateSchema tests use fixed schemas")]
 mod tests {
-    use super::{ValidateSchema, validate_schema};
+    use super::{SCHEMA_CAP, ValidateSchema, validate_schema};
     use crate::{
         operators::{Operator as _, OperatorContext, OperatorEnum, Outputs},
         transaction::Transaction,
@@ -213,11 +302,87 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_that_does_not_compile_is_an_error() {
+    fn a_schema_that_does_not_compile_is_an_error_without_echoing_it() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("schema.json"), r#"{"type": 42}"#).unwrap();
+        std::fs::write(dir.path().join("schema.json"), r#"{"type": "secret-marker"}"#).unwrap();
         let error = validate_schema(dir.path(), "schema.json").unwrap_err();
-        assert!(error.starts_with("compiling JSON schema:"), "{error}");
+        assert_eq!(error, "compiling JSON schema failed");
+        assert!(!error.contains("secret-marker"), "the error must not quote the schema");
+    }
+
+    #[test]
+    fn an_absolute_schema_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for argument in ["/etc/passwd", "/etc/coraza-schema.json", "/schema.json"] {
+            assert_eq!(
+                validate_schema(dir.path(), argument).unwrap_err(),
+                "schema path must stay inside the configured root",
+                "{argument} must not leave the root"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_directory_schema_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("schemas")).unwrap();
+        for argument in ["../schema.json", "schemas/../../schema.json", "./../schema.json"] {
+            assert_eq!(
+                validate_schema(dir.path(), argument).unwrap_err(),
+                "schema path must stay inside the configured root",
+                "{argument} must not leave the root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_root_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("schema.json");
+        std::fs::write(&target, SCHEMA).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("linked.json")).unwrap();
+        assert_eq!(
+            validate_schema(root.path(), "linked.json").unwrap_err(),
+            "schema path must stay inside the configured root"
+        );
+    }
+
+    #[test]
+    fn a_schema_larger_than_the_cap_is_rejected_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = " ".repeat(usize::try_from(SCHEMA_CAP).unwrap() + 1);
+        std::fs::write(dir.path().join("schema.json"), &contents).unwrap();
+        assert_eq!(
+            validate_schema(dir.path(), "schema.json").unwrap_err(),
+            format!("schema file is larger than {SCHEMA_CAP} bytes")
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_a_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("schema.json")).unwrap();
+        assert_eq!(
+            validate_schema(dir.path(), "schema.json").unwrap_err(),
+            "reading schema from root FS: not a regular file"
+        );
+    }
+
+    #[test]
+    fn the_dialect_is_draft_2020_12() {
+        // `dependentRequired` is a 2020-12 keyword: a document without a
+        // `$schema` is compiled as 2020-12, so it is enforced.
+        let (_dir, operator) = load(r#"{"dependentRequired": {"name": ["age"]}}"#);
+        assert!(
+            evaluate(&operator, br#"{"name": "John"}"#),
+            "2020-12 keywords must be enforced"
+        );
+        assert!(
+            !evaluate(&operator, VALID),
+            "a document that satisfies the dependency must not match"
+        );
     }
 
     #[test]

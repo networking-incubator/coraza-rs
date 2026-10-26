@@ -36,8 +36,13 @@ sha2 = "0.11"
 async-server = ["dep:base64", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio"]
 # `SecAuditLogType HTTPS` writer, via ureq's blocking client with rustls.
 https-audit = ["dep:ureq"]
-# `@inspectFile` and `@rbl`, which execute a local program and resolve DNS.
-host-operators = []
+# `@inspectFile`, which runs a local program over each value.
+inspect-file = []
+# `@rbl`, which resolves a DNS blocklist. Split from `inspect-file` so an
+# embedder can allow DNS lookups without granting process execution.
+rbl = []
+# Both host operators; the umbrella name this crate started with.
+host-operators = ["inspect-file", "rbl"]
 # `@validateSchema`, which compiles JSON Schema documents.
 validate-schema = ["dep:jsonschema"]
 
@@ -48,6 +53,11 @@ required-features = ["async-server"]
 [[bench]]
 name = "coraza_workload"
 harness = false
+
+# Publish the feature-gated operators in the docs build, which otherwise shows
+# only the default build.
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

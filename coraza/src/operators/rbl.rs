@@ -29,18 +29,86 @@
 //! Go then looks up the address's TXT record, stores its first entry in
 //! `TX.httpbl_msg`, copies it into capture 0, and reports no match when the TXT
 //! lookup fails. This port has no DNS dependency, so it performs the A/AAAA
-//! lookup only: the TXT message and its capture are absent, and an address with
-//! a record but no TXT entry matches here where Go would not.
+//! lookup only: the TXT message and its capture are absent, and a name whose TXT
+//! lookup fails matches here where Go reports no match.
+//!
+//! Resource bounds: the system resolver cannot be cancelled, so each lookup
+//! runs on its own thread with [`LOOKUP_STACK`] of stack and the operator gives
+//! up after [`LOOKUP_TIMEOUT`], abandoning that thread until the resolver
+//! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process; above
+//! that, and when a thread cannot be spawned, the operator reports
+//! [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected)
+//! instead of queueing or panicking. Rules treat that as not matched, so it
+//! never turns a lookup that could not run into a match.
+//!
+//! A resolver failure also reports no verdict: std's resolver does not expose
+//! whether a name has no record or the lookup itself failed, and this port does
+//! not guess. Go reports not matched in both cases; [`Rbl::evaluate`] returns
+//! `false` there, so rule evaluation is unchanged.
 
-use std::{net::ToSocketAddrs as _, sync::mpsc, time::Duration};
+use std::{
+    net::ToSocketAddrs as _,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 
 use crate::{
-    operators::{Operator, Outputs},
+    operators::{Operator, OperatorOutcome, Outputs},
     transaction::Transaction,
 };
 
 /// Go's `500 * time.Millisecond` budget for the whole lookup in `rbl.go`.
 const LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Stack for one lookup thread.
+///
+/// The resolver runs libc and NSS modules in this thread, so the size stays
+/// well above the default but far below the multi-megabyte default of a
+/// request thread.
+const LOOKUP_STACK: usize = 512 * 1024;
+
+/// Lookups allowed to run at once in one process.
+///
+/// Abandoned lookups hold their slot until the resolver returns, so this is the
+/// bound on threads and stack a hostile name set can pin.
+const MAX_IN_FLIGHT: usize = 64;
+
+/// Lookups currently running, process-wide.
+static LIMITER: Limiter = Limiter {
+    in_flight: AtomicUsize::new(0),
+};
+
+/// Counts lookups in flight against [`MAX_IN_FLIGHT`].
+struct Limiter {
+    /// Slots currently held.
+    in_flight: AtomicUsize,
+}
+
+/// One reserved lookup slot, released when dropped.
+struct InFlight<'a> {
+    /// The limiter the slot was taken from.
+    limiter: &'a Limiter,
+}
+
+impl Limiter {
+    /// Reserve a slot, or report `None` when the cap is already reached.
+    fn acquire(&self) -> Option<InFlight<'_>> {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(InFlight { limiter: self })
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.limiter.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Looks an inspected value up in a DNS blocklist.
 #[derive(Debug, Clone)]
@@ -54,10 +122,12 @@ impl Rbl {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty service. Go builds `<value>.` for it and
-    /// relies on the TXT lookup to reject that self-resolving name; without the
-    /// TXT lookup this port would report a match, so it rejects the service.
+    /// Returns an error for a service that is empty or only whitespace. Go
+    /// builds `<value>.` for an empty service and relies on the TXT lookup to
+    /// reject that self-resolving name; without the TXT lookup this port would
+    /// report a match, so it rejects the service when the rule compiles.
     pub fn new(service: &str) -> Result<Self, String> {
+        let service = service.trim();
         if service.is_empty() {
             return Err("missing rbl service".to_owned());
         }
@@ -73,16 +143,22 @@ impl Rbl {
 }
 
 impl Operator for Rbl {
-    fn evaluate(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
+    fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
+    }
+
+    fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> OperatorOutcome {
         let name = self.query_name(&String::from_utf8_lossy(input));
         // Go's `LookupHost` returns every A and AAAA record and errors when the
         // name has none; `ToSocketAddrs` is the same getaddrinfo lookup.
-        bounded(LOOKUP_TIMEOUT, move || {
-            (name.as_str(), 0)
-                .to_socket_addrs()
-                .is_ok_and(|mut addresses| addresses.next().is_some())
-        })
-        .unwrap_or(false)
+        match bounded(LOOKUP_TIMEOUT, move || match (name.as_str(), 0).to_socket_addrs() {
+            Ok(mut addresses) => Answer::Listed(addresses.next().is_some()),
+            Err(_) => Answer::Unavailable,
+        }) {
+            Some(Answer::Listed(true)) => OperatorOutcome::Matched,
+            Some(Answer::Listed(false)) => OperatorOutcome::NotMatched,
+            Some(Answer::Unavailable) | None => OperatorOutcome::NotInspected,
+        }
     }
 }
 
@@ -95,28 +171,51 @@ pub fn rbl(service: &str) -> Result<Rbl, String> {
     Rbl::new(service)
 }
 
+/// The answer from one bounded lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The resolver answered, and whether the value is listed.
+    Listed(bool),
+    /// The resolver failed, so there is no answer.
+    Unavailable,
+}
+
 /// Run `work` on a worker thread and give up after `timeout`.
 ///
-/// The resolver has no cancellation, so a lookup that overruns the deadline is
-/// abandoned: its thread lives until the system resolver returns.
+/// Returns `None` when the lookup never completed: the deadline expired, the
+/// in-flight cap was reached, or the thread could not be spawned. An abandoned
+/// lookup keeps its in-flight slot until the resolver returns.
 fn bounded<T: Send + 'static>(timeout: Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let slot = LIMITER.acquire()?;
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        // A timeout drops the receiver, and the result is unusable then.
-        drop(sender.send(work()));
-    });
+    let spawned = std::thread::Builder::new()
+        .name("coraza-rbl".to_owned())
+        .stack_size(LOOKUP_STACK)
+        .spawn(move || {
+            // A timeout drops the receiver, and the result is unusable then.
+            drop(sender.send(work()));
+            drop(slot);
+        });
+    if spawned.is_err() {
+        // The builder dropped the closure, and its slot with it.
+        return None;
+    }
     receiver.recv_timeout(timeout).ok()
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "rbl tests use fixed service names")]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::AtomicUsize,
+        time::{Duration, Instant},
+    };
 
-    use super::{Rbl, bounded};
+    use super::{Answer, Limiter, MAX_IN_FLIGHT, Rbl, bounded};
     use crate::{
-        operators::{Operator as _, OperatorContext, OperatorEnum, Outputs},
+        operators::{Operator as _, OperatorContext, OperatorEnum, OperatorOutcome, Outputs},
         transaction::Transaction,
+        types::RuleVariable,
     };
 
     fn operator(service: &str) -> Rbl {
@@ -149,9 +248,30 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_service_is_rejected() {
+    fn an_empty_or_whitespace_service_is_rejected() {
         assert_eq!(operator_result(""), Err("missing rbl service".to_owned()));
-        assert_eq!(operator_result("   "), Ok(()));
+        assert_eq!(operator_result("   "), Err("missing rbl service".to_owned()));
+        assert_eq!(operator_result("\t\n"), Err("missing rbl service".to_owned()));
+    }
+
+    #[test]
+    fn a_service_is_stored_without_surrounding_whitespace() {
+        assert_eq!(
+            operator(" zen.spamhaus.org ").query_name("192.0.2.1"),
+            "192.0.2.1.zen.spamhaus.org"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_cap_is_enforced_and_released() {
+        let limiter = Limiter {
+            in_flight: AtomicUsize::new(0),
+        };
+        let slots: Vec<_> = (0..MAX_IN_FLIGHT).filter_map(|_| limiter.acquire()).collect();
+        assert_eq!(slots.len(), MAX_IN_FLIGHT, "the cap grants every slot once");
+        assert!(limiter.acquire().is_none(), "lookups above the cap are refused");
+        drop(slots);
+        assert!(limiter.acquire().is_some(), "a released slot can be taken again");
     }
 
     #[test]
@@ -159,11 +279,27 @@ mod tests {
         assert_eq!(
             bounded(Duration::from_millis(20), || {
                 std::thread::sleep(Duration::from_millis(200));
-                true
+                Answer::Listed(true)
             }),
             None
         );
-        assert_eq!(bounded(Duration::from_secs(1), || false), Some(false));
+        assert_eq!(
+            bounded(Duration::from_secs(1), || Answer::Listed(false)),
+            Some(Answer::Listed(false))
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_overruns_the_budget_reports_no_verdict() {
+        // The operator's own budget is Go's; this pins the mapping from a
+        // failed bounded call to `NotInspected` through the deadline path only
+        // for a name the resolver rejects without contacting the network.
+        let rbl = operator("zen.spamhaus.org");
+        assert_eq!(
+            rbl.evaluate_outcome(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()),
+            OperatorOutcome::NotInspected
+        );
+        assert!(!rbl.evaluate(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()));
     }
 
     #[test]
@@ -172,6 +308,34 @@ mod tests {
         // reaching the network.
         let rbl = operator("zen.spamhaus.org");
         assert!(!rbl.evaluate(&Transaction::new("rbl"), b"192.0.2.1\0", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn the_lookup_sets_no_txt_message_or_capture() {
+        let rbl = operator("zen.spamhaus.org");
+        let mut tx = Transaction::new("rbl");
+        let mut out = Outputs::new(true);
+        assert!(!rbl.evaluate(&tx, b"192.0.2.1\0", &mut out));
+        tx.store_operator_outputs(&mut out);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("httpbl_msg")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("0")),
+            None,
+            "capture 0 must stay unset"
+        );
+    }
+
+    #[test]
+    fn a_bounded_call_returns_as_soon_as_the_work_ends() {
+        let started = Instant::now();
+        assert_eq!(
+            bounded(Duration::from_secs(5), || Answer::Listed(true)),
+            Some(Answer::Listed(true))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a quick lookup must not wait for the deadline"
+        );
     }
 
     #[test]
