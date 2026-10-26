@@ -206,8 +206,12 @@ impl Rule {
                             }
                             matched_values.push(matched);
                         },
-                        OperatorOutcome::NotMatched => {},
-                        OperatorOutcome::NotInspected => tx.record_inspection_incomplete(id),
+                        // A detector skip records the transaction's inspection signal. A
+                        // host operator that could not run is a miss: its cause is a
+                        // resolver, process or resource failure, not over-long detector
+                        // input, so it must not raise that signal.
+                        OperatorOutcome::NotInspected if operator.is_detector() => tx.record_inspection_incomplete(id),
+                        OperatorOutcome::NotMatched | OperatorOutcome::NotInspected => {},
                     }
                 }
             }
@@ -238,9 +242,27 @@ impl Rule {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "rule tests use fixed valid rules"
+)]
 mod tests {
     use super::Rule;
-    use crate::actions::{ActionType, CompiledAction};
+    use crate::{
+        actions::{ActionType, CompiledAction},
+        config::DetectorInspectionAction,
+        seclang::Parser,
+        types::RuleVariable,
+        waf::Waf,
+    };
+
+    fn build_waf(rules: &str, detector_inspection_action: DetectorInspectionAction) -> Waf {
+        let mut parser = Parser::new();
+        parser.from_string(rules).unwrap();
+        parser.config_mut().detector_inspection_action = detector_inspection_action;
+        parser.into_waf().unwrap()
+    }
 
     #[test]
     fn later_disruptive_action_replaces_the_previous_one() {
@@ -267,6 +289,94 @@ mod tests {
                 .map(|action| action.name.as_str())
                 .collect::<Vec<_>>(),
             ["setvar", "pass"]
+        );
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn a_host_operator_that_cannot_run_is_a_miss_under_fail_closed() {
+        let waf = build_waf(
+            "SecRule ARGS:q \"@inspectFile /nonexistent/coraza-inspect-file-test\" \"id:960,phase:1,pass\"",
+            DetectorInspectionAction::FailClosed,
+        );
+        let mut tx = waf.new_transaction_with_id("inspect-file-spawn-failure");
+        tx.add_get_argument("q", b"value");
+
+        assert!(
+            tx.process_request_headers().is_none(),
+            "a spawn failure is not over-long detector input, so it must not interrupt"
+        );
+        assert!(!tx.inspection_incomplete());
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
+    }
+
+    #[cfg(feature = "rbl")]
+    #[test]
+    fn a_resolver_error_is_a_miss_under_fail_closed() {
+        let waf = build_waf(
+            "SecRule ARGS:q \"@rbl zen.spamhaus.org\" \"id:961,phase:1,pass\"",
+            DetectorInspectionAction::FailClosed,
+        );
+        let mut tx = waf.new_transaction_with_id("rbl-resolver-error");
+        // A NUL byte cannot be part of a resolver request, so this fails without
+        // reaching the network, as `LookupHost` does for the same value in Go.
+        tx.add_get_argument("q", b"192.0.2.1\0");
+
+        assert!(
+            tx.process_request_headers().is_none(),
+            "a not-listed value must not interrupt"
+        );
+        assert!(!tx.inspection_incomplete());
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
+    }
+
+    #[test]
+    fn a_detector_over_the_input_bound_still_fails_closed() {
+        let waf = build_waf(
+            "SecRule ARGS:q \"@detectSQLi\" \"id:962,phase:1,pass\"",
+            DetectorInspectionAction::FailClosed,
+        );
+        let mut tx = waf.new_transaction_with_id("detector-input-bound");
+        tx.add_get_argument("q", vec![b' '; libperfusion::MAX_INPUT_LEN + 1]);
+
+        let interruption = tx
+            .process_request_headers()
+            .expect("a skipped detector input interrupts");
+        assert_eq!(interruption.status, 500);
+        assert!(tx.inspection_incomplete());
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn count_mode_reports_go_key_str_as_the_matched_name() {
+        let waf = build_waf(
+            "SecRule &REQUEST_HEADERS:X-Foo \"@ge 1\" \"id:963,phase:1,pass\"",
+            DetectorInspectionAction::RecordOnly,
+        );
+        let mut tx = waf.new_transaction_with_id("count-header-name");
+        tx.add_request_header("X-Foo", b"bar");
+        assert!(tx.process_request_headers().is_none());
+        // Go reports the compile-time `KeyStr`, not the written selector
+        // (`internal/corazawaf/transaction.go:698-704`).
+        assert_eq!(
+            tx.get_variable(RuleVariable::MatchedVarName, None).as_deref(),
+            Some("REQUEST_HEADERS:x-foo")
+        );
+
+        let waf = build_waf(
+            "SecRule &ARGS:/re/ \"@ge 1\" \"id:964,phase:1,pass\"",
+            DetectorInspectionAction::RecordOnly,
+        );
+        let mut tx = waf.new_transaction_with_id("count-args-name");
+        tx.add_get_argument("re1", b"one");
+        assert!(tx.process_request_headers().is_none());
+        assert_eq!(
+            tx.get_variable(RuleVariable::MatchedVarName, None).as_deref(),
+            Some("ARGS:/re/")
         );
     }
 }

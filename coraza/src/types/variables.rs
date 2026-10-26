@@ -480,13 +480,15 @@ impl RuleVariable {
         )
     }
 
-    /// Whether selector regexes for this variable keep their written case.
+    /// Whether this variable's key selectors keep their written case.
     ///
-    /// Go lower-cases the pattern source for every variable except the argument
-    /// collections (`caseSensitiveVariable` in `internal/corazawaf/rule.go:548`), then
-    /// compiles it without the case-insensitive flag. `ARGS_PATH` is absent from Go's list
-    /// even though its map is case-sensitive under `coraza.rule.case_sensitive_args_keys`.
-    pub const fn has_case_sensitive_regex_keys(self) -> bool {
+    /// Go lower-cases both the selector text and its regex source for every variable
+    /// outside `caseSensitiveVariable` (`internal/corazawaf/rule.go:548-570`), then
+    /// compiles the pattern without the case-insensitive flag. `ARGS_PATH` is absent
+    /// from Go's list even though its map is case-sensitive under
+    /// `coraza.rule.case_sensitive_args_keys`, so its literal selectors are lowered
+    /// against a map that keeps stored keys as written.
+    pub const fn has_case_sensitive_selectors(self) -> bool {
         matches!(
             self,
             Self::Args | Self::ArgsGet | Self::ArgsPost | Self::ArgsNames | Self::ArgsGetNames | Self::ArgsPostNames
@@ -682,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_case_sensitive_regex_key_variables() {
+    fn test_case_sensitive_selector_variables() {
         for variable in [
             RuleVariable::Args,
             RuleVariable::ArgsGet,
@@ -691,7 +693,7 @@ mod tests {
             RuleVariable::ArgsGetNames,
             RuleVariable::ArgsPostNames,
         ] {
-            assert!(variable.has_case_sensitive_regex_keys(), "{variable:?}");
+            assert!(variable.has_case_sensitive_selectors(), "{variable:?}");
         }
         // Go's `caseSensitiveVariable` leaves ARGS_PATH out even though the map itself is
         // case-sensitive under its build tag.
@@ -701,7 +703,7 @@ mod tests {
             RuleVariable::RequestXML,
             RuleVariable::XML,
         ] {
-            assert!(!variable.has_case_sensitive_regex_keys(), "{variable:?}");
+            assert!(!variable.has_case_sensitive_selectors(), "{variable:?}");
         }
     }
 

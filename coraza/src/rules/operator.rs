@@ -46,6 +46,14 @@ impl RuleOperator {
         self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
     }
 
+    /// Whether the wrapped operator is a detector bounded by the inspection limit.
+    ///
+    /// Only a detector's [`OperatorOutcome::NotInspected`] is the transaction's
+    /// inspection-incomplete signal; see [`OperatorEnum::is_detector`].
+    pub(crate) fn is_detector(&self) -> bool {
+        self.operator.is_detector()
+    }
+
     /// Evaluate one value, applying SecLang negation after the operator runs.
     ///
     /// Negation flips [`OperatorOutcome::Matched`] and
