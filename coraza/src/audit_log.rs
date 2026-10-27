@@ -91,6 +91,9 @@ pub trait AuditLogFormatter: Send + Sync {
     fn format(&self, entry: &AuditLog) -> Vec<u8>;
 
     /// MIME type associated with the serialized entry.
+    ///
+    /// This must remain stable for the formatter's lifetime: built-in sinks capture it
+    /// at activation and pair it with later bytes. Varying it violates the contract.
     fn mime(&self) -> &'static str;
 }
 
@@ -1195,8 +1198,11 @@ impl fmt::Debug for CustomWriterPlan {
 
 impl CustomWriterPlan {
     /// Construct the custom sink only when the audit logger activates it.
-    fn open(&self) -> io::Result<Writer> {
-        (self.factory)(self.config.as_ref()).map(Writer::Custom)
+    fn open(&self, activation_mime: &'static str) -> io::Result<Writer> {
+        (self.factory)(self.config.as_ref()).map(|writer| Writer::Custom {
+            writer,
+            activation_mime,
+        })
     }
 }
 
@@ -1275,8 +1281,13 @@ enum Writer {
     /// One POST each, to an HTTP endpoint
     #[cfg(feature = "https-audit")]
     Https(https::HttpsWriter),
-    /// An embedder-provided sink.
-    Custom(Box<dyn AuditLogWriter>),
+    /// An embedder-provided sink and the MIME captured when it was activated.
+    Custom {
+        /// The embedder's writer.
+        writer: Box<dyn AuditLogWriter>,
+        /// Formatter MIME declared when activation opened the writer.
+        activation_mime: &'static str,
+    },
 }
 
 impl fmt::Debug for Writer {
@@ -1288,7 +1299,7 @@ impl fmt::Debug for Writer {
             Self::Syslog(_) => f.write_str("Syslog"),
             #[cfg(feature = "https-audit")]
             Self::Https(_) => f.write_str("Https"),
-            Self::Custom(_) => f.write_str("Custom"),
+            Self::Custom { .. } => f.write_str("Custom"),
         }
     }
 }
@@ -1303,10 +1314,7 @@ impl Writer {
             Self::Https(https) => https.write(bytes),
             Self::Syslog(syslog) => {
                 let mut syslog = syslog.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                match formatted {
-                    FormattedAudit::Text(text) => syslog.send_text(text, entry.transaction.is_interrupted),
-                    FormattedAudit::Bytes(bytes) => syslog.send(bytes, entry.transaction.is_interrupted),
-                }
+                syslog.send(bytes, entry.transaction.is_interrupted)
             },
             Self::Serial(output) => {
                 let mut output = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1363,7 +1371,16 @@ impl Writer {
                 )?;
                 index.flush()
             },
-            Self::Custom(writer) => writer.write(entry, bytes, mime),
+            Self::Custom {
+                writer,
+                activation_mime,
+            } => {
+                debug_assert_eq!(
+                    mime, *activation_mime,
+                    "AuditLogFormatter::mime() must remain stable for its lifetime"
+                );
+                writer.write(entry, bytes, mime)
+            },
         }
     }
 }
@@ -1591,9 +1608,10 @@ impl AuditLogger {
 
     /// Open the planned writer outside the state lock; the activation gate is held.
     fn install(&self, internal: bool) -> io::Result<()> {
+        let activation_mime = self.formatter.mime();
         let opened = match &self.custom_writer {
-            Some(custom_writer) => custom_writer.open(),
-            None => self.plan.open(self.formatter.mime(), internal),
+            Some(custom_writer) => custom_writer.open(activation_mime),
+            None => self.plan.open(activation_mime, internal),
         };
         let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(test)]
@@ -1888,6 +1906,8 @@ impl Syslog {
     /// Sends `message` at severity `err` if `error`, `info` otherwise, framed as Go's
     /// `log/syslog` does.
     fn send(&mut self, message: &[u8], error: bool) -> io::Result<()> {
+        // shortcut: syslog validates UTF-8 for each audit entry; accepted because writes
+        // are I/O-bound, revisit if audit throughput becomes a target.
         if let Ok(message) = std::str::from_utf8(message) {
             return self.send_text(message, error);
         }
@@ -1913,7 +1933,7 @@ impl Syslog {
         self.send_frame(&framed)
     }
 
-    /// Sends a built-in formatter's already-UTF-8 output without validating its bytes again.
+    /// Frames UTF-8 messages after `send` has validated their bytes.
     fn send_text(&mut self, message: &str, error: bool) -> io::Result<()> {
         // local0 (16) times 8, plus the severity
         let priority = 16 * 8 + if error { 3 } else { 6 };
@@ -2476,8 +2496,8 @@ fn index_field(value: &str) -> String {
 mod tests {
     use super::{
         ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditLog, AuditLogger,
-        AuditTransaction, Syslog, SyslogSocket, connect_deadline, connect_tcp, index_field, next_backoff,
-        safe_file_component, write_new,
+        AuditTransaction, FormattedAudit, Syslog, SyslogSocket, Writer, connect_deadline, connect_tcp, index_field,
+        next_backoff, safe_file_component, write_new,
     };
     use crate::{
         actions::RuleMetadata,
@@ -2874,26 +2894,59 @@ mod tests {
         receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         sender.connect(receiver.local_addr().unwrap()).unwrap();
-        let mut syslog = Syslog {
+        let syslog = Syslog {
             socket: SyslogSocket::Udp(sender),
             target: "udp://127.0.0.1:0".to_owned(),
             local: false,
             connect_timeout: None,
             write_timeout: None,
         };
+        let writer = Writer::Syslog(std::sync::Mutex::new(syslog));
+        let entry = AuditLog::default();
         let mut received = [0; 512];
 
-        syslog.send_text("formatted π\n", false).unwrap();
+        writer
+            .write(&FormattedAudit::Text("formatted π\n".to_owned()), &entry, "")
+            .unwrap();
         let text_len = receiver.recv(&mut received).unwrap();
         let text_frame = received.get(..text_len).unwrap_or_default().to_vec();
-        syslog.send("formatted π\n".as_bytes(), false).unwrap();
+        writer
+            .write(&FormattedAudit::Bytes("formatted π\n".as_bytes().to_vec()), &entry, "")
+            .unwrap();
         let bytes_len = receiver.recv(&mut received).unwrap();
         let bytes_frame = received.get(..bytes_len).unwrap_or_default();
         assert_eq!(payload(&text_frame), payload(bytes_frame));
 
-        syslog.send(b"raw\xff\n", false).unwrap();
+        writer
+            .write(&FormattedAudit::Bytes(b"raw\xff\n".to_vec()), &entry, "")
+            .unwrap();
         let raw_len = receiver.recv(&mut received).unwrap();
         assert_eq!(payload(received.get(..raw_len).unwrap_or_default()), b"raw\xff\n");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "AuditLogFormatter::mime() must remain stable for its lifetime")]
+    fn custom_writer_checks_mime_stability() {
+        struct NoopWriter;
+
+        impl super::AuditLogWriter for NoopWriter {
+            fn write(&self, _entry: &AuditLog, _formatted: &[u8], _mime: &'static str) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer = Writer::Custom {
+            writer: Box::new(NoopWriter),
+            activation_mime: "application/activation",
+        };
+        writer
+            .write(
+                &FormattedAudit::Bytes(Vec::new()),
+                &AuditLog::default(),
+                "application/later",
+            )
+            .unwrap();
     }
 
     #[test]

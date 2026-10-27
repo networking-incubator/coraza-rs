@@ -90,6 +90,9 @@ The writer factory receives the resolved `WafConfig` and is called only on
 `Waf::activate` or the first audit write; it must not open a file or socket
 before then. Writers receive the `AuditLog`, its already-formatted bytes, and the
 MIME type declared by the formatter that produced those bytes.
+That MIME type must remain stable for the formatter's lifetime: built-in sinks
+capture it at activation and pair it with later bytes. A formatter that varies
+its MIME type violates the contract; debug builds check this for custom writers.
 The engine drops a writer with its audit logger and does not call fallible
 teardown; a host that needs fallible teardown must own the sink outside the
 `AuditLogWriter` trait. This crate supplies no custom writer for WASI; an embedder
