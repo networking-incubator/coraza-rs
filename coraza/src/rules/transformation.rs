@@ -403,8 +403,41 @@ mod tests {
         add(&mut chain, "sha1", sha1_hash);
         add(&mut chain, "hexEncode", hex_encode);
         let (result, errors) = chain.apply(b"hello");
-        assert_eq!(result, b"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
-        assert!(errors.is_empty());
+
+        #[cfg(all(feature = "hash-transformations", not(feature = "fips")))]
+        {
+            assert_eq!(result, b"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+            assert!(errors.is_empty());
+        }
+        #[cfg(feature = "fips")]
+        {
+            assert_eq!(result, b"68656c6c6f");
+            assert_eq!(
+                errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
+                ["sha1 transformation is unavailable in FIPS 140-3 mode"]
+            );
+        }
+        #[cfg(not(any(feature = "fips", feature = "hash-transformations")))]
+        {
+            assert_eq!(result, b"68656c6c6f");
+            assert_eq!(
+                errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
+                ["sha1 transformation requires the hash-transformations feature"]
+            );
+        }
+
+        #[cfg(feature = "fips")]
+        {
+            let mut chain = TransformationChain::new();
+            add(&mut chain, "md5", crate::transformations::md5_hash);
+            add(&mut chain, "hexEncode", hex_encode);
+            let (result, errors) = chain.apply(b"hello");
+            assert_eq!(result, b"68656c6c6f");
+            assert_eq!(
+                errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
+                ["md5 transformation is unavailable in FIPS 140-3 mode"]
+            );
+        }
 
         let mut chain = TransformationChain::new();
         add(&mut chain, "urlDecode", url_decode);

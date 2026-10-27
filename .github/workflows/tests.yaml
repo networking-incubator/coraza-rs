@@ -169,3 +169,9 @@ jobs:
 
       - name: Test each feature
         run: cargo hack test --workspace --each-feature
+
+      - name: Test the digest-free FIPS profile
+        run: cargo test -p coraza --no-default-features --features fips
+
+      - name: Verify the FIPS dependency graph
+        run: tree=$(cargo tree -p coraza --no-default-features --features fips) && ! printf '%s\n' "$tree" | grep -Eq '(^|[[:space:]])(md-5|sha1) v'

@@ -5,6 +5,21 @@ provides SecLang parsing, request and response phase processing, and audit
 logging. It is not the upstream Go implementation. The `exec`, `initcol`, and
 `expirevar` action effects are not implemented.
 
+## FIPS build profile
+
+The `hash-transformations` feature (enabled by default) preserves the existing
+`t:md5` and `t:sha1` behavior. The `fips` Cargo feature makes both return their
+input unchanged, with `changed == false` and an error (`md5 transformation is
+unavailable in FIPS 140-3 mode` or `sha1 transformation is unavailable in FIPS
+140-3 mode`). It is a build profile, not runtime `GODEBUG=fips140` detection.
+In FIPS mode, the hash transformations return the input unchanged and their
+transformation error is currently not surfaced during rule evaluation.
+Use `--no-default-features --features fips` for a digest-free FIPS build (for
+example, `cargo test -p coraza --no-default-features --features fips`). Cargo
+features are additive, so plain `--features fips` keeps the default hash
+dependencies but still selects FIPS behavior. Disabling default features
+without `fips` also omits the hashes, which then return a build-feature error.
+
 ## Audit logging
 
 Configure audit logging through SecLang:

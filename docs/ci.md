@@ -16,7 +16,13 @@ This repository uses GitHub Actions to block risky changes early.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
-- Feature matrix: test and lint each feature combo with `cargo-hack`
+- Feature matrix: test and lint each feature combo with `cargo-hack`; also test
+  the digest-free FIPS profile with
+  `cargo test -p coraza --no-default-features --features fips`, then assert its
+  graph omits both digest crates with
+  `tree=$(cargo tree -p coraza --no-default-features --features fips) && ! printf '%s\n' "$tree" | grep -Eq '(^|[[:space:]])(md-5|sha1) v'`.
+  Cargo features are additive: plain `--features fips` keeps the crates but
+  selects FIPS behavior.
 
 ### `differential parity`
 
