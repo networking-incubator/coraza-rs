@@ -68,14 +68,24 @@ impl RuleGroup {
 
     /// Add a rule, attaching it to an open chain when needed.
     pub(crate) fn add(&mut self, rule: Rule) -> Result<(), String> {
+        let open_parent_id = self.open_chain().map(|parent| parent.metadata().id());
+        if let Some(parent_id) = open_parent_id
+            && rule.explicit_disruptive
+        {
+            return Err(format!(
+                "disruptive actions can only be specified in the chain starter rule (parent id: {parent_id})"
+            ));
+        }
+
         let id = rule.metadata().id();
         if id != 0 && self.find_by_id(id).is_some() {
             return Err(format!("duplicated rule id {id}"));
         }
 
-        match self.open_chain() {
-            Some(parent) => parent.chain.push(rule),
-            None => self.rules.push(rule),
+        if let Some(parent) = self.open_chain() {
+            parent.chain.push(rule);
+        } else {
+            self.rules.push(rule);
         }
         Ok(())
     }
@@ -193,6 +203,20 @@ mod tests {
         assert_eq!(group.count(), 1);
         assert_eq!(group.rules()[0].chain.len(), 1);
         assert!(!group.discard_open_chain());
+    }
+
+    #[test]
+    fn disruptive_chain_member_error_precedes_duplicate_id() {
+        let mut group = RuleGroup::new();
+        group.add(rule("42", "chain")).unwrap();
+        let mut member = rule("42", "deny");
+        member.explicit_disruptive = true;
+
+        assert_eq!(
+            group.add(member).unwrap_err(),
+            "disruptive actions can only be specified in the chain starter rule (parent id: 42)"
+        );
+        assert!(group.rules()[0].chain.is_empty());
     }
 
     #[test]

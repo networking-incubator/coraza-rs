@@ -4394,6 +4394,28 @@ v\r\n\
     }
 
     #[test]
+    fn inherited_pass_default_keeps_chain_members_runnable() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecDefaultAction \"phase:1,pass\"\n\
+                 SecRule ARGS \"@streq parent\" \"id:14,phase:1,chain\"\n\
+                 SecRule ARGS \"@streq child\" \"phase:1,setvar:TX.inherited_pass=1\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inherited-pass-chain");
+        tx.add_get_argument("parent", b"parent");
+        tx.add_get_argument("child", b"child");
+
+        assert_eq!(tx.process_request_headers(), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("inherited_pass")).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn setvar_updates_tx_during_rule_evaluation() {
         let mut parser = crate::seclang::Parser::new();
         parser
@@ -4484,7 +4506,7 @@ v\r\n\
         parser
             .from_string(
                 "SecRule ARGS \"@rx (attack)\" \"id:24,phase:1,capture,chain,pass\"\n\\
-                 SecRule ARGS \"@streq attack\" \"setvar:TX.saved=%{TX.1},pass\"",
+                 SecRule ARGS \"@streq attack\" \"setvar:TX.saved=%{TX.1}\"",
             )
             .unwrap();
         let waf = parser.into_waf().unwrap();

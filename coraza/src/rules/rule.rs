@@ -39,6 +39,8 @@ pub(crate) struct Rule {
     operator: Option<RuleOperator>,
     /// Actions retained for transaction evaluation.
     actions: Vec<CompiledAction>,
+    /// Whether this rule explicitly declares a disruptive action, excluding inherited defaults.
+    pub(crate) explicit_disruptive: bool,
     /// Following rules in a chain.
     pub(crate) chain: Vec<Rule>,
 }
@@ -51,6 +53,7 @@ impl Rule {
             variables: Vec::new(),
             operator: None,
             actions: Vec::new(),
+            explicit_disruptive: false,
             chain: Vec::new(),
         }
     }
