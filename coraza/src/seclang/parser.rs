@@ -1504,6 +1504,33 @@ mod tests {
     }
 
     #[test]
+    fn rule_observer_sees_included_rules_in_source_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let included_file = dir.path().join("included.conf");
+        std::fs::write(
+            &included_file,
+            "SecRule ARGS \"@contains a\" \"id:2,phase:1,log,chain\"\n\
+             SecRule ARGS \"@contains b\" \"id:3,phase:1,log\"\n",
+        )
+        .unwrap();
+        let main_file = dir.path().join("main.conf");
+        std::fs::write(
+            &main_file,
+            "SecAction \"id:1,pass\"\nInclude included.conf\nSecAction \"id:4,pass\"",
+        )
+        .unwrap();
+
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = Arc::clone(&ids);
+        let mut parser = Parser::new();
+        parser.state.current_dir = dir.path().to_string_lossy().into_owned();
+        parser.on_rule(move |metadata| observed_ids.lock().unwrap().push(metadata.id()));
+        parser.from_file(&main_file).unwrap();
+
+        assert_eq!(*ids.lock().unwrap(), [1, 2, 4]);
+    }
+
+    #[test]
     fn rule_observer_does_not_see_a_rejected_duplicate() {
         let ids = Arc::new(Mutex::new(Vec::new()));
         let observed_ids = Arc::clone(&ids);
@@ -1593,6 +1620,27 @@ mod tests {
         tx.add_get_argument("q", "match");
         tx.process_request_headers();
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
+    }
+
+    #[test]
+    fn rule_observer_is_not_invoked_after_compile() {
+        let invocations = Arc::new(Mutex::new(0));
+        let observed_invocations = Arc::clone(&invocations);
+        let mut parser = Parser::new();
+        parser.on_rule(move |_| *observed_invocations.lock().unwrap() += 1);
+        parser.from_string("SecAction \"id:1,pass\"").unwrap();
+        let invocations_after_parsing = *invocations.lock().unwrap();
+        assert_eq!(invocations_after_parsing, 1);
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("rule-observer-lifetime");
+        tx.process_request_headers();
+        tx.process_request_body(b"request body");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.process_response_body(b"response body");
+        tx.finish().unwrap();
+
+        assert_eq!(*invocations.lock().unwrap(), invocations_after_parsing);
     }
 
     #[test]
