@@ -14,13 +14,23 @@ source-derived fields are recomputed from the Rust source on every run:
 - `reference_revision` from the pinned Go reference;
 - `producer` and `evaluator`, the group registry and dispatch symbols for
   implemented capabilities, or the entry's override when one is present.
+- `requires_features` from the override's optional `features` list, sorted and
+  deduplicated.
 
 `capability-overrides.json` is hand-maintained. It holds the human decisions
 keyed by group and primary name: `state`, `go_reference`, `fixtures`,
 `differences`, optional `producer` and `evaluator`, and optional `notes`
-(review context that is not emitted into the manifest). Optional `aliases`
-groups spellings that share one entry. The top-level `reference` block pins the
+(review context that is not emitted into the manifest), and optional `features`
+(Cargo features required by the capability). Optional `aliases` groups
+spellings that share one entry. The top-level `reference` block pins the
 profiles and commits; it is copied into the manifest.
+
+`state` describes the capability's semantics; it does not describe whether the
+default build includes it. `requires_features` lists the Cargo features a build
+must enable, and an empty list means the capability is available in the default
+build. The generator checks feature names against `coraza/Cargo.toml` and checks
+feature-gated names against the explicit source-gate map in
+`xtask/src/conformance.rs`.
 
 For an entry whose state is not `unavailable`, an optional `producer` or
 `evaluator` overrides the group default for that field. Each override is
