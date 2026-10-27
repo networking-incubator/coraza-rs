@@ -1,0 +1,152 @@
+benchmark	workload	unit	base_median	base_repeat_low	base_repeat_high	candidate_median	candidate_repeat_low	candidate_repeat_high	base_sample_low	base_sample_high	candidate_sample_low	candidate_sample_high	base_speed_port_over_C	candidate_speed_port_over_C	verdict
+compare-caller-bounded	SQLi hit	ns/input	154.6	153.6	159.1	152.8	148.9	157.5	151.8	160.5	147.2	160.9			within repeated-run spread
+compare-caller-bounded	SQLi miss	ns/input	149.7	149.5	154.0	151.1	142.3	151.2	147.9	220.0	141.8	157.3			within repeated-run spread
+compare-caller-bounded	XSS hit	ns/input	33.3	32.9	41.1	32.4	31.0	33.3	32.4	42.9	30.9	35.5			within repeated-run spread
+compare-caller-bounded	XSS miss	ns/input	93.0	93.0	119.3	94.4	89.6	94.7	88.1	133.4	89.3	99.5			within repeated-run spread
+compare-capped	SQLi hit	ns/input	155.8	155.3	158.1	155.1	147.9	157.4	151.6	160.3	147.4	158.4			within repeated-run spread
+compare-capped	SQLi miss	ns/input	150.7	147.5	152.7	150.0	141.9	150.9	147.1	197.1	141.4	161.7			within repeated-run spread
+compare-capped	XSS hit	ns/input	33.3	32.8	41.2	32.6	30.9	32.6	32.3	41.9	30.7	33.3			outside repeated-run spread
+compare-capped	XSS miss	ns/input	93.9	93.3	115.7	94.3	90.0	95.1	88.6	118.9	89.2	100.5			within repeated-run spread
+coraza-bench	form-attack	ns/transaction	6793.0	6572.0	7123.5	6442.0	6181.0	6803.0	5601.0	60193.0	5601.0	51236.0			within repeated-run spread
+coraza-bench	form-benign	ns/transaction	6382.0	6322.0	6622.0	5851.0	5520.0	6232.0	5170.0	54152.0	5089.0	44604.0			outside repeated-run spread
+coraza-bench	get-attack	ns/transaction	6422.0	6322.0	6632.0	5961.0	5681.0	6272.0	5189.0	92895.0	5260.0	86563.0			outside repeated-run spread
+coraza-bench	get-benign	ns/transaction	5971.0	5190.0	6012.0	5561.0	5280.0	5861.0	4759.0	125416.0	4949.0	104666.0			within repeated-run spread
+coraza-bench	json-attack	ns/transaction	8065.0	7093.0	8406.0	7715.0	7398.5	8015.0	6623.0	72547.0	6642.0	45796.0			within repeated-run spread
+coraza-bench	json-benign	ns/transaction	7614.0	6783.0	8035.0	7234.0	7033.0	7524.0	6242.0	124504.0	6352.0	46368.0			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/1024/hit	ns/call	569.8	530.5	722.0	574.3	563.5	620.5	526.9	876.4	549.7	708.1			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/1048576/hit	ns/call	456057.4	444106.9	458697.2	660006.9	459550.0	680143.0	440903.2	484799.0	456559.2	749306.3			outside repeated-run spread
+scaling	SQLi/attack_after_whitespace/16384/hit	ns/call	7252.3	7233.5	7289.9	7152.2	6924.2	7306.7	7207.8	8120.6	6897.8	9076.2			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/256/hit	ns/call	217.8	215.0	242.4	224.6	220.3	225.5	208.3	271.6	214.0	269.5			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/262144/hit	ns/call	115521.9	114353.1	115954.1	114909.3	109365.4	150953.6	113960.9	131491.1	108857.8	160067.5			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/4096/hit	ns/call	1893.7	1891.1	2670.8	1937.6	1897.5	2025.3	1882.3	2824.5	1885.5	2271.8			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/64/hit	ns/call	130.0	127.1	133.7	127.3	125.7	129.8	124.8	139.8	123.0	144.1			within repeated-run spread
+scaling	SQLi/attack_after_whitespace/65536/hit	ns/call	27541.5	27450.0	29540.6	29083.5	28632.1	29418.8	27352.4	31232.8	28561.3	34199.8			within repeated-run spread
+scaling	SQLi/attack_at_start/1024/hit	ns/call	109.9	107.2	146.1	107.8	106.3	111.9	105.1	171.6	104.3	133.5			within repeated-run spread
+scaling	SQLi/attack_at_start/1048576/hit	ns/call	8786.1	8713.6	9029.4	11772.6	9367.7	14941.9	8583.9	9245.7	9028.0	16452.1			outside repeated-run spread
+scaling	SQLi/attack_at_start/16384/hit	ns/call	179.8	177.2	180.7	175.9	171.1	179.3	176.7	185.0	170.8	180.3			within repeated-run spread
+scaling	SQLi/attack_at_start/256/hit	ns/call	106.5	105.2	117.9	109.2	106.1	111.1	103.4	122.6	105.3	121.7			within repeated-run spread
+scaling	SQLi/attack_at_start/262144/hit	ns/call	1949.9	1937.5	1951.3	1912.6	1850.0	2269.8	1920.3	2459.1	1843.1	2530.4			within repeated-run spread
+scaling	SQLi/attack_at_start/4096/hit	ns/call	125.7	123.6	151.0	124.3	123.1	124.5	122.8	166.7	122.6	137.3			within repeated-run spread
+scaling	SQLi/attack_at_start/64/hit	ns/call	106.6	105.6	131.6	107.3	104.1	111.4	104.8	150.6	99.6	125.0			within repeated-run spread
+scaling	SQLi/attack_at_start/65536/hit	ns/call	557.6	557.4	607.1	585.1	582.9	586.5	555.8	642.6	569.2	641.2			within repeated-run spread
+scaling	SQLi/base64_4k_miss/4096/miss	ns/call	2888.6	2821.2	2934.2	3024.3	2826.0	3799.9	2794.9	3208.6	2805.0	4156.1			within repeated-run spread
+scaling	SQLi/json_4k_miss/4096/miss	ns/call	240.1	239.2	240.1	230.5	228.9	290.3	238.7	264.7	227.6	369.7			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/12802/miss	ns/call	14257.3	14221.0	14593.9	14309.9	14288.7	26399.2	14090.2	16228.5	14075.6	29070.3			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/1602/miss	ns/call	1855.4	1834.5	1900.7	2136.1	1868.8	2472.4	1804.9	2081.6	1758.2	2672.9			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/25602/miss	ns/call	28604.9	28467.9	29366.3	28780.2	28613.9	35141.3	28294.0	31557.3	27829.7	46976.8			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/3202/miss	ns/call	3609.5	3451.8	3673.8	4111.5	3554.4	5051.4	3439.2	3942.6	3520.7	6528.5			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/51202/miss	ns/call	56799.7	55659.9	58884.3	61351.2	56922.9	72269.1	55534.8	62904.5	55036.6	77543.7			within repeated-run spread
+scaling	SQLi/mixed_escaped_quote_suffix/6402/miss	ns/call	7162.4	7122.1	7179.1	9682.8	7121.6	10183.0	6847.3	7911.0	7099.0	12863.5			within repeated-run spread
+scaling	SQLi/operator_noise_miss/1024/miss	ns/call	5090.6	5025.5	6641.0	4965.2	4950.2	4980.7	4994.0	7125.0	4898.0	5451.5			outside repeated-run spread
+scaling	SQLi/operator_noise_miss/1048576/miss	ns/call	5147941.3	5117253.7	5358103.0	5952106.3	5348051.0	7099306.3	5039320.3	5629370.0	5319737.7	7607131.0			within repeated-run spread
+scaling	SQLi/operator_noise_miss/16384/miss	ns/call	79634.7	78916.6	81815.6	76382.6	75144.9	82484.9	78240.9	86212.1	74900.9	87006.1			within repeated-run spread
+scaling	SQLi/operator_noise_miss/256/miss	ns/call	1274.7	1256.8	1363.2	1260.1	1208.7	1292.7	1253.4	1520.2	1198.5	1928.8			within repeated-run spread
+scaling	SQLi/operator_noise_miss/262144/miss	ns/call	1326380.2	1311990.7	1326747.6	1317540.3	1200378.2	1736993.2	1275132.2	1463716.3	1198716.6	1931747.9			within repeated-run spread
+scaling	SQLi/operator_noise_miss/4096/miss	ns/call	19907.6	19726.5	24309.6	19839.6	19584.7	20136.6	19675.0	27199.2	19569.5	24326.7			within repeated-run spread
+scaling	SQLi/operator_noise_miss/64/miss	ns/call	334.0	330.9	441.8	332.5	315.2	336.0	328.0	519.2	312.4	377.1			within repeated-run spread
+scaling	SQLi/operator_noise_miss/65536/miss	ns/call	321534.9	313895.3	333352.7	331961.3	318909.7	344347.1	313355.6	340138.1	315760.1	359028.1			within repeated-run spread
+scaling	SQLi/plain_miss/1024/miss	ns/call	320.7	267.8	431.2	287.2	282.8	290.0	266.3	512.5	281.8	297.3			within repeated-run spread
+scaling	SQLi/plain_miss/1048576/miss	ns/call	256526.7	255683.1	265655.6	255660.6	246381.4	351032.0	250438.3	291855.4	240458.7	455214.6			within repeated-run spread
+scaling	SQLi/plain_miss/16384/miss	ns/call	3759.0	3723.9	3762.2	3752.5	3698.1	3792.0	3699.5	3794.0	3618.1	4174.0			within repeated-run spread
+scaling	SQLi/plain_miss/256/miss	ns/call	107.9	105.5	109.2	107.0	103.8	111.0	104.3	120.9	102.3	117.1			within repeated-run spread
+scaling	SQLi/plain_miss/262144/miss	ns/call	62214.4	62087.7	64504.4	62875.6	57178.9	90655.1	58319.9	72215.1	57154.4	104209.5			within repeated-run spread
+scaling	SQLi/plain_miss/4096/miss	ns/call	980.7	965.1	1307.1	991.3	986.1	1006.1	964.9	1375.3	968.2	1108.7			within repeated-run spread
+scaling	SQLi/plain_miss/64/miss	ns/call	63.2	62.4	93.7	62.4	59.4	64.7	62.1	101.0	58.7	65.7			within repeated-run spread
+scaling	SQLi/plain_miss/65536/miss	ns/call	15278.3	14359.6	15578.4	15318.1	15234.7	16790.7	14320.8	16350.0	14992.0	18559.5			within repeated-run spread
+scaling	SQLi/prose_4k_miss/4096/miss	ns/call	311.1	309.8	316.8	314.3	294.2	398.1	307.8	340.9	293.3	555.7			within repeated-run spread
+scaling	XSS/angle_noise_miss/1024/miss	ns/call	6704.5	5244.1	6847.7	7049.1	6134.1	7084.8	5216.8	6896.4	6026.8	7177.7			within repeated-run spread
+scaling	XSS/angle_noise_miss/1048576/miss	ns/call	6006632.3	5747925.7	6198206.0	6484574.0	5734807.7	7951037.5	5734213.3	6242435.7	5722404.7	8614640.0			within repeated-run spread
+scaling	XSS/angle_noise_miss/16384/miss	ns/call	111063.6	100582.2	111280.8	97584.0	88923.1	100237.2	99460.5	112366.4	87542.1	111902.4			outside repeated-run spread
+scaling	XSS/angle_noise_miss/256/miss	ns/call	1764.8	1667.5	1838.6	1813.7	1654.7	1815.3	1650.9	1890.0	1617.5	2011.8			within repeated-run spread
+scaling	XSS/angle_noise_miss/262144/miss	ns/call	1647436.2	1624359.7	1781360.0	1644090.8	1554608.6	1736005.9	1442321.5	1786014.2	1538634.6	1760952.8			within repeated-run spread
+scaling	XSS/angle_noise_miss/4096/miss	ns/call	26960.7	25287.3	30315.3	24534.0	21782.7	25032.4	25112.3	30833.8	21696.5	28883.0			outside repeated-run spread
+scaling	XSS/angle_noise_miss/64/miss	ns/call	450.2	449.7	462.7	468.7	442.3	484.6	429.1	471.0	440.9	505.2			within repeated-run spread
+scaling	XSS/angle_noise_miss/65536/miss	ns/call	389678.2	371391.4	402801.5	364476.1	330642.5	406052.0	365679.1	429824.3	329443.7	407307.1			within repeated-run spread
+scaling	XSS/attack_at_start/1024/hit	ns/call	16.8	16.7	30.2	16.7	16.6	17.6	16.5	30.3	16.5	17.8			within repeated-run spread
+scaling	XSS/attack_at_start/1048576/hit	ns/call	38.8	37.1	50.0	44.3	38.3	48.9	36.6	57.0	37.4	50.5			within repeated-run spread
+scaling	XSS/attack_at_start/16384/hit	ns/call	22.4	22.2	36.3	22.5	22.2	22.6	22.1	36.6	21.9	24.6			within repeated-run spread
+scaling	XSS/attack_at_start/256/hit	ns/call	16.9	16.6	31.8	16.7	16.6	17.5	16.5	32.1	16.2	18.7			within repeated-run spread
+scaling	XSS/attack_at_start/262144/hit	ns/call	37.6	37.6	47.5	38.0	35.8	50.6	37.3	48.3	35.4	58.7			within repeated-run spread
+scaling	XSS/attack_at_start/4096/hit	ns/call	22.8	17.9	32.9	17.9	17.8	18.2	17.9	33.2	17.7	20.0			within repeated-run spread
+scaling	XSS/attack_at_start/64/hit	ns/call	16.8	16.8	34.6	16.6	16.3	17.1	16.6	36.2	16.2	18.2			within repeated-run spread
+scaling	XSS/attack_at_start/65536/hit	ns/call	37.7	37.5	49.4	38.3	37.5	38.9	37.1	49.9	37.4	43.3			within repeated-run spread
+scaling	XSS/base64_4k_miss/4096/miss	ns/call	2841.6	2834.5	2857.5	2748.3	2727.9	3558.6	2817.0	2986.8	2701.7	4208.5			within repeated-run spread
+scaling	XSS/benign_tags_miss/1024/miss	ns/call	4185.0	4096.6	6213.3	4053.2	4042.4	4131.5	4079.4	6939.8	4005.6	4473.9			within repeated-run spread
+scaling	XSS/benign_tags_miss/1048576/miss	ns/call	4237098.0	4215242.0	6175997.3	4243963.5	4070547.5	5192819.0	4078582.8	6304499.0	4043892.5	5526733.3			within repeated-run spread
+scaling	XSS/benign_tags_miss/16384/miss	ns/call	85702.0	63611.0	99786.4	64468.5	63899.2	65333.2	63183.2	100947.9	63518.6	66736.8			within repeated-run spread
+scaling	XSS/benign_tags_miss/256/miss	ns/call	1044.7	1038.7	1548.4	1031.4	1030.2	1084.0	1037.3	1613.9	1025.8	1242.3			within repeated-run spread
+scaling	XSS/benign_tags_miss/262144/miss	ns/call	1038683.3	988681.2	1462612.5	1063153.4	1051239.0	1071525.9	985116.4	1465757.5	1031789.1	1104022.6			within repeated-run spread
+scaling	XSS/benign_tags_miss/4096/miss	ns/call	18923.8	17169.6	24898.3	16242.9	16183.5	16694.7	17071.9	28174.6	15855.3	17862.8			outside repeated-run spread
+scaling	XSS/benign_tags_miss/64/miss	ns/call	291.1	290.5	410.1	282.4	274.7	294.0	287.7	422.2	274.0	314.2			within repeated-run spread
+scaling	XSS/benign_tags_miss/65536/miss	ns/call	264323.2	256729.8	380407.7	245359.2	244404.3	257151.9	248985.6	387363.4	242185.0	283910.9			within repeated-run spread
+scaling	XSS/binary_noise_miss/1024/miss	ns/call	144.9	137.4	146.4	145.7	143.5	149.2	135.8	153.9	139.2	165.7			within repeated-run spread
+scaling	XSS/binary_noise_miss/1048576/miss	ns/call	72730.6	71740.2	72856.2	74534.9	72098.2	104049.5	70781.7	81222.4	69391.3	105811.2			within repeated-run spread
+scaling	XSS/binary_noise_miss/16384/miss	ns/call	840.9	837.3	853.6	839.6	838.1	843.3	836.8	874.9	834.8	849.6			within repeated-run spread
+scaling	XSS/binary_noise_miss/256/miss	ns/call	111.9	111.0	113.2	110.1	106.0	110.5	106.3	122.8	102.5	113.5			outside repeated-run spread
+scaling	XSS/binary_noise_miss/262144/miss	ns/call	15498.0	14676.5	15712.0	15401.9	14629.9	23387.2	14643.9	16079.1	14619.8	24295.7			within repeated-run spread
+scaling	XSS/binary_noise_miss/4096/miss	ns/call	287.8	286.0	399.8	286.7	285.1	288.4	281.9	407.7	282.3	320.2			within repeated-run spread
+scaling	XSS/binary_noise_miss/64/miss	ns/call	70.7	69.1	71.0	69.8	69.5	71.9	67.7	78.9	68.1	77.1			within repeated-run spread
+scaling	XSS/binary_noise_miss/65536/miss	ns/call	3986.8	3965.2	4003.5	4021.4	3801.7	4034.5	3942.3	4073.1	3778.9	4406.9			within repeated-run spread
+scaling	XSS/comment_miss/1024/miss	ns/call	1126.5	1099.1	1152.2	1162.3	1131.7	1173.0	1092.0	1222.3	1130.0	1317.7			within repeated-run spread
+scaling	XSS/comment_miss/1048576/miss	ns/call	1114286.2	1094541.3	1143751.6	1209614.1	1073168.2	1522080.4	1083793.9	1261386.3	1070449.7	1579633.6			within repeated-run spread
+scaling	XSS/comment_miss/16384/miss	ns/call	17548.2	17434.9	18130.1	17859.7	17356.1	18273.3	17391.3	23814.2	17248.8	19799.3			within repeated-run spread
+scaling	XSS/comment_miss/256/miss	ns/call	337.4	322.1	354.4	348.8	338.6	357.2	318.8	359.5	338.0	406.6			within repeated-run spread
+scaling	XSS/comment_miss/262144/miss	ns/call	279167.2	270834.7	283103.0	286561.2	281243.7	289944.3	267668.5	287149.1	269689.1	307042.3			within repeated-run spread
+scaling	XSS/comment_miss/4096/miss	ns/call	4556.7	4468.2	5348.8	4553.7	4506.9	4602.7	4445.7	5777.6	4422.5	4940.0			within repeated-run spread
+scaling	XSS/comment_miss/64/miss	ns/call	137.3	135.4	137.7	139.5	130.7	139.7	132.1	151.4	128.7	149.6			within repeated-run spread
+scaling	XSS/comment_miss/65536/miss	ns/call	70288.4	69696.6	71987.7	69819.0	69208.0	74728.8	69194.8	83547.4	68581.8	76033.3			within repeated-run spread
+scaling	XSS/encoded_url_at_end/1024/hit	ns/call	70.7	65.0	97.6	61.8	59.9	62.0	59.0	118.8	58.2	66.7			outside repeated-run spread
+scaling	XSS/encoded_url_at_end/1048576/hit	ns/call	10344.8	8974.5	10358.0	9442.4	9067.6	12348.5	8843.5	13224.4	8676.6	13087.3			within repeated-run spread
+scaling	XSS/encoded_url_at_end/16384/hit	ns/call	123.2	122.8	140.2	122.0	121.9	123.2	122.5	147.2	120.5	137.2			within repeated-run spread
+scaling	XSS/encoded_url_at_end/256/hit	ns/call	59.0	58.1	69.9	57.6	57.5	61.5	57.0	70.2	57.0	63.8			within repeated-run spread
+scaling	XSS/encoded_url_at_end/262144/hit	ns/call	1818.5	1787.1	1863.5	1871.0	1774.5	2359.5	1784.7	1887.7	1770.1	2697.4			within repeated-run spread
+scaling	XSS/encoded_url_at_end/4096/hit	ns/call	86.0	71.0	92.0	72.3	71.2	73.6	70.4	97.5	70.6	80.8			within repeated-run spread
+scaling	XSS/encoded_url_at_end/64/hit	ns/call	57.0	56.8	69.0	56.8	56.8	59.6	56.2	73.0	56.1	67.9			within repeated-run spread
+scaling	XSS/encoded_url_at_end/65536/hit	ns/call	511.0	508.3	522.3	519.6	519.3	568.4	502.4	538.0	513.9	609.0			within repeated-run spread
+scaling	XSS/event_near_miss/1024/miss	ns/call	6385.9	6164.0	7876.4	6354.7	6304.3	6439.7	5987.2	8699.6	6162.6	7020.1			within repeated-run spread
+scaling	XSS/event_near_miss/1048576/miss	ns/call	6581529.7	6404634.0	8011767.0	7664719.3	6367096.3	8471080.5	6302178.0	8721441.0	6098688.7	8902566.5			within repeated-run spread
+scaling	XSS/event_near_miss/16384/miss	ns/call	123560.0	100748.3	150297.6	100024.4	99149.4	100551.9	99627.5	159106.8	97519.1	112201.2			outside repeated-run spread
+scaling	XSS/event_near_miss/256/miss	ns/call	1688.6	1617.1	2025.6	1603.2	1600.8	1692.0	1579.0	2038.3	1588.8	1784.1			within repeated-run spread
+scaling	XSS/event_near_miss/262144/miss	ns/call	1645964.4	1529052.6	2000230.4	1634391.5	1589188.6	1674533.7	1523372.9	2101264.1	1557000.1	1810131.9			within repeated-run spread
+scaling	XSS/event_near_miss/4096/miss	ns/call	29600.0	26532.0	31135.7	25263.7	25160.5	25387.3	25126.9	31862.5	24944.5	28025.0			outside repeated-run spread
+scaling	XSS/event_near_miss/64/miss	ns/call	410.9	410.6	516.8	405.8	386.2	420.3	402.8	565.7	384.9	462.9			within repeated-run spread
+scaling	XSS/event_near_miss/65536/miss	ns/call	403733.5	384384.9	500591.1	384120.6	380021.7	398152.5	376987.5	641063.5	379184.1	442609.4			within repeated-run spread
+scaling	XSS/json_4k_miss/4096/miss	ns/call	5657.8	5585.5	5701.5	5621.1	5500.8	6929.7	5576.4	6315.2	5461.4	8318.3			within repeated-run spread
+scaling	XSS/large_tag_stream_miss/1048576/miss	ns/call	4179209.2	4095046.2	6134259.0	4888728.0	4147805.2	5381614.0	4051697.0	6585620.7	4101515.5	6125966.7			within repeated-run spread
+scaling	XSS/large_tag_stream_miss/10485760/miss	ns/call	42150653.0	41844967.0	63545574.0	43069669.0	41297498.0	49391484.0	41207519.0	64307807.0	39982245.0	53028322.0			within repeated-run spread
+scaling	XSS/large_tag_stream_miss/5242880/miss	ns/call	20799112.0	20737977.0	29480122.0	21031358.0	20417584.0	24228690.0	20372861.0	30471565.0	20186469.0	25799072.0			within repeated-run spread
+scaling	XSS/plain_miss/1024/miss	ns/call	132.2	130.5	134.2	130.9	128.5	133.3	127.0	151.3	128.0	139.4			within repeated-run spread
+scaling	XSS/plain_miss/1048576/miss	ns/call	73612.9	72705.1	74176.8	71775.9	68570.0	93185.6	70879.3	80142.0	68184.6	104384.3			within repeated-run spread
+scaling	XSS/plain_miss/16384/miss	ns/call	829.4	826.7	1107.1	830.0	822.5	838.4	820.4	1158.3	820.9	936.0			within repeated-run spread
+scaling	XSS/plain_miss/256/miss	ns/call	98.5	96.5	100.2	98.2	96.2	101.4	96.4	103.9	96.0	108.2			within repeated-run spread
+scaling	XSS/plain_miss/262144/miss	ns/call	14658.7	14612.7	15227.9	15944.9	15595.3	15952.0	14602.5	15691.1	15574.5	17100.6			outside repeated-run spread
+scaling	XSS/plain_miss/4096/miss	ns/call	278.8	268.5	336.0	278.6	271.8	312.9	266.1	352.7	270.0	322.8			within repeated-run spread
+scaling	XSS/plain_miss/64/miss	ns/call	79.0	78.4	79.6	78.1	76.5	81.1	76.3	82.4	73.9	85.4			within repeated-run spread
+scaling	XSS/plain_miss/65536/miss	ns/call	3939.3	3848.8	4049.2	3792.7	3765.3	3921.7	3829.7	4278.2	3760.1	3963.4			within repeated-run spread
+scaling	XSS/prose_4k_miss/4096/miss	ns/call	15431.2	14721.3	15737.5	14824.8	14614.8	17692.1	14356.1	15947.6	14600.0	22095.8			within repeated-run spread
+scaling	XSS/quote_noise_miss/1024/miss	ns/call	226.0	225.3	233.1	233.2	232.7	233.7	224.4	256.8	231.5	257.1			within repeated-run spread
+scaling	XSS/quote_noise_miss/1048576/miss	ns/call	102123.2	99681.8	104927.8	107395.3	97290.6	148934.8	95021.7	119633.2	96985.0	149650.3			within repeated-run spread
+scaling	XSS/quote_noise_miss/16384/miss	ns/call	1311.0	1307.4	1311.1	1323.7	1311.1	1332.1	1302.0	1322.3	1301.3	1442.4			within repeated-run spread
+scaling	XSS/quote_noise_miss/256/miss	ns/call	183.9	179.0	191.0	180.4	175.8	182.5	178.0	198.8	174.0	199.5			within repeated-run spread
+scaling	XSS/quote_noise_miss/262144/miss	ns/call	21722.1	20729.1	21787.9	21238.9	20700.0	29830.6	20698.1	24917.3	20689.3	34947.1			within repeated-run spread
+scaling	XSS/quote_noise_miss/4096/miss	ns/call	451.1	450.6	591.6	449.9	447.9	451.0	447.7	599.3	444.7	462.0			within repeated-run spread
+scaling	XSS/quote_noise_miss/64/miss	ns/call	148.6	147.0	149.9	150.6	139.2	161.4	145.6	163.6	138.8	203.6			within repeated-run spread
+scaling	XSS/quote_noise_miss/65536/miss	ns/call	5673.3	5604.9	5803.1	5609.7	5480.5	5643.6	5437.0	6102.6	5353.2	6450.4			within repeated-run spread
+scaling	XSS/slashes_miss/1048576/miss	ns/call	265462.6	257436.8	268488.0	380101.3	267278.3	390861.7	250052.7	284442.7	264057.3	401513.0			within repeated-run spread
+scaling	XSS/slashes_miss/10485760/miss	ns/call	2741582.3	2733674.3	2812282.0	2928200.0	2702914.7	3850751.2	2517179.0	3325928.6	2626279.0	3941604.2			within repeated-run spread
+scaling	XSS/slashes_miss/5242880/miss	ns/call	1311732.7	1311487.2	1348532.7	1687397.8	1320130.2	2258478.7	1289008.2	1458951.9	1316869.0	2297583.7			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/1024/miss	ns/call	150.5	145.3	152.8	151.9	151.3	163.3	144.1	169.4	149.4	182.6			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/1048576/miss	ns/call	80647.7	77456.5	81084.1	85583.4	76679.9	108754.9	75893.8	83538.1	76171.4	118438.6			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/16384/miss	ns/call	917.5	907.9	918.6	910.4	906.1	918.3	906.0	925.6	903.7	1000.1			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/256/miss	ns/call	113.5	113.5	114.6	114.5	110.9	115.9	106.8	125.3	110.6	132.5			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/262144/miss	ns/call	16346.2	16332.3	17028.3	17343.7	16809.5	17648.8	16296.3	18354.0	16554.4	23095.2			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/4096/miss	ns/call	369.6	305.4	372.8	308.0	306.0	329.6	303.2	491.6	304.0	334.0			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/64/miss	ns/call	91.0	89.3	93.2	94.2	88.3	95.8	88.4	94.0	86.9	99.8			within repeated-run spread
+scaling	XSS/unclosed_comment_miss/65536/miss	ns/call	4401.7	4396.4	4618.9	4394.5	4200.9	4778.8	4381.6	4861.0	4197.2	4992.7			within repeated-run spread
+speed	sqli: attack samples	ns/input	450.0	430.8	453.6	488.9	466.3	493.8	430.5	455.2	453.7	496.4	0.525	0.555	outside repeated-run spread
+speed	sqli: benign samples	ns/input	261.1	255.9	308.5	270.9	262.2	287.0	255.2	312.7	260.6	288.4	0.550	0.550	within repeated-run spread
+speed	sqli: upstream's speed test	ns/input	170.1	163.9	175.2	179.2	172.9	181.4	163.9	175.7	172.6	184.7	0.500	0.505	within repeated-run spread
+speed	xss: attack samples	ns/input	35.8	33.5	35.8	35.1	34.1	35.8	33.5	37.6	33.9	36.3	0.280	0.270	within repeated-run spread
+speed	xss: benign samples	ns/input	121.2	119.7	124.8	122.2	119.1	122.7	118.7	128.8	118.6	126.7	0.400	0.405	within repeated-run spread
+speed	xss: sqli attack samples	ns/input	442.6	431.3	448.1	441.6	436.4	446.4	429.4	449.3	418.1	474.7	0.360	0.355	within repeated-run spread
+speed	xss: upstream's speed test	ns/input	59.1	57.0	59.3	61.0	60.8	62.6	56.4	60.7	57.0	68.2	0.335	0.330	outside repeated-run spread

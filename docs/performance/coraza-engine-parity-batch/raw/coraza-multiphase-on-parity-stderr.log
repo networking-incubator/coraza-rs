@@ -1,0 +1,9 @@
+coraza parity runner failed: run Rust driver: exit status 1: Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/coraza_workload.rs (/tmp/opencode/parity/l4-target-multiphase/release/deps/coraza_workload-3ac0e4d0c3d2b3dd)
+case get-benign: pass
+coraza workload driver failed: outcome mismatch: case get-attack match 0 is rule 1001 phase 1 ARGS_GET:Some("q") [97, 116, 116, 97, 99, 107], expected rule 1001 phase 2 ARGS_GET:Some("q") [97, 116, 116, 97, 99, 107]
+error: bench failed, to rerun pass `-p coraza --bench coraza_workload`
+
+Caused by:
+  process didn't exit successfully: `/tmp/opencode/parity/l4-target-multiphase/release/deps/coraza_workload-3ac0e4d0c3d2b3dd --workloads /tmp/opencode/parity/l4-multiphase/benchmarks/coraza/workloads --outcome /tmp/coraza-parity-3017961988/rust.ndjson --bench` (exit status: 1)
+exit status 1
