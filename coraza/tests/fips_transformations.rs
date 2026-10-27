@@ -14,8 +14,10 @@
 
 //! SecLang-level tests for the FIPS transformation profile.
 
+#[cfg(test)]
 mod fips {
     #[cfg(feature = "fips")]
+    #[expect(clippy::expect_used, reason = "FIPS tests compile fixed directives")]
     #[test]
     fn hash_rules_match_the_unchanged_input() {
         use coraza::seclang::Parser;
@@ -37,7 +39,7 @@ mod fips {
             transaction
                 .matched_rules()
                 .iter()
-                .map(|matched| matched.rule_id())
+                .map(coraza::audit_log::MatchedRule::rule_id)
                 .collect::<Vec<_>>(),
             [1001, 1002]
         );

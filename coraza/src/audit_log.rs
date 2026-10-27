@@ -2006,7 +2006,9 @@ fn hostname() -> String {
 mod https {
     use std::{io, time::Duration};
 
+    #[cfg(test)]
     use super::audit_log_mime;
+    #[cfg(test)]
     use crate::types::AuditLogFormat;
 
     /// `User-Agent` Go Coraza's HTTPS writer sends with every entry.
@@ -2189,6 +2191,11 @@ mod https {
     }
 
     /// The `Content-Type` of entries in `format`, as Go Coraza's formatters report it.
+    ///
+    /// Only the HTTPS writer tests need it: built-in sinks take the MIME from
+    /// [`super::FormattedAudit`], so without this gate an all-features library build
+    /// reports it as dead code.
+    #[cfg(test)]
     fn format_mime(format: AuditLogFormat) -> &'static str {
         audit_log_mime(format)
     }

@@ -709,8 +709,8 @@ No regression is claimed and none is established; the change is accepted
 without a built-in-only fast path. If an isolated or production profile later
 shows material dispatch cost, split built-in actions from custom actions so
 built-in evaluation avoids both the enum branch and the larger custom-action
-representation. Raw samples:
-`/tmp/opencode/parity/l3b-bench2/`.
+representation. The raw per-pair samples were not retained; the per-pair
+medians above are the record of that run.
 
 CPU-3-pinned release pairs measured one million `CompiledAction::evaluate`
 calls per sample (`ctl:requestBodyAccess=On`): base `557ba71` was 6.8 ns/eval
