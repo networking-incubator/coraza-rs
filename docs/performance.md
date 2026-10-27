@@ -680,27 +680,34 @@ and `log,capture` metadata actions. The rule ID was cleared in the harness to
 avoid accumulating match records. It compares whole matched-rule evaluation,
 not the dispatch branch in isolation.
 
-Three paired samples ran pinned to logical CPU 3, alternating order
-base/candidate, candidate/base, base/candidate. Base was `2b4ef751`; candidate
-was `482c51f` plus this lane's code changes. Both used the release test profile
-and Rust 1.99.1 on an AMD Ryzen 7 PRO 7840HS, Linux 7.2.9. The CPU frequency
-was not locked.
-The samples used `taskset -c 3` with `cargo test --release -p coraza --lib
-bench_builtin_action_evaluation_sample -- --ignored --nocapture`; separate
-`CARGO_TARGET_DIR`s held the base and candidate release binaries.
+Seven alternating pairs ran pinned to logical CPU 3 against clean worktrees at
+`2b4ef751` (base) and `c0888bc1` (candidate plus this lane's code changes),
+five samples per side per pair, Rust 1.99.1, AMD Ryzen 7 PRO 7840HS, CPU
+frequency not locked. The measured process CPU was 99% in every sample.
 
-| Revision | Samples (ns/evaluation) | Median | Range |
-| --- | --- | ---: | ---: |
-| Base | 885.5, 869.2, 1,294.7 | 885.5 | 869.2–1,294.7 |
-| Candidate | 1,242.4, 1,285.0, 842.9 | 1,242.4 | 842.9–1,285.0 |
+| Base median (ns/evaluation) | Candidate median (ns/evaluation) | Candidate/base |
+| ---: | ---: | ---: |
+| 904.2 | 916.8 | +1.4% |
+| 929.3 | 892.4 | -4.0% |
+| 920.3 | 898.5 | -2.4% |
+| 920.3 | 915.0 | -0.6% |
+| 904.0 | 897.4 | -0.7% |
+| 932.7 | 910.7 | -2.4% |
+| 950.3 | 1,045.0 | +10.0% |
 
-The candidate median was 40.3% higher, but the observed ranges overlap broadly
-and no candidate sample exceeded the base range. Background load varied during
-the run; this host cannot resolve effects around 1%, the same limitation
-recorded in the [debug-logging measurement](#coraza-debug-logging-disabled-path-2026-10-27).
-This does not establish either a regression or its absence. Accept the change
-provisionally without a built-in-only fast path. If an isolated or production
-profile later shows material dispatch cost, split built-in actions from custom
-actions so built-in evaluation avoids both the enum branch and the larger
-custom-action representation. Raw sample logs and the release binaries' build
-artifacts are in `/tmp/opencode/parity/l3b-bench/`.
+The median of the per-pair ratios is 0.9927, i.e. the candidate was 0.7% faster
+at the median, and the same-tree spread within a pair had a median range of
+about 8% (81.3 ns/evaluation base, 71.2 candidate). A single noisy pairing
+(+10.0%) shows how easily this host produces spurious differences; an earlier
+three-sample run reported +40%, which did not reproduce here.
+
+This workload carries matching and transaction work, so it cannot isolate
+dispatch cost, and this host cannot resolve effects around 1% (the same
+limitation recorded in the
+[debug-logging measurement](#coraza-debug-logging-disabled-path-2026-10-27)).
+No regression is claimed and none is established; the change is accepted
+without a built-in-only fast path. If an isolated or production profile later
+shows material dispatch cost, split built-in actions from custom actions so
+built-in evaluation avoids both the enum branch and the larger custom-action
+representation. Raw samples:
+`/tmp/opencode/parity/l3b-bench2/`.
