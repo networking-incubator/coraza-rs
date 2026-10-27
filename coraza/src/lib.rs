@@ -20,7 +20,7 @@
 //! The port is based on the original Coraza, created by Juan Pablo Tosso and
 //! the OWASP Coraza contributors. External or persistent actions remain unimplemented.
 
-mod actions;
+pub mod actions;
 pub mod audit_log;
 mod body_processors;
 pub mod collection;

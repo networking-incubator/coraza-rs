@@ -467,7 +467,7 @@ impl Rule {
 mod tests {
     use super::Rule;
     use crate::{
-        actions::{ActionType, CompiledAction},
+        actions::{ActionImplementation, ActionType, CompiledAction},
         config::DetectorInspectionAction,
         seclang::Parser,
         types::{RulePhase, RuleVariable},
@@ -488,16 +488,19 @@ mod tests {
             name: "deny".to_owned(),
             argument: String::new(),
             action_type: ActionType::Disruptive,
+            implementation: ActionImplementation::Builtin,
         });
         rule.push_action(CompiledAction {
             name: "setvar".to_owned(),
             argument: "TX.count=1".to_owned(),
             action_type: ActionType::Nondisruptive,
+            implementation: ActionImplementation::Builtin,
         });
         rule.push_action(CompiledAction {
             name: "pass".to_owned(),
             argument: String::new(),
             action_type: ActionType::Disruptive,
+            implementation: ActionImplementation::Builtin,
         });
 
         assert_eq!(

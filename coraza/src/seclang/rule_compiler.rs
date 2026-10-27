@@ -166,7 +166,7 @@ pub(crate) fn apply_actions<'a>(
             if explicit && action.action_type() == ActionType::Disruptive {
                 rule.explicit_disruptive = true;
             }
-            if defer_block && parsed.key == "block" {
+            if defer_block && parsed.key == "block" && action.action_type() == ActionType::Disruptive {
                 continue;
             }
             rule.push_action(action);
@@ -217,7 +217,7 @@ impl DefaultActions {
     /// If `actions` is not valid, names no phase or no disruptive action, holds metadata
     /// actions (`id`, `msg`, `tag`, ...) or transformations, or its phase already has
     /// defaults.
-    pub(crate) fn add(&mut self, actions: &str) -> CompileResult<()> {
+    pub(crate) fn add(&mut self, actions: &str, action_context: ActionCompileContext<'_>) -> CompileResult<()> {
         const METADATA: [&str; 8] = ["accuracy", "id", "maturity", "msg", "rev", "severity", "tag", "ver"];
 
         let mut metadata = RuleMetadata::new();
@@ -236,12 +236,7 @@ impl DefaultActions {
                     "SecDefaultAction must not contain transformations (t)".to_owned(),
                 ));
             }
-            let action = compile_action(
-                &parsed.key,
-                &parsed.value,
-                &mut metadata,
-                ActionCompileContext::default(),
-            )?;
+            let action = compile_action(&parsed.key, &parsed.value, &mut metadata, action_context)?;
             if parsed.key == "phase" {
                 has_phase = true;
             } else if action.is_some_and(|a| a.action_type() == ActionType::Disruptive) {
@@ -514,7 +509,9 @@ mod tests {
     #[test]
     fn test_default_actions_apply_to_explicit_and_builtin_phases() {
         let mut defaults = DefaultActions::default();
-        defaults.add("phase:1,log,auditlog,deny,status:403").unwrap();
+        defaults
+            .add("phase:1,log,auditlog,deny,status:403", ActionCompileContext::default())
+            .unwrap();
         let context = OperatorContext::default();
 
         let rule = compile_sec_rule_in(
