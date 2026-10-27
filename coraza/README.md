@@ -20,6 +20,16 @@ features are additive, so plain `--features fips` keeps the default hash
 dependencies but still selects FIPS behavior. Disabling default features
 without `fips` also omits the hashes, which then return a build-feature error.
 
+## Multiphase evaluation profile
+
+Set `WafConfig::multiphase_evaluation` before compiling rules to let a rule run
+in an earlier processing phase when its variables are already available. This
+runtime, per-WAF setting is the equivalent of Go Coraza's
+`coraza.rule.multiphase_evaluation` build tag; it is not a Cargo feature or a
+per-transaction switch. The default is `false`, preserving the ordinary
+phase-matched evaluation behavior. A compiled rule set cannot be paired with a
+WAF config that changes this setting.
+
 ## Audit logging
 
 Configure audit logging through SecLang:

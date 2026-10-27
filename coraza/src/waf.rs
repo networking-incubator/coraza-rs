@@ -84,7 +84,8 @@ impl Waf {
     /// `case_sensitive_args_keys` mode the rules were compiled under because it selects
     /// the transaction's argument maps; a configuration with a different mode is rejected
     /// so those maps cannot disagree with the rule set. Key selectors are compiled from
-    /// their variable alone, independently of the mode.
+    /// their variable alone, independently of the mode. The multiphase setting is also
+    /// recorded when rules are compiled and cannot be changed for the resulting WAF.
     ///
     /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
     /// [`Transaction::finish`] that writes an entry opens them, so a candidate policy can
@@ -102,6 +103,15 @@ impl Waf {
                 "case_sensitive_args_keys was {compiled} when the rules were compiled but is {} in the \
                  configuration",
                 config.case_sensitive_args_keys
+            )));
+        }
+        if let Some(compiled) = rules.compiled_multiphase_evaluation()
+            && compiled != config.multiphase_evaluation
+        {
+            return Err(ConfigError(format!(
+                "multiphase_evaluation was {compiled} when the rules were compiled but is {} in the \
+                 configuration",
+                config.multiphase_evaluation
             )));
         }
         let audit_logger = AuditLogger::prepare(&config).map_err(ConfigError)?;

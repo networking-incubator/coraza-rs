@@ -53,7 +53,7 @@ pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
 /// transaction's argument maps decide whether the keys it is matched against fold case.
 pub(crate) fn parse_variables_in(input: &str) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
-    VariableList::parse(input)?.apply_to(&mut variables);
+    VariableList::parse(input)?.apply_to(&mut variables, false);
     Ok(variables)
 }
 
@@ -82,12 +82,32 @@ impl VariableList {
     }
 
     /// Apply entries in order. A negation modifies matching earlier variables.
-    pub(crate) fn apply_to(&self, variables: &mut Vec<VariableSpec>) {
+    pub(crate) fn apply_to(&self, variables: &mut Vec<VariableSpec>, multiphase: bool) {
         for element in &self.0 {
             match element {
-                Element::Inspect(spec) => variables.push(spec.clone()),
+                Element::Inspect(spec) => {
+                    if multiphase {
+                        match spec.clone().split_args() {
+                            Ok(split) => variables.extend(split),
+                            Err(spec) => variables.push(spec),
+                        }
+                    } else {
+                        variables.push(spec.clone());
+                    }
+                },
                 Element::Exclude(variable, key) => {
-                    for spec in variables.iter_mut().filter(|spec| spec.variable() == *variable) {
+                    for spec in variables.iter_mut().filter(|spec| {
+                        spec.variable() == *variable
+                            || (multiphase
+                                && matches!(
+                                    (*variable, spec.variable()),
+                                    (RuleVariable::Args, RuleVariable::ArgsGet | RuleVariable::ArgsPost)
+                                        | (
+                                            RuleVariable::ArgsNames,
+                                            RuleVariable::ArgsGetNames | RuleVariable::ArgsPostNames
+                                        )
+                                ))
+                    }) {
                         match key {
                             VariableKey::String(key) => spec.add_exception_string(key),
                             VariableKey::Regex(key) => spec.add_exception_regex(key.clone()),
@@ -650,6 +670,24 @@ mod tests {
         assert_eq!(counted.first().expect("count creates one match").value, b"2");
         assert_eq!(matches("ARGS|!ARGS:id", RuleVariable::Args, &map), ["alice"]);
         assert!(parsed("!ARGS:id").is_empty());
+    }
+
+    #[test]
+    fn multiphase_variable_list_splits_count_regex_and_negation() {
+        let list = VariableList::parse("&ARGS:/^user/|!ARGS:blocked").expect("test variable list is valid");
+        let mut variables = Vec::new();
+        list.apply_to(&mut variables, true);
+
+        assert_eq!(variables.len(), 2);
+        for (spec, variable) in variables.iter().zip([RuleVariable::ArgsGet, RuleVariable::ArgsPost]) {
+            assert_eq!(spec.variable(), variable);
+            let mut map = Map::new_case_sensitive(variable);
+            map.add("user1", b"one");
+            map.add("blocked", b"two");
+            let matches = spec.get_matches(Some(CollectionView::Map(&map)));
+            assert_eq!(matches.first().map(|matched| matched.value.as_slice()), Some(&b"1"[..]));
+            assert_eq!(matches.first().map(|matched| matched.key.as_str()), Some("/^user/"));
+        }
     }
 
     #[test]

@@ -278,7 +278,8 @@ impl Parser {
     /// # Errors
     ///
     /// Returns an error when the parsed configuration is invalid for WAF construction.
-    pub fn compile(self) -> Result<Waf, ConfigError> {
+    pub fn compile(mut self) -> Result<Waf, ConfigError> {
+        self.rules.finalize_multiphase(self.waf_config.multiphase_evaluation);
         Waf::with_rules(self.waf_config, self.rules, self.error_log)
     }
 
@@ -704,7 +705,9 @@ fn add_rule(options: &mut DirectiveOptions<'_>, rule: Result<Rule, CompileError>
     options.file.clone_into(&mut metadata.file);
     metadata.line = options.line;
     options.raw.clone_into(&mut metadata.raw);
-    options.rules.add(rule)
+    let multiphase_evaluation = options.waf_config.multiphase_evaluation;
+    options.rules.record_multiphase_evaluation(multiphase_evaluation)?;
+    options.rules.add(rule, multiphase_evaluation)
 }
 
 /// `SecRule` VARIABLES "OPERATOR" "ACTIONS"
@@ -840,6 +843,8 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
+    let multiphase_evaluation = options.waf_config.multiphase_evaluation;
+    options.rules.record_multiphase_evaluation(multiphase_evaluation)?;
     let variables = VariableList::parse(variables).map_err(|e| e.message)?;
 
     for spec in ids.split_whitespace() {
@@ -849,7 +854,7 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
-            variables.apply_to(rule.variables_mut());
+            variables.apply_to(rule.variables_mut(), multiphase_evaluation);
         }
     }
     Ok(())
@@ -866,11 +871,13 @@ fn directive_sec_rule_update_target_by_tag(options: &mut DirectiveOptions<'_>) -
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
+    let multiphase_evaluation = options.waf_config.multiphase_evaluation;
+    options.rules.record_multiphase_evaluation(multiphase_evaluation)?;
     let variables = VariableList::parse(variables).map_err(|e| e.message)?;
 
-    options
-        .rules
-        .update_by_tag(tag, |rule| variables.apply_to(rule.variables_mut()));
+    options.rules.update_by_tag(tag, |rule| {
+        variables.apply_to(rule.variables_mut(), multiphase_evaluation);
+    });
     Ok(())
 }
 
@@ -1500,6 +1507,47 @@ mod tests {
         let error = Waf::with_rules(config, parser.rules, None).unwrap_err();
 
         assert!(error.to_string().contains("case_sensitive_args_keys"));
+    }
+
+    #[test]
+    fn into_waf_accepts_each_multiphase_mode() {
+        for multiphase_evaluation in [false, true] {
+            let mut parser = Parser::new();
+            parser.config_mut().multiphase_evaluation = multiphase_evaluation;
+            parser
+                .from_string("SecRule REQUEST_URI \"@contains /\" \"id:1,phase:2,pass\"")
+                .unwrap();
+            assert!(parser.into_waf().is_ok(), "{multiphase_evaluation}");
+        }
+    }
+
+    #[test]
+    fn changing_multiphase_mode_after_rule_compilation_is_rejected() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule REQUEST_URI \"@contains /\" \"id:1,phase:2,pass\"")
+            .unwrap();
+        parser.config_mut().multiphase_evaluation = true;
+
+        let error = parser.into_waf().unwrap_err();
+
+        assert!(error.to_string().contains("multiphase_evaluation"));
+    }
+
+    #[test]
+    fn changing_multiphase_mode_between_rule_directives_is_rejected() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule REQUEST_URI \"@contains /\" \"id:1,phase:2,pass\"")
+            .unwrap();
+        parser.config_mut().multiphase_evaluation = true;
+
+        let error = parser
+            .from_string("SecRule REQUEST_URI \"@contains /\" \"id:2,phase:2,pass\"")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("multiphase_evaluation"));
+        assert_eq!(parser.rule_count(), 1);
     }
 
     #[test]

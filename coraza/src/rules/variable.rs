@@ -238,6 +238,27 @@ impl VariableSpec {
         self.variable
     }
 
+    /// Copy this selector for one of the phase-specific argument collections.
+    fn with_variable(&self, variable: RuleVariable) -> Self {
+        Self {
+            variable,
+            key: self.key.clone(),
+            count_key: self.count_key.clone(),
+            count: self.count,
+            exceptions: self.exceptions.clone(),
+        }
+    }
+
+    /// Split the combined argument collections while retaining their selector state.
+    pub(crate) fn split_args(self) -> Result<[Self; 2], Self> {
+        let variables = match self.variable {
+            RuleVariable::Args => [RuleVariable::ArgsGet, RuleVariable::ArgsPost],
+            RuleVariable::ArgsNames => [RuleVariable::ArgsGetNames, RuleVariable::ArgsPostNames],
+            _ => return Err(self),
+        };
+        Ok([self.with_variable(variables[0]), self.with_variable(variables[1])])
+    }
+
     /// Visit the map entries selected by this specification, with keys as stored.
     ///
     /// `exact` is set for the names views: Go looks a literal names selector up as
@@ -544,6 +565,38 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches.first().map(|matched| matched.key.as_str()), Some("/re/"));
         assert_eq!(matches.first().map(|matched| matched.value.as_slice()), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn args_split_preserves_selectors_counts_and_exceptions() {
+        let mut literal = VariableSpec::new_string(RuleVariable::Args, "user".to_owned());
+        literal.add_exception_string("blocked");
+        let [get, post] = literal.split_args().expect("ARGS splits");
+        assert_eq!(get.variable(), RuleVariable::ArgsGet);
+        assert_eq!(post.variable(), RuleVariable::ArgsPost);
+        assert_eq!(
+            get.key.as_ref().map(|key| match key {
+                super::VariableKey::String(key) => key.as_str(),
+                super::VariableKey::Regex(_) => "regex",
+            }),
+            Some("user")
+        );
+        assert_eq!(get.exceptions, post.exceptions);
+
+        let mut regex = VariableSpec::new_regex(
+            RuleVariable::ArgsNames,
+            Regex::new("^user").expect("test regex is valid"),
+            "/^user/".to_owned(),
+        );
+        regex.set_count(true);
+        regex.add_exception_regex(Regex::new("blocked").expect("test regex is valid"));
+        let [get_names, post_names] = regex.split_args().expect("ARGS_NAMES splits");
+        assert_eq!(get_names.variable(), RuleVariable::ArgsGetNames);
+        assert_eq!(post_names.variable(), RuleVariable::ArgsPostNames);
+        assert!(get_names.count);
+        assert_eq!(get_names.count_key, "/^user/");
+        assert_eq!(get_names.exceptions, post_names.exceptions);
+        assert!(matches!(get_names.key, Some(super::VariableKey::Regex(_))));
     }
 
     #[test]
