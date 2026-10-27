@@ -90,12 +90,10 @@ was discarded and rerun sequentially. `make coraza-bench` used three campaigns
 per revision, each with three internal paired repetitions and 1,000 transactions
 per case; debug logging and multiphase were off. The full paired per-workload
 medians and ranges are in
-[`performance/coraza-engine-parity-batch.tsv`](performance/coraza-engine-parity-batch.tsv);
-raw detector logs and all six `run.json` files are in
 [`performance/coraza-engine-parity-batch.tsv`](performance/coraza-engine-parity-batch.tsv).
-Only the per-workload summary and the multiphase-on profile run are retained;
-the raw benchmark logs and per-run JSON dumps were not kept, because they repeat
-the same numbers at megabyte scale and carry machine-local paths.
+Only that summary and the multiphase-on profile run are retained. The raw
+detector logs and all six `run.json` files were discarded, because they repeat
+the same numbers at megabyte scale and carried machine-local build paths.
 
 Detector commands were `taskset -c 3 env RUSTUP_TOOLCHAIN=1.99.1
 CARGO_BUILD_JOBS=6 CARGO_TARGET_DIR=<revision-target> LIBINJECTION_DIR=<pinned-C>
@@ -111,10 +109,10 @@ resolve effects around 1%; no sub-1% effect is claimed.
 
 | Benchmark | Workloads | Base vs candidate, median and observed range | Verdict against repeated-run spread |
 | --- | ---: | --- | --- |
-| `speed` vs pinned libinjection C | 7 groups | Every full row is in the paired TSV. Two groups had non-overlapping run-median ranges: SQLi attack samples 450.1 [430.8–453.6] vs 488.9 [466.3–493.8] ns/input; XSS upstream sample 59.2 [57.1–59.3] vs 61.0 [60.9–62.6]. | Candidate was slower in those two observed ranges; no libperfusion source changed, so this is not attributable to the Coraza batch. |
+| `speed` vs pinned libinjection C | 7 groups | Every full row is in the paired TSV. Two groups had non-overlapping run-median ranges: SQLi attack samples 450.0 [430.8–453.6] vs 488.9 [466.3–493.8] ns/input; XSS upstream sample 59.1 [57.0–59.3] vs 61.0 [60.8–62.6]. | Candidate was slower in those two observed ranges; no libperfusion source changed, so this is not attributable to the Coraza batch. |
 | `compare` | 8 API/workload pairs (4 workloads × capped/caller-bounded) | All workload medians/ranges are in the paired TSV. Seven ranges overlap; capped XSS hit was 33.3 [32.8–41.2] vs 32.6 [30.9–32.6] ns/input. | One small non-overlap; 2.1% faster nominally, below the host's resolution. |
 | `scaling` | 130 generated workloads | All 130 pairs, including medians and repeated-run/sample ranges, are in the TSV. Eleven run-median ranges did not overlap (8 candidate-faster, 3 slower). Two large SQLi cases showed nominal candidate medians +44.7% and +34.0%, but the candidate run spread was wide and the per-sample ranges overlap the baseline. | Inconclusive on this shared host; no `libperfusion/` source changed. Do not attribute those isolated shifts to this batch. |
-| `make coraza-bench` | 6 end-to-end cases | Candidate medians were lower in all six. Two non-overlapping run-median ranges were form-benign 6,382 [6,322–6,622] vs 5,851 [5,520–6,232] ns/transaction and get-attack 6,422 [6,322–6,632] vs 5,961 [5,681–6,272]. Raw per-sample extrema are retained in each `run.json`. | No candidate slowdown observed; apparent speedups are not claimed because the raw sample ranges are broad and the host is shared. |
+| `make coraza-bench` | 6 end-to-end cases | Candidate medians were lower in all six. Two non-overlapping run-median ranges were form-benign 6,382 [6,322–6,622] vs 5,851 [5,520–6,232] ns/transaction and get-attack 6,422 [6,322–6,632] vs 5,961 [5,681–6,272]. | No candidate slowdown observed; apparent speedups are not claimed because the raw sample ranges are broad and the host is shared. |
 
 `MatchData::chain_level` widening and the multiphase duplicate-check change are
 included in this batch. The default, multiphase-off profile showed no systematic
