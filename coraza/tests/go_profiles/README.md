@@ -22,15 +22,15 @@ fixtures that some profiles load through file-backed operators.
 
 ## Regenerating
 
-`cargo xtask go-fixtures-refresh` re-vendors `data/` and regenerates
-`profiles.json` from the module version pinned in `exporter/go.mod`. To bump the
-fixture, update that `require` version, run the command, and review the diff,
-including `FIXTURE_PROFILES` and `FIXTURE_STAGES` in
-`../go_profiles_replay.rs`. `cargo xtask go-fixtures-check` compares the
-checked-in data files with the pinned module and verifies the exported profile
-inventory; add `--provenance` to re-export the profiles and byte-compare the
-document (it needs the exporter's Go 1.27.3 toolchain), and `--require-go` to
-fail instead of skipping when the Go toolchain is unavailable.
+`cargo xtask go-fixtures-refresh` re-vendors `data/` and regenerates the default
+`profiles.json` and tagged `profiles-multiphase.json` from the module version
+pinned in `exporter/go.mod`. To bump the fixture, update that `require` version,
+run the command, and review the diff, including both replay inventories in
+`../go_profiles_replay.rs`. `cargo xtask go-fixtures-check` compares the checked-in
+data files with the pinned module and verifies both profile inventories; add
+`--provenance` to re-export both documents and byte-compare them (it needs the
+exporter's Go 1.27.3 toolchain), and `--require-go` to fail instead of skipping
+when the Go toolchain is unavailable.
 
 The exporter is a standalone Go module pinned to the source version (no `replace`
 directive), so the JSON can also be regenerated on its own:
@@ -38,18 +38,15 @@ directive), so the JSON can also be regenerated on its own:
 ```sh
 cd coraza/tests/go_profiles/exporter
 GOWORK=off GOTOOLCHAIN=local go run . -o ../profiles.json
+GOWORK=off GOTOOLCHAIN=local go run -tags coraza.rule.multiphase_evaluation . -o ../profiles-multiphase.json
 ```
 
 Upstream gates a second set of profiles behind the
-`coraza.rule.multiphase_evaluation` build tag. They are not part of this fixture, but
-the same exporter emits them:
+`coraza.rule.multiphase_evaluation` build tag. They are checked in as
+`profiles-multiphase.json` and emitted by the same exporter command above.
 
-```sh
-cd coraza/tests/go_profiles/exporter
-GOWORK=off GOTOOLCHAIN=local go run -tags coraza.rule.multiphase_evaluation . -o /tmp/tagged-profiles.json
-```
-
-`source.build_tags` records which set a given file holds (`default` here).
+`source.build_tags` records which set each file holds (`default` and
+`coraza.rule.multiphase_evaluation`, respectively).
 
 The exporter refuses to emit a stage that uses `input.version`, `input.port`,
 `input.stop_magic`, `input.raw_request` or `input.encoded_request`: the Rust
@@ -57,14 +54,15 @@ replay would ignore them, so the export panics instead of silently dropping a
 Go expectation. `output.no_log_contains` is exported and asserted as the
 inverse of `log_contains`.
 
-## What the default build contains
+## Build profiles and inventories
 
 The default build registers 49 profiles (78 tests, 120 stages). With
 `coraza.rule.multiphase_evaluation` the Go package registers 52 profiles (81 tests,
 123 stages); 8 profiles are `!coraza.rule.multiphase_evaluation` only and 11 are
 tag-only, so the union of both builds is 60 profiles (89 tests, 138 stages).
 
-Tag-only profiles, absent from this fixture: `chains_multiphase.yaml`,
+Tag-only profiles, absent from the default fixture but present in the multiphase
+fixture: `chains_multiphase.yaml`,
 `chains_multiphase_2.yaml`, `chains_multiphase_counter.yaml`,
 `chains_multiphase_crs.yaml`, `chains_multiphase_crs_920250.yaml`,
 `chains_multiphase_crs_931130.yaml`, `chains_multiphase_crs_933120.yaml`,
@@ -112,9 +110,10 @@ than adding to it.
 cargo test -p coraza --test go_profiles_replay -- --nocapture
 ```
 
-The replay runs by default. It discovers 49 profiles, all compile, and all 120
-stages pass; a parser rejection or a stage mismatch fails the test with the
-profile, stage and expected/actual values.
+The replay runs both build profiles by default. The default test asserts 49
+profiles, 78 tests, and 120 stages; the tagged test asserts 52 profiles, 81
+tests, and 123 stages. Each profile must compile, and every stage compares rule
+IDs, interruption details, and log text.
 
 ## Parser tolerance (resolved)
 
@@ -146,9 +145,3 @@ The three default-build profiles that previously differed now pass every stage:
 - `multipart_process_partial.yaml`: a truncated body follows Go's `ErrUnexpectedEOF`
   path (`INBOUND_DATA_ERROR` suppresses `MULTIPART_STRICT_ERROR`), so the truncated
   arguments are inspected and no interruption is raised.
-
-## Not replayed
-
-The fixture covers the default build: 49 profiles, 78 tests, 120 stages. The 11
-profiles registered only with `coraza.rule.multiphase_evaluation` are listed above
-and are not replayed.

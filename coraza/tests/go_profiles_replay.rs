@@ -42,6 +42,7 @@ use coraza::{Waf, seclang::Parser};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("go_profiles/profiles.json");
+const FIXTURE_MULTIPHASE: &str = include_str!("go_profiles/profiles-multiphase.json");
 const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/go_profiles/data");
 /// Files the `operators_with_files` profile loads through `@pmFromFile`/`@ipMatchFromFile`.
 const DATA_FILES: [&str; 3] = ["netranges-01.dat", "netranges-02.dat", "pmFromFile-01.dat"];
@@ -51,8 +52,27 @@ const FIXTURE_VERSION: &str = "v3.8.1";
 const FIXTURE_BUILD_TAGS: &str = "default";
 /// Profiles registered by the default build.
 const FIXTURE_PROFILES: usize = 49;
+/// Tests those profiles hold.
+const FIXTURE_TESTS: usize = 78;
 /// Stages those profiles hold.
 const FIXTURE_STAGES: usize = 120;
+/// Build tag of the multiphase profile set.
+const FIXTURE_MULTIPHASE_BUILD_TAGS: &str = "coraza.rule.multiphase_evaluation";
+/// Profiles registered by the multiphase build.
+const FIXTURE_MULTIPHASE_PROFILES: usize = 52;
+/// Tests those profiles hold.
+const FIXTURE_MULTIPHASE_TESTS: usize = 81;
+/// Stages those profiles hold.
+const FIXTURE_MULTIPHASE_STAGES: usize = 123;
+
+/// Expected identity and inventory for one exported Go build profile.
+#[derive(Clone, Copy)]
+struct FixtureInventory {
+    build_tags: &'static str,
+    profiles: usize,
+    tests: usize,
+    stages: usize,
+}
 
 /// One expectation the engine did not meet.
 struct Mismatch {
@@ -73,8 +93,35 @@ struct Actual {
 
 #[test]
 fn replays_go_engine_profiles() {
-    let document: Value = serde_json::from_str(FIXTURE).expect("fixture is JSON");
-    let profiles = fixture(&document);
+    replay_go_profiles(
+        FIXTURE,
+        FixtureInventory {
+            build_tags: FIXTURE_BUILD_TAGS,
+            profiles: FIXTURE_PROFILES,
+            tests: FIXTURE_TESTS,
+            stages: FIXTURE_STAGES,
+        },
+        false,
+    );
+}
+
+#[test]
+fn replays_go_engine_profiles_with_multiphase() {
+    replay_go_profiles(
+        FIXTURE_MULTIPHASE,
+        FixtureInventory {
+            build_tags: FIXTURE_MULTIPHASE_BUILD_TAGS,
+            profiles: FIXTURE_MULTIPHASE_PROFILES,
+            tests: FIXTURE_MULTIPHASE_TESTS,
+            stages: FIXTURE_MULTIPHASE_STAGES,
+        },
+        true,
+    );
+}
+
+fn replay_go_profiles(fixture_data: &str, inventory: FixtureInventory, multiphase: bool) {
+    let document: Value = serde_json::from_str(fixture_data).expect("fixture is JSON");
+    let profiles = fixture(&document, inventory);
 
     let mut mismatches = Vec::new();
     let mut parse_failures: Vec<(String, String)> = Vec::new();
@@ -86,7 +133,7 @@ fn replays_go_engine_profiles() {
         let name = text(profile, "name").to_owned();
         let rules = text(profile, "rules");
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let waf = match compile_profile(&name, rules, Arc::clone(&logs)) {
+        let waf = match compile_profile(&name, rules, Arc::clone(&logs), multiphase) {
             Ok(waf) => waf,
             Err(error) => {
                 parse_failures.push((name.clone(), error));
@@ -156,7 +203,7 @@ fn replays_go_engine_profiles() {
 }
 
 /// Check the fixture's identity and inventory, returning its profiles.
-fn fixture(document: &Value) -> &[Value] {
+fn fixture(document: &Value, inventory: FixtureInventory) -> &[Value] {
     let source = document.get("source").expect("source");
     assert_eq!(
         text(source, "version"),
@@ -165,7 +212,7 @@ fn fixture(document: &Value) -> &[Value] {
     );
     assert_eq!(
         text(source, "build_tags"),
-        FIXTURE_BUILD_TAGS,
+        inventory.build_tags,
         "fixture was exported from a different build-tag set; regenerate it"
     );
     let profiles = document
@@ -174,28 +221,28 @@ fn fixture(document: &Value) -> &[Value] {
         .expect("profiles array");
     assert_eq!(
         profiles.len(),
-        FIXTURE_PROFILES,
+        inventory.profiles,
         "the fixture profile inventory changed; regenerate it"
     );
-    let stages: usize = profiles
-        .iter()
-        .map(|profile| {
-            profile
-                .get("tests")
+    let mut tests = 0;
+    let mut stages = 0;
+    for profile in profiles {
+        let profile_tests = profile.get("tests").and_then(Value::as_array).expect("tests array");
+        tests += profile_tests.len();
+        for test in profile_tests {
+            stages += test
+                .get("stages")
                 .and_then(Value::as_array)
-                .expect("tests array")
-                .iter()
-                .map(|test| {
-                    test.get("stages")
-                        .and_then(Value::as_array)
-                        .expect("stages array")
-                        .len()
-                })
-                .sum::<usize>()
-        })
-        .sum();
+                .expect("stages array")
+                .len();
+        }
+    }
     assert_eq!(
-        stages, FIXTURE_STAGES,
+        tests, inventory.tests,
+        "the fixture test inventory changed; regenerate it"
+    );
+    assert_eq!(
+        stages, inventory.stages,
         "the fixture stage inventory changed; regenerate it"
     );
     profiles
@@ -205,7 +252,7 @@ fn fixture(document: &Value) -> &[Value] {
 ///
 /// Every file-backed operator in the fixture reads its file while compiling, so the
 /// directory can be dropped on return.
-fn compile_profile(name: &str, rules: &str, logs: Arc<Mutex<Vec<String>>>) -> Result<Waf, String> {
+fn compile_profile(name: &str, rules: &str, logs: Arc<Mutex<Vec<String>>>, multiphase: bool) -> Result<Waf, String> {
     let dir = tempfile::Builder::new()
         .prefix("coraza-go-profile-")
         .tempdir()
@@ -218,6 +265,7 @@ fn compile_profile(name: &str, rules: &str, logs: Arc<Mutex<Vec<String>>>) -> Re
     fs::write(&rules_path, rules).map_err(|error| format!("write rules: {error}"))?;
 
     let mut parser = Parser::new();
+    parser.config_mut().multiphase_evaluation = multiphase;
     parser.on_error_log(move |matched| {
         logs.lock().expect("log lock").push(matched.error_log());
     });
