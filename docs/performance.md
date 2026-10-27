@@ -648,3 +648,24 @@ and ranges. Until then no regression and no absence of regression is claimed.
 If such a run shows the effect matters, remove the per-transaction logger
 reference (resolve it through the shared configuration instead) so the disabled
 path keeps only the numeric compare.
+
+## Coraza transformation dispatch (2026-10-27)
+
+The custom-transformation seam stores each chain entry as a built-in function
+pointer or a host-supplied implementation behind a shared pointer. Built-in-only
+chains therefore pay one enum-tag branch per entry, while the call itself still
+goes through the built-in function pointer.
+
+A paired release measurement of a five-entry built-in chain
+(`urlDecode`, `lowercase`, `removeNulls`, `compressWhitespace`, `trim`, single
+match, 1,000,000 applies per side, seven samples per run, three alternating
+runs pinned to one CPU) reported baseline medians of 415.3, 415.9 and 417.3
+ns/op against candidate medians of 416.5, 420.5 and 420.7 ns/op. The candidate
+median is 1.11% higher with overlapping ranges, and the pinned CPU carried
+background activity, so the workload measures whole-chain cost and cannot
+isolate dispatch overhead.
+
+That roughly 1% median difference is accepted for this seam rather than adding
+a second built-in-only code path. Upgrade only if a real workload shows it
+matters: split the chain into a built-in slice and a custom slice, so the
+built-in path drops the tag entirely.
