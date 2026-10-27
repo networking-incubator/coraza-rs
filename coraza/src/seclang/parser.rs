@@ -2294,7 +2294,14 @@ SecWebAppId production
 
     #[test]
     fn chain_disruptive_actions_match_go_acceptance_matrix() {
-        let disruptive = ["deny", "drop", "block", "redirect:https://example.test", "allow"];
+        let disruptive = [
+            "deny",
+            "drop",
+            "block",
+            "pass",
+            "redirect:https://example.test",
+            "allow",
+        ];
         for action in disruptive {
             let mut starter = Parser::new();
             starter
@@ -2386,29 +2393,68 @@ SecWebAppId production
     }
 
     #[test]
+    fn parser_reuse_after_disruptive_chain_member_error_starts_a_top_level_rule() {
+        let mut parser = Parser::new();
+        let error = parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,deny\"",
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "failed to compile directive \"SecRule\": disruptive actions can only be specified in the chain starter rule (parent id: 1)"
+        );
+        assert!(parser.rules.find_by_id(1).is_none());
+
+        parser
+            .from_string("SecRule ARGS:q \"@contains matched\" \"id:3,phase:1,pass\"")
+            .unwrap();
+        assert_eq!(parser.rule_count(), 1);
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(3).is_some());
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("parser-reuse-chain-rejection");
+        tx.add_get_argument("q", "matched");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 3));
+    }
+
+    #[test]
     fn skipping_a_disruptive_chain_link_drops_the_pending_chain() {
         let mut parser = Parser::new();
         parser.skip_failed_directives();
         parser
             .from_string(
                 "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
-                 SecRule ARGS \"@contains b\" \"id:2,phase:1,deny,chain\"\n\
-                 SecRule ARGS \"@contains c\" \"id:3,phase:1,log\"\n\
-                 SecAction \"id:4,phase:1,pass\"",
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains c\" \"id:3,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains d\" \"id:4,phase:1,log\"\n\
+                 SecRule ARGS:q \"@contains matched\" \"id:5,phase:1,pass\"",
             )
             .unwrap();
 
         assert!(parser.rules.find_by_id(1).is_none());
         assert!(parser.rules.find_by_id(2).is_none());
         assert!(parser.rules.find_by_id(3).is_none());
-        assert!(parser.rules.find_by_id(4).is_some());
+        assert!(parser.rules.find_by_id(4).is_none());
+        assert!(parser.rules.find_by_id(5).is_some());
         assert_eq!(parser.rule_count(), 1);
+        assert_eq!(parser.skipped().len(), 2);
         assert_eq!(
             parser.skipped().first().map(|error| error.message.as_str()),
             Some(
                 "failed to compile directive \"SecRule\": disruptive actions can only be specified in the chain starter rule (parent id: 1)"
             )
         );
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("chain-drop-following-rule");
+        tx.add_get_argument("q", "matched");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 5));
     }
 
     #[test]

@@ -100,6 +100,17 @@ fn is_registry(spec: &GroupSpec) -> bool {
     !matches!(&spec.source, Source::Variables)
 }
 
+/// Registry scopes from which a group's names are derived.
+fn registry_scopes(spec: &GroupSpec) -> Vec<(&'static str, &'static str)> {
+    match &spec.source {
+        Source::MatchArms { sources, .. } => sources.to_vec(),
+        Source::StringList { file, signature } | Source::EnumVariants { file, signature, .. } => {
+            vec![(*file, *signature)]
+        },
+        Source::Variables => Vec::new(),
+    }
+}
+
 /// One capability group and its registry and dispatch symbols.
 struct GroupSpec {
     /// Group key in the manifest.
@@ -977,6 +988,24 @@ fn source_feature_gates(source: &str, scope: &str) -> Result<BTreeSet<(String, S
     Ok(gates)
 }
 
+/// Fails when a registry scope has a feature gate missing from `FEATURE_GATES`.
+fn validate_registry_feature_gates(group: &str, file: &str, scope: &str, source: &str) -> Result<(), String> {
+    for (feature, name) in source_feature_gates(source, scope)? {
+        if !FEATURE_GATES.iter().any(|gate| {
+            gate.group == group
+                && gate.file == file
+                && gate.scope == scope
+                && gate.feature == feature
+                && gate.name.eq_ignore_ascii_case(&name)
+        }) {
+            return Err(format!(
+                "{file} registry scope {scope} has unaccounted cfg(feature = \"{feature}\") gate for {name}; update FEATURE_GATES"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Confirms every explicit source-gate map entry still matches source and Cargo metadata.
 fn validate_source_feature_gates(
     root: &Path,
@@ -1001,8 +1030,11 @@ fn validate_source_feature_gates(
             return Err(format!("{context} is not gated by source feature {}", gate.feature));
         }
     }
-    // Compare every source gate in these registry scopes so a newly gated built-in cannot
-    // disappear from the hand-maintained map and receive an empty requirement list.
+    for (file, scope) in registry_scopes(spec) {
+        let source = read_source(root, file)?;
+        validate_registry_feature_gates(spec.key, file, scope, &source)?;
+    }
+    // Keep the exact gate-map check for existing entries after scanning every registry scope.
     let expected = FEATURE_GATES
         .iter()
         .filter(|gate| gate.group == spec.key)
@@ -1833,6 +1865,86 @@ mod tests {
         "#;
         assert!(source_item_has_feature_gate(source, "fn registry", "inspect-file", "\"inspectfile\"").unwrap());
         assert!(!source_item_has_feature_gate(source, "fn registry", "rbl", "\"inspectfile\"").unwrap());
+    }
+
+    #[test]
+    fn source_feature_gate_validation_checks_every_registry_scope() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        const SOURCES: &[(&str, &str)] = &[
+            ("coraza/src/operators/mod.rs", "pub fn with_context"),
+            ("coraza/src/operators/mod.rs", "fn secondary_registry"),
+        ];
+        let spec = GroupSpec {
+            key: "operators",
+            producer: "",
+            evaluator: "",
+            source: Source::MatchArms {
+                sources: SOURCES,
+                extra: &[],
+            },
+        };
+        let known_features = BTreeSet::from([
+            "inspect-file".to_owned(),
+            "rbl".to_owned(),
+            "validate-schema".to_owned(),
+            "new-action-feature".to_owned(),
+        ]);
+        let source_path = "coraza/src/operators/mod.rs";
+        let source_file = r#"
+            pub fn with_context() {
+                #[cfg(feature = "inspect-file")]
+                "inspectfile" => true,
+                #[cfg(feature = "rbl")]
+                "rbl" => true,
+                #[cfg(feature = "validate-schema")]
+                "validateschema" => true,
+            }
+
+            fn secondary_registry() {
+                #[cfg(feature = "new-action-feature")]
+                "newaction" => true,
+            }
+        "#;
+        let accounted_source = r#"
+            pub fn with_context() {
+                #[cfg(feature = "inspect-file")]
+                "inspectfile" => true,
+                #[cfg(feature = "rbl")]
+                "rbl" => true,
+                #[cfg(feature = "validate-schema")]
+                "validateschema" => true,
+            }
+
+            fn secondary_registry() {
+                "existing" => true,
+            }
+        "#;
+        let root = std::env::temp_dir().join(format!(
+            "xtask-conformance-feature-gates-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let source_root = root.join(source_path);
+        fs::create_dir_all(source_root.parent().unwrap()).unwrap();
+        fs::write(&source_root, source_file).unwrap();
+        let rejected = source_names(&root, &spec)
+            .and_then(|names| validate_source_feature_gates(&root, &spec, &names, &known_features));
+
+        fs::write(&source_root, accounted_source).unwrap();
+        let accepted = source_names(&root, &spec)
+            .and_then(|names| validate_source_feature_gates(&root, &spec, &names, &known_features));
+        fs::remove_dir_all(&root).unwrap();
+
+        let error = rejected.unwrap_err();
+        assert!(error.contains(source_path), "{error}");
+        assert!(error.contains("fn secondary_registry"), "{error}");
+        assert!(error.contains("new-action-feature"), "{error}");
+        accepted.unwrap();
     }
 
     #[test]
