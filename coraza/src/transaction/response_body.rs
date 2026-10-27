@@ -204,6 +204,7 @@ impl Transaction {
             factory,
             processor: None,
         });
-        self.res_body_processor.set(name.to_ascii_uppercase());
+        self.res_body_processor
+            .set(truncate_custom_body_text(&name.to_ascii_uppercase()));
     }
 }
