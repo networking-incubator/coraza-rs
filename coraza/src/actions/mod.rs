@@ -25,7 +25,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use crate::{
     operators::{Macro, MacroError},
     rules::TransformationChain,
-    transaction::Transaction,
+    transaction::{AllowScope, Transaction},
     transformations::{self, CustomTransformation},
     types::{RulePhase, RuleSeverity},
 };
@@ -37,6 +37,10 @@ use crate::{
 /// not panic or block indefinitely.
 pub trait CustomAction: Send + Sync {
     /// Returns when this action runs in rule evaluation.
+    ///
+    /// This is a scheduling class, not a capability boundary: the engine does not
+    /// prevent an action from having effects inconsistent with its declared class.
+    /// The host must keep the implementation's effects consistent with this value.
     fn action_type(&self) -> ActionType;
 
     /// Applies the action to a matched rule and its transaction.
@@ -109,10 +113,17 @@ impl From<MacroError> for ActionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionType {
     /// Runs for each matching variable value.
+    ///
+    /// Custom actions are not restricted to nondisruptive effects by the engine; the
+    /// host must keep their effects consistent with this scheduling class.
     Nondisruptive,
     /// Runs after the whole rule chain matches.
+    ///
+    /// This is a scheduling class, not an enforced capability boundary for custom actions.
     Flow,
     /// Runs after the whole rule chain matches and may interrupt processing.
+    ///
+    /// This is a scheduling class, not an enforced capability boundary for custom actions.
     Disruptive,
 }
 
@@ -187,7 +198,12 @@ impl CompiledAction {
                 };
                 tx.interrupt(rule.id, "redirect", status, &data);
             },
-            "allow" => tx.allow(&self.argument),
+            "allow" => match self.argument.as_str() {
+                "" | "all" => tx.allow(AllowScope::All),
+                "phase" => tx.allow(AllowScope::Phase),
+                "request" => tx.allow(AllowScope::Request),
+                _ => {},
+            },
             "skip" => {
                 if let Ok(count) = self.argument.parse::<i32>() {
                     tx.set_skip(count);
@@ -485,7 +501,7 @@ pub(crate) fn compile_action(
             Some(compiled(name, argument, ActionType::Disruptive))
         },
         "allow" => {
-            if !matches!(argument, "" | "phase" | "request") {
+            if !matches!(argument, "" | "all" | "phase" | "request") {
                 return Err(ActionError::InvalidArguments(format!("invalid argument {argument:?}")));
             }
             Some(compiled(name, argument, ActionType::Disruptive))

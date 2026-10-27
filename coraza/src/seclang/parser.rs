@@ -78,6 +78,29 @@ use crate::{
     waf::{ConfigError, Waf},
 };
 
+/// Action names that update rule metadata during compilation and cannot be custom actions.
+const RESERVED_CUSTOM_ACTION_NAMES: [&str; 19] = [
+    "accuracy",
+    "auditlog",
+    "capture",
+    "chain",
+    "id",
+    "log",
+    "logdata",
+    "maturity",
+    "msg",
+    "multimatch",
+    "noauditlog",
+    "nolog",
+    "phase",
+    "rev",
+    "severity",
+    "status",
+    "t",
+    "tag",
+    "ver",
+];
+
 /// Maximum include recursion depth to prevent `DoS` attacks.
 const MAX_INCLUDE_RECURSION: usize = 100;
 /// Unique suffix for temporary upload directory probes.
@@ -322,9 +345,21 @@ impl Parser {
     ///
     /// A custom registration takes precedence over a built-in action with the same
     /// name. The factory is resolved when each action is compiled, so registration
-    /// does not change actions already compiled into rules.
-    pub fn register_action(&mut self, name: &str, factory: CustomActionFactory) {
-        self.custom_actions.insert(name.to_lowercase(), factory);
+    /// does not change actions already compiled into rules. Metadata-only names are
+    /// reserved: `accuracy`, `auditlog`, `capture`, `chain`, `id`, `log`, `logdata`,
+    /// `maturity`, `msg`, `multimatch`, `noauditlog`, `nolog`, `phase`, `rev`,
+    /// `severity`, `status`, `t`, `tag`, and `ver`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is reserved for rule metadata.
+    pub fn register_action(&mut self, name: &str, factory: CustomActionFactory) -> Result<(), String> {
+        let name = name.to_lowercase();
+        if RESERVED_CUSTOM_ACTION_NAMES.contains(&name.as_str()) {
+            return Err(format!("custom action name {name:?} is reserved for rule metadata"));
+        }
+        self.custom_actions.insert(name, factory);
+        Ok(())
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.
@@ -938,12 +973,12 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
     let (ids, actions) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateActionById ID \"ACTIONS\"")?;
     let actions = parse_actions(actions).map_err(|e| e.message)?;
+    let mut staged_rules = options.rules.clone();
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
         let mut found = false;
-        for rule in options
-            .rules
+        for rule in staged_rules
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
@@ -954,6 +989,7 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
             return Err(format!("rule {} not found", range.start()));
         }
     }
+    *options.rules = staged_rules;
     Ok(())
 }
 

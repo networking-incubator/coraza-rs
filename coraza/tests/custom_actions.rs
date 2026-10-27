@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use coraza::{
-    RulePhase,
+    AllowScope, RulePhase,
     actions::{ActionType, CustomAction, CustomActionFactory, RuleMetadata},
     seclang::Parser,
     transaction::Transaction,
@@ -81,6 +81,30 @@ impl CustomAction for SkipOne {
     }
 }
 
+struct ObserveInterruption;
+
+impl CustomAction for ObserveInterruption {
+    fn action_type(&self) -> ActionType {
+        ActionType::Flow
+    }
+
+    fn evaluate(&self, _rule: &RuleMetadata, tx: &mut Transaction) {
+        tx.set_tx_variable("observed_interruption", tx.interruption().is_some().to_string());
+    }
+}
+
+struct Allow(AllowScope);
+
+impl CustomAction for Allow {
+    fn action_type(&self) -> ActionType {
+        ActionType::Disruptive
+    }
+
+    fn evaluate(&self, _rule: &RuleMetadata, tx: &mut Transaction) {
+        tx.allow(self.0);
+    }
+}
+
 struct Interrupt;
 
 impl CustomAction for Interrupt {
@@ -104,7 +128,9 @@ fn set_value_factory(action_type: ActionType, value: &'static str) -> CustomActi
 }
 
 fn register_interrupt(parser: &mut Parser) {
-    parser.register_action("hostdeny", Arc::new(|_| Ok(Box::new(Interrupt))));
+    parser
+        .register_action("hostdeny", Arc::new(|_| Ok(Box::new(Interrupt))))
+        .unwrap();
 }
 
 fn matched_transaction(waf: &Waf) -> Transaction {
@@ -117,7 +143,9 @@ fn matched_transaction(waf: &Waf) -> Transaction {
 #[test]
 fn custom_nondisruptive_action_can_read_rule_metadata() {
     let mut parser = Parser::new();
-    parser.register_action("observe", Arc::new(|_| Ok(Box::new(ObserveMetadata))));
+    parser
+        .register_action("observe", Arc::new(|_| Ok(Box::new(ObserveMetadata))))
+        .unwrap();
     parser
         .from_string("SecRule ARGS \"@streq hit\" \"id:101,phase:1,status:429,log,observe\"")
         .unwrap();
@@ -132,7 +160,9 @@ fn custom_nondisruptive_action_can_read_rule_metadata() {
 #[test]
 fn custom_flow_action_skips_the_next_rule() {
     let mut parser = Parser::new();
-    parser.register_action("skipone", Arc::new(|_| Ok(Box::new(SkipOne))));
+    parser
+        .register_action("skipone", Arc::new(|_| Ok(Box::new(SkipOne))))
+        .unwrap();
     parser
         .from_string(
             "SecRule ARGS \"@streq hit\" \"id:1,phase:1,skipone\"\n\
@@ -181,6 +211,133 @@ fn the_last_disruptive_action_wins_across_builtin_and_custom_actions() {
 }
 
 #[test]
+fn transaction_allow_scopes_match_their_seclang_actions() {
+    fn run_policy(
+        allow_action: &str,
+        custom_scope: Option<AllowScope>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut parser = Parser::new();
+        let action_name = if let Some(scope) = custom_scope {
+            parser
+                .register_action("hostallow", Arc::new(move |_| Ok(Box::new(Allow(scope)))))
+                .unwrap();
+            "hostallow"
+        } else {
+            allow_action
+        };
+        parser
+            .from_string(&format!(
+                "SecRule ARGS \"@streq hit\" \"id:401,phase:1,{action_name}\"\n\
+                 SecRule ARGS \"@streq hit\" \"id:402,phase:1,setvar:TX.same_phase=ran\"\n\
+                 SecRule ARGS \"@streq hit\" \"id:403,phase:2,setvar:TX.next_phase=ran\"\n\
+                 SecRule ARGS \"@streq hit\" \"id:404,phase:3,setvar:TX.response_phase=ran\""
+            ))
+            .unwrap();
+
+        let mut tx = parser.compile().unwrap().new_transaction();
+        tx.add_get_argument("q", "hit");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.process_response_headers(200, "HTTP/1.1");
+        (
+            tx.get_variable(RuleVariable::TX, Some("same_phase")),
+            tx.get_variable(RuleVariable::TX, Some("next_phase")),
+            tx.get_variable(RuleVariable::TX, Some("response_phase")),
+        )
+    }
+
+    for (scope, action) in [
+        (AllowScope::All, "allow:all"),
+        (AllowScope::Phase, "allow:phase"),
+        (AllowScope::Request, "allow:request"),
+    ] {
+        assert_eq!(run_policy(action, None), run_policy(action, Some(scope)));
+    }
+    assert_eq!(run_policy("allow:all", None), (None, None, None));
+    assert_eq!(
+        run_policy("allow:phase", None),
+        (None, Some("ran".to_owned()), Some("ran".to_owned()))
+    );
+    assert_eq!(run_policy("allow:request", None), (None, None, Some("ran".to_owned())));
+}
+
+#[test]
+fn replacing_disruptive_action_preserves_its_position_before_flow_actions() {
+    let mut parser = Parser::new();
+    register_interrupt(&mut parser);
+    parser
+        .register_action("observe", Arc::new(|_| Ok(Box::new(ObserveInterruption))))
+        .unwrap();
+    parser
+        .from_string("SecRule ARGS \"@streq hit\" \"id:81,phase:1,deny,observe,hostdeny\"")
+        .unwrap();
+
+    let tx = matched_transaction(&parser.compile().unwrap());
+    assert_eq!(
+        tx.get_variable(RuleVariable::TX, Some("observed_interruption"))
+            .as_deref(),
+        Some("true")
+    );
+}
+
+#[test]
+fn failed_action_update_is_atomic_with_and_without_skip_failed_directives() {
+    for skip_failed in [false, true] {
+        let mut parser = Parser::new();
+        register_interrupt(&mut parser);
+        parser
+            .register_action("failsecond", Arc::new(|_| Err("second factory failed".to_owned())))
+            .unwrap();
+        if skip_failed {
+            parser.skip_failed_directives();
+        }
+
+        let result = parser.from_string(
+            "SecRule ARGS \"@streq hit\" \"id:82,phase:1,setvar:TX.original=kept,deny\"\n\
+             SecRuleUpdateActionById 82 \"hostdeny,failsecond\"",
+        );
+        if skip_failed {
+            assert!(result.is_ok());
+            assert_eq!(parser.skipped().len(), 1);
+            assert!(
+                parser
+                    .skipped()
+                    .first()
+                    .is_some_and(|error| error.message.contains("second factory failed"))
+            );
+        } else {
+            assert!(result.unwrap_err().message.contains("second factory failed"));
+        }
+
+        let tx = matched_transaction(&parser.compile().unwrap());
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("original")).as_deref(),
+            Some("kept")
+        );
+        assert_eq!(tx.interruption().unwrap().action, "deny");
+    }
+}
+
+#[test]
+fn metadata_action_names_cannot_be_registered_and_default_phase_still_works() {
+    let mut parser = Parser::new();
+    let error = parser
+        .register_action("phase", set_value_factory(ActionType::Nondisruptive, "wrong"))
+        .unwrap_err();
+    assert!(error.contains("phase"));
+
+    parser
+        .from_string(
+            "SecDefaultAction \"phase:1,deny,status:451\"\n\
+             SecRule ARGS \"@streq hit\" \"id:83,phase:1\"",
+        )
+        .unwrap();
+    let tx = matched_transaction(&parser.compile().unwrap());
+    assert_eq!(tx.interruption().unwrap().action, "deny");
+    assert_eq!(tx.interruption().unwrap().status, 451);
+}
+
+#[test]
 fn chain_members_reject_custom_disruptive_actions() {
     let mut parser = Parser::new();
     register_interrupt(&mut parser);
@@ -200,7 +357,9 @@ fn chain_members_reject_custom_disruptive_actions() {
 #[test]
 fn default_disruptive_action_merges_with_custom_rule_actions() {
     let mut parser = Parser::new();
-    parser.register_action("mark", set_value_factory(ActionType::Nondisruptive, "ran"));
+    parser
+        .register_action("mark", set_value_factory(ActionType::Nondisruptive, "ran"))
+        .unwrap();
     parser
         .from_string(
             "SecDefaultAction \"phase:1,deny,status:451\"\n\
@@ -218,7 +377,9 @@ fn default_disruptive_action_merges_with_custom_rule_actions() {
     assert_eq!(interruption.status, 451);
 
     let mut parser = Parser::new();
-    parser.register_action("block", set_value_factory(ActionType::Nondisruptive, "ran"));
+    parser
+        .register_action("block", set_value_factory(ActionType::Nondisruptive, "ran"))
+        .unwrap();
     parser
         .from_string(
             "SecDefaultAction \"phase:1,deny,status:451\"\n\
@@ -266,7 +427,9 @@ fn default_disruptive_action_merges_with_custom_rule_actions() {
 #[test]
 fn custom_registration_is_case_insensitive_and_overrides_builtins() {
     let mut parser = Parser::new();
-    parser.register_action("DENY", set_value_factory(ActionType::Nondisruptive, "custom"));
+    parser
+        .register_action("DENY", set_value_factory(ActionType::Nondisruptive, "custom"))
+        .unwrap();
     parser
         .from_string("SecRule ARGS \"@streq hit\" \"id:13,phase:1,DeNy:overridden\"")
         .unwrap();
@@ -282,11 +445,15 @@ fn custom_registration_is_case_insensitive_and_overrides_builtins() {
 #[test]
 fn registration_after_compilation_only_affects_later_rules() {
     let mut parser = Parser::new();
-    parser.register_action("stamp", set_value_factory(ActionType::Nondisruptive, "old"));
+    parser
+        .register_action("stamp", set_value_factory(ActionType::Nondisruptive, "old"))
+        .unwrap();
     parser
         .from_string("SecRule ARGS \"@streq hit\" \"id:14,phase:1,stamp:first\"")
         .unwrap();
-    parser.register_action("stamp", set_value_factory(ActionType::Nondisruptive, "new"));
+    parser
+        .register_action("stamp", set_value_factory(ActionType::Nondisruptive, "new"))
+        .unwrap();
     parser
         .from_string("SecRule ARGS \"@streq hit\" \"id:15,phase:1,stamp:second\"")
         .unwrap();

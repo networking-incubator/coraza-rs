@@ -26,7 +26,7 @@ use crate::{actions::RuleMetadata, rules::Rule};
 pub(crate) type RuleObserver = dyn Fn(&RuleMetadata) + Send + Sync;
 
 /// Rules compiled so far, in SecLang order.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RuleGroup {
     /// Top-level rules in directive order.
     rules: Vec<Rule>,

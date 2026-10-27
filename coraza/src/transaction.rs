@@ -129,6 +129,17 @@ enum AllowType {
     Request,
 }
 
+/// Closed set of rule-skip scopes that a custom action can select with [`Transaction::allow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowScope {
+    /// Skip rules in this and subsequent phases (except logging).
+    All,
+    /// Skip rules in the current phase only.
+    Phase,
+    /// Skip request phases, but continue with response phases.
+    Request,
+}
+
 /// A transaction's input collections, rule state, and phase evaluation.
 #[expect(
     clippy::struct_excessive_bools,
@@ -1189,15 +1200,15 @@ impl Transaction {
         }
     }
 
-    /// Set the rule-skip scope for an `allow` action (`phase`, `request`, or all rules).
-    pub fn allow(&mut self, scope: &str) {
+    /// Set the rule-skip scope for an `allow` action.
+    pub fn allow(&mut self, scope: AllowScope) {
         if self.rule_engine != RuleEngineStatus::On {
             return;
         }
         self.allow = match scope {
-            "phase" => AllowType::Phase,
-            "request" => AllowType::Request,
-            _ => AllowType::All,
+            AllowScope::All => AllowType::All,
+            AllowScope::Phase => AllowType::Phase,
+            AllowScope::Request => AllowType::Request,
         };
     }
 
