@@ -53,7 +53,11 @@ pub type Transformation = fn(&[u8]) -> TransformationResult;
 /// A transformation supplied by an embedder and selected with a SecLang `t:` action.
 ///
 /// Implementations receive untrusted input bytes. An error leaves the current value
-/// unchanged and does not stop later transformations in the chain.
+/// unchanged and does not stop later transformations in the chain. Custom
+/// transformations run synchronously on the request path; the engine enforces no
+/// timeout or output-size bound, and an implementation can panic or block its caller.
+/// This trait is for trusted host code, which must bound its own work and output and
+/// avoid panics.
 pub trait CustomTransformation: Send + Sync {
     /// Transform `input`, returning bytes, whether they changed, and an optional error.
     fn transform(&self, input: &[u8]) -> TransformationResult;

@@ -17,7 +17,7 @@
 
 //! End-to-end tests for parser-registered transformations.
 
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
 use coraza::{
     seclang::Parser,
@@ -81,6 +81,79 @@ fn custom_transformations_override_builtins_and_registration_is_case_insensitive
 
     let waf = parser.compile().unwrap();
     assert_eq!(process_arg(&waf, b"original"), [2]);
+}
+
+#[test]
+fn none_clears_the_chain_even_when_a_custom_none_is_registered() {
+    let mut parser = Parser::new();
+    parser.register_transformation("none", Arc::new(Fixed(b"overridden")));
+    parser.register_transformation("appendbang", Arc::new(AppendBang));
+    parser
+        .from_string(
+            r#"SecRule ARGS "@streq ORIGINAL!" "id:7,phase:1,t:lowercase,t:none,t:appendbang,pass"
+SecRule ARGS "@streq ORIGINAL" "id:8,phase:1,t:none,pass""#,
+        )
+        .unwrap();
+
+    let waf = parser.compile().unwrap();
+    assert_eq!(process_arg(&waf, b"ORIGINAL"), [7, 8]);
+}
+
+#[test]
+fn custom_transformation_names_use_unicode_case_folding() {
+    let mut parser = Parser::new();
+    parser.register_transformation("Åfoo", Arc::new(Fixed(b"unicode")));
+    parser
+        .from_string("SecRule ARGS \"@streq unicode\" \"id:9,phase:1,t:åFOO,pass\"")
+        .unwrap();
+
+    let waf = parser.compile().unwrap();
+    assert_eq!(process_arg(&waf, b"input"), [9]);
+}
+
+#[test]
+fn custom_transformation_resolves_from_sec_action() {
+    let mut parser = Parser::new();
+    parser.register_transformation("appendbang", Arc::new(AppendBang));
+    parser
+        .from_string("SecAction \"id:10,phase:1,t:appendbang,pass\"")
+        .unwrap();
+
+    assert!(parser.compile().is_ok());
+}
+
+#[test]
+fn custom_transformation_resolves_from_rule_action_update() {
+    let mut parser = Parser::new();
+    parser.register_transformation("appendbang", Arc::new(AppendBang));
+    parser
+        .from_string(
+            r#"SecRule ARGS "@streq original!" "id:11,phase:1,pass"
+SecRuleUpdateActionById 11 "t:appendbang""#,
+        )
+        .unwrap();
+
+    let waf = parser.compile().unwrap();
+    assert_eq!(process_arg(&waf, b"original"), [11]);
+}
+
+#[test]
+fn custom_transformation_resolves_from_included_file() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("included.conf"),
+        "SecRule ARGS \"@streq original!\" \"id:12,phase:1,t:appendbang,pass\"",
+    )
+    .unwrap();
+    let root = directory.path().join("root.conf");
+    fs::write(&root, "Include included.conf").unwrap();
+
+    let mut parser = Parser::new();
+    parser.register_transformation("appendbang", Arc::new(AppendBang));
+    parser.from_file(root).unwrap();
+
+    let waf = parser.compile().unwrap();
+    assert_eq!(process_arg(&waf, b"original"), [12]);
 }
 
 #[test]

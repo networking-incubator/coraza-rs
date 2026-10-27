@@ -305,8 +305,7 @@ impl Parser {
     /// transformations already compiled into rules. Registering the same name again
     /// replaces the earlier implementation.
     pub fn register_transformation(&mut self, name: &str, transformation: Arc<dyn CustomTransformation>) {
-        self.custom_transformations
-            .insert(name.to_ascii_lowercase(), transformation);
+        self.custom_transformations.insert(name.to_lowercase(), transformation);
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.

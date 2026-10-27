@@ -188,7 +188,11 @@ registration overrides a built-in and a later registration replaces an earlier
 one. Each `t:` action resolves when its rule is compiled, so later registrations
 do not change existing rules or compiled WAFs. Implementations receive
 untrusted input bytes. If a transformation returns an error, its output is
-discarded, the previous value is kept, and the chain continues.
+discarded, the previous value is kept, and the chain continues. Custom
+transformations run synchronously on the request path. The engine enforces
+neither a timeout nor an output-size bound, and a transformation can panic or
+block its caller. Registrations must be trusted host code; the host must bound
+its own work and output and avoid panics.
 
 ## Operators
 

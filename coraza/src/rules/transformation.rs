@@ -49,6 +49,7 @@ pub(crate) enum TransformationFunction {
 
 impl TransformationFunction {
     /// Apply the selected implementation to one value.
+    #[inline]
     fn apply(&self, input: &[u8]) -> crate::transformations::TransformationResult {
         match self {
             Self::Builtin(function) => function(input),

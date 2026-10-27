@@ -344,16 +344,16 @@ pub(crate) fn compile_action(
         },
         "t" => {
             require_argument(argument)?;
-            let custom = context
+            if argument.eq_ignore_ascii_case("none") {
+                metadata.transformations.clear();
+            } else if let Some(transformation) = context
                 .custom_transformations
-                .and_then(|registry| registry.get(&argument.to_ascii_lowercase()));
-            if let Some(transformation) = custom {
+                .and_then(|registry| registry.get(&argument.to_lowercase()))
+            {
                 metadata
                     .transformations
                     .add_custom(argument, Arc::clone(transformation))
                     .map_err(ActionError::InvalidArguments)?;
-            } else if argument.eq_ignore_ascii_case("none") {
-                metadata.transformations.clear();
             } else {
                 let function = transformation_by_name(argument)
                     .ok_or_else(|| ActionError::InvalidArguments(format!("unknown transformation: {argument}")))?;
