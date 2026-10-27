@@ -623,25 +623,28 @@ full native comparison.
 
 ## Coraza debug logging, disabled path (2026-10-27)
 
-The debug logger is compiled in and enabled per configuration. Every emission
-point first compares a numeric level threshold and only touches the
-`Arc<dyn DebugLogger>` when the event is enabled, so a WAF with no
-`SecDebugLog` performs a load and a compare per emission point and never calls
-into the logger. The cost carried unconditionally is that compare plus the
-logger reference held by each transaction (two pointers).
+The debug logger is compiled in and enabled per configuration. Each emission
+point calls a single predicate that compares the effective numeric level first
+and only calls the logger's `enabled()` when the number passes. With the
+default configuration (`SecDebugLog` unset, `SecDebugLogLevel` 0) the compare
+fails, so neither the sink nor the logger is touched. A nonzero
+`SecDebugLogLevel` with no configured sink still calls the no-op logger's
+`enabled()` for each event. The cost carried unconditionally is the compare,
+the transaction-level override lookup, and the logger reference held by each
+transaction (two pointers).
 
-Three measurement campaigns were run against the six `make coraza-bench`
-workloads with logging off. The first recorded a dirty candidate identity and
-is void. The second, pinned to one CPU, reported four workloads overlapping
-baseline and two (GET attack, form benign) about 1.3-1.4% above it. The third,
-five alternating pairs on the same host, produced per-pair ratios from 0.47 to
-2.41 as background load rose from 2.7 to 5.7 on a 16-core developer machine, so
-it carries no information about a 1% effect.
+**Performance gate: incomplete for this change.** Three campaigns against the
+six `make coraza-bench` workloads with logging off did not resolve the effect.
+The first recorded a dirty candidate identity and is void. The second, pinned
+to one CPU, reported four workloads overlapping baseline and two (GET attack,
+form benign) about 1.3-1.4% above it. The third, five alternating pairs on the
+same host, produced per-pair ratios from 0.47 to 2.41 as background load rose
+from 2.7 to 5.7 on a 16-core developer machine, so it carries no information
+about a 1% effect.
 
-The disabled path is therefore documented as *not resolved by measurement on
-this host*: no added work was identified in code beyond the compare and the two
-pointers, and the available timings neither confirm nor exclude a roughly 1%
-difference. Re-test on an isolated machine before attributing any of it to the
-logger, and if a real workload shows it matters, remove the per-transaction
-reference (resolve the logger through the shared configuration instead) so the
-disabled path keeps only the numeric compare.
+The prerequisite for closing this gate is an isolated machine: rerun the paired
+comparison there with exact revision identities and record per-workload medians
+and ranges. Until then no regression and no absence of regression is claimed.
+If such a run shows the effect matters, remove the per-transaction logger
+reference (resolve it through the shared configuration instead) so the disabled
+path keeps only the numeric compare.
