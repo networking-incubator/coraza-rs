@@ -86,14 +86,15 @@ where downloaded tool integrity is enforced.
 - `tests` also replays Go Coraza's acceptance corpus against this crate:
   `coraza/tests/go_operators.rs` runs the 29-file operator corpus in
   `coraza/tests/go_operators`, and `coraza/tests/go_profiles_replay.rs` replays
-  the 49 default-build engine profiles exported into
-  `coraza/tests/go_profiles/profiles.json`. The replay asserts the fixture's
-  Go version, build tags and profile/stage inventory before running.
+  the 49-profile default fixture and the 52-profile
+  `coraza.rule.multiphase_evaluation` fixture. The replay asserts each fixture's
+  Go version, build tags, profile/test/stage inventory before running.
 - The vendored Go Coraza fixtures are refreshed from the version pinned in
   `coraza/tests/go_profiles/exporter/go.mod`: bump that `require` version, run
   `cargo xtask go-fixtures-refresh`, and review the diff, including the
   `FIXTURE_*` count constants in `coraza/tests/go_operators.rs` and
-  `coraza/tests/go_profiles_replay.rs`. The command needs the pinned module in
+  `coraza/tests/go_profiles_replay.rs`. This writes both `profiles.json` and
+  `profiles-multiphase.json`; the command needs the pinned module in
   the Go module cache (`go mod download`). `cargo xtask go-fixtures-check`
   compares the checked-in operator and profile data bytes with that module and
   validates the operator and profile inventories against the `OPERATOR_*` and
@@ -101,9 +102,9 @@ where downloaded tool integrity is enforced.
   Go), and `make go-harness-check` runs it after its Go tests with
   `--require-go` so a missing toolchain or a drifted fixture fails there.
 - `cargo xtask go-fixtures-check --provenance` also regenerates
-  `coraza/tests/go_profiles/profiles.json` with the exporter and byte-compares
-  it, so a same-inventory edit to rules or expected results fails. It needs the
-  exporter's pinned Go 1.27.3 toolchain, which the `go-harness` setup does not
+  both profile JSON documents with the matching default and multiphase tags and
+  byte-compares them, so a same-inventory edit to rules or expected results
+  fails. It needs the exporter's pinned Go 1.27.3 toolchain, which the `go-harness` setup does not
   install (that job runs `GOTOOLCHAIN=local` with an older Go), so it is a
   manual/pre-release step and not part of `make test` or `make go-harness-check`.
 - `ftw-smoke`: runs the FTW runner in strict conformance mode against the

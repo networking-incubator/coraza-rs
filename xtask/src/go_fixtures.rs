@@ -32,10 +32,17 @@ const EXPORTER_DIR: &str = "coraza/tests/go_profiles/exporter";
 const OPERATORS_DIR: &str = "coraza/tests/go_operators";
 const PROFILES_DATA_DIR: &str = "coraza/tests/go_profiles/data";
 const PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles.json";
+const MULTIPHASE_PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles-multiphase.json";
 const OPERATOR_JSON_FILES: usize = 29;
 const OPERATOR_CASES: usize = 3934;
 const PROFILE_COUNT: usize = 49;
+const PROFILE_TEST_COUNT: usize = 78;
 const PROFILE_STAGE_COUNT: usize = 120;
+const MULTIPHASE_PROFILE_COUNT: usize = 52;
+const MULTIPHASE_TEST_COUNT: usize = 81;
+const MULTIPHASE_STAGE_COUNT: usize = 123;
+const DEFAULT_BUILD_TAG: &str = "default";
+const MULTIPHASE_BUILD_TAG: &str = "coraza.rule.multiphase_evaluation";
 
 #[derive(Args)]
 pub(crate) struct CheckArgs {
@@ -52,6 +59,14 @@ pub(crate) struct CheckArgs {
 struct Source {
     version: String,
     module: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct ProfileInventory {
+    build_tag: &'static str,
+    profiles: usize,
+    tests: usize,
+    stages: usize,
 }
 
 pub(crate) fn check_or_exit(args: &CheckArgs) {
@@ -160,14 +175,16 @@ fn refresh(root: &Path, source: &Source) -> Result<(), String> {
     remove_stale(&operator_data_dir, &operator_data_files, "dat")?;
     remove_stale(&profiles_data_dir, &profile_data_files, "dat")?;
 
-    run_exporter(root, &root.join(PROFILES_FILE))?;
+    run_exporter(root, &root.join(PROFILES_FILE), false)?;
+    run_exporter(root, &root.join(MULTIPHASE_PROFILES_FILE), true)?;
     verify_inventory(root, &operator_files, &source.version)?;
 
     println!(
-        "Refreshed Go Coraza {} fixtures: {} operator files, {} profiles; run the harnesses to review parity.",
+        "Refreshed Go Coraza {} fixtures: {} operator files, {} default profiles and {} multiphase profiles; run the harnesses to review parity.",
         source.version,
         operator_files.len(),
-        PROFILE_COUNT
+        PROFILE_COUNT,
+        MULTIPHASE_PROFILE_COUNT
     );
     Ok(())
 }
@@ -208,11 +225,12 @@ fn check(root: &Path, source: &Source, provenance: bool) -> Result<(), String> {
         ));
     }
     if provenance {
-        check_provenance(root, &root.join(PROFILES_FILE))?;
+        check_provenance(root, &root.join(PROFILES_FILE), false)?;
+        check_provenance(root, &root.join(MULTIPHASE_PROFILES_FILE), true)?;
     }
     println!(
-        "Verified Go Coraza {} fixtures: {} operator files, {} profiles.",
-        source.version, OPERATOR_JSON_FILES, PROFILE_COUNT
+        "Verified Go Coraza {} fixtures: {} operator files, {} default profiles and {} multiphase profiles.",
+        source.version, OPERATOR_JSON_FILES, PROFILE_COUNT, MULTIPHASE_PROFILE_COUNT
     );
     Ok(())
 }
@@ -245,9 +263,10 @@ fn compare_trees(
     Ok(())
 }
 
-fn check_provenance(root: &Path, pinned: &Path) -> Result<(), String> {
-    let exported = std::env::temp_dir().join(format!("coraza-go-profiles-{}.json", std::process::id()));
-    run_exporter(root, &exported)?;
+fn check_provenance(root: &Path, pinned: &Path, multiphase: bool) -> Result<(), String> {
+    let suffix = if multiphase { "-multiphase" } else { "" };
+    let exported = std::env::temp_dir().join(format!("coraza-go-profiles{}-{}.json", suffix, std::process::id()));
+    run_exporter(root, &exported, multiphase)?;
     let expected = fs::read(pinned).map_err(|error| format!("{}: {error}", pinned.display()))?;
     let actual = fs::read(&exported).map_err(|error| format!("{}: {error}", exported.display()))?;
     if expected == actual {
@@ -277,42 +296,92 @@ fn verify_inventory(root: &Path, operator_files: &[PathBuf], version: &str) -> R
         ));
     }
 
-    let profiles_path = root.join(PROFILES_FILE);
-    let label = relative(root, &profiles_path);
-    let document = read_json(&profiles_path)?;
-    if document.pointer("/source/version").and_then(Value::as_str) != Some(version) {
+    verify_profile_inventory(
+        root,
+        &root.join(PROFILES_FILE),
+        version,
+        ProfileInventory {
+            build_tag: DEFAULT_BUILD_TAG,
+            profiles: PROFILE_COUNT,
+            tests: PROFILE_TEST_COUNT,
+            stages: PROFILE_STAGE_COUNT,
+        },
+    )?;
+    verify_profile_inventory(
+        root,
+        &root.join(MULTIPHASE_PROFILES_FILE),
+        version,
+        ProfileInventory {
+            build_tag: MULTIPHASE_BUILD_TAG,
+            profiles: MULTIPHASE_PROFILE_COUNT,
+            tests: MULTIPHASE_TEST_COUNT,
+            stages: MULTIPHASE_STAGE_COUNT,
+        },
+    )?;
+    Ok(())
+}
+
+fn verify_profile_inventory(
+    root: &Path,
+    path: &Path,
+    version: &str,
+    inventory: ProfileInventory,
+) -> Result<(), String> {
+    let label = relative(root, path);
+    let document = read_json(path)?;
+    let source = document
+        .get("source")
+        .ok_or_else(|| format!("{label}: missing source"))?;
+    if source.get("version").and_then(Value::as_str) != Some(version) {
         return Err(format!(
             "{label} was exported from a different Go Coraza version; rerun `cargo xtask go-fixtures-refresh`"
+        ));
+    }
+    if source.get("build_tags").and_then(Value::as_str) != Some(inventory.build_tag) {
+        return Err(format!(
+            "{label} has the wrong Go build tags; rerun `cargo xtask go-fixtures-refresh`"
         ));
     }
     let profiles = document
         .get("profiles")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{label}: missing profiles array"))?;
-    let stages = profile_stages(profiles);
-    if profiles.len() != PROFILE_COUNT || stages != PROFILE_STAGE_COUNT {
+    let (tests, stages) = profile_test_stage_counts(profiles);
+    if profiles.len() != inventory.profiles || tests != inventory.tests || stages != inventory.stages {
         return Err(format!(
-            "profile inventory changed: found {} profiles and {stages} stages, expected {PROFILE_COUNT} profiles and {PROFILE_STAGE_COUNT} stages; update PROFILE_COUNT and PROFILE_STAGE_COUNT in xtask/src/go_fixtures.rs and FIXTURE_PROFILES and FIXTURE_STAGES in coraza/tests/go_profiles_replay.rs, then rerun `cargo xtask go-fixtures-refresh`",
-            profiles.len()
+            "{label} inventory changed: found {} profiles, {tests} tests, and {stages} stages; expected {}, {}, and {}; update the matching fixture inventory constants and rerun `cargo xtask go-fixtures-refresh`",
+            profiles.len(),
+            inventory.profiles,
+            inventory.tests,
+            inventory.stages
         ));
     }
     Ok(())
 }
 
-fn profile_stages(profiles: &[Value]) -> usize {
+fn profile_test_stage_counts(profiles: &[Value]) -> (usize, usize) {
+    let mut tests = 0;
     let mut stages = 0;
     for profile in profiles {
-        for test in profile.get("tests").and_then(Value::as_array).into_iter().flatten() {
-            stages += test.get("stages").and_then(Value::as_array).map_or(0, Vec::len);
+        if let Some(profile_tests) = profile.get("tests").and_then(Value::as_array) {
+            tests += profile_tests.len();
+            for test in profile_tests {
+                stages += test.get("stages").and_then(Value::as_array).map_or(0, Vec::len);
+            }
         }
     }
-    stages
+    (tests, stages)
 }
 
-fn run_exporter(root: &Path, output: &Path) -> Result<(), String> {
+fn run_exporter(root: &Path, output: &Path, multiphase: bool) -> Result<(), String> {
     let exporter = root.join(EXPORTER_DIR);
-    let result = Command::new("go")
-        .args(["run", ".", "-o"])
+    let mut command = Command::new("go");
+    command.arg("run");
+    if multiphase {
+        command.args(["-tags", MULTIPHASE_BUILD_TAG]);
+    }
+    let result = command
+        .args([".", "-o"])
         .arg(output)
         .env("GOWORK", "off")
         .env("GOPROXY", "off")
