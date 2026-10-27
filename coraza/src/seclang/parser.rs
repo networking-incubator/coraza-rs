@@ -816,7 +816,7 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
-            apply_actions(rule, &actions).map_err(|e| e.message)?;
+            apply_actions(rule, &actions, true, false).map_err(|e| e.message)?;
             found = true;
         }
         if !found && range.start() == range.end() {
@@ -2290,6 +2290,125 @@ SecWebAppId production
 
         assert_eq!(parser.rule_count(), 1);
         assert_eq!(parser.rules.find_by_id(1).unwrap().chain.len(), 1);
+    }
+
+    #[test]
+    fn chain_disruptive_actions_match_go_acceptance_matrix() {
+        let disruptive = ["deny", "drop", "block", "redirect:https://example.test", "allow"];
+        for action in disruptive {
+            let mut starter = Parser::new();
+            starter
+                .from_string(&format!(
+                    "SecRule ARGS \"@contains a\" \"id:1,phase:1,{action},chain\"\n\
+                     SecRule ARGS \"@contains b\" \"id:2,phase:1,log\""
+                ))
+                .unwrap();
+            assert_eq!(starter.rules.find_by_id(1).unwrap().chain.len(), 1, "{action}");
+
+            for (position, links) in [
+                (
+                    "middle",
+                    format!(
+                        "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                         SecRule ARGS \"@contains b\" \"id:2,phase:1,{action},chain\"\n\
+                         SecRule ARGS \"@contains c\" \"id:3,phase:1,log\""
+                    ),
+                ),
+                (
+                    "last",
+                    format!(
+                        "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                         SecRule ARGS \"@contains b\" \"id:2,phase:1,log,chain\"\n\
+                         SecRule ARGS \"@contains c\" \"id:3,phase:1,{action}\""
+                    ),
+                ),
+            ] {
+                let mut parser = Parser::new();
+                let error = parser.from_string(&links).unwrap_err();
+                assert_eq!(
+                    error.message,
+                    "failed to compile directive \"SecRule\": disruptive actions can only be specified in the chain starter rule (parent id: 1)",
+                    "{action} on {position} link"
+                );
+            }
+        }
+
+        for action in ["skip:1", "skipAfter:END"] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                     SecRule ARGS \"@contains b\" \"id:2,phase:1,{action},chain\"\n\
+                     SecRule ARGS \"@contains c\" \"id:3,phase:1,log\""
+                ))
+                .unwrap();
+            assert_eq!(parser.rules.find_by_id(1).unwrap().chain.len(), 2, "{action}");
+        }
+    }
+
+    #[test]
+    fn inherited_disruptive_actions_are_allowed_on_chain_members() {
+        for action in [
+            "pass",
+            "deny",
+            "drop",
+            "block",
+            "redirect:https://example.test",
+            "allow",
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecDefaultAction \"phase:1,{action}\"\n\
+                     SecRule ARGS \"@contains a\" \"id:1,phase:1,chain\"\n\
+                     SecRule ARGS \"@contains b\" \"id:2,phase:1\""
+                ))
+                .unwrap();
+            assert_eq!(parser.rules.find_by_id(1).unwrap().chain.len(), 1, "{action}");
+        }
+    }
+
+    #[test]
+    fn explicit_block_is_rejected_even_when_default_action_resolves_it() {
+        let mut parser = Parser::new();
+        let error = parser
+            .from_string(
+                "SecDefaultAction \"phase:1,deny\"\n\
+                 SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,block\"",
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "failed to compile directive \"SecRule\": disruptive actions can only be specified in the chain starter rule (parent id: 1)"
+        );
+    }
+
+    #[test]
+    fn skipping_a_disruptive_chain_link_drops_the_pending_chain() {
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains c\" \"id:3,phase:1,log\"\n\
+                 SecAction \"id:4,phase:1,pass\"",
+            )
+            .unwrap();
+
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(2).is_none());
+        assert!(parser.rules.find_by_id(3).is_none());
+        assert!(parser.rules.find_by_id(4).is_some());
+        assert_eq!(parser.rule_count(), 1);
+        assert_eq!(
+            parser.skipped().first().map(|error| error.message.as_str()),
+            Some(
+                "failed to compile directive \"SecRule\": disruptive actions can only be specified in the chain starter rule (parent id: 1)"
+            )
+        );
     }
 
     #[test]

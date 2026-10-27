@@ -121,18 +121,18 @@ pub(crate) fn compile_sec_action_in(input: &str, defaults: &DefaultActions) -> C
 /// as written, `block` included (which then does nothing).
 fn add_actions(mut rule: Rule, parsed_actions: &[ParsedAction], defaults: &DefaultActions) -> CompileResult<Rule> {
     let Some(defaults) = defaults.for_phase(phase_of(parsed_actions)?) else {
-        apply_actions(&mut rule, parsed_actions)?;
+        apply_actions(&mut rule, parsed_actions, true, false)?;
         return Ok(rule);
     };
 
-    apply_actions(&mut rule, &defaults.others)?;
-    apply_actions(&mut rule, parsed_actions.iter().filter(|a| a.key != "block"))?;
+    apply_actions(&mut rule, &defaults.others, false, false)?;
+    apply_actions(&mut rule, parsed_actions, true, true)?;
     if !rule
         .actions()
         .iter()
         .any(|action| action.action_type() == ActionType::Disruptive)
     {
-        apply_actions(&mut rule, [&defaults.disruptive])?;
+        apply_actions(&mut rule, [&defaults.disruptive], false, false)?;
     }
     Ok(rule)
 }
@@ -142,9 +142,17 @@ fn add_actions(mut rule: Rule, parsed_actions: &[ParsedAction], defaults: &Defau
 pub(crate) fn apply_actions<'a>(
     rule: &mut Rule,
     parsed_actions: impl IntoIterator<Item = &'a ParsedAction>,
+    explicit: bool,
+    defer_block: bool,
 ) -> CompileResult<()> {
     for parsed in parsed_actions {
         if let Some(action) = compile_action(&parsed.key, &parsed.value, rule.metadata_mut())? {
+            if explicit && action.action_type() == ActionType::Disruptive {
+                rule.explicit_disruptive = true;
+            }
+            if defer_block && parsed.key == "block" {
+                continue;
+            }
             rule.push_action(action);
         }
     }
