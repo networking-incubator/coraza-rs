@@ -5,6 +5,21 @@ provides SecLang parsing, request and response phase processing, and audit
 logging. It is not the upstream Go implementation. The `exec`, `initcol`, and
 `expirevar` action effects are not implemented.
 
+## Extension seams
+
+| Seam | Registration/API | Contract |
+| --- | --- | --- |
+| Operators | `Parser::register_operator` | [Operators](#operators) |
+| Transformations | `CustomTransformation`, `Parser::register_transformation` | [Custom transformations](#custom-transformations) |
+| Actions | `CustomAction`, `Parser::register_action` | [Custom actions](#custom-actions) |
+| Audit writers and formatters | `Parser::register_audit_log_writer` / `register_audit_log_formatter` | [Audit logging](#audit-logging) |
+| Body processors | `BodyProcessor`, `Parser::register_body_processor` | [Custom body processors](#custom-body-processors) |
+| Rule observer | `Parser::on_rule` | [Rule observer](#rule-observer) |
+
+These host implementations run synchronously in the engine. Review each
+section's execution, lifetime, and trust-boundary constraints before registering
+custom code.
+
 ## FIPS build profile
 
 The `hash-transformations` feature (enabled by default) preserves the existing
@@ -194,6 +209,22 @@ neither a timeout nor an output-size bound, and a transformation can panic or
 block its caller. Registrations must be trusted host code; the host must bound
 its own work and output and avoid panics.
 
+## Custom actions
+
+Implement `coraza::actions::CustomAction` and register a factory with
+`Parser::register_action`. Names are case-insensitive; a custom action overrides
+a built-in name except for the reserved metadata-only names listed in the
+[root README](../README.md#custom-actions). The factory resolves while each
+action is compiled, so later registrations do not rewrite compiled rules.
+
+`ActionType` chooses when the action runs (`Nondisruptive`, `Flow`, or
+`Disruptive`); it does not restrict what the implementation can do. A custom
+action receives read-only `RuleMetadata` and a mutable `Transaction`, and can
+use `interrupt`, `allow`, `set_skip`, and `set_skip_after` for rule-flow effects.
+Keep effects consistent with the declared type. Actions execute synchronously
+on the request thread; the engine provides neither panic catching nor a
+timeout, so register only trusted implementations that do not panic or block.
+
 ## Custom body processors
 
 Implement `coraza::BodyProcessor` and register a factory with
@@ -336,6 +367,21 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 
 ## Migrating from the previous release
 
+- `WafConfig::multiphase_evaluation` is a new runtime setting, defaulting to
+  `false`. Set it before compiling rules; a compiled rule set cannot be paired
+  with a WAF whose setting differs. It replaces the equivalent Go build-tag
+  choice for this Rust crate.
+- `AllowScope::{All, Phase, Request}` and `Transaction::allow` are new public
+  APIs for custom actions. `Transaction::interrupt`, `set_skip`, and
+  `set_skip_after` are also public so host actions can express disruptive and
+  flow effects.
+- `ActionType` and `RuleMetadata` are public custom-action APIs. Metadata is
+  read through `id`, `phase`, `status`, `log`, and `audit_log` getters;
+  `ActionType` is a scheduling declaration, not an enforced capability limit.
+- `DebugLogger` and its event types are public. Supply a shared implementation
+  with `Parser::with_debug_logger` or `Waf::with_debug_logger`; the configured
+  debug level still filters calls. Debug events are synchronous, and a slow
+  logger can block request processing.
 - `SecDebugLog` and `SecDebugLogLevel` now emit engine events. The default level
   remains 0 (off), and configured sinks open only on `Waf::activate` or the first
   enabled event.
@@ -349,9 +395,10 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   addition breaks exhaustive struct literals and patterns; literals now need
   `..Default::default()` and patterns need `..` to remain forward compatible.
 - `Operator` now requires `Send + Sync`.
-- `MatchData::chain_level` is a `usize`, widened from the pre-release `u16` so the
-  chain depth increments like Go's `int` instead of wrapping in release builds or
-  panicking in debug builds at absurd depths.
+- `MatchData::chain_level` is a new public `usize` field (parent level is zero),
+  replacing the pre-release `u16`. Exhaustive `MatchData` literals must now
+  initialize it; chain depth increments like Go's `int` instead of wrapping or
+  panicking at extreme depths.
 - `OperatorContext` has a new `custom` field for registered operators, and
   `OperatorEnum` has a new `Custom(Registered)` variant.
 - `OperatorEnum` also has three feature-gated variants: `InspectFile`

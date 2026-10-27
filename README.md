@@ -10,7 +10,7 @@ detecting.
 
 | Path | Purpose |
 | --- | --- |
-| `coraza/` | Separate Rust Coraza implementation with SecLang rule compilation, request and response header/body phases, transaction storage, operators, transformations, and audit logging. Request bodies support RAW, URLENCODED, JSON, XML, and multipart processing; response bodies support raw storage and JSON arguments. The `exec`, `initcol`, and `expirevar` effects remain unimplemented. |
+| `coraza/` | Separate Rust Coraza implementation with SecLang rule compilation, request and response phases, transaction storage, operators, transformations, custom host extension seams, and audit logging. Optional features gate host operators, schema validation, HTTPS audit, and FIPS hash behavior; multiphase evaluation is selected per WAF at runtime. Request bodies support RAW, URLENCODED, JSON, XML, and multipart processing; response bodies support raw storage and JSON arguments. The `exec`, `initcol`, and `expirevar` effects remain unimplemented. |
 | `ftw-runner/` | Optional Go FTW integration harness for the Coraza crate. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
@@ -149,6 +149,9 @@ names are reserved and registration returns an error for: `accuracy`,
 `auditlog`, `capture`, `chain`, `id`, `log`, `logdata`, `maturity`, `msg`,
 `multimatch`, `noauditlog`, `nolog`, `phase`, `rev`, `severity`, `status`, `t`,
 `tag`, and `ver`.
+
+See the [Coraza extension-seam index](coraza/README.md#extension-seams) for the
+other host hooks and their contracts.
 
 The [FTW runner guide](ftw-runner/README.md) explains how to build the Coraza
 test server and run go-ftw tests against a CRS checkout.
