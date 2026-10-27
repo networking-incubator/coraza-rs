@@ -495,7 +495,8 @@ fn validate_ctl(argument: &str) -> Result<(), ActionError> {
         "requestBodyLimit" | "responseBodyLimit" => value.parse::<i64>().is_ok_and(|limit| limit >= 0),
         "requestBodyProcessor" | "responseBodyProcessor" => is_body_processor(value),
         "ruleRemoveById" => parse_id_range(value).is_ok(),
-        "ruleRemoveByTag" | "ruleRemoveByMsg" | "hashEngine" | "hashEnforcement" => true,
+        // Go reports malformed debug levels at runtime instead of rejecting the rule.
+        "ruleRemoveByTag" | "ruleRemoveByMsg" | "hashEngine" | "hashEnforcement" | "debugLogLevel" => true,
         "ruleRemoveTargetById" => value
             .split_once(';')
             .is_some_and(|(ids, target)| parse_id_range(ids).is_ok() && valid_rule_target(target)),
@@ -504,7 +505,6 @@ fn validate_ctl(argument: &str) -> Result<(), ActionError> {
             .is_some_and(|(_, target)| valid_rule_target(target)),
         "auditEngine" => value.parse::<crate::types::AuditEngineStatus>().is_ok(),
         "auditLogParts" => crate::types::apply_audit_log_parts(&[], value).is_ok(),
-        "debugLogLevel" => value.parse::<u8>().is_ok_and(|level| level <= 9),
         _ => false,
     };
     if valid {

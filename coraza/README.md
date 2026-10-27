@@ -13,7 +13,8 @@ input unchanged, with `changed == false` and an error (`md5 transformation is
 unavailable in FIPS 140-3 mode` or `sha1 transformation is unavailable in FIPS
 140-3 mode`). It is a build profile, not runtime `GODEBUG=fips140` detection.
 In FIPS mode, the hash transformations return the input unchanged and their
-transformation error is currently not surfaced during rule evaluation.
+transformation error is reported at the debug logger's warning level for each
+argument evaluation.
 Use `--no-default-features --features fips` for a digest-free FIPS build (for
 example, `cargo test -p coraza --no-default-features --features fips`). Cargo
 features are additive, so plain `--features fips` keeps the default hash
@@ -29,6 +30,23 @@ runtime, per-WAF setting is the equivalent of Go Coraza's
 per-transaction switch. The default is `false`, preserving the ordinary
 phase-matched evaluation behavior. A compiled rule set cannot be paired with a
 WAF config that changes this setting.
+
+## Debug logging
+
+`SecDebugLog` selects an append-only path; `/dev/stdout` and `/dev/stderr` select
+the standard streams. `SecDebugLogLevel` accepts levels 0 through 9: 0 disables
+logging, 1-3 enable error/warn/info, 4-8 enable debug, and 9 enables trace.
+The default is 0. Parsing and compiling a policy do not open the debug sink;
+`Waf::activate` opens it explicitly, or the first enabled event opens it lazily.
+An open failure is returned by `Waf::activate` and is also available through
+`Waf::debug_log_error`.
+
+`ctl:debugLogLevel=N` changes the threshold only for the current transaction.
+Hosts can supply a `DebugLogger` with `Parser::with_debug_logger` or
+`Waf::with_debug_logger`; the configured level still filters its events. Debug
+events do not include request values by default. Trace logging can include
+matched/argument values, body processor error details, and interruption details,
+so enable it only when that data may be written to the selected sink.
 
 ## Audit logging
 
@@ -230,6 +248,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 
 ## Migrating from the previous release
 
+- `SecDebugLog` and `SecDebugLogLevel` now emit engine events. The default level
+  remains 0 (off), and configured sinks open only on `Waf::activate` or the first
+  enabled event.
 - `WafConfig::upload_keep_files` is an `UploadKeepFiles` (`Off`, `On`,
   `RelevantOnly`) instead of a `bool`.
 - `WafConfig` has new `audit_log_connect_timeout` and `audit_log_write_timeout`

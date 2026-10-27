@@ -207,8 +207,8 @@ pub struct WafConfig {
     /// one-second whole-request budget.
     pub audit_log_write_timeout: Option<std::time::Duration>,
 
-    /// Path of the debug log, for the embedder: the library writes none; empty when
-    /// unset (`SecDebugLog`).
+    /// Path of the debug log, empty when unset (`SecDebugLog`). The sink is opened by
+    /// [`Waf::activate`](crate::Waf::activate) or on the first enabled debug event.
     pub debug_log: String,
 
     /// Lifetime of persistent collection entries, in seconds (`SecCollectionTimeout`).

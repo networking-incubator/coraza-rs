@@ -26,6 +26,7 @@ use regex::Regex;
 
 use super::Transaction;
 use crate::{
+    debug_log::{DebugField, DebugLevel},
     rules::{VariableException, lowercase_like_go},
     types::{AuditEngineStatus, RuleEngineStatus, RulePhase, RuleVariable},
 };
@@ -47,6 +48,7 @@ impl Transaction {
                     self.audit_log_parts = parts;
                 }
             },
+            "debugLogLevel" => self.set_debug_log_level(value),
             "ruleEngine" => {
                 if let Ok(rule_engine) = value.parse::<RuleEngineStatus>() {
                     self.rule_engine = rule_engine;
@@ -129,6 +131,16 @@ impl Transaction {
                 self.apply_rule_target_removal(name, value, expression);
             },
             _ => {},
+        }
+    }
+
+    /// Set this transaction's level override, warning and keeping the old level if invalid.
+    fn set_debug_log_level(&mut self, value: &str) {
+        match value.parse::<u8>() {
+            Ok(level) if level <= 9 => self.debug_log_level = Some(level),
+            _ => self.debug_log(DebugLevel::Warn, "Invalid ctl debug log level", || {
+                [DebugField::Text(value)]
+            }),
         }
     }
 
