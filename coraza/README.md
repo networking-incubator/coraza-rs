@@ -298,6 +298,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   addition breaks exhaustive struct literals and patterns; literals now need
   `..Default::default()` and patterns need `..` to remain forward compatible.
 - `Operator` now requires `Send + Sync`.
+- `MatchData::chain_level` is a `usize`, widened from the pre-release `u16` so the
+  chain depth increments like Go's `int` instead of wrapping in release builds or
+  panicking in debug builds at absurd depths.
 - `OperatorContext` has a new `custom` field for registered operators, and
   `OperatorEnum` has a new `Custom(Registered)` variant.
 - `OperatorEnum` also has three feature-gated variants: `InspectFile`

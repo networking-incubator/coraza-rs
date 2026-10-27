@@ -240,7 +240,7 @@ impl Rule {
         id: i32,
         phase: RulePhase,
         top_level: bool,
-        chain_level: u16,
+        chain_level: usize,
         collective_matched_values: &mut Vec<MatchData>,
     ) -> Vec<MatchData> {
         if !top_level {
@@ -285,7 +285,7 @@ impl Rule {
     }
 
     /// Log a chain link with both its compiled ID and its position under the parent rule.
-    fn log_chain_evaluation(tx: &Transaction, message: &'static str, parent_id: i32, link_id: i32, level: u16) {
+    fn log_chain_evaluation(tx: &Transaction, message: &'static str, parent_id: i32, link_id: i32, level: usize) {
         tx.debug_log_with(DebugLevel::Debug, |logger| {
             let identity = format!("parent_rule_id={parent_id} chain_level={level}");
             let fields = [DebugField::RuleId(link_id), DebugField::Text(&identity)];
@@ -310,7 +310,7 @@ impl Rule {
         id: i32,
         phase: RulePhase,
         top_level: bool,
-        chain_level: u16,
+        chain_level: usize,
         collective_matched_values: &mut Vec<MatchData>,
     ) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
@@ -322,8 +322,9 @@ impl Rule {
             if !self.variables.is_empty() || self.metadata.sec_mark.is_some() {
                 return Vec::new();
             }
+            // Go zero-values the match of an operatorless link instead of assigning
+            // its chain depth (internal/corazawaf/rule.go:215-233).
             let mut matched = MatchData::new_empty();
-            matched.chain_level = chain_level;
             if tx.multiphase_evaluation() {
                 collective_matched_values.push(matched.clone());
             }

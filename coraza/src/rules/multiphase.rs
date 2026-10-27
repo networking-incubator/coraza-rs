@@ -48,7 +48,7 @@ pub(crate) fn multiphase_skip_variable(rule: &Rule, variable: RuleVariable, phas
 }
 
 /// The last chain level represented in `matched_values`.
-pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> u16 {
+pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> usize {
     matched_values
         .iter()
         .map(|matched| matched.chain_level)
@@ -56,36 +56,25 @@ pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> u16 {
         .unwrap_or(0)
 }
 
-/// Build every ordered chain from matches grouped by their chain level.
-pub(crate) fn generate_chain_matches(
-    matched_values: &[MatchData],
-    current_depth: u16,
-    building: &mut Vec<MatchData>,
-    result: &mut Vec<Vec<MatchData>>,
-) {
-    let final_depth = matched_chain_depth(matched_values);
-    for matched in matched_values
-        .iter()
-        .filter(|matched| matched.chain_level == current_depth)
-    {
-        building.push(matched.clone());
-        if current_depth == final_depth {
-            result.push(building.clone());
-        } else {
-            generate_chain_matches(matched_values, current_depth + 1, building, result);
-        }
-        drop(building.pop());
-    }
-}
-
-/// Whether `new_chain` is already present as a prefix of one of the completed chains.
-pub(crate) fn chain_part_of(new_chain: &[MatchData], matched_chains: &[Vec<MatchData>]) -> bool {
-    matched_chains.iter().any(|matched_chain| {
-        new_chain.len() <= matched_chain.len()
-            && new_chain
-                .iter()
-                .zip(matched_chain)
-                .all(|(new, matched)| new.variable == matched.variable && new.value == matched.value)
+/// Whether every level of the candidate chain already has an equal recorded part.
+///
+/// Go compares the Cartesian products of the per-level matches, but the levels are
+/// independent: a candidate chain repeats an earlier one exactly when each of its
+/// levels holds a variable and value already recorded at that level. Checking the
+/// per-level intersections gives Go's answer without building every ordered
+/// combination, so repeated evaluation of a wide chain stays bounded.
+fn chain_already_matched(candidate: &[MatchData], recorded: &[MatchData], depth: usize) -> bool {
+    (0..=depth).all(|level| {
+        candidate
+            .iter()
+            .filter(|matched| matched.chain_level == level)
+            .any(|matched| {
+                recorded.iter().any(|previous| {
+                    previous.chain_level == level
+                        && previous.variable == matched.variable
+                        && previous.value == matched.value
+                })
+            })
     })
 }
 
@@ -107,16 +96,7 @@ pub(crate) fn is_multiphase_double_evaluation(
             continue;
         }
 
-        let mut matched_chains = Vec::new();
-        let mut building = Vec::new();
-        generate_chain_matches(&previous.matches, 0, &mut building, &mut matched_chains);
-        let mut collective_chains = Vec::new();
-        let mut building = Vec::new();
-        generate_chain_matches(collective_matched_values, 0, &mut building, &mut collective_chains);
-        if collective_chains
-            .iter()
-            .any(|new_chain| chain_part_of(new_chain, &matched_chains))
-        {
+        if chain_already_matched(collective_matched_values, &previous.matches, depth) {
             drop(collective_matched_values.pop());
             return true;
         }
@@ -131,7 +111,7 @@ pub(crate) fn is_multiphase_double_evaluation(
     reason = "multiphase helper tests use fixed rules and known matched chains"
 )]
 mod tests {
-    use super::{chain_part_of, generate_chain_matches, matched_chain_depth, multiphase_skip_variable};
+    use super::{chain_already_matched, matched_chain_depth, multiphase_skip_variable};
     use crate::{
         collection::MatchData,
         rules::{Rule, multiphase::is_multiphase_double_evaluation},
@@ -195,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_chain_matches_are_grouped_by_level_and_compared_by_value() {
+    fn chain_parts_are_compared_per_level_by_variable_and_value() {
         let mut parent_a = MatchData::new(RuleVariable::RequestURI, "", b"/a".to_vec());
         let mut parent_b = MatchData::new(RuleVariable::RequestURI, "", b"/b".to_vec());
         let mut child_a = MatchData::new(RuleVariable::RequestBody, "", b"body".to_vec());
@@ -204,18 +184,93 @@ mod tests {
         parent_b.chain_level = 0;
         child_a.chain_level = 1;
         child_b.chain_level = 1;
-        let matches = [parent_a.clone(), parent_b, child_a.clone(), child_b];
-        let mut chains = Vec::new();
-        generate_chain_matches(&matches, 0, &mut Vec::new(), &mut chains);
+        let recorded = [parent_a.clone(), parent_b, child_a.clone(), child_b];
 
-        assert_eq!(matched_chain_depth(&matches), 1);
-        assert_eq!(chains.len(), 4);
-        assert!(chain_part_of(&[parent_a.clone(), child_a.clone()], &chains));
+        assert_eq!(matched_chain_depth(&recorded), 1);
+        assert!(chain_already_matched(
+            &[parent_a.clone(), child_a.clone()],
+            &recorded,
+            1
+        ));
         let other = [
             MatchData::new(RuleVariable::RequestURI, "", b"/other".to_vec()),
             child_a,
         ];
-        assert!(!chain_part_of(&other, &chains));
+        assert!(!chain_already_matched(&other, &recorded, 1));
+
+        // A level with no candidate parts, as left by an operatorless link that keeps
+        // level 0, can never repeat an earlier chain: Go's generated chain set is empty.
+        let mut deep = MatchData::new(RuleVariable::RequestBody, "", b"deep".to_vec());
+        deep.chain_level = 2;
+        assert!(!chain_already_matched(&[parent_a, deep], &recorded, 2));
+    }
+
+    #[test]
+    fn operatorless_chain_link_keeps_level_zero_and_is_never_a_duplicate() {
+        let mut parser = Parser::new();
+        parser.config_mut().multiphase_evaluation = true;
+        parser
+            .from_string(
+                "SecRule REQUEST_URI \"@streq /\" \"id:1,phase:2,pass,chain\"\n\
+                 SecAction \"chain\"\n\
+                 SecRule REQUEST_URI \"@streq /\" \"setvar:tx.count=+1\"\n\
+                 SecRule TX:count \"@eq 2\" \"id:2,phase:2,deny,status:403\"",
+            )
+            .expect("test rules are valid");
+        let waf = parser.into_waf().expect("test WAF compiles");
+        let mut tx = waf.new_transaction_with_id("operatorless-chain-level");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+
+        let matched = tx.matched_rules().first().expect("chain matches at request headers");
+        assert_eq!(
+            matched
+                .matches
+                .iter()
+                .map(|matched| matched.chain_level)
+                .collect::<Vec<_>>(),
+            [0, 0, 2],
+            "an operatorless link records level 0 like Go's zero-valued match"
+        );
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("count")).as_deref(), Some("1"));
+
+        // The level 0 short-circuit keeps the link itself out of the suppression path,
+        // and the missing level 1 part means no completed chain can repeat, so the
+        // re-evaluation runs the inner actions again, as in Go.
+        let interruption = tx.process_request_body(b"").expect("count reaches 2 and rule 2 fires");
+        assert_eq!(interruption.rule_id, 2);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("count")).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn duplicate_check_stays_bounded_for_wide_chains() {
+        // Eight chain levels with ten values each: the recorded rule holds 80 matches
+        // and the Cartesian product of the per-level values would hold 10^8 chains.
+        // Finishing this test under the default timeout is the bound on the work; the
+        // duplicate decision itself is asserted exactly.
+        let mut rules = String::from("SecRule ARGS \"@contains hit\" \"id:1,phase:2,pass,chain\"\n");
+        for _ in 1..7 {
+            rules.push_str("SecRule ARGS \"@contains hit\" \"chain\"\n");
+        }
+        rules.push_str("SecRule ARGS \"@contains hit\" \"setvar:tx.hits=+1\"\n");
+
+        let mut parser = Parser::new();
+        parser.config_mut().multiphase_evaluation = true;
+        parser.from_string(&rules).expect("stress chain compiles");
+        let waf = parser.into_waf().expect("stress WAF compiles");
+        let mut tx = waf.new_transaction_with_id("multiphase-wide-chain");
+        for index in 0..10 {
+            tx.add_get_argument(format!("key{index}"), "hit");
+        }
+
+        tx.process_request_headers();
+        let recorded = tx.matched_rules().first().expect("wide chain matches");
+        assert_eq!(recorded.matches.len(), 80);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("hits")).as_deref(), Some("10"));
+
+        tx.process_request_body(b"");
+        assert_eq!(tx.matched_rules().len(), 1, "the repeated chain is suppressed");
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("hits")).as_deref(), Some("10"));
     }
 
     #[test]
