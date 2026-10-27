@@ -24,8 +24,9 @@ use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
     collection::MatchData,
     operators::{OperatorOutcome, Outputs},
-    rules::{RuleOperator, VariableSpec},
+    rules::{RuleOperator, VariableSpec, multiphase::multiphase_skip_variable},
     transaction::Transaction,
+    types::RulePhase,
 };
 
 /// A rule compiled from SecLang for transaction evaluation.
@@ -39,6 +40,12 @@ pub(crate) struct Rule {
     operator: Option<RuleOperator>,
     /// Actions retained for transaction evaluation.
     actions: Vec<CompiledAction>,
+    /// Phases inferred from the declared phase and selected variables.
+    pub(crate) inferred_phases: u8,
+    /// Earliest phase at which a complete chain can be evaluated.
+    pub(crate) chain_min_phase: RulePhase,
+    /// Whether this rule or a chain link uses a phase-unknown variable.
+    pub(crate) has_phase_unknown_variable: bool,
     /// Whether this rule explicitly declares a disruptive action, excluding inherited defaults.
     pub(crate) explicit_disruptive: bool,
     /// Following rules in a chain.
@@ -53,6 +60,9 @@ impl Rule {
             variables: Vec::new(),
             operator: None,
             actions: Vec::new(),
+            inferred_phases: 0,
+            chain_min_phase: RulePhase::Unknown,
+            has_phase_unknown_variable: false,
             explicit_disruptive: false,
             chain: Vec::new(),
         }
@@ -100,9 +110,68 @@ impl Rule {
         &self.actions
     }
 
+    /// Split `ARGS` and `ARGS_NAMES` after the entire variable expression, including
+    /// its negations, has been compiled.
+    pub(crate) fn split_args_variables(&mut self) {
+        let mut variables = Vec::with_capacity(self.variables.len());
+        for variable in self.variables.drain(..) {
+            match variable.split_args() {
+                Ok(split) => variables.extend(split),
+                Err(variable) => variables.push(variable),
+            }
+        }
+        self.variables = variables;
+    }
+
+    /// Calculate per-rule inferred phases and return whether this subtree has an
+    /// unknown-phase variable.
+    pub(crate) fn finalize_multiphase(&mut self) -> bool {
+        self.inferred_phases = 1_u8 << self.metadata.phase.as_int();
+        self.has_phase_unknown_variable = false;
+        for variable in &self.variables {
+            match variable.variable().min_phase() {
+                Some(phase) => self.inferred_phases |= 1_u8 << phase.as_int(),
+                None => self.has_phase_unknown_variable = true,
+            }
+        }
+
+        let mut chain_min_phase = RulePhase::Unknown;
+        for link in &mut self.chain {
+            let has_unknown = link.finalize_multiphase();
+            self.has_phase_unknown_variable |= has_unknown;
+            if let Some(minimum) = link
+                .variables
+                .iter()
+                .filter_map(|variable| variable.variable().min_phase())
+                .min()
+            {
+                chain_min_phase = chain_min_phase.max(minimum);
+            }
+        }
+        self.chain_min_phase = chain_min_phase;
+        self.has_phase_unknown_variable
+    }
+
+    /// Whether the Go multiphase phase gate selects this rule for `phase`.
+    pub(crate) fn should_evaluate_in_phase(&self, phase: RulePhase, multiphase: bool) -> bool {
+        if self.metadata.phase == RulePhase::Unknown || self.metadata.phase == phase {
+            return true;
+        }
+        if !multiphase {
+            return false;
+        }
+        if !self.metadata.has_chain {
+            return self.inferred_phases & (1_u8 << phase.as_int()) != 0;
+        }
+
+        self.chain_min_phase <= phase
+            && phase <= self.metadata.phase
+            && (self.inferred_phases & ((1_u8 << (phase.as_int() + 1)) - 2) != 0 || self.has_phase_unknown_variable)
+    }
+
     /// Evaluate this rule and its chain against a transaction.
-    pub(crate) fn evaluate(&self, tx: &mut Transaction) {
-        let matched_values = self.matches_chain(tx, self.metadata.id);
+    pub(crate) fn evaluate(&self, tx: &mut Transaction, phase: RulePhase) {
+        let matched_values = self.matches_chain(tx, self.metadata.id, phase, true);
         if matched_values.is_empty() {
             return;
         }
@@ -140,18 +209,21 @@ impl Rule {
     }
 
     /// Match this rule and its chain, running nondisruptive actions at each link.
-    fn matches_chain(&self, tx: &mut Transaction, id: i32) -> Vec<MatchData> {
+    fn matches_chain(&self, tx: &mut Transaction, id: i32, phase: RulePhase, top_level: bool) -> Vec<MatchData> {
         if self.metadata.sec_mark.is_some() {
             return Vec::new();
         }
-        let mut matched_values = self.match_values(tx, id);
+        if tx.multiphase_evaluation() && top_level && self.metadata.has_chain && phase < self.chain_min_phase {
+            return Vec::new();
+        }
+        let mut matched_values = self.match_values(tx, id, phase, top_level);
         if matched_values.is_empty() {
             return matched_values;
         }
         let own_matches = matched_values.len();
 
         for link in &self.chain {
-            let link_matches = link.matches_chain(tx, id);
+            let link_matches = link.matches_chain(tx, id, phase, false);
             if link_matches.is_empty() {
                 return Vec::new();
             }
@@ -168,7 +240,7 @@ impl Rule {
     }
 
     /// Match the values selected by this rule and run per-match actions.
-    fn match_values(&self, tx: &mut Transaction, id: i32) -> Vec<MatchData> {
+    fn match_values(&self, tx: &mut Transaction, id: i32, phase: RulePhase, top_level: bool) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
         let log_data = self.metadata.log_data.as_ref().map(|value| value.expand(tx));
         let severity = self.metadata.severity.map_or("unknown", |value| value.as_str());
@@ -189,6 +261,9 @@ impl Rule {
 
         let mut matched_values = Vec::new();
         for variable in &self.variables {
+            if tx.multiphase_evaluation() && top_level && multiphase_skip_variable(self, variable.variable(), phase) {
+                continue;
+            }
             for value in tx.find_matches_for_rule(variable, id) {
                 // shortcut: transformation errors are dropped here; L2a's debug logger is
                 // the upgrade point (Go internal/corazawaf/rule.go:272-279 warn path).
@@ -258,7 +333,7 @@ mod tests {
         actions::{ActionType, CompiledAction},
         config::DetectorInspectionAction,
         seclang::Parser,
-        types::RuleVariable,
+        types::{RulePhase, RuleVariable},
         waf::Waf,
     };
 
@@ -295,6 +370,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["setvar", "pass"]
         );
+    }
+
+    #[test]
+    fn phase_gate_matches_default_and_multiphase_rules() {
+        let mut rule = Rule::new();
+        rule.metadata_mut().phase = RulePhase::RequestBody;
+        rule.inferred_phases = (1 << RulePhase::RequestHeaders.as_int()) | (1 << RulePhase::RequestBody.as_int());
+
+        assert!(!rule.should_evaluate_in_phase(RulePhase::RequestHeaders, false));
+        assert!(rule.should_evaluate_in_phase(RulePhase::RequestHeaders, true));
+        assert!(rule.should_evaluate_in_phase(RulePhase::RequestBody, false));
+        assert!(!rule.should_evaluate_in_phase(RulePhase::ResponseHeaders, true));
+
+        rule.metadata_mut().has_chain = true;
+        rule.chain_min_phase = RulePhase::RequestBody;
+        assert!(!rule.should_evaluate_in_phase(RulePhase::RequestHeaders, true));
+        assert!(rule.should_evaluate_in_phase(RulePhase::RequestBody, true));
+        assert!(!rule.should_evaluate_in_phase(RulePhase::ResponseHeaders, true));
+
+        rule.chain_min_phase = RulePhase::RequestHeaders;
+        rule.inferred_phases = 1 << RulePhase::RequestBody.as_int();
+        assert!(!rule.should_evaluate_in_phase(RulePhase::RequestHeaders, true));
+        rule.has_phase_unknown_variable = true;
+        assert!(rule.should_evaluate_in_phase(RulePhase::RequestHeaders, true));
+
+        rule.metadata_mut().phase = RulePhase::Unknown;
+        assert!(rule.should_evaluate_in_phase(RulePhase::RequestHeaders, false));
     }
 
     #[cfg(feature = "inspect-file")]

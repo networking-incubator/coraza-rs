@@ -35,6 +35,8 @@ pub(crate) struct RuleGroup {
     /// setting the compiled rules were built under, so `Waf::with_rules` can reject a
     /// configuration that changed afterwards.
     case_sensitive_args_keys: Option<bool>,
+    /// The multiphase mode under which this group was compiled, when any rule exists.
+    multiphase_evaluation: Option<bool>,
 }
 
 impl RuleGroup {
@@ -66,8 +68,39 @@ impl RuleGroup {
         self.case_sensitive_args_keys
     }
 
+    /// Record the multiphase setting that affects rule compilation.
+    pub(crate) fn record_multiphase_evaluation(&mut self, multiphase_evaluation: bool) -> Result<(), String> {
+        match self.multiphase_evaluation {
+            Some(compiled) if compiled != multiphase_evaluation => Err(format!(
+                "multiphase_evaluation changed after rules were compiled (was {compiled}, now \
+                 {multiphase_evaluation}); compile all rules under one setting"
+            )),
+            _ => {
+                self.multiphase_evaluation = Some(multiphase_evaluation);
+                Ok(())
+            },
+        }
+    }
+
+    /// The multiphase setting recorded at compile time, if any.
+    pub(crate) fn compiled_multiphase_evaluation(&self) -> Option<bool> {
+        self.multiphase_evaluation
+    }
+
+    /// Finalize phase metadata once all chain links and target updates are present.
+    pub(crate) fn finalize_multiphase(&mut self, multiphase_evaluation: bool) {
+        if multiphase_evaluation {
+            for rule in &mut self.rules {
+                rule.finalize_multiphase();
+            }
+        }
+    }
+
     /// Add a rule, attaching it to an open chain when needed.
-    pub(crate) fn add(&mut self, rule: Rule) -> Result<(), String> {
+    pub(crate) fn add(&mut self, mut rule: Rule, multiphase_evaluation: bool) -> Result<(), String> {
+        if multiphase_evaluation {
+            rule.split_args_variables();
+        }
         let open_parent_id = self.open_chain().map(|parent| parent.metadata().id());
         if let Some(parent_id) = open_parent_id
             && rule.explicit_disruptive
@@ -167,12 +200,17 @@ impl RuleGroup {
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     reason = "rule group tests use fixed valid inputs"
 )]
 mod tests {
     use super::RuleGroup;
-    use crate::{actions::compile_action, rules::Rule};
+    use crate::{
+        actions::compile_action,
+        rules::{Rule, VariableSpec},
+        types::{RulePhase, RuleVariable},
+    };
 
     fn rule(id: &str, action: &str) -> Rule {
         let mut rule = Rule::new();
@@ -188,16 +226,26 @@ mod tests {
     #[test]
     fn rejects_duplicate_nonzero_ids() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", "")).unwrap();
-        assert!(group.add(rule("1", "")).unwrap_err().contains("duplicated rule id 1"));
+        group.add(rule("1", ""), false).unwrap();
+        assert!(
+            group
+                .add(rule("1", ""), false)
+                .unwrap_err()
+                .contains("duplicated rule id 1")
+        );
     }
 
     #[test]
     fn duplicate_chain_member_id_leaves_the_open_chain_unchanged() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", "chain")).unwrap();
+        group.add(rule("1", "chain"), false).unwrap();
 
-        assert!(group.add(rule("1", "")).unwrap_err().contains("duplicated rule id 1"));
+        assert!(
+            group
+                .add(rule("1", ""), false)
+                .unwrap_err()
+                .contains("duplicated rule id 1")
+        );
         assert_eq!(group.count(), 1);
         assert!(group.discard_open_chain());
     }
@@ -205,12 +253,12 @@ mod tests {
     #[test]
     fn chains_rules_and_discards_an_incomplete_chain() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", "chain")).unwrap();
+        group.add(rule("1", "chain"), false).unwrap();
         assert!(group.discard_open_chain());
         assert_eq!(group.count(), 0);
 
-        group.add(rule("1", "chain")).unwrap();
-        group.add(rule("", "")).unwrap();
+        group.add(rule("1", "chain"), false).unwrap();
+        group.add(rule("", ""), false).unwrap();
         assert_eq!(group.count(), 1);
         assert_eq!(group.rules()[0].chain.len(), 1);
         assert!(!group.discard_open_chain());
@@ -219,12 +267,12 @@ mod tests {
     #[test]
     fn disruptive_chain_member_error_precedes_duplicate_id() {
         let mut group = RuleGroup::new();
-        group.add(rule("42", "chain")).unwrap();
+        group.add(rule("42", "chain"), false).unwrap();
         let mut member = rule("42", "deny");
         member.explicit_disruptive = true;
 
         assert_eq!(
-            group.add(member).unwrap_err(),
+            group.add(member, false).unwrap_err(),
             "disruptive actions can only be specified in the chain starter rule (parent id: 42)"
         );
         assert_eq!(group.count(), 0);
@@ -236,12 +284,37 @@ mod tests {
         let mut tagged = rule("2", "");
         tagged.metadata_mut().msg = Some(crate::operators::Macro::new("blocked").unwrap());
         tagged.metadata_mut().tags.push("attack".to_owned());
-        group.add(tagged).unwrap();
-        group.add(rule("3", "")).unwrap();
+        group.add(tagged, false).unwrap();
+        group.add(rule("3", ""), false).unwrap();
 
         group.delete_by_msg("blocked");
         assert!(group.find_by_id(2).is_none());
         group.delete_by_range(3, 3);
         assert_eq!(group.count(), 0);
+    }
+
+    #[test]
+    fn finalizes_chain_minimum_and_phase_unknown_metadata() {
+        let mut group = RuleGroup::new();
+        let mut parent = rule("1", "chain");
+        parent.metadata_mut().phase = RulePhase::RequestBody;
+        parent = parent.add_variable(VariableSpec::new(RuleVariable::RequestURI));
+        group.add(parent, true).unwrap();
+
+        let mut first_link = Rule::new();
+        first_link.metadata_mut().has_chain = true;
+        first_link = first_link
+            .add_variable(VariableSpec::new(RuleVariable::TX))
+            .add_variable(VariableSpec::new(RuleVariable::RequestBody));
+        group.add(first_link, true).unwrap();
+
+        let last_link = Rule::new().add_variable(VariableSpec::new(RuleVariable::ResponseHeaders));
+        group.add(last_link, true).unwrap();
+        group.finalize_multiphase(true);
+
+        let root = group.rules().first().expect("parent rule exists");
+        assert_eq!(root.chain_min_phase, RulePhase::ResponseHeaders);
+        assert!(root.has_phase_unknown_variable);
+        assert_eq!(root.inferred_phases, (1 << 1) | (1 << 2));
     }
 }

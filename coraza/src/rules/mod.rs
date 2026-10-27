@@ -21,6 +21,7 @@
 //! Rule helpers used by the Coraza engine.
 
 mod group;
+mod multiphase;
 mod operator;
 mod rule;
 mod transformation;

@@ -25,6 +25,8 @@
 
 use std::{fmt, str::FromStr};
 
+use super::RulePhase;
+
 /// Identifies information from a transaction that can be inspected by rules.
 ///
 /// Variables are used in SecLang rules to specify what data to inspect.
@@ -386,6 +388,132 @@ const VARIABLES: &[(RuleVariable, &str)] = &[
 ];
 
 impl RuleVariable {
+    /// Earliest transaction phase in which Go Coraza v3.8.1 can populate this variable.
+    ///
+    /// `None` represents Go's `PhaseUnknown`; those variables may depend on rule state
+    /// or are only useful for logging. This mapping is used by multiphase inference and
+    /// variable skipping.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive Go variable phase table stays in one match"
+    )]
+    pub const fn min_phase(self) -> Option<RulePhase> {
+        use RulePhase::{RequestBody, RequestHeaders, ResponseBody, ResponseHeaders};
+
+        match self {
+            Self::ResponseContentType
+            | Self::ResponseProtocol
+            | Self::ResponseStatus
+            | Self::StatusLine
+            | Self::ResponseHeadersNames
+            | Self::ResponseHeaders => Some(ResponseHeaders),
+            Self::FilesCombinedSize
+            | Self::FullRequestLength
+            | Self::InboundDataError
+            | Self::MultipartDataAfter
+            | Self::MultipartDuplicatePartHeader
+            | Self::MultipartInvalidQuoting
+            | Self::ReqbodyError
+            | Self::ReqbodyErrorMsg
+            | Self::ReqbodyProcessorError
+            | Self::ReqbodyProcessorErrorMsg
+            | Self::RequestBody
+            | Self::RequestBodyLength
+            | Self::Args
+            | Self::ArgsPost
+            | Self::ArgsNames
+            | Self::ArgsPostNames
+            | Self::FilesSizes
+            | Self::FilesNames
+            | Self::FilesTmpContent
+            | Self::MultipartFilename
+            | Self::MultipartFilenameCharset
+            | Self::MultipartFilenameLanguage
+            | Self::MultipartName
+            | Self::Files
+            | Self::FilesTmpNames
+            | Self::JSON
+            | Self::RequestXML
+            | Self::XML
+            | Self::MultipartPartHeaders => Some(RequestBody),
+            Self::OutboundDataError
+            | Self::ResponseBody
+            | Self::ResponseContentLength
+            | Self::ResponseArgs
+            | Self::ResponseXML => Some(ResponseBody),
+            Self::UniqueID
+            | Self::ArgsCombinedSize
+            | Self::QueryString
+            | Self::RemoteAddr
+            | Self::RemoteHost
+            | Self::RemotePort
+            | Self::RequestBasename
+            | Self::RequestFilename
+            | Self::RequestLine
+            | Self::RequestMethod
+            | Self::RequestProtocol
+            | Self::RequestURI
+            | Self::RequestURIRaw
+            | Self::ServerAddr
+            | Self::ServerName
+            | Self::ServerPort
+            | Self::RequestHeadersNames
+            | Self::ArgsGet
+            | Self::ArgsGetNames
+            | Self::ArgsPath
+            | Self::RequestCookies
+            | Self::RequestHeaders
+            | Self::Geo
+            | Self::RequestCookiesNames
+            | Self::Env
+            | Self::UrlencodedError
+            | Self::URIParseError
+            | Self::Time
+            | Self::TimeDay
+            | Self::TimeEpoch
+            | Self::TimeHour
+            | Self::TimeMin
+            | Self::TimeMon
+            | Self::TimeSec
+            | Self::TimeWday
+            | Self::TimeYear => Some(RequestHeaders),
+            Self::Unknown
+            | Self::MatchedVar
+            | Self::MatchedVarName
+            | Self::ReqbodyProcessor
+            | Self::HighestSeverity
+            | Self::Duration
+            | Self::MatchedVarsNames
+            | Self::MatchedVars
+            | Self::ResBodyProcessor
+            | Self::TX
+            | Self::Rule
+            | Self::AuthType
+            | Self::FullRequest
+            | Self::MultipartBoundaryQuoted
+            | Self::MultipartBoundaryWhitespace
+            | Self::MultipartCrlfLfLines
+            | Self::MultipartDataBefore
+            | Self::MultipartFileLimitExceeded
+            | Self::MultipartHeaderFolding
+            | Self::MultipartInvalidHeaderFolding
+            | Self::MultipartInvalidPart
+            | Self::MultipartLfLine
+            | Self::MultipartMissingSemicolon
+            | Self::MultipartStrictError
+            | Self::MultipartUnmatchedBoundary
+            | Self::PathInfo
+            | Self::Sessionid
+            | Self::Userid
+            | Self::IP
+            | Self::ResBodyError
+            | Self::ResBodyErrorMsg
+            | Self::ResBodyProcessorError
+            | Self::ResBodyProcessorErrorMsg
+            | Self::ArgumentsLimitReached => None,
+        }
+    }
+
     /// Returns the `SCREAMING_SNAKE_CASE` name of the variable.
     ///
     /// Used for audit logging and string representation.
@@ -720,5 +848,165 @@ mod tests {
         }
 
         assert_eq!(usize::from(RuleVariable::URIParseError.as_u8()) + 1, VARIABLES.len());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table asserts the phase of every RuleVariable variant"
+    )]
+    fn min_phase_covers_every_variable_variant() {
+        use RulePhase::{RequestBody, RequestHeaders, ResponseBody, ResponseHeaders};
+
+        let cases: &[(Option<RulePhase>, &[RuleVariable])] = &[
+            (
+                Some(RequestHeaders),
+                &[
+                    RuleVariable::UniqueID,
+                    RuleVariable::ArgsCombinedSize,
+                    RuleVariable::QueryString,
+                    RuleVariable::RemoteAddr,
+                    RuleVariable::RemoteHost,
+                    RuleVariable::RemotePort,
+                    RuleVariable::RequestBasename,
+                    RuleVariable::RequestFilename,
+                    RuleVariable::RequestLine,
+                    RuleVariable::RequestMethod,
+                    RuleVariable::RequestProtocol,
+                    RuleVariable::RequestURI,
+                    RuleVariable::RequestURIRaw,
+                    RuleVariable::ServerAddr,
+                    RuleVariable::ServerName,
+                    RuleVariable::ServerPort,
+                    RuleVariable::RequestHeadersNames,
+                    RuleVariable::ArgsGet,
+                    RuleVariable::ArgsGetNames,
+                    RuleVariable::ArgsPath,
+                    RuleVariable::RequestCookies,
+                    RuleVariable::RequestHeaders,
+                    RuleVariable::Geo,
+                    RuleVariable::RequestCookiesNames,
+                    RuleVariable::Env,
+                    RuleVariable::UrlencodedError,
+                    RuleVariable::URIParseError,
+                    RuleVariable::Time,
+                    RuleVariable::TimeDay,
+                    RuleVariable::TimeEpoch,
+                    RuleVariable::TimeHour,
+                    RuleVariable::TimeMin,
+                    RuleVariable::TimeMon,
+                    RuleVariable::TimeSec,
+                    RuleVariable::TimeWday,
+                    RuleVariable::TimeYear,
+                ],
+            ),
+            (
+                Some(RequestBody),
+                &[
+                    RuleVariable::FilesCombinedSize,
+                    RuleVariable::FullRequestLength,
+                    RuleVariable::InboundDataError,
+                    RuleVariable::MultipartDataAfter,
+                    RuleVariable::MultipartDuplicatePartHeader,
+                    RuleVariable::MultipartInvalidQuoting,
+                    RuleVariable::ReqbodyError,
+                    RuleVariable::ReqbodyErrorMsg,
+                    RuleVariable::ReqbodyProcessorError,
+                    RuleVariable::ReqbodyProcessorErrorMsg,
+                    RuleVariable::RequestBody,
+                    RuleVariable::RequestBodyLength,
+                    RuleVariable::Args,
+                    RuleVariable::ArgsPost,
+                    RuleVariable::ArgsNames,
+                    RuleVariable::ArgsPostNames,
+                    RuleVariable::FilesSizes,
+                    RuleVariable::FilesNames,
+                    RuleVariable::FilesTmpContent,
+                    RuleVariable::MultipartFilename,
+                    RuleVariable::MultipartFilenameCharset,
+                    RuleVariable::MultipartFilenameLanguage,
+                    RuleVariable::MultipartName,
+                    RuleVariable::Files,
+                    RuleVariable::FilesTmpNames,
+                    RuleVariable::JSON,
+                    RuleVariable::RequestXML,
+                    RuleVariable::XML,
+                    RuleVariable::MultipartPartHeaders,
+                ],
+            ),
+            (
+                Some(ResponseHeaders),
+                &[
+                    RuleVariable::ResponseContentType,
+                    RuleVariable::ResponseProtocol,
+                    RuleVariable::ResponseStatus,
+                    RuleVariable::StatusLine,
+                    RuleVariable::ResponseHeadersNames,
+                    RuleVariable::ResponseHeaders,
+                ],
+            ),
+            (
+                Some(ResponseBody),
+                &[
+                    RuleVariable::OutboundDataError,
+                    RuleVariable::ResponseBody,
+                    RuleVariable::ResponseContentLength,
+                    RuleVariable::ResponseArgs,
+                    RuleVariable::ResponseXML,
+                ],
+            ),
+            (
+                None,
+                &[
+                    RuleVariable::Unknown,
+                    RuleVariable::MatchedVar,
+                    RuleVariable::MatchedVarName,
+                    RuleVariable::ReqbodyProcessor,
+                    RuleVariable::HighestSeverity,
+                    RuleVariable::Duration,
+                    RuleVariable::MatchedVarsNames,
+                    RuleVariable::MatchedVars,
+                    RuleVariable::ResBodyProcessor,
+                    RuleVariable::TX,
+                    RuleVariable::Rule,
+                    RuleVariable::AuthType,
+                    RuleVariable::FullRequest,
+                    RuleVariable::MultipartBoundaryQuoted,
+                    RuleVariable::MultipartBoundaryWhitespace,
+                    RuleVariable::MultipartCrlfLfLines,
+                    RuleVariable::MultipartDataBefore,
+                    RuleVariable::MultipartFileLimitExceeded,
+                    RuleVariable::MultipartHeaderFolding,
+                    RuleVariable::MultipartInvalidHeaderFolding,
+                    RuleVariable::MultipartInvalidPart,
+                    RuleVariable::MultipartLfLine,
+                    RuleVariable::MultipartMissingSemicolon,
+                    RuleVariable::MultipartStrictError,
+                    RuleVariable::MultipartUnmatchedBoundary,
+                    RuleVariable::PathInfo,
+                    RuleVariable::Sessionid,
+                    RuleVariable::Userid,
+                    RuleVariable::IP,
+                    RuleVariable::ResBodyError,
+                    RuleVariable::ResBodyErrorMsg,
+                    RuleVariable::ResBodyProcessorError,
+                    RuleVariable::ResBodyProcessorErrorMsg,
+                    RuleVariable::ArgumentsLimitReached,
+                ],
+            ),
+        ];
+
+        let mut seen = Vec::new();
+        for (expected, variables) in cases {
+            for variable in *variables {
+                assert_eq!(variable.min_phase(), *expected, "{variable:?}");
+                assert!(!seen.contains(variable), "duplicate min_phase case: {variable:?}");
+                seen.push(*variable);
+            }
+        }
+        assert_eq!(seen.len(), VARIABLES.len());
+        for (variable, _) in VARIABLES {
+            assert!(seen.contains(variable), "missing min_phase case: {variable:?}");
+        }
     }
 }

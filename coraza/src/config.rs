@@ -221,6 +221,12 @@ pub struct WafConfig {
     /// case-insensitive, as in Go. There is no SecLang directive for this, as in Go.
     pub case_sensitive_args_keys: bool,
 
+    /// Whether rules may be evaluated in phases earlier than their declared phase when
+    /// all selected variables are available. `true` is the runtime equivalent of Go's
+    /// `coraza.rule.multiphase_evaluation` build tag; it is selected per WAF, not per
+    /// transaction. There is no SecLang directive for this setting.
+    pub multiphase_evaluation: bool,
+
     /// What happens when a detector operator cannot inspect a value that exceeds
     /// libperfusion's input bound.
     ///
@@ -300,6 +306,7 @@ impl Default for WafConfig {
             debug_log_level: 0,
             argument_limit: DEFAULT_ARGUMENT_LIMIT,
             case_sensitive_args_keys: false,
+            multiphase_evaluation: false,
             detector_inspection_action: DetectorInspectionAction::RecordOnly,
             web_app_id: String::new(),
             sensor_id: String::new(),
@@ -335,6 +342,7 @@ mod tests {
         assert_eq!(config.audit_engine, AuditEngineStatus::Off);
         assert_eq!(config.argument_limit, 1000);
         assert!(!config.case_sensitive_args_keys);
+        assert!(!config.multiphase_evaluation);
         assert_eq!(config.detector_inspection_action, DetectorInspectionAction::RecordOnly);
         assert_eq!(config.audit_log_format, AuditLogFormat::Native);
         assert_eq!(config.audit_log_type, AuditLogType::Serial);

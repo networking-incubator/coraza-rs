@@ -555,6 +555,11 @@ impl Transaction {
         &self.matched_rules
     }
 
+    /// Whether this transaction's WAF uses multiphase rule evaluation.
+    pub(crate) fn multiphase_evaluation(&self) -> bool {
+        self.config.multiphase_evaluation
+    }
+
     /// Record a matched rule, notifying the connector and retaining it for audit output.
     pub(crate) fn record_match(
         &mut self,
@@ -1001,7 +1006,7 @@ impl Transaction {
             if (phase != RulePhase::Logging && self.interruption.is_some()) || self.is_allowed(phase) {
                 break;
             }
-            if rule.metadata().phase != RulePhase::Unknown && rule.metadata().phase != phase {
+            if !rule.should_evaluate_in_phase(phase, self.config.multiphase_evaluation) {
                 continue;
             }
             if (!self.removed_rule_ids.is_empty() || !self.removed_rule_id_ranges.is_empty())
@@ -1022,7 +1027,7 @@ impl Transaction {
             }
 
             self.reset_matched_vars();
-            rule.evaluate(self);
+            rule.evaluate(self, phase);
         }
         self.skip = 0;
         if self.allow == AllowType::Phase {
