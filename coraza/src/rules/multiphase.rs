@@ -206,6 +206,15 @@ mod tests {
     }
 
     #[test]
+    fn chain_depth_represents_more_than_a_widened_u16() {
+        let mut matched = MatchData::new(RuleVariable::RequestURI, "", b"/a".to_vec());
+
+        matched.chain_level = usize::from(u16::MAX) + 1;
+
+        assert_eq!(matched_chain_depth(&[matched]), usize::from(u16::MAX) + 1);
+    }
+
+    #[test]
     fn operatorless_chain_link_keeps_level_zero_and_is_never_a_duplicate() {
         let mut parser = Parser::new();
         parser.config_mut().multiphase_evaluation = true;
