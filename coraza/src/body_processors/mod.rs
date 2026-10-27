@@ -200,8 +200,12 @@ impl BodyProcessorOutput {
     /// Add a file whose bytes the engine will write to its private temporary-file path.
     ///
     /// The processor cannot select or invent the path. Files beyond the resolved upload
-    /// limit are dropped. WASI targets reject file output until a connector provides a
-    /// memory-backed sink.
+    /// limit are dropped. Unlike the built-in multipart processor, custom files cannot
+    /// reproduce wire part headers: this deliberately narrow API has no raw-header input,
+    /// so `MULTIPART_PART_HEADERS` contains only `Content-Type: <content_type>`. Rules
+    /// that depend on wire part headers, including `Content-Disposition`, must use the
+    /// built-in multipart processor. WASI targets reject file output until a connector
+    /// provides a memory-backed sink.
     pub fn add_file(&mut self, name: &[u8], filename: &[u8], content_type: &[u8], bytes: &[u8]) {
         if !self.file_storage_available {
             self.set_error("file-producing body processors are unavailable on WASI without a connector memory sink");
