@@ -1164,8 +1164,10 @@ impl Transaction {
         }
     }
 
-    /// Apply a disruptive action according to the transaction's engine mode.
-    pub(crate) fn interrupt(&mut self, rule_id: i32, action: &str, status: i32, data: &str) {
+    /// Apply an interruption according to the transaction's engine mode.
+    ///
+    /// Custom actions can use this to signal their disruptive effect.
+    pub fn interrupt(&mut self, rule_id: i32, action: &str, status: i32, data: &str) {
         self.debug_log(DebugLevel::Warn, "Transaction interruption requested", || {
             [DebugField::RuleId(rule_id), DebugField::Text(action)]
         });
@@ -1187,8 +1189,8 @@ impl Transaction {
         }
     }
 
-    /// Set the rule-skip scope for an `allow` action.
-    pub(crate) fn allow(&mut self, scope: &str) {
+    /// Set the rule-skip scope for an `allow` action (`phase`, `request`, or all rules).
+    pub fn allow(&mut self, scope: &str) {
         if self.rule_engine != RuleEngineStatus::On {
             return;
         }
@@ -1200,12 +1202,12 @@ impl Transaction {
     }
 
     /// Skip the next `count` rules in the current phase.
-    pub(crate) fn set_skip(&mut self, count: i32) {
+    pub fn set_skip(&mut self, count: i32) {
         self.skip = count;
     }
 
     /// Skip rules through the named marker.
-    pub(crate) fn set_skip_after(&mut self, marker: &str) {
+    pub fn set_skip_after(&mut self, marker: &str) {
         self.skip_after = Some(marker.to_owned());
     }
 

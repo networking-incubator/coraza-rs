@@ -58,7 +58,7 @@ use winnow::{
 };
 
 use crate::{
-    actions::{ActionCompileContext, RuleMetadata},
+    actions::{ActionCompileContext, CustomActionFactory, RuleMetadata},
     audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
     config::{UploadKeepFiles, WafConfig},
     debug_log::DebugLogger,
@@ -162,7 +162,7 @@ struct DirectiveOptions<'a> {
     /// Audit log implementations registered on the parser
     audit_log_registry: &'a AuditLogRegistry,
 
-    /// Custom transformation implementations registered on the parser.
+    /// Custom transformations and actions registered on the parser.
     action_compile_context: ActionCompileContext<'a>,
 
     /// Rule observer registered on the parser.
@@ -236,6 +236,8 @@ pub struct Parser {
 
     /// Optional callback invoked after each rule is inserted during parsing.
     rule_observer: Option<Arc<RuleObserver>>,
+    /// Custom actions keyed by lower-case SecLang name.
+    custom_actions: BTreeMap<String, CustomActionFactory>,
 
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
@@ -267,6 +269,7 @@ impl Parser {
             audit_log_registry: AuditLogRegistry::default(),
             custom_transformations: BTreeMap::new(),
             rule_observer: None,
+            custom_actions: BTreeMap::new(),
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -313,6 +316,15 @@ impl Parser {
     /// replaces the earlier implementation.
     pub fn register_transformation(&mut self, name: &str, transformation: Arc<dyn CustomTransformation>) {
         self.custom_transformations.insert(name.to_lowercase(), transformation);
+    }
+
+    /// Register a custom action factory under `name`, matched case-insensitively.
+    ///
+    /// A custom registration takes precedence over a built-in action with the same
+    /// name. The factory is resolved when each action is compiled, so registration
+    /// does not change actions already compiled into rules.
+    pub fn register_action(&mut self, name: &str, factory: CustomActionFactory) {
+        self.custom_actions.insert(name.to_lowercase(), factory);
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.
@@ -639,7 +651,8 @@ impl Parser {
                 datasets: &mut self.datasets,
                 custom_operators: &self.custom_operators,
                 audit_log_registry: &self.audit_log_registry,
-                action_compile_context: ActionCompileContext::with_transformations(&self.custom_transformations),
+                action_compile_context: ActionCompileContext::with_transformations(&self.custom_transformations)
+                    .with_actions(&self.custom_actions),
                 rule_observer: self.rule_observer.as_deref(),
                 skip_failed: &mut self.skip_failed,
             }),
@@ -848,7 +861,10 @@ fn directive_sec_action(options: &mut DirectiveOptions<'_>) -> Result<(), String
 /// Sets the actions that rules of the phase named in ACTIONS, from here on, merge their
 /// own with; `block` takes the disruptive one.
 fn directive_sec_default_action(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    options.default_actions.add(&options.opts).map_err(|e| e.message)
+    options
+        .default_actions
+        .add(&options.opts, options.action_compile_context)
+        .map_err(|e| e.message)
 }
 
 /// `SecMarker` LABEL

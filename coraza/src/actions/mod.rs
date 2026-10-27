@@ -30,11 +30,29 @@ use crate::{
     types::{RulePhase, RuleSeverity},
 };
 
+/// An action supplied by an embedder and selected by a SecLang action name.
+///
+/// Actions run synchronously on the transaction thread. The engine does not catch
+/// panics or impose a timeout, so register only trusted implementations that do
+/// not panic or block indefinitely.
+pub trait CustomAction: Send + Sync {
+    /// Returns when this action runs in rule evaluation.
+    fn action_type(&self) -> ActionType;
+
+    /// Applies the action to a matched rule and its transaction.
+    fn evaluate(&self, rule: &RuleMetadata, tx: &mut Transaction);
+}
+
+/// Creates a fresh custom action from its SecLang argument.
+pub type CustomActionFactory = Arc<dyn Fn(&str) -> Result<Box<dyn CustomAction>, String> + Send + Sync>;
+
 /// Parser-scoped host implementations visible while actions are compiled.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ActionCompileContext<'a> {
     /// Registered transformations to consult before built-ins, when compiling parser rules.
     custom_transformations: Option<&'a BTreeMap<String, Arc<dyn CustomTransformation>>>,
+    /// Registered actions to consult before built-ins, when compiling parser rules.
+    custom_actions: Option<&'a BTreeMap<String, CustomActionFactory>>,
 }
 
 impl<'a> ActionCompileContext<'a> {
@@ -44,7 +62,14 @@ impl<'a> ActionCompileContext<'a> {
     ) -> Self {
         Self {
             custom_transformations: Some(custom_transformations),
+            custom_actions: None,
         }
+    }
+
+    /// Adds the parser's custom actions to this compile context.
+    pub(crate) fn with_actions(mut self, custom_actions: &'a BTreeMap<String, CustomActionFactory>) -> Self {
+        self.custom_actions = Some(custom_actions);
+        self
     }
 }
 
@@ -82,7 +107,7 @@ impl From<MacroError> for ActionError {
 
 /// When a compiled action runs in the rule engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActionType {
+pub enum ActionType {
     /// Runs for each matching variable value.
     Nondisruptive,
     /// Runs after the whole rule chain matches.
@@ -92,7 +117,7 @@ pub(crate) enum ActionType {
 }
 
 /// A runtime action after its name and value have been validated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct CompiledAction {
     /// Lowercase SecLang action name.
     pub(crate) name: String,
@@ -100,7 +125,37 @@ pub(crate) struct CompiledAction {
     pub(crate) argument: String,
     /// Point in rule evaluation where the action runs.
     pub(crate) action_type: ActionType,
+    /// Built-in name dispatch or a parser-resolved host implementation.
+    pub(crate) implementation: ActionImplementation,
 }
+
+/// Runtime implementation selected while compiling an action.
+#[derive(Clone)]
+pub(crate) enum ActionImplementation {
+    /// Dispatch through the existing built-in name match.
+    Builtin,
+    /// Dispatch to the parser-resolved host action.
+    Custom(Arc<dyn CustomAction>),
+}
+
+impl fmt::Debug for CompiledAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledAction")
+            .field("name", &self.name)
+            .field("argument", &self.argument)
+            .field("action_type", &self.action_type)
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledAction {
+    fn eq(&self, other: &Self) -> bool {
+        // Host implementation identity is not comparable; retain name-based equality.
+        self.name == other.name
+    }
+}
+
+impl Eq for CompiledAction {}
 
 impl CompiledAction {
     /// Returns when the action runs.
@@ -110,6 +165,11 @@ impl CompiledAction {
 
     /// Apply the runtime effect of a compiled action.
     pub(crate) fn evaluate(&self, rule: &RuleMetadata, tx: &mut Transaction) {
+        if let ActionImplementation::Custom(action) = &self.implementation {
+            action.evaluate(rule, tx);
+            return;
+        }
+
         match self.name.as_str() {
             "deny" => {
                 let status = if rule.status == 0 { 403 } else { rule.status };
@@ -223,8 +283,28 @@ impl RuleMetadata {
     }
 
     /// Returns the rule id.
-    pub(crate) fn id(&self) -> i32 {
+    pub fn id(&self) -> i32 {
         self.id
+    }
+
+    /// Returns the rule processing phase.
+    pub fn phase(&self) -> RulePhase {
+        self.phase
+    }
+
+    /// Returns the response status configured by the `status` action, or zero when unset.
+    pub fn status(&self) -> i32 {
+        self.status
+    }
+
+    /// Whether matching this rule should be logged.
+    pub fn log(&self) -> bool {
+        self.log
+    }
+
+    /// Whether matching this rule should be included in the audit log.
+    pub fn audit_log(&self) -> bool {
+        self.audit_log
     }
 
     /// Returns the rule tags in source order.
@@ -238,7 +318,7 @@ impl RuleMetadata {
     }
 }
 
-/// Compile a parsed action, resolving custom transformations from `context` before built-ins.
+/// Compile a parsed action, resolving custom implementations before built-ins.
 #[expect(
     clippy::too_many_lines,
     reason = "one dispatch keeps SecLang action validation in source order"
@@ -249,7 +329,18 @@ pub(crate) fn compile_action(
     metadata: &mut RuleMetadata,
     context: ActionCompileContext<'_>,
 ) -> Result<Option<CompiledAction>, ActionError> {
-    let name = name.to_ascii_lowercase();
+    let name = name.to_lowercase();
+    if let Some(factory) = context.custom_actions.and_then(|registry| registry.get(&name)) {
+        let action = factory(argument).map_err(ActionError::InvalidArguments)?;
+        let action_type = action.action_type();
+        return Ok(Some(CompiledAction {
+            name,
+            argument: argument.to_owned(),
+            action_type,
+            implementation: ActionImplementation::Custom(Arc::from(action)),
+        }));
+    }
+
     let action = match name.as_str() {
         "id" => {
             metadata.id = parse_positive_i32(argument, "id")?;
@@ -441,6 +532,7 @@ fn compiled(name: String, argument: &str, action_type: ActionType) -> CompiledAc
         name,
         argument: argument.to_owned(),
         action_type,
+        implementation: ActionImplementation::Builtin,
     }
 }
 
