@@ -23,7 +23,7 @@
 use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
     collection::MatchData,
-    debug_log::{DebugField, DebugLevel},
+    debug_log::{DebugEvent, DebugField, DebugLevel},
     operators::{OperatorOutcome, Outputs},
     rules::{
         RuleOperator, VariableSpec,
@@ -238,35 +238,60 @@ impl Rule {
         chain_level: u16,
         collective_matched_values: &mut Vec<MatchData>,
     ) -> Vec<MatchData> {
-        if self.metadata.sec_mark.is_some() {
-            return Vec::new();
+        if !top_level {
+            Self::log_chain_evaluation(tx, "Evaluating chain link", id, self.metadata.id, chain_level);
         }
-        if tx.multiphase_evaluation() && top_level && self.metadata.has_chain && phase < self.chain_min_phase {
-            return Vec::new();
-        }
-        let mut matched_values = self.match_values(tx, id, phase, top_level, chain_level, collective_matched_values);
-        if matched_values.is_empty() {
-            return matched_values;
-        }
-        let own_matches = matched_values.len();
-
-        let mut chain_level = chain_level;
-        for link in &self.chain {
-            chain_level += 1;
-            let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
-            if link_matches.is_empty() {
+        let matched_values = (|| {
+            if self.metadata.sec_mark.is_some() {
                 return Vec::new();
             }
-            matched_values.extend(link_matches);
-        }
-        if !self.chain.is_empty() {
-            let (message, data) = self.describe_match(tx);
-            for matched in matched_values.iter_mut().take(own_matches) {
-                matched.message.clone_from(&message);
-                matched.data.clone_from(&data);
+            if tx.multiphase_evaluation() && top_level && self.metadata.has_chain && phase < self.chain_min_phase {
+                return Vec::new();
             }
+            let mut matched_values =
+                self.match_values(tx, id, phase, top_level, chain_level, collective_matched_values);
+            if matched_values.is_empty() {
+                return matched_values;
+            }
+            let own_matches = matched_values.len();
+
+            let mut chain_level = chain_level;
+            for link in &self.chain {
+                chain_level += 1;
+                let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
+                if link_matches.is_empty() {
+                    return Vec::new();
+                }
+                matched_values.extend(link_matches);
+            }
+            if !self.chain.is_empty() {
+                let (message, data) = self.describe_match(tx);
+                for matched in matched_values.iter_mut().take(own_matches) {
+                    matched.message.clone_from(&message);
+                    matched.data.clone_from(&data);
+                }
+            }
+            matched_values
+        })();
+        if !top_level {
+            Self::log_chain_evaluation(tx, "Finished chain link evaluation", id, self.metadata.id, chain_level);
         }
         matched_values
+    }
+
+    /// Log a chain link with both its compiled ID and its position under the parent rule.
+    fn log_chain_evaluation(tx: &Transaction, message: &'static str, parent_id: i32, link_id: i32, level: u16) {
+        tx.debug_log_with(DebugLevel::Debug, |logger| {
+            let identity = format!("parent_rule_id={parent_id} chain_level={level}");
+            let fields = [DebugField::RuleId(link_id), DebugField::Text(&identity)];
+            logger.log(
+                DebugLevel::Debug,
+                &DebugEvent {
+                    message,
+                    fields: &fields,
+                },
+            );
+        });
     }
 
     /// Match the values selected by this rule and run per-match actions.
@@ -379,24 +404,29 @@ impl Rule {
 
     /// Log an operator argument only at Trace level, where value exposure is explicit.
     fn log_operator_argument(tx: &Transaction, rule_id: i32, variable: RuleVariable, input: &[u8]) {
-        if tx.debug_level_enabled(DebugLevel::Trace) {
+        tx.debug_log_with(DebugLevel::Trace, |logger| {
             let text = crate::transformations::text_of(input);
-            tx.debug_log(DebugLevel::Trace, "Evaluating operator argument", || {
-                [
-                    DebugField::RuleId(rule_id),
-                    DebugField::Variable(variable.name()),
-                    DebugField::Text(&text),
-                ]
-            });
-        }
+            let fields = [
+                DebugField::RuleId(rule_id),
+                DebugField::Variable(variable.name()),
+                DebugField::Text(&text),
+            ];
+            logger.log(
+                DebugLevel::Trace,
+                &DebugEvent {
+                    message: "Evaluating operator argument",
+                    fields: &fields,
+                },
+            );
+        });
     }
 
     /// Record the operator's match verdict without including the inspected value.
     fn log_operator_outcome(tx: &Transaction, rule_id: i32, variable: RuleVariable, outcome: OperatorOutcome) {
-        let message = if outcome == OperatorOutcome::Matched {
-            "Evaluating operator: MATCH"
-        } else {
-            "Evaluating operator: NO MATCH"
+        let message = match outcome {
+            OperatorOutcome::Matched => "Evaluating operator: MATCH",
+            OperatorOutcome::NotMatched => "Evaluating operator: NO MATCH",
+            OperatorOutcome::NotInspected => "Evaluating operator: NOT INSPECTED",
         };
         tx.debug_log(DebugLevel::Debug, message, || {
             [DebugField::RuleId(rule_id), DebugField::Variable(variable.name())]
