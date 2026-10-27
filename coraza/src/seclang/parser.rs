@@ -1504,6 +1504,28 @@ mod tests {
     }
 
     #[test]
+    fn rule_observer_sees_secmarker_after_chain_starter_like_go() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let mut parser = Parser::new();
+        parser.on_rule(move |metadata| {
+            observed
+                .lock()
+                .unwrap()
+                .push((metadata.id(), metadata.sec_mark.clone()));
+        });
+
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                 SecMarker END",
+            )
+            .unwrap();
+
+        assert_eq!(*observations.lock().unwrap(), [(1, None), (0, Some("END".to_owned()))]);
+    }
+
+    #[test]
     fn rule_observer_sees_included_rules_in_source_order() {
         let dir = tempfile::tempdir().unwrap();
         let included_file = dir.path().join("included.conf");
