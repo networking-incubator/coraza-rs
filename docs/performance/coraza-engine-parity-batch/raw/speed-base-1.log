@@ -1,0 +1,21 @@
+   Compiling libperfusion v0.1.0 (/tmp/opencode/parity/l4-base/libperfusion)
+   Compiling memchr v2.8.3
+    Finished `bench` profile [optimized] target(s) in 3.20s
+     Running benches/speed.rs (/tmp/opencode/parity/l4-target-base/release/deps/speed-6d4c9a26f0efba59)
+libinjection built with `cc -O3`, time per input in nanoseconds
+
+workload                      inputs avg bytes sample        order  libinjection      port port / C
+sqli: upstream's speed test        8        28      1      C first         325.1     164.0    0.50x
+sqli: upstream's speed test        8        28      2   port first         325.2     163.9    0.50x
+sqli: attack samples           85802       141      1      C first         800.2     430.5    0.54x
+sqli: attack samples           85802       141      2   port first         850.2     431.0    0.51x
+sqli: benign samples             423        34      1      C first         491.6     264.0    0.54x
+sqli: benign samples             423        34      2   port first         460.4     258.2    0.56x
+xss: upstream's speed test        26        30      1      C first         172.0      57.7    0.34x
+xss: upstream's speed test        26        30      2   port first         171.3      56.4    0.33x
+xss: attack samples            81417        74      1      C first         119.8      33.5    0.28x
+xss: attack samples            81417        74      2   port first         119.2      33.5    0.28x
+xss: sqli attack samples       85802       141      1      C first        1154.1     433.2    0.38x
+xss: sqli attack samples       85802       141      2   port first        1247.1     429.4    0.34x
+xss: benign samples              423        34      1      C first         312.9     121.6    0.39x
+xss: benign samples              423        34      2   port first         277.7     120.8    0.44x

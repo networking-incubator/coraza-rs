@@ -1,0 +1,21 @@
+   Compiling libperfusion v0.1.0 (/home/rpchevuz/codes/work/waf/coraza-rs-wt-parity-batch/libperfusion)
+   Compiling memchr v2.8.3
+    Finished `bench` profile [optimized] target(s) in 3.73s
+     Running benches/speed.rs (/tmp/opencode/parity/l4-target-cand/release/deps/speed-6d4c9a26f0efba59)
+libinjection built with `cc -O3`, time per input in nanoseconds
+
+workload                      inputs avg bytes sample        order  libinjection      port port / C
+sqli: upstream's speed test        8        28      1      C first         338.5     172.6    0.51x
+sqli: upstream's speed test        8        28      2   port first         345.2     173.2    0.50x
+sqli: attack samples           85802       141      1      C first         814.1     478.9    0.59x
+sqli: attack samples           85802       141      2   port first         836.7     453.7    0.54x
+sqli: benign samples             423        34      1      C first         470.3     260.6    0.55x
+sqli: benign samples             423        34      2   port first         483.4     263.8    0.55x
+xss: upstream's speed test        26        30      1      C first         181.5      57.0    0.31x
+xss: upstream's speed test        26        30      2   port first         180.6      68.2    0.38x
+xss: attack samples            81417        74      1      C first         123.4      33.9    0.27x
+xss: attack samples            81417        74      2   port first         129.6      34.4    0.27x
+xss: sqli attack samples       85802       141      1      C first        1216.1     418.1    0.34x
+xss: sqli attack samples       85802       141      2   port first        1259.1     474.7    0.38x
+xss: benign samples              423        34      1      C first         296.6     119.4    0.40x
+xss: benign samples              423        34      2   port first         289.1     118.8    0.41x

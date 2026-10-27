@@ -1,0 +1,27 @@
+    Finished `bench` profile [optimized] target(s) in 0.02s
+     Running benches/compare.rs (/tmp/opencode/parity/l4-target-base/release/deps/compare-eb8dccc4ae20c6b7)
+Using all 498 repository corpus inputs.
+SQLi hit   sample= 1/5 order=capped-first | capped    160.3 ns/input | caller-bounded    159.1 ns/input
+SQLi hit   sample= 2/5 order=caller-bounded-first | capped    158.0 ns/input | caller-bounded    158.6 ns/input
+SQLi hit   sample= 3/5 order=capped-first | capped    157.8 ns/input | caller-bounded    158.9 ns/input
+SQLi hit   sample= 4/5 order=caller-bounded-first | capped    158.1 ns/input | caller-bounded    160.5 ns/input
+SQLi hit   sample= 5/5 order=capped-first | capped    158.6 ns/input | caller-bounded    159.1 ns/input
+SQLi hit      98 inputs | capped    158.1 ns/input | caller-bounded    159.1 ns/input
+SQLi miss  sample= 1/5 order=capped-first | capped    151.0 ns/input | caller-bounded    151.1 ns/input
+SQLi miss  sample= 2/5 order=caller-bounded-first | capped    152.7 ns/input | caller-bounded    154.0 ns/input
+SQLi miss  sample= 3/5 order=capped-first | capped    151.1 ns/input | caller-bounded    151.5 ns/input
+SQLi miss  sample= 4/5 order=caller-bounded-first | capped    197.1 ns/input | caller-bounded    220.0 ns/input
+SQLi miss  sample= 5/5 order=capped-first | capped    196.3 ns/input | caller-bounded    197.8 ns/input
+SQLi miss    400 inputs | capped    152.7 ns/input | caller-bounded    154.0 ns/input
+XSS hit    sample= 1/5 order=capped-first | capped     41.2 ns/input | caller-bounded     41.0 ns/input
+XSS hit    sample= 2/5 order=caller-bounded-first | capped     38.9 ns/input | caller-bounded     38.6 ns/input
+XSS hit    sample= 3/5 order=capped-first | capped     38.5 ns/input | caller-bounded     41.1 ns/input
+XSS hit    sample= 4/5 order=caller-bounded-first | capped     41.6 ns/input | caller-bounded     42.0 ns/input
+XSS hit    sample= 5/5 order=capped-first | capped     41.9 ns/input | caller-bounded     42.9 ns/input
+XSS hit       17 inputs | capped     41.2 ns/input | caller-bounded     41.1 ns/input
+XSS miss   sample= 1/5 order=capped-first | capped    118.9 ns/input | caller-bounded    133.4 ns/input
+XSS miss   sample= 2/5 order=caller-bounded-first | capped    114.6 ns/input | caller-bounded    119.3 ns/input
+XSS miss   sample= 3/5 order=capped-first | capped    110.8 ns/input | caller-bounded    108.4 ns/input
+XSS miss   sample= 4/5 order=caller-bounded-first | capped    115.7 ns/input | caller-bounded    110.6 ns/input
+XSS miss   sample= 5/5 order=capped-first | capped    116.5 ns/input | caller-bounded    124.2 ns/input
+XSS miss     481 inputs | capped    115.7 ns/input | caller-bounded    119.3 ns/input
