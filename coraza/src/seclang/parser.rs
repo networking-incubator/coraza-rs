@@ -275,6 +275,11 @@ impl Parser {
     /// A custom name takes precedence over a built-in writer of the same name. The
     /// factory is resolved while compiling this parser and called only by
     /// [`Waf::activate`] or the first audit write, never while parsing.
+    /// Register it before [`Parser::from_string`] parses a `SecAuditLogType` that selects
+    /// it: selection is resolved while parsing. If parsing failed for an unknown name,
+    /// register the writer and re-parse those directives. Parser registrations are not
+    /// part of [`WafConfig`] equality, so equal configurations can use different custom
+    /// implementations.
     pub fn register_audit_log_writer(&mut self, name: &str, factory: AuditLogWriterFactory) {
         self.audit_log_registry.register_writer(name, factory);
     }
@@ -283,7 +288,10 @@ impl Parser {
     ///
     /// A custom name takes precedence over a built-in formatter of the same name. The
     /// selected formatter is frozen into the WAF at [`Parser::compile`]; registrations on
-    /// another parser cannot change it.
+    /// another parser cannot change it. Register it before [`Parser::from_string`] parses
+    /// a `SecAuditLogFormat` that selects it: selection is resolved while parsing. If
+    /// parsing failed for an unknown name, register the formatter and re-parse those
+    /// directives.
     pub fn register_audit_log_formatter(&mut self, name: &str, formatter: std::sync::Arc<dyn AuditLogFormatter>) {
         self.audit_log_registry.register_formatter(name, formatter);
     }

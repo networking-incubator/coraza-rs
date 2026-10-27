@@ -71,6 +71,26 @@ mod tests {
         }
     }
 
+    struct ArgsAuditFormatter;
+
+    impl AuditLogFormatter for ArgsAuditFormatter {
+        fn format(&self, entry: &AuditLog) -> Vec<u8> {
+            entry
+                .transaction
+                .request
+                .args
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("&")
+                .into_bytes()
+        }
+
+        fn mime(&self) -> &'static str {
+            "text/plain"
+        }
+    }
+
     struct FailedAuditWriter;
 
     impl AuditLogWriter for FailedAuditWriter {
@@ -132,6 +152,26 @@ mod tests {
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0], (id.to_owned(), expected));
         }
+    }
+
+    #[test]
+    fn custom_formatter_can_read_args_outside_selected_audit_parts() {
+        let entries = CapturedEntries::default();
+        let mut parser = Parser::new();
+        parser.register_audit_log_writer("capture", capture_factory(Arc::clone(&entries)));
+        parser.register_audit_log_formatter("args", Arc::new(ArgsAuditFormatter));
+        parser
+            .from_string(
+                "SecAuditEngine On\nSecAuditLogType capture\nSecAuditLogFormat args\nSecAuditLogParts AZ\nSecAuditLog target",
+            )
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        let mut transaction = waf.new_transaction_with_id("parts-are-not-a-boundary");
+        transaction.process_uri("/?secret=visible", "GET", "HTTP/1.1");
+        transaction.finish().unwrap();
+
+        assert_eq!(entries.lock().unwrap()[0].1, b"secret=visible");
     }
 
     #[test]

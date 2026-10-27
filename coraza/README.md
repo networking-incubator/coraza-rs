@@ -74,11 +74,25 @@ absolute epoch values.
 Embedders can register parser-scoped `AuditLogFormatter` and `AuditLogWriter`
 implementations with `Parser::register_audit_log_formatter` and
 `Parser::register_audit_log_writer`. Names are case-insensitive, and a custom
-registration wins over a built-in name. The writer factory receives the
-resolved `WafConfig` and is called only on `Waf::activate` or the first audit
-write; it must not open a file or socket before then. Writers receive both the
-`AuditLog` and its already-formatted bytes. This crate supplies no custom writer
-for WASI; an embedder must provide one that avoids filesystem and socket calls.
+registration wins over a built-in name. Register each name **before** calling
+`Parser::from_string` on directives that select it: `SecAuditLogType` and
+`SecAuditLogFormat` are resolved during parsing. If parsing fails because a name
+is unknown, register it and re-parse the selecting directives; later registration
+does not revise a failed or already-parsed selection. These registrations are
+parser state, not `WafConfig` fields: `WafConfig` equality compares configuration
+only, so two WAFs with equal configs can use different custom implementations.
+
+**Security:** `SecAuditLogParts` controls what built-in formatters serialize; it
+is **not a confidentiality boundary** for custom formatters or writers. Custom
+code receives the full `AuditLog` entry, including `ARGS` even when those parts
+are not selected. The host is trusted code and must redact sensitive data itself.
+The writer factory receives the resolved `WafConfig` and is called only on
+`Waf::activate` or the first audit write; it must not open a file or socket
+before then. Writers receive both the `AuditLog` and its already-formatted bytes.
+The engine drops a writer with its audit logger and does not call fallible
+teardown; a host that needs fallible teardown must own the sink outside the
+`AuditLogWriter` trait. This crate supplies no custom writer for WASI; an embedder
+must provide one that avoids filesystem and socket calls.
 
 `SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
 WAF is built with that writer rejected, never silently replaced by another one.
@@ -131,10 +145,11 @@ no deadline is configured: a blackholed syslog peer would otherwise park that
 thread for the kernel's SYN timeout, about two minutes. This is a deliberate
 safety deviation from Go Coraza, whose dial is unbounded.
 
-The audit parts control which headers, bodies, files, and rule details are
-retained and written. Body capture is bounded by the configured request and
-response body limits. Review the selected parts and storage permissions before
-enabling audit logging for sensitive traffic.
+The audit parts control which sections built-in formatters serialize. They do
+not filter fields visible to custom formatters or writers (see the security note
+above). Body capture is bounded by the configured request and response body
+limits. Review the selected parts and storage permissions before enabling audit
+logging for sensitive traffic.
 
 ## Operators
 
@@ -216,6 +231,10 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 - `WafConfig` has new `audit_log_connect_timeout` and `audit_log_write_timeout`
   fields; both default to `None`, and an unset connect deadline is bounded for
   internal activation and unbounded for `Waf::activate`.
+- `WafConfig` has new public `audit_log_custom_type` and
+  `audit_log_custom_format` fields (hidden from generated docs). This pre-1.0 API
+  addition breaks exhaustive struct literals and patterns; literals now need
+  `..Default::default()` and patterns need `..` to remain forward compatible.
 - `Operator` now requires `Send + Sync`.
 - `OperatorContext` has a new `custom` field for registered operators, and
   `OperatorEnum` has a new `Custom(Registered)` variant.
