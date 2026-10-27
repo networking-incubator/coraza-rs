@@ -180,6 +180,16 @@ above). Body capture is bounded by the configured request and response body
 limits. Review the selected parts and storage permissions before enabling audit
 logging for sensitive traffic.
 
+## Custom transformations
+
+Implement `coraza::transformations::CustomTransformation` and register it with
+`Parser::register_transformation`. Names are case-insensitive; a custom
+registration overrides a built-in and a later registration replaces an earlier
+one. Each `t:` action resolves when its rule is compiled, so later registrations
+do not change existing rules or compiled WAFs. Implementations receive
+untrusted input bytes. If a transformation returns an error, its output is
+discarded, the previous value is kept, and the chain continues.
+
 ## Operators
 
 The default build compiles the built-in operators. Three upstream operators

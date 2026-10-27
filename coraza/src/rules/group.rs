@@ -207,7 +207,7 @@ impl RuleGroup {
 mod tests {
     use super::RuleGroup;
     use crate::{
-        actions::compile_action,
+        actions::{ActionCompileContext, compile_action},
         rules::{Rule, VariableSpec},
         types::{RulePhase, RuleVariable},
     };
@@ -215,10 +215,10 @@ mod tests {
     fn rule(id: &str, action: &str) -> Rule {
         let mut rule = Rule::new();
         if !id.is_empty() {
-            compile_action("id", id, rule.metadata_mut()).unwrap();
+            compile_action("id", id, rule.metadata_mut(), ActionCompileContext::default()).unwrap();
         }
         if !action.is_empty() {
-            compile_action(action, "", rule.metadata_mut()).unwrap();
+            compile_action(action, "", rule.metadata_mut(), ActionCompileContext::default()).unwrap();
         }
         rule
     }

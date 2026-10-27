@@ -34,7 +34,28 @@
 //! - **Simple Mode**: Apply transformations in sequence, returning the final value
 //! - **Multi-Match Mode**: Collect all intermediate transformed values for matching
 
-use crate::transformations::{Transformation, TransformationError};
+use std::sync::Arc;
+
+use crate::transformations::{CustomTransformation, Transformation, TransformationError};
+
+/// Built-in function pointers stay direct; dynamic dispatch is limited to custom entries.
+#[derive(Clone)]
+pub(crate) enum TransformationFunction {
+    /// A built-in function pointer, with no dynamic dispatch.
+    Builtin(Transformation),
+    /// An embedder-supplied transformation.
+    Custom(Arc<dyn CustomTransformation>),
+}
+
+impl TransformationFunction {
+    /// Apply the selected implementation to one value.
+    fn apply(&self, input: &[u8]) -> crate::transformations::TransformationResult {
+        match self {
+            Self::Builtin(function) => function(input),
+            Self::Custom(transformation) => transformation.transform(input),
+        }
+    }
+}
 
 /// A transformation in the chain with its name for identification.
 #[derive(Clone)]
@@ -42,7 +63,7 @@ struct NamedTransformation {
     /// Name used by SecLang and log output.
     name: String,
     /// Function that performs the transformation.
-    function: Transformation,
+    function: TransformationFunction,
 }
 
 /// The transformation's name, as `t:` gives it, rather than a function address.
@@ -93,7 +114,32 @@ impl TransformationChain {
             return Err("transformation name cannot be empty".to_owned());
         }
 
-        self.transformations.push(NamedTransformation { name, function });
+        self.transformations.push(NamedTransformation {
+            name,
+            function: TransformationFunction::Builtin(function),
+        });
+        Ok(())
+    }
+
+    /// Add a custom transformation to the chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `name` is empty.
+    pub fn add_custom(
+        &mut self,
+        name: impl Into<String>,
+        transformation: Arc<dyn CustomTransformation>,
+    ) -> Result<(), String> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err("transformation name cannot be empty".to_owned());
+        }
+
+        self.transformations.push(NamedTransformation {
+            name,
+            function: TransformationFunction::Custom(transformation),
+        });
         Ok(())
     }
 
@@ -143,7 +189,7 @@ impl TransformationChain {
         let mut errors = Vec::new();
 
         for t in &self.transformations {
-            let (transformed, _changed, err) = (t.function)(&value);
+            let (transformed, _changed, err) = t.function.apply(&value);
             if let Some(e) = err {
                 errors.push(e);
                 continue;
@@ -181,7 +227,7 @@ impl TransformationChain {
         let mut value = input.to_vec();
 
         for t in &self.transformations {
-            let (transformed, changed, err) = (t.function)(&value);
+            let (transformed, changed, err) = t.function.apply(&value);
             if let Some(e) = err {
                 errors.push(e);
                 continue;
@@ -206,8 +252,12 @@ impl Default for TransformationChain {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::transformations::{TransformationResult, hex_encode, lowercase, sha1_hash, uppercase, url_decode};
+    use crate::transformations::{
+        CustomTransformation, TransformationResult, hex_encode, lowercase, sha1_hash, uppercase, url_decode,
+    };
 
     // Helper transformations for testing
     fn append_a(input: &[u8]) -> TransformationResult {
@@ -224,6 +274,18 @@ mod tests {
 
     fn error_b(_input: &[u8]) -> TransformationResult {
         (Vec::new(), false, Some(TransformationError::new("errorB")))
+    }
+
+    struct ErrorWithOutput;
+
+    impl CustomTransformation for ErrorWithOutput {
+        fn transform(&self, _input: &[u8]) -> TransformationResult {
+            (
+                b"discarded".to_vec(),
+                true,
+                Some(TransformationError::new("custom error")),
+            )
+        }
     }
 
     fn add(chain: &mut TransformationChain, name: &str, function: fn(&[u8]) -> TransformationResult) {
@@ -293,6 +355,27 @@ mod tests {
         assert_eq!(
             errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
             ["errorA", "errorB"]
+        );
+    }
+
+    #[test]
+    fn custom_transform_error_keeps_previous_value_in_both_modes() {
+        let mut chain = TransformationChain::new();
+        assert!(chain.add_custom("custom", Arc::new(ErrorWithOutput)).is_ok());
+        add(&mut chain, "AppendA", append_a);
+
+        let (result, errors) = chain.apply(b"input");
+        assert_eq!(result, b"inputA");
+        assert_eq!(
+            errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
+            ["custom error"]
+        );
+
+        let (values, errors) = chain.apply_multimatch(b"input");
+        assert_eq!(values, [b"input".to_vec(), b"inputA".to_vec()]);
+        assert_eq!(
+            errors.iter().map(TransformationError::message).collect::<Vec<_>>(),
+            ["custom error"]
         );
     }
 
