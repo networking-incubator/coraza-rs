@@ -20,7 +20,9 @@
 
 //! Byte-oriented encoding transformations.
 
+#[cfg(all(not(feature = "fips"), feature = "hash-transformations"))]
 use md5::{Digest as _, Md5};
+#[cfg(all(not(feature = "fips"), feature = "hash-transformations"))]
 use sha1::Sha1;
 
 use crate::{
@@ -147,14 +149,60 @@ pub fn base64_encode(input: &[u8]) -> TransformationResult {
     (transformed, true, None)
 }
 
-/// Computes the MD5 digest as raw bytes. Follow it with `hex_encode` for hex output.
+/// Hashes input to raw MD5 bytes, or returns it unchanged in the FIPS profile.
 pub fn md5_hash(input: &[u8]) -> TransformationResult {
-    (Md5::digest(input).to_vec(), true, None)
+    #[cfg(feature = "fips")]
+    {
+        (
+            input.to_vec(),
+            false,
+            Some(TransformationError::new(
+                "md5 transformation is unavailable in FIPS 140-3 mode",
+            )),
+        )
+    }
+    #[cfg(all(not(feature = "fips"), feature = "hash-transformations"))]
+    {
+        (Md5::digest(input).to_vec(), true, None)
+    }
+    #[cfg(not(any(feature = "fips", feature = "hash-transformations")))]
+    {
+        (
+            input.to_vec(),
+            false,
+            Some(TransformationError::new(
+                "md5 transformation requires the hash-transformations feature",
+            )),
+        )
+    }
 }
 
-/// Computes the SHA1 digest as raw bytes. Follow it with `hex_encode` for hex output.
+/// Hashes input to raw SHA-1 bytes, or returns it unchanged in the FIPS profile.
 pub fn sha1_hash(input: &[u8]) -> TransformationResult {
-    (Sha1::digest(input).to_vec(), true, None)
+    #[cfg(feature = "fips")]
+    {
+        (
+            input.to_vec(),
+            false,
+            Some(TransformationError::new(
+                "sha1 transformation is unavailable in FIPS 140-3 mode",
+            )),
+        )
+    }
+    #[cfg(all(not(feature = "fips"), feature = "hash-transformations"))]
+    {
+        (Sha1::digest(input).to_vec(), true, None)
+    }
+    #[cfg(not(any(feature = "fips", feature = "hash-transformations")))]
+    {
+        (
+            input.to_vec(),
+            false,
+            Some(TransformationError::new(
+                "sha1 transformation requires the hash-transformations feature",
+            )),
+        )
+    }
 }
 
 /// Decodes Base64 up to the first invalid byte. CR and LF are ignored.
@@ -256,6 +304,8 @@ fn base64_digit(value: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "fips", not(feature = "hash-transformations")))]
+    use super::TransformationError;
     use super::{
         base64_decode, base64_decode_ext, base64_encode, hex_decode, hex_encode, length, md5_hash, none, remove_nulls,
         replace_nulls, sha1_hash, url_encode,
@@ -311,6 +361,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "hash-transformations")]
+    #[cfg(not(feature = "fips"))]
     fn hashes_return_raw_binary_digests() {
         assert_eq!(hex_encode(&md5_hash(b"hello").0).0, b"5d41402abc4b2a76b9719d911017c592");
         assert_eq!(
@@ -324,6 +376,44 @@ mod tests {
         );
         assert!(md5_hash(b"hello").1);
         assert!(sha1_hash(b"hello").1);
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn hashes_are_unavailable_in_fips_profile() {
+        fn assert_unavailable(
+            transform: fn(&[u8]) -> crate::transformations::TransformationResult,
+            expected_message: &str,
+        ) {
+            for input in [&b""[..], b"hello", b"\x00\xff"] {
+                let (output, changed, error) = transform(input);
+                assert_eq!(output.as_slice(), input);
+                assert!(!changed);
+                assert_eq!(error.as_ref().map(TransformationError::message), Some(expected_message));
+            }
+        }
+
+        assert_unavailable(md5_hash, "md5 transformation is unavailable in FIPS 140-3 mode");
+        assert_unavailable(sha1_hash, "sha1 transformation is unavailable in FIPS 140-3 mode");
+    }
+
+    #[cfg(not(any(feature = "fips", feature = "hash-transformations")))]
+    #[test]
+    fn hashes_are_unavailable_when_hash_feature_is_disabled() {
+        type TransformationFn = fn(&[u8]) -> crate::transformations::TransformationResult;
+        let transformations: [(TransformationFn, &str); 2] = [
+            (md5_hash, "md5 transformation requires the hash-transformations feature"),
+            (
+                sha1_hash,
+                "sha1 transformation requires the hash-transformations feature",
+            ),
+        ];
+        for (transform, expected_message) in transformations {
+            let (output, changed, error) = transform(b"hello");
+            assert_eq!(output.as_slice(), b"hello");
+            assert!(!changed);
+            assert_eq!(error.as_ref().map(TransformationError::message), Some(expected_message));
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! transaction. Each stage mirrors the Go runner's lifecycle (`testing/engine.go`) and
 //! compares matched rule IDs, the interruption, and the error-log text.
 
+#![cfg(all(feature = "hash-transformations", not(feature = "fips")))]
 #![expect(clippy::tests_outside_test_module, reason = "integration test binary")]
 #![expect(
     clippy::expect_used,

@@ -190,6 +190,8 @@ impl Rule {
         let mut matched_values = Vec::new();
         for variable in &self.variables {
             for value in tx.find_matches_for_rule(variable, id) {
+                // shortcut: transformation errors are dropped here; L2a's debug logger is
+                // the upgrade point (Go internal/corazawaf/rule.go:272-279 warn path).
                 let candidates = if self.metadata.multi_match {
                     self.metadata.transformations.apply_multimatch(&value.value).0
                 } else {
