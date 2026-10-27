@@ -388,6 +388,7 @@ mod tests {
             ..WafConfig::default()
         };
 
+        // Equal config values do not imply equal parser-scoped audit implementations.
         assert_eq!(config.clone(), config);
         assert_ne!(config, WafConfig::default());
     }

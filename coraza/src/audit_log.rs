@@ -71,9 +71,9 @@ const ACTIVATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A transaction's audit log entry.
 #[derive(Debug, Clone, Default)]
 pub struct AuditLog {
-    /// The parts the entry holds, in the order they are written
+    /// The configured parts, in the order built-in formatters write them.
     pub parts: AuditLogParts,
-    /// The transaction, as far as `parts` include it
+    /// The transaction fields captured for this entry; custom code can see fields beyond `parts`.
     pub transaction: AuditTransaction,
     /// What the rules with `auditlog` that matched have to say: one per value they
     /// matched with part `K`, or one per rule with only part `H`
@@ -81,6 +81,11 @@ pub struct AuditLog {
 }
 
 /// Formats an audit entry for an embedder-provided audit sink.
+///
+/// **Security:** `SecAuditLogParts` is not a confidentiality boundary for custom
+/// formatters or writers. They receive the full [`AuditLog`] entry, including fields
+/// such as `ARGS` even when those parts are not selected. The host is trusted code and
+/// must redact sensitive data itself.
 pub trait AuditLogFormatter: Send + Sync {
     /// Return the serialized entry.
     fn format(&self, entry: &AuditLog) -> Vec<u8>;
@@ -90,6 +95,10 @@ pub trait AuditLogFormatter: Send + Sync {
 }
 
 /// Writes an audit entry produced by [`AuditLogFormatter`].
+///
+/// The engine drops this writer when its audit logger is dropped; it does not call a
+/// teardown method. A host that needs fallible teardown must own the sink outside this
+/// trait.
 pub trait AuditLogWriter: Send + Sync {
     /// Write `formatted`, while retaining access to the source entry's metadata.
     ///
@@ -97,15 +106,6 @@ pub trait AuditLogWriter: Send + Sync {
     ///
     /// Return the sink's I/O failure so `Transaction::finish` can report it.
     fn write(&self, entry: &AuditLog, formatted: &[u8]) -> io::Result<()>;
-
-    /// Release resources owned by this writer.
-    ///
-    /// # Errors
-    ///
-    /// Return a resource-release failure to the caller.
-    fn close(&self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Builds a custom writer when the WAF activates its audit sink.
@@ -987,6 +987,24 @@ const fn audit_log_mime(format: AuditLogFormat) -> &'static str {
     }
 }
 
+/// One formatted audit entry, retaining whether built-in output is already UTF-8.
+enum FormattedAudit {
+    /// Built-in formatters produce a `String`.
+    Text(String),
+    /// Custom formatters may produce arbitrary bytes.
+    Bytes(Vec<u8>),
+}
+
+impl FormattedAudit {
+    /// The serialized bytes shared with every writer.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
 /// The selected formatter; built-ins retain their allocation-compatible path.
 #[derive(Clone)]
 enum SelectedFormatter {
@@ -1007,10 +1025,10 @@ impl fmt::Debug for SelectedFormatter {
 
 impl SelectedFormatter {
     /// Format one entry, reusing the built-in String allocation as its byte buffer.
-    fn format(&self, entry: &AuditLog) -> Vec<u8> {
+    fn format(&self, entry: &AuditLog) -> FormattedAudit {
         match self {
-            Self::Builtin(format) => entry.format(*format).into_bytes(),
-            Self::Custom(formatter) => formatter.format(entry),
+            Self::Builtin(format) => FormattedAudit::Text(entry.format(*format)),
+            Self::Custom(formatter) => FormattedAudit::Bytes(formatter.format(entry)),
         }
     }
 
@@ -1274,18 +1292,22 @@ impl fmt::Debug for Writer {
 
 impl Writer {
     /// Write one formatted entry to this writer.
-    fn write(&self, formatted: &[u8], entry: &AuditLog) -> io::Result<()> {
+    fn write(&self, formatted: &FormattedAudit, entry: &AuditLog) -> io::Result<()> {
+        let bytes = formatted.as_bytes();
         match self {
             Self::Discard => Ok(()),
             #[cfg(feature = "https-audit")]
-            Self::Https(https) => https.write(formatted),
-            Self::Syslog(syslog) => syslog
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .send(formatted, entry.transaction.is_interrupted),
+            Self::Https(https) => https.write(bytes),
+            Self::Syslog(syslog) => {
+                let mut syslog = syslog.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                match formatted {
+                    FormattedAudit::Text(text) => syslog.send_text(text, entry.transaction.is_interrupted),
+                    FormattedAudit::Bytes(bytes) => syslog.send(bytes, entry.transaction.is_interrupted),
+                }
+            },
             Self::Serial(output) => {
                 let mut output = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                output.write_all(formatted)?;
+                output.write_all(bytes)?;
                 output.write_all(b"\n")?;
                 output.flush()
             },
@@ -1308,7 +1330,7 @@ impl Writer {
                     at.second,
                     std::process::id()
                 ));
-                write_new(&path, formatted, *file_mode)?;
+                write_new(&path, bytes, *file_mode)?;
 
                 // The index lines, as Go Coraza's logger writes them
                 let mut index = index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1338,7 +1360,7 @@ impl Writer {
                 )?;
                 index.flush()
             },
-            Self::Custom(writer) => writer.write(entry, formatted),
+            Self::Custom(writer) => writer.write(entry, bytes),
         }
     }
 }
@@ -1671,7 +1693,7 @@ impl AuditLogger {
     /// If the writer cannot be activated or writing fails.
     pub(crate) fn write(&self, entry: &AuditLog) -> io::Result<()> {
         let formatted = self.formatter.format(entry);
-        if formatted.is_empty() {
+        if formatted.as_bytes().is_empty() {
             return Ok(());
         }
         self.ensure_activated()?;
@@ -1863,24 +1885,17 @@ impl Syslog {
     /// Sends `message` at severity `err` if `error`, `info` otherwise, framed as Go's
     /// `log/syslog` does.
     fn send(&mut self, message: &[u8], error: bool) -> io::Result<()> {
-        // local0 (16) times 8, plus the severity
+        if let Ok(message) = std::str::from_utf8(message) {
+            return self.send_text(message, error);
+        }
+
+        // Custom formatters may emit arbitrary bytes; preserve those without lossy UTF-8 conversion.
         let priority = 16 * 8 + if error { 3 } else { 6 };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
         let at = LocalTime::from_unix(now);
         let tag = format!("com.coraza.waf[{}]", std::process::id());
-        if let Ok(message) = std::str::from_utf8(message) {
-            let newline = if message.ends_with('\n') { "" } else { "\n" };
-            let framed = if self.local {
-                format!("<{priority}>{} {tag}: {message}{newline}", at.syslog_stamp())
-            } else {
-                format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
-            };
-            return self.send_frame(framed.as_bytes());
-        }
-
-        // Custom formatters may emit arbitrary bytes; preserve those without lossy UTF-8 conversion.
         let prefix = if self.local {
             format!("<{priority}>{} {tag}: ", at.syslog_stamp())
         } else {
@@ -1893,6 +1908,24 @@ impl Syslog {
             framed.push(b'\n');
         }
         self.send_frame(&framed)
+    }
+
+    /// Sends a built-in formatter's already-UTF-8 output without validating its bytes again.
+    fn send_text(&mut self, message: &str, error: bool) -> io::Result<()> {
+        // local0 (16) times 8, plus the severity
+        let priority = 16 * 8 + if error { 3 } else { 6 };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+        let at = LocalTime::from_unix(now);
+        let tag = format!("com.coraza.waf[{}]", std::process::id());
+        let newline = if message.ends_with('\n') { "" } else { "\n" };
+        let framed = if self.local {
+            format!("<{priority}>{} {tag}: {message}{newline}", at.syslog_stamp())
+        } else {
+            format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
+        };
+        self.send_frame(framed.as_bytes())
     }
 
     /// Send one framed message, reconnecting once when the original socket fails.
@@ -2440,8 +2473,8 @@ fn index_field(value: &str) -> String {
 mod tests {
     use super::{
         ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditLog, AuditLogger,
-        AuditTransaction, Syslog, connect_deadline, connect_tcp, index_field, next_backoff, safe_file_component,
-        write_new,
+        AuditTransaction, Syslog, SyslogSocket, connect_deadline, connect_tcp, index_field, next_backoff,
+        safe_file_component, write_new,
     };
     use crate::{
         actions::RuleMetadata,
@@ -2823,6 +2856,41 @@ mod tests {
 
         let message = server.join().unwrap().unwrap();
         assert!(message.ends_with(b"reconnected\n"));
+    }
+
+    #[test]
+    fn syslog_builtin_text_keeps_framing_and_custom_bytes_are_preserved() {
+        use std::{net::UdpSocket, time::Duration};
+
+        fn payload(frame: &[u8]) -> &[u8] {
+            let delimiter = frame.windows(2).position(|window| window == b": ").unwrap();
+            frame.get(delimiter + 2..).unwrap_or_default()
+        }
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.connect(receiver.local_addr().unwrap()).unwrap();
+        let mut syslog = Syslog {
+            socket: SyslogSocket::Udp(sender),
+            target: "udp://127.0.0.1:0".to_owned(),
+            local: false,
+            connect_timeout: None,
+            write_timeout: None,
+        };
+        let mut received = [0; 512];
+
+        syslog.send_text("formatted π\n", false).unwrap();
+        let text_len = receiver.recv(&mut received).unwrap();
+        let text_frame = received.get(..text_len).unwrap_or_default().to_vec();
+        syslog.send("formatted π\n".as_bytes(), false).unwrap();
+        let bytes_len = receiver.recv(&mut received).unwrap();
+        let bytes_frame = received.get(..bytes_len).unwrap_or_default();
+        assert_eq!(payload(&text_frame), payload(bytes_frame));
+
+        syslog.send(b"raw\xff\n", false).unwrap();
+        let raw_len = receiver.recv(&mut received).unwrap();
+        assert_eq!(payload(received.get(..raw_len).unwrap_or_default()), b"raw\xff\n");
     }
 
     #[test]
