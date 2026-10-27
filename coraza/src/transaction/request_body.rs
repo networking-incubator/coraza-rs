@@ -360,9 +360,13 @@ pub(super) fn process_custom_body_processor(
     } else {
         PathBuf::from(&tx.config.upload_dir)
     };
+    // Both directions pass the raw `Content-Type` header, parameters included, so a
+    // custom processor sees the same shape the built-in processors and Go receive
+    // (`internal/corazawaf/transaction.go:1132-1135`). `RESPONSE_CONTENT_TYPE` is a
+    // different variable: it keeps the value before the first `;`.
     let mime = match direction {
         BodyDirection::Request => tx.request_headers.first("content-type").unwrap_or_default(),
-        BodyDirection::Response => tx.response_content_type.get_bytes(),
+        BodyDirection::Response => tx.response_headers.values("content-type").last().unwrap_or_default(),
     };
     let current_argument_count = match direction {
         BodyDirection::Request => tx.args_post.value_count(),
