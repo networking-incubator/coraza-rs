@@ -27,8 +27,9 @@ profiles and commits; it is copied into the manifest.
 
 `state` describes the capability's semantics; it does not describe whether the
 default build includes it. `requires_features` lists the Cargo features a build
-must enable, and an empty list means the capability is available in the default
-build. The generator checks feature names against `coraza/Cargo.toml` and checks
+must enable. An empty list means no feature is required: for an entry whose
+`state` is not `unavailable` that also means the default build provides it, and
+for an `unavailable` entry it says nothing about presence. The generator checks feature names against `coraza/Cargo.toml` and checks
 feature-gated names against the explicit source-gate map in
 `xtask/src/conformance.rs`.
 

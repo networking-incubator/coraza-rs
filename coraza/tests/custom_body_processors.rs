@@ -1095,3 +1095,56 @@ fn oversized_selected_response_processor_names_stay_bounded() {
         reported.len()
     );
 }
+
+#[test]
+fn response_processors_receive_the_raw_content_type_header() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut parser = Parser::new();
+    parser.config_mut().response_body_access = true;
+    parser
+        .config_mut()
+        .response_body_mime_types
+        .push("text/plain".to_owned());
+    parser.register_body_processor(
+        "raw-mime",
+        Arc::new({
+            let observed = Arc::clone(&observed);
+            move || Box::new(MimeRecorder(Arc::clone(&observed)))
+        }),
+    );
+    parser
+        .from_string("SecAction \"id:1,phase:3,ctl:responseBodyProcessor=raw-mime,pass\"")
+        .unwrap();
+
+    let mut tx = parser.compile().unwrap().new_transaction();
+    tx.add_request_header("Content-Type", "text/plain");
+    tx.process_request_headers();
+    tx.process_request_body(b"");
+    tx.add_response_header("Content-Type", "text/plain; charset=utf-8");
+    // Go keeps the last `Content-Type`, so the parameters of the final header win.
+    tx.add_response_header("Content-Type", "text/plain; boundary=xyz");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.process_response_body(b"response");
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        b"text/plain; boundary=xyz",
+        "a response processor must receive the raw header, not RESPONSE_CONTENT_TYPE"
+    );
+}
+
+/// Records the MIME a custom processor received.
+struct MimeRecorder(Arc<Mutex<Vec<u8>>>);
+
+impl BodyProcessor for MimeRecorder {
+    fn process(
+        &self,
+        _body: &[u8],
+        _direction: BodyDirection,
+        options: &BodyProcessorOptions<'_>,
+        _out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        *self.0.lock().unwrap() = options.mime.to_vec();
+        Ok(())
+    }
+}
