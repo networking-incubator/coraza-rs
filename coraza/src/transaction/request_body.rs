@@ -31,7 +31,7 @@ use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyP
 use crate::{
     body_processors::{
         BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, BodyProcessorFile,
-        BodyProcessorOptions, BodyProcessorOutput, multipart, xml,
+        BodyProcessorOptions, BodyProcessorOutput, multipart, truncate_custom_body_text, xml,
     },
     transformations::url_decode,
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
@@ -120,18 +120,15 @@ impl Transaction {
                     .as_ref()
                     .is_some_and(|processors| processors.request.is_some())
             {
-                // Go reads a body that reached the limit as a partial body instead of a
-                // malformed one (`internal/bodyprocessors/multipart.go`'s
-                // `flagUnexpectedEOF`, and `WriteRequestBody`'s `>=` check). The limit
-                // counters say whether that happened; INBOUND_DATA_ERROR also covers
-                // ingest and replay I/O failures, which do not cut the body.
                 let stats = self.request_body_stats();
-                let truncated =
-                    stats.truncated || stats.supplied >= u64::try_from(self.request_body_limit).unwrap_or(0);
+                let truncated = stats.truncated;
+                // Go's multipart processor treats any >= limit hit as partial, even when
+                // no bytes were discarded. Keep that separate from the custom option.
+                let partial = stats.truncated || stats.supplied >= u64::try_from(self.request_body_limit).unwrap_or(0);
                 let mut buffer = std::mem::take(&mut self.request_body_buffer);
                 let inspected = buffer.contiguous().map(|body| {
                     let length = body.len();
-                    self.inspect_request_body(&body, truncated);
+                    self.inspect_request_body(&body, truncated, partial);
                     length
                 });
                 self.request_body_buffer = buffer;
@@ -153,9 +150,9 @@ impl Transaction {
 
     /// Store and parse the body with the selected processor.
     ///
-    /// `truncated` reports that the body limit discarded supplied bytes, which makes a
-    /// multipart body that ends mid-part a partial body rather than a malformed one.
-    fn inspect_request_body(&mut self, body: &[u8], truncated: bool) {
+    /// `truncated` reports discarded bytes; `partial` preserves multipart's limit-hit
+    /// handling, including an exact `>=` boundary with no discarded bytes.
+    fn inspect_request_body(&mut self, body: &[u8], truncated: bool, partial: bool) {
         if let Some(processor) = selected_custom_body_processor(self, BodyDirection::Request) {
             process_custom_body_processor(self, body, BodyDirection::Request, truncated, processor.as_ref());
             return;
@@ -177,7 +174,7 @@ impl Transaction {
                 }
             },
             BodyProcessor::Multipart => {
-                if let Err(message) = self.process_multipart_body(body, truncated) {
+                if let Err(message) = self.process_multipart_body(body, partial) {
                     self.log_body_processor_error(true, "MULTIPART", &message);
                     self.reqbody_error.set("1");
                     self.reqbody_error_msg.set(format!("MULTIPART: {message}"));
@@ -394,7 +391,10 @@ pub(super) fn process_custom_body_processor(
         request_body_recursion_limit: tx.config.request_body_json_depth_limit,
         response_body_recursion_limit: tx.config.response_body_json_depth_limit,
     };
-    let processor_error = processor.process(body, direction, &options, &mut output).err();
+    let processor_error = processor
+        .process(body, direction, &options, &mut output)
+        .err()
+        .map(|message| truncate_custom_body_text(&message));
     let mut error = if output.byte_limit_reached {
         Some("custom body processor output exceeded byte limit".to_owned())
     } else {
@@ -443,17 +443,18 @@ pub(super) fn process_custom_body_processor(
     }
 
     if let Some(message) = error {
-        record_custom_body_processor_error(tx, direction, message);
+        record_custom_body_processor_error(tx, direction, &message);
     }
 }
 
 /// Set the matching request or response processor error variables.
-fn record_custom_body_processor_error(tx: &mut Transaction, direction: BodyDirection, message: String) {
+fn record_custom_body_processor_error(tx: &mut Transaction, direction: BodyDirection, message: &str) {
     let request = direction == BodyDirection::Request;
     let processor_name = match direction {
-        BodyDirection::Request => tx.reqbody_processor.get().into_owned(),
-        BodyDirection::Response => tx.res_body_processor.get().into_owned(),
+        BodyDirection::Request => truncate_custom_body_text(&tx.reqbody_processor.get()),
+        BodyDirection::Response => truncate_custom_body_text(&tx.res_body_processor.get()),
     };
+    let message = truncate_custom_body_text(message);
     tx.log_body_processor_error(request, &processor_name, &message);
     match direction {
         BodyDirection::Request => {
@@ -2061,7 +2062,7 @@ DATA\r\n\
         tx.process_request_headers();
         tx.inbound_data_error.set("1");
 
-        tx.inspect_request_body(body, false);
+        tx.inspect_request_body(body, false, false);
         assert_eq!(tx.reqbody_error.get(), "1");
         assert_eq!(tx.multipart_strict_error.get(), "1");
 
@@ -2069,7 +2070,7 @@ DATA\r\n\
         let mut tx = waf.new_transaction_with_id("multipart-partial");
         tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
         tx.process_request_headers();
-        tx.inspect_request_body(body, true);
+        tx.inspect_request_body(body, true, true);
         assert_eq!(tx.reqbody_error.get(), "0");
         assert_eq!(tx.multipart_strict_error.get(), "0");
         assert_eq!(tx.args_post.first(b"q"), Some(&b"v"[..]));
