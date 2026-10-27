@@ -30,8 +30,8 @@ use std::{
 use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyProcessor};
 use crate::{
     body_processors::{
-        BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorFile, BodyProcessorOptions,
-        BodyProcessorOutput, multipart, xml,
+        BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, BodyProcessorFile,
+        BodyProcessorOptions, BodyProcessorOutput, multipart, xml,
     },
     transformations::url_decode,
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
@@ -156,14 +156,8 @@ impl Transaction {
     /// `truncated` reports that the body limit discarded supplied bytes, which makes a
     /// multipart body that ends mid-part a partial body rather than a malformed one.
     fn inspect_request_body(&mut self, body: &[u8], truncated: bool) {
-        if let Some(processor) = self
-            .computed
-            .custom_body_processors
-            .as_ref()
-            .and_then(|processors| processors.request.as_ref())
-            .map(std::sync::Arc::clone)
-        {
-            process_custom_body_processor(self, body, BodyDirection::Request, processor.as_ref());
+        if let Some(processor) = selected_custom_body_processor(self, BodyDirection::Request) {
+            process_custom_body_processor(self, body, BodyDirection::Request, truncated, processor.as_ref());
             return;
         }
         let Some(processor) = self.request_body_processor else {
@@ -340,17 +334,16 @@ impl Transaction {
     }
 
     /// Select a parser-resolved custom processor for request bodies.
-    pub(super) fn set_request_custom_body_processor(
-        &mut self,
-        name: &str,
-        processor: std::sync::Arc<dyn CustomBodyProcessor>,
-    ) {
+    pub(super) fn set_request_custom_body_processor(&mut self, name: &str, factory: BodyProcessorFactory) {
         self.request_body_processor = None;
         let processors = self
             .computed
             .custom_body_processors
             .get_or_insert_with(|| Box::new(super::CustomBodyProcessors::default()));
-        processors.request = Some(processor);
+        processors.request = Some(super::CustomBodyProcessorSelection {
+            factory,
+            processor: None,
+        });
         self.reqbody_processor.set(name.to_ascii_uppercase());
     }
 }
@@ -360,6 +353,7 @@ pub(super) fn process_custom_body_processor(
     tx: &mut Transaction,
     body: &[u8],
     direction: BodyDirection,
+    truncated: bool,
     processor: &dyn CustomBodyProcessor,
 ) {
     let upload_dir = if tx.config.upload_dir.is_empty() {
@@ -375,9 +369,14 @@ pub(super) fn process_custom_body_processor(
         BodyDirection::Request => tx.args_post.value_count(),
         BodyDirection::Response => tx.response_args.value_count(),
     };
+    let byte_capacity = match direction {
+        BodyDirection::Request => usize::try_from(tx.request_body_limit).unwrap_or(0),
+        BodyDirection::Response => usize::try_from(tx.response_body_limit).unwrap_or(0),
+    };
     let mut output = BodyProcessorOutput::new(
         tx.config.argument_limit.saturating_sub(current_argument_count),
-        tx.config.upload_file_limit.saturating_sub(tx.files.value_count()),
+        tx.config.upload_file_limit.saturating_sub(tx.uploaded_paths.len()),
+        byte_capacity,
         !cfg!(target_os = "wasi"),
     );
     let options = BodyProcessorOptions {
@@ -387,13 +386,27 @@ pub(super) fn process_custom_body_processor(
         upload_file_mode: tx.config.upload_file_mode,
         upload_keep_files: tx.config.upload_keep_files,
         argument_limit: tx.config.argument_limit,
+        truncated,
+        data_error: match direction {
+            BodyDirection::Request => tx.inbound_data_error.get_bytes() == b"1",
+            BodyDirection::Response => tx.outbound_data_error.get_bytes() == b"1",
+        },
         request_body_recursion_limit: tx.config.request_body_json_depth_limit,
         response_body_recursion_limit: tx.config.response_body_json_depth_limit,
     };
-    let mut error = processor
-        .process(body, direction, &options, &mut output)
-        .err()
-        .or_else(|| output.error.take());
+    let processor_error = processor.process(body, direction, &options, &mut output).err();
+    let mut error = if output.byte_limit_reached {
+        Some("custom body processor output exceeded byte limit".to_owned())
+    } else {
+        processor_error.or_else(|| output.error.take())
+    };
+
+    if output.byte_limit_reached {
+        match direction {
+            BodyDirection::Request => tx.inbound_data_error.set("1"),
+            BodyDirection::Response => tx.outbound_data_error.set("1"),
+        }
+    }
 
     if let Some(name) = output.processor.take() {
         match direction {
@@ -430,27 +443,48 @@ pub(super) fn process_custom_body_processor(
     }
 
     if let Some(message) = error {
-        let request = direction == BodyDirection::Request;
-        let processor_name = match direction {
-            BodyDirection::Request => tx.reqbody_processor.get().into_owned(),
-            BodyDirection::Response => tx.res_body_processor.get().into_owned(),
-        };
-        tx.log_body_processor_error(request, &processor_name, &message);
-        match direction {
-            BodyDirection::Request => {
-                tx.reqbody_error.set("1");
-                tx.reqbody_error_msg.set(format!("{processor_name}: {message}"));
-                tx.reqbody_processor_error.set("1");
-                tx.reqbody_processor_error_msg.set(message);
-            },
-            BodyDirection::Response => {
-                tx.res_body_error.set("1");
-                tx.res_body_error_msg.set(format!("{processor_name}: {message}"));
-                tx.res_body_processor_error.set("1");
-                tx.res_body_processor_error_msg.set(message);
-            },
-        }
+        record_custom_body_processor_error(tx, direction, message);
     }
+}
+
+/// Set the matching request or response processor error variables.
+fn record_custom_body_processor_error(tx: &mut Transaction, direction: BodyDirection, message: String) {
+    let request = direction == BodyDirection::Request;
+    let processor_name = match direction {
+        BodyDirection::Request => tx.reqbody_processor.get().into_owned(),
+        BodyDirection::Response => tx.res_body_processor.get().into_owned(),
+    };
+    tx.log_body_processor_error(request, &processor_name, &message);
+    match direction {
+        BodyDirection::Request => {
+            tx.reqbody_error.set("1");
+            tx.reqbody_error_msg.set(format!("{processor_name}: {message}"));
+            tx.reqbody_processor_error.set("1");
+            tx.reqbody_processor_error_msg.set(message);
+        },
+        BodyDirection::Response => {
+            tx.res_body_error.set("1");
+            tx.res_body_error_msg.set(format!("{processor_name}: {message}"));
+            tx.res_body_processor_error.set("1");
+            tx.res_body_processor_error_msg.set(message);
+        },
+    }
+}
+
+/// Create the selected custom processor once, on the first body-processing call.
+pub(super) fn selected_custom_body_processor(
+    tx: &mut Transaction,
+    direction: BodyDirection,
+) -> Option<std::sync::Arc<dyn CustomBodyProcessor>> {
+    let processors = tx.computed.custom_body_processors.as_mut()?;
+    let selection = match direction {
+        BodyDirection::Request => processors.request.as_mut(),
+        BodyDirection::Response => processors.response.as_mut(),
+    }?;
+    if selection.processor.is_none() {
+        selection.processor = Some(std::sync::Arc::from((selection.factory)()));
+    }
+    selection.processor.as_ref().map(std::sync::Arc::clone)
 }
 
 /// Publish response arguments under the same per-collection argument limit as JSON.

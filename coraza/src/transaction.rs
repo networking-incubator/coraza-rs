@@ -51,7 +51,7 @@ use crate::{
         AuditFile, AuditLog, AuditLogger, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse,
         AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
-    body_processors::BodyProcessor as CustomBodyProcessor,
+    body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory},
     collection::{Map, MatchData, Single},
     config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
@@ -62,13 +62,21 @@ use crate::{
     utils::time::LocalTime,
 };
 
-/// Optional custom processor instances selected by request/response `ctl` actions.
+/// Custom processor selections and lazily created instances for one transaction.
 #[derive(Default)]
 struct CustomBodyProcessors {
     /// Selected request-body processor.
-    request: Option<Arc<dyn CustomBodyProcessor>>,
+    request: Option<CustomBodyProcessorSelection>,
     /// Selected response-body processor.
-    response: Option<Arc<dyn CustomBodyProcessor>>,
+    response: Option<CustomBodyProcessorSelection>,
+}
+
+/// A selected host factory and the instance created on first body processing.
+struct CustomBodyProcessorSelection {
+    /// Factory captured by the matching compiled `ctl` action.
+    factory: BodyProcessorFactory,
+    /// Instance created on the first body-processing call, if any.
+    processor: Option<Arc<dyn CustomBodyProcessor>>,
 }
 
 /// URI derivatives and start-time values, boxed so `Transaction` stays small.

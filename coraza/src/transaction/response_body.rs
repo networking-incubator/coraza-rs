@@ -23,12 +23,14 @@
 use super::{
     Interruption, Transaction,
     body_buffer::BodyBuffer,
-    request_body::{process_custom_body_processor, publish_json_arguments, read_json_body},
+    request_body::{
+        process_custom_body_processor, publish_json_arguments, read_json_body, selected_custom_body_processor,
+    },
     variables::BodyProcessor,
 };
 use crate::{
     audit_log::Failure,
-    body_processors::{BodyDirection, BodyProcessor as CustomBodyProcessor},
+    body_processors::BodyDirection,
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
 };
 
@@ -113,10 +115,11 @@ impl Transaction {
         } else if processable {
             // Go runs the selected processor even for an empty response body
             // (`internal/corazawaf/transaction.go:1389-1423`).
+            let truncated = self.response_body_buffer.stats().truncated;
             let mut buffer = std::mem::take(&mut self.response_body_buffer);
             let inspected = buffer.contiguous().map(|body| {
                 let length = body.len();
-                self.inspect_response_body(&body);
+                self.inspect_response_body(&body, truncated);
                 length
             });
             self.response_body_buffer = buffer;
@@ -144,15 +147,9 @@ impl Transaction {
     /// `RESPONSE_BODY` unset (`internal/bodyprocessors/json.go:92-99`,
     /// `internal/corazawaf/transaction.go:1399-1423`). Other processors keep the
     /// existing contract.
-    fn inspect_response_body(&mut self, body: &[u8]) {
-        if let Some(processor) = self
-            .computed
-            .custom_body_processors
-            .as_ref()
-            .and_then(|processors| processors.response.as_ref())
-            .map(std::sync::Arc::clone)
-        {
-            process_custom_body_processor(self, body, BodyDirection::Response, processor.as_ref());
+    fn inspect_response_body(&mut self, body: &[u8], truncated: bool) {
+        if let Some(processor) = selected_custom_body_processor(self, BodyDirection::Response) {
+            process_custom_body_processor(self, body, BodyDirection::Response, truncated, processor.as_ref());
             return;
         }
         if let Some(BodyProcessor::Json) = self.response_body_processor {
@@ -195,14 +192,17 @@ impl Transaction {
     pub(super) fn set_response_custom_body_processor(
         &mut self,
         name: &str,
-        processor: std::sync::Arc<dyn CustomBodyProcessor>,
+        factory: crate::body_processors::BodyProcessorFactory,
     ) {
         self.response_body_processor = None;
         let processors = self
             .computed
             .custom_body_processors
             .get_or_insert_with(|| Box::new(super::CustomBodyProcessors::default()));
-        processors.response = Some(processor);
+        processors.response = Some(super::CustomBodyProcessorSelection {
+            factory,
+            processor: None,
+        });
         self.res_body_processor.set(name.to_ascii_uppercase());
     }
 }

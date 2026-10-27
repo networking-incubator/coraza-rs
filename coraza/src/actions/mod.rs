@@ -191,13 +191,16 @@ impl CompiledAction {
 
     /// Apply the runtime effect of a compiled action.
     pub(crate) fn evaluate(&self, rule: &RuleMetadata, tx: &mut Transaction) {
-        if let ActionImplementation::Custom(action) = &self.implementation {
-            action.evaluate(rule, tx);
-            return;
-        }
-        if let ActionImplementation::BodyProcessor(factory) = &self.implementation {
-            tx.apply_ctl_with_body_processor(&self.argument, factory);
-            return;
+        match &self.implementation {
+            ActionImplementation::Builtin => {},
+            ActionImplementation::Custom(action) => {
+                action.evaluate(rule, tx);
+                return;
+            },
+            ActionImplementation::BodyProcessor(factory) => {
+                tx.apply_ctl_with_body_processor(&self.argument, factory);
+                return;
+            },
         }
 
         match self.name.as_str() {

@@ -20,7 +20,7 @@
 
 //! Built-in body decoders and the custom body-processor API.
 
-use std::{path::Path, sync::Arc};
+use std::{mem::size_of, path::Path, sync::Arc};
 
 use crate::config::UploadKeepFiles;
 
@@ -37,7 +37,9 @@ pub enum BodyDirection {
 ///
 /// These are values already selected by the transaction, not a reference to the
 /// WAF configuration. The body itself has already been bounded by the applicable
-/// request or response body limit.
+/// request or response body limit. If `truncated` is true, `body` is only the prefix
+/// retained by the engine. Recursion limits are advisory for custom processors; only
+/// built-in processors enforce them.
 #[derive(Debug, Clone, Copy)]
 pub struct BodyProcessorOptions<'a> {
     /// The original Content-Type bytes, or an empty slice when unavailable.
@@ -52,6 +54,10 @@ pub struct BodyProcessorOptions<'a> {
     pub upload_keep_files: UploadKeepFiles,
     /// Maximum arguments accepted by one argument collection.
     pub argument_limit: usize,
+    /// Whether the engine discarded bytes beyond the retained body prefix.
+    pub truncated: bool,
+    /// Whether request or response body ingestion reported a data error.
+    pub data_error: bool,
     /// Request JSON-style recursion limit.
     pub request_body_recursion_limit: usize,
     /// Response JSON-style recursion limit.
@@ -60,11 +66,12 @@ pub struct BodyProcessorOptions<'a> {
 
 /// A processor for a body selected by a SecLang `ctl` action.
 ///
-/// The processor is called synchronously on the request path with attacker-controlled
+/// The processor is called synchronously on the transaction path with attacker-controlled
 /// bytes. The engine has no timeout and does not catch panics. Implementations must not
 /// panic, must bound their own work, and must honor the limits and storage policy in
-/// `options`. The factory is retained by compiled rules and runs when the `ctl` action
-/// selects this processor.
+/// `options`. Recursion limits are advisory for custom processors; only built-ins enforce
+/// them. The factory is retained by compiled rules and runs only if the selected body is
+/// actually processed.
 pub trait BodyProcessor: Send + Sync {
     /// Parse `body` and append supported values to `out`.
     ///
@@ -81,8 +88,10 @@ pub trait BodyProcessor: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Creates a body processor when a compiled `ctl:requestBodyProcessor` or
-/// `ctl:responseBodyProcessor` action runs.
+/// Creates a body processor on the first processing call for a processor selected by a
+/// compiled `ctl:requestBodyProcessor` or `ctl:responseBodyProcessor` action.
+///
+/// The zero-argument factory does not receive body bytes.
 pub type BodyProcessorFactory = Arc<dyn Fn() -> Box<dyn BodyProcessor> + Send + Sync>;
 
 /// Values a custom body processor can publish without direct transaction access.
@@ -92,7 +101,7 @@ pub type BodyProcessorFactory = Arc<dyn Fn() -> Box<dyn BodyProcessor> + Send + 
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "the two independent truncation flags and target storage capability describe output state"
+    reason = "independent limit and storage flags describe processor-output state"
 )]
 pub struct BodyProcessorOutput {
     /// Buffered argument values waiting for transaction insertion.
@@ -115,7 +124,16 @@ pub struct BodyProcessorOutput {
     file_capacity: usize,
     /// Whether the current target has an engine-managed file storage sink.
     file_storage_available: bool,
+    /// Maximum staged-output bytes, including copied data and per-entry storage.
+    byte_capacity: usize,
+    /// Bytes already accepted by the output methods.
+    output_bytes: usize,
+    /// Whether an output entry exceeded the cumulative byte budget.
+    pub(crate) byte_limit_reached: bool,
 }
+
+/// Error reported when a custom processor exceeds its cumulative output budget.
+const OUTPUT_BYTE_LIMIT_ERROR: &str = "custom body processor output exceeded byte limit";
 
 /// One file staged for transaction-managed temporary storage.
 pub(crate) struct BodyProcessorFile {
@@ -131,13 +149,37 @@ pub(crate) struct BodyProcessorFile {
 
 impl BodyProcessorOutput {
     /// Build an output limited to the transaction's remaining capacity.
-    pub(crate) fn new(argument_capacity: usize, file_capacity: usize, file_storage_available: bool) -> Self {
+    pub(crate) fn new(
+        argument_capacity: usize,
+        file_capacity: usize,
+        byte_capacity: usize,
+        file_storage_available: bool,
+    ) -> Self {
         Self {
             argument_capacity,
             file_capacity,
             file_storage_available,
+            byte_capacity,
             ..Self::default()
         }
+    }
+
+    /// Reserve output bytes before copying any caller-provided slices.
+    fn reserve_bytes(&mut self, parts: &[&[u8]], entry_storage: usize) -> bool {
+        if self.byte_limit_reached {
+            return false;
+        }
+        let additional = parts
+            .iter()
+            .try_fold(entry_storage, |total, part| total.checked_add(part.len()));
+        let total = additional.and_then(|additional| self.output_bytes.checked_add(additional));
+        let Some(total) = total.filter(|total| *total <= self.byte_capacity) else {
+            self.byte_limit_reached = true;
+            self.error = Some(OUTPUT_BYTE_LIMIT_ERROR.to_owned());
+            return false;
+        };
+        self.output_bytes = total;
+        true
     }
 
     /// Add an argument to `ARGS_POST` or `RESPONSE_ARGS`.
@@ -147,6 +189,9 @@ impl BodyProcessorOutput {
     pub fn add_argument(&mut self, name: &[u8], value: &[u8]) {
         if self.arguments.len() >= self.argument_capacity {
             self.argument_limit_reached = true;
+            return;
+        }
+        if !self.reserve_bytes(&[name, value], size_of::<(Vec<u8>, Vec<u8>)>()) {
             return;
         }
         self.arguments.push((name.to_vec(), value.to_vec()));
@@ -166,6 +211,9 @@ impl BodyProcessorOutput {
             self.file_limit_reached = true;
             return;
         }
+        if !self.reserve_bytes(&[name, filename, content_type, bytes], size_of::<BodyProcessorFile>()) {
+            return;
+        }
         self.files.push(BodyProcessorFile {
             name: name.to_vec(),
             filename: filename.to_vec(),
@@ -176,18 +224,24 @@ impl BodyProcessorOutput {
 
     /// Add a value to the request or response XML collection under `path`.
     pub fn add_xml(&mut self, path: &[u8], value: &[u8]) {
+        if !self.reserve_bytes(&[path, value], size_of::<(Vec<u8>, Vec<u8>)>()) {
+            return;
+        }
         self.xml.push((path.to_vec(), value.to_vec()));
     }
 
     /// Set the processor name reported by `REQBODY_PROCESSOR` or
-    /// `RES_BODY_PROCESSOR`.
+    /// `RES_BODY_PROCESSOR`. This is host-reported, not authoritative: it can differ from
+    /// the name selected by `ctl` and is also used in body-error message prefixes.
     pub fn set_processor(&mut self, name: &str) {
         self.processor = Some(name.to_uppercase());
     }
 
     /// Report a processor-specific error while retaining any output already added.
     pub fn set_error(&mut self, message: &str) {
-        self.error = Some(message.to_owned());
+        if !self.byte_limit_reached {
+            self.error = Some(message.to_owned());
+        }
     }
 }
 
@@ -200,10 +254,47 @@ mod tests {
 
     #[test]
     fn file_output_is_rejected_without_a_storage_sink() {
-        let mut output = BodyProcessorOutput::new(1, 1, false);
+        let mut output = BodyProcessorOutput::new(1, 1, 4, false);
         output.add_file(b"upload", b"file.txt", b"text/plain", b"bytes");
 
         assert!(output.files.is_empty());
         assert!(output.error.as_deref().is_some_and(|message| message.contains("WASI")));
+    }
+
+    #[test]
+    fn output_byte_budget_is_cumulative_and_stops_before_copying_more() {
+        let capacity = 2 * size_of::<(Vec<u8>, Vec<u8>)>() + 5;
+        let mut output = BodyProcessorOutput::new(4, 4, capacity, true);
+        output.add_argument(b"a", b"12");
+        output.add_xml(b"/", b"3");
+        output.add_file(b"f", b"n", b"t", b"x");
+
+        assert_eq!(output.output_bytes, capacity);
+        assert!(output.output_bytes <= output.byte_capacity);
+        assert_eq!(output.arguments.len(), 1);
+        assert_eq!(output.xml.len(), 1);
+        assert!(output.files.is_empty());
+        assert!(output.byte_limit_reached);
+        assert_eq!(
+            output.error.as_deref(),
+            Some("custom body processor output exceeded byte limit")
+        );
+
+        output.add_argument(b"later", b"ignored");
+        assert_eq!(output.output_bytes, capacity);
+        assert_eq!(output.arguments.len(), 1);
+    }
+
+    #[test]
+    fn empty_entries_still_consume_the_output_byte_budget() {
+        let capacity = size_of::<(Vec<u8>, Vec<u8>)>();
+        let mut output = BodyProcessorOutput::new(1, 1, capacity, true);
+        for _ in 0..10_000 {
+            output.add_xml(b"", b"");
+        }
+
+        assert_eq!(output.xml.len(), 1);
+        assert!(output.byte_limit_reached);
+        assert_eq!(output.output_bytes, capacity);
     }
 }
