@@ -72,6 +72,7 @@ impl RuleGroup {
         if let Some(parent_id) = open_parent_id
             && rule.explicit_disruptive
         {
+            self.discard_open_chain();
             return Err(format!(
                 "disruptive actions can only be specified in the chain starter rule (parent id: {parent_id})"
             ));
@@ -192,6 +193,16 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_chain_member_id_leaves_the_open_chain_unchanged() {
+        let mut group = RuleGroup::new();
+        group.add(rule("1", "chain")).unwrap();
+
+        assert!(group.add(rule("1", "")).unwrap_err().contains("duplicated rule id 1"));
+        assert_eq!(group.count(), 1);
+        assert!(group.discard_open_chain());
+    }
+
+    #[test]
     fn chains_rules_and_discards_an_incomplete_chain() {
         let mut group = RuleGroup::new();
         group.add(rule("1", "chain")).unwrap();
@@ -216,7 +227,7 @@ mod tests {
             group.add(member).unwrap_err(),
             "disruptive actions can only be specified in the chain starter rule (parent id: 42)"
         );
-        assert!(group.rules()[0].chain.is_empty());
+        assert_eq!(group.count(), 0);
     }
 
     #[test]
