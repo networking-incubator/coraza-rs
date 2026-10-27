@@ -338,13 +338,26 @@ fn compare(stage: &Value, actual: &Actual) -> Vec<String> {
     let output = stage.get("output").expect("output");
     let mut differences = Vec::new();
 
-    for expected in ids(output, "triggered_rules") {
-        if !actual.matched.contains(&expected) {
-            differences.push(format!(
-                "triggered rule {expected} expected, actual matched {:?}",
-                actual.matched
-            ));
+    let mut expected_triggered = ids(output, "triggered_rules");
+    let mut actual_triggered = actual
+        .matched
+        .iter()
+        .filter(|id| expected_triggered.contains(id))
+        .copied()
+        .collect::<Vec<_>>();
+    expected_triggered.sort_unstable();
+    actual_triggered.sort_unstable();
+    let mut expected = expected_triggered.iter();
+    let mut next_expected = expected.next();
+    for matched in &actual_triggered {
+        if next_expected == Some(matched) {
+            next_expected = expected.next();
         }
+    }
+    if next_expected.is_some() {
+        differences.push(format!(
+            "triggered rule multiplicities expected at least {expected_triggered:?}, actual {actual_triggered:?}"
+        ));
     }
     for expected in ids(output, "non_triggered_rules") {
         if actual.matched.contains(&expected) {
@@ -430,6 +443,34 @@ fn no_log_contains_rejects_the_line_it_names() {
 
     actual.logs = vec!["an unrelated line".to_owned()];
     assert!(compare(&stage, &actual).is_empty(), "an absent line must pass");
+}
+
+#[test]
+fn triggered_rules_compare_multiplicity_without_rejecting_unlisted_matches() {
+    let mut actual = Actual {
+        matched: vec![1],
+        logs: Vec::new(),
+        interruption: None,
+    };
+    let duplicate = serde_json::json!({ "output": { "triggered_rules": [1, 1] } });
+    assert_eq!(
+        compare(&duplicate, &actual),
+        ["triggered rule multiplicities expected at least [1, 1], actual [1]"]
+    );
+
+    actual.matched = vec![1, 2, 99];
+    let reordered = serde_json::json!({ "output": { "triggered_rules": [2, 1] } });
+    assert!(
+        compare(&reordered, &actual).is_empty(),
+        "the Go profile contract requires expected IDs but permits additional matches"
+    );
+
+    actual.matched = vec![1, 1, 2, 99];
+    let subset = serde_json::json!({ "output": { "triggered_rules": [1, 2] } });
+    assert!(
+        compare(&subset, &actual).is_empty(),
+        "additional matches are permitted by the Go fixture contract"
+    );
 }
 
 /// A string field, or `""`.
