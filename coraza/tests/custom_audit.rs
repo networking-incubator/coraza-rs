@@ -30,17 +30,17 @@ mod tests {
         seclang::Parser,
     };
 
-    type CapturedEntries = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+    type CapturedEntries = Arc<Mutex<Vec<(String, Vec<u8>, &'static str)>>>;
 
     #[derive(Clone)]
     struct CapturingAuditWriter(CapturedEntries);
 
     impl AuditLogWriter for CapturingAuditWriter {
-        fn write(&self, entry: &AuditLog, formatted: &[u8]) -> std::io::Result<()> {
+        fn write(&self, entry: &AuditLog, formatted: &[u8], mime: &'static str) -> std::io::Result<()> {
             self.0
                 .lock()
                 .unwrap()
-                .push((entry.transaction.id.clone(), formatted.to_vec()));
+                .push((entry.transaction.id.clone(), formatted.to_vec(), mime));
             Ok(())
         }
     }
@@ -94,7 +94,7 @@ mod tests {
     struct FailedAuditWriter;
 
     impl AuditLogWriter for FailedAuditWriter {
-        fn write(&self, _entry: &AuditLog, _formatted: &[u8]) -> std::io::Result<()> {
+        fn write(&self, _entry: &AuditLog, _formatted: &[u8], _mime: &'static str) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "custom sink write failed",
@@ -138,6 +138,7 @@ mod tests {
             ),
         ];
         for (name, formatter, expected) in cases {
+            let mime = formatter.mime();
             let (parser, entries) = capture_parser(name, formatter);
             let waf = parser.compile().unwrap();
             let id = if name == "custom-json" {
@@ -150,7 +151,7 @@ mod tests {
 
             let captured = entries.lock().unwrap();
             assert_eq!(captured.len(), 1);
-            assert_eq!(captured[0], (id.to_owned(), expected));
+            assert_eq!(captured[0], (id.to_owned(), expected, mime));
         }
     }
 
