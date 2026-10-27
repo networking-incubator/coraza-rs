@@ -81,6 +81,11 @@ pub struct DebugEvent<'a> {
 }
 
 /// A thread-safe debug log sink.
+///
+/// Events are delivered synchronously on the calling thread. The built-in
+/// [`Writer`] holds its shared sink lock while opening and writing; a slow or blocked sink
+/// therefore blocks that transaction and serializes other transactions sharing the writer.
+/// Hosts that cannot tolerate this must provide their own buffered or asynchronous logger.
 pub trait DebugLogger: Send + Sync {
     /// Whether an event at `level` would be accepted.
     fn enabled(&self, level: DebugLevel) -> bool;
@@ -110,7 +115,12 @@ pub(crate) fn noop_logger() -> Arc<dyn DebugLogger> {
 /// A lazily opened append-only debug log file or standard stream path.
 ///
 /// The file is opened by [`Writer::activate`] or the first enabled event, not when the
-/// writer is constructed. `/dev/stdout` and `/dev/stderr` are accepted as paths.
+/// writer is constructed. `/dev/stdout` and `/dev/stderr` are accepted as paths. Writes
+/// run synchronously on the calling thread while holding the shared sink lock, so a slow
+/// or blocked sink blocks that transaction and serializes other transactions sharing this
+/// writer. This built-in writer is intended for development and diagnostics, not
+/// high-throughput production logging; use a host-provided buffered or asynchronous
+/// [`DebugLogger`] when blocking request threads is unacceptable.
 pub struct Writer {
     /// Destination path or standard stream path.
     path: PathBuf,
@@ -322,9 +332,7 @@ impl DebugLogger for LevelFilter {
     }
 
     fn log(&self, level: DebugLevel, event: &DebugEvent<'_>) {
-        if self.enabled(level) {
-            self.logger.log(level, event);
-        }
+        self.logger.log(level, event);
     }
 }
 
@@ -379,8 +387,12 @@ mod tests {
             message: "accepted",
             fields: &[],
         };
-        filter.log(DebugLevel::Trace, &event);
-        filter.log(DebugLevel::Debug, &event);
+        if filter.enabled(DebugLevel::Trace) {
+            filter.log(DebugLevel::Trace, &event);
+        }
+        if filter.enabled(DebugLevel::Debug) {
+            filter.log(DebugLevel::Debug, &event);
+        }
         assert_eq!(logged.load(Ordering::Relaxed), 1);
     }
 

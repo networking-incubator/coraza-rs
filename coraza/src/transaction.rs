@@ -564,16 +564,16 @@ impl Transaction {
         message: &'static str,
         fields: impl FnOnce() -> [DebugField<'a>; N],
     ) {
-        if self.debug_level_enabled(level) {
+        self.debug_log_with(level, |logger| {
             let fields = fields();
-            self.debug_logger.log(
+            logger.log(
                 level,
                 &DebugEvent {
                     message,
                     fields: &fields,
                 },
             );
-        }
+        });
     }
 
     /// Apply an event with a dynamic number of fields, allocating only when enabled.
@@ -583,15 +583,22 @@ impl Transaction {
         message: &'static str,
         fields: impl FnOnce() -> Vec<DebugField<'a>>,
     ) {
-        if self.debug_level_enabled(level) {
+        self.debug_log_with(level, |logger| {
             let fields = fields();
-            self.debug_logger.log(
+            logger.log(
                 level,
                 &DebugEvent {
                     message,
                     fields: &fields,
                 },
             );
+        });
+    }
+
+    /// Decide once whether an event is enabled, then format and emit it in `log`.
+    pub(crate) fn debug_log_with(&self, level: DebugLevel, log: impl FnOnce(&dyn DebugLogger)) {
+        if self.debug_level_enabled(level) {
+            log(self.debug_logger.as_ref());
         }
     }
 
@@ -608,11 +615,9 @@ impl Transaction {
             "Response body processor failed"
         };
         self.debug_log(DebugLevel::Error, message, || [DebugField::Text(processor)]);
-        if self.debug_level_enabled(DebugLevel::Trace) {
-            self.debug_log(DebugLevel::Trace, "Body processor failure detail", || {
-                [DebugField::Text(error)]
-            });
-        }
+        self.debug_log(DebugLevel::Trace, "Body processor failure detail", || {
+            [DebugField::Text(error)]
+        });
     }
 
     /// Attach the connector's matched-rule callback.
@@ -835,17 +840,21 @@ impl Transaction {
         self.debug_log(DebugLevel::Debug, "Transaction finalized", || []);
         if !self.finalization_errors.is_empty() {
             self.debug_log(DebugLevel::Error, "Transaction finalization failed", || []);
-            if self.debug_level_enabled(DebugLevel::Trace) {
+            self.debug_log_with(DebugLevel::Trace, |logger| {
                 let details = self
                     .finalization_errors
                     .iter()
                     .map(|failure| failure.to_error().to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
-                self.debug_log(DebugLevel::Trace, "Finalization failure detail", || {
-                    [DebugField::Text(&details)]
-                });
-            }
+                logger.log(
+                    DebugLevel::Trace,
+                    &DebugEvent {
+                        message: "Finalization failure detail",
+                        fields: &[DebugField::Text(&details)],
+                    },
+                );
+            });
         }
     }
 
@@ -903,12 +912,16 @@ impl Transaction {
             self.debug_log(DebugLevel::Debug, "Transaction marked for audit logging", || []);
             if let Err(error) = logger.write(&self.audit_log()) {
                 self.debug_log(DebugLevel::Error, "Failed to write audit log", || []);
-                if self.debug_level_enabled(DebugLevel::Trace) {
+                self.debug_log_with(DebugLevel::Trace, |logger| {
                     let details = error.to_string();
-                    self.debug_log(DebugLevel::Trace, "Audit log failure detail", || {
-                        [DebugField::Text(&details)]
-                    });
-                }
+                    logger.log(
+                        DebugLevel::Trace,
+                        &DebugEvent {
+                            message: "Audit log failure detail",
+                            fields: &[DebugField::Text(&details)],
+                        },
+                    );
+                });
                 return Err(error);
             }
             self.debug_log(DebugLevel::Info, "Audit log entry written", || []);
@@ -1156,11 +1169,9 @@ impl Transaction {
         self.debug_log(DebugLevel::Warn, "Transaction interruption requested", || {
             [DebugField::RuleId(rule_id), DebugField::Text(action)]
         });
-        if self.debug_level_enabled(DebugLevel::Trace) {
-            self.debug_log(DebugLevel::Trace, "Transaction interruption detail", || {
-                [DebugField::Text(data)]
-            });
-        }
+        self.debug_log(DebugLevel::Trace, "Transaction interruption detail", || {
+            [DebugField::Text(data)]
+        });
         let interruption = Interruption {
             rule_id,
             action: action.to_owned(),

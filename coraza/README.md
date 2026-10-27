@@ -48,6 +48,13 @@ events do not include request values by default. Trace logging can include
 matched/argument values, body processor error details, and interruption details,
 so enable it only when that data may be written to the selected sink.
 
+Debug logger calls are synchronous on the request thread. The built-in `Writer`
+holds its shared sink lock while opening and writing, so a slow or blocked sink
+(including a full stdout/stderr pipe) blocks that transaction and serializes
+other transactions sharing the writer. `Writer` is intended for development and
+diagnostics, not high-throughput production logging. Hosts that cannot tolerate
+this must provide their own buffered or asynchronous `DebugLogger`.
+
 ## Audit logging
 
 Configure audit logging through SecLang:
