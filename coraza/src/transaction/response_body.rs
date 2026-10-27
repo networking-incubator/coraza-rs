@@ -53,7 +53,7 @@ impl Transaction {
     /// Process an eligible response body and evaluate response-body rules.
     ///
     /// When the body is eligible, bytes are retained in a bounded buffer truncated to
-    /// [`Transaction::response_body_limit`]. Like Go Coraza v3.8.1 `WriteResponseBody`
+    /// `Transaction::response_body_limit`. Like Go Coraza v3.8.1 `WriteResponseBody`
     /// (`internal/corazawaf/transaction.go:1263`), reaching the limit itself sets
     /// `OUTBOUND_DATA_ERROR`, so the boundary is `>=`. The response buffer never spills:
     /// its memory limit equals the response body limit, as in Go. An I/O failure while
