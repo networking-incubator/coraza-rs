@@ -24,7 +24,10 @@ use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
     collection::MatchData,
     operators::{OperatorOutcome, Outputs},
-    rules::{RuleOperator, VariableSpec, multiphase::multiphase_skip_variable},
+    rules::{
+        RuleOperator, VariableSpec,
+        multiphase::{is_multiphase_double_evaluation, multiphase_skip_variable},
+    },
     transaction::Transaction,
     types::RulePhase,
 };
@@ -171,7 +174,8 @@ impl Rule {
 
     /// Evaluate this rule and its chain against a transaction.
     pub(crate) fn evaluate(&self, tx: &mut Transaction, phase: RulePhase) {
-        let matched_values = self.matches_chain(tx, self.metadata.id, phase, true);
+        let mut collective_matched_values = Vec::new();
+        let matched_values = self.matches_chain(tx, self.metadata.id, phase, true, 0, &mut collective_matched_values);
         if matched_values.is_empty() {
             return;
         }
@@ -209,21 +213,36 @@ impl Rule {
     }
 
     /// Match this rule and its chain, running nondisruptive actions at each link.
-    fn matches_chain(&self, tx: &mut Transaction, id: i32, phase: RulePhase, top_level: bool) -> Vec<MatchData> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "phase and shared chain state are explicit across recursive rule evaluation"
+    )]
+    fn matches_chain(
+        &self,
+        tx: &mut Transaction,
+        id: i32,
+        phase: RulePhase,
+        top_level: bool,
+        chain_level: u8,
+        collective_matched_values: &mut Vec<MatchData>,
+    ) -> Vec<MatchData> {
         if self.metadata.sec_mark.is_some() {
             return Vec::new();
         }
         if tx.multiphase_evaluation() && top_level && self.metadata.has_chain && phase < self.chain_min_phase {
             return Vec::new();
         }
-        let mut matched_values = self.match_values(tx, id, phase, top_level);
+        let mut matched_values = self.match_values(tx, id, phase, top_level, chain_level, collective_matched_values);
         if matched_values.is_empty() {
             return matched_values;
         }
         let own_matches = matched_values.len();
 
+        let mut chain_level = chain_level;
         for link in &self.chain {
-            let link_matches = link.matches_chain(tx, id, phase, false);
+            // shortcut: MatchData chain depth saturates at 255; widen its public field if deeper chains are supported.
+            chain_level = chain_level.saturating_add(1);
+            let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
             if link_matches.is_empty() {
                 return Vec::new();
             }
@@ -240,7 +259,19 @@ impl Rule {
     }
 
     /// Match the values selected by this rule and run per-match actions.
-    fn match_values(&self, tx: &mut Transaction, id: i32, phase: RulePhase, top_level: bool) -> Vec<MatchData> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "phase and shared chain state are explicit across recursive rule evaluation"
+    )]
+    fn match_values(
+        &self,
+        tx: &mut Transaction,
+        id: i32,
+        phase: RulePhase,
+        top_level: bool,
+        chain_level: u8,
+        collective_matched_values: &mut Vec<MatchData>,
+    ) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
         let log_data = self.metadata.log_data.as_ref().map(|value| value.expand(tx));
         let severity = self.metadata.severity.map_or("unknown", |value| value.as_str());
@@ -251,6 +282,10 @@ impl Rule {
                 return Vec::new();
             }
             let mut matched = MatchData::new_empty();
+            matched.chain_level = chain_level;
+            if tx.multiphase_evaluation() {
+                collective_matched_values.push(matched.clone());
+            }
             tx.record_matched_variable(&matched);
             self.run_nondisruptive_actions(tx);
             if self.chain.is_empty() {
@@ -259,9 +294,10 @@ impl Rule {
             return vec![matched];
         };
 
+        let multiphase = tx.multiphase_evaluation();
         let mut matched_values = Vec::new();
         for variable in &self.variables {
-            if tx.multiphase_evaluation() && top_level && multiphase_skip_variable(self, variable.variable(), phase) {
+            if multiphase && top_level && multiphase_skip_variable(self, variable.variable(), phase) {
                 continue;
             }
             for value in tx.find_matches_for_rule(variable, id) {
@@ -279,6 +315,12 @@ impl Rule {
                     match outcome {
                         OperatorOutcome::Matched => {
                             let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
+                            matched.chain_level = chain_level;
+                            if multiphase
+                                && is_multiphase_double_evaluation(tx, id, collective_matched_values, &matched)
+                            {
+                                continue;
+                            }
                             tx.record_matched_variable(&matched);
                             self.run_nondisruptive_actions(tx);
                             if self.chain.is_empty() {
