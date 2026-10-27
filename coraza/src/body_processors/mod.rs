@@ -135,6 +135,18 @@ pub struct BodyProcessorOutput {
 /// Error reported when a custom processor exceeds its cumulative output budget.
 const OUTPUT_BYTE_LIMIT_ERROR: &str = "custom body processor output exceeded byte limit";
 
+/// 256 bytes preserves useful diagnostic context while bounding transaction and log storage.
+pub(crate) const CUSTOM_BODY_PROCESSOR_TEXT_LIMIT: usize = 256;
+
+/// Copy at most the configured byte limit without splitting a UTF-8 character.
+pub(crate) fn truncate_custom_body_text(value: &str) -> String {
+    let mut end = value.len().min(CUSTOM_BODY_PROCESSOR_TEXT_LIMIT);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.get(..end).unwrap_or_default().to_owned()
+}
+
 /// One file staged for transaction-managed temporary storage.
 pub(crate) struct BodyProcessorFile {
     /// Form field name associated with the file.
@@ -238,13 +250,14 @@ impl BodyProcessorOutput {
     /// `RES_BODY_PROCESSOR`. This is host-reported, not authoritative: it can differ from
     /// the name selected by `ctl` and is also used in body-error message prefixes.
     pub fn set_processor(&mut self, name: &str) {
-        self.processor = Some(name.to_uppercase());
+        let name = truncate_custom_body_text(name);
+        self.processor = Some(truncate_custom_body_text(&name.to_uppercase()));
     }
 
     /// Report a processor-specific error while retaining any output already added.
     pub fn set_error(&mut self, message: &str) {
         if !self.byte_limit_reached {
-            self.error = Some(message.to_owned());
+            self.error = Some(truncate_custom_body_text(message));
         }
     }
 }

@@ -146,6 +146,28 @@ impl BodyProcessor for ErrorProcessor {
     }
 }
 
+struct LargeErrors;
+
+impl BodyProcessor for LargeErrors {
+    fn process(
+        &self,
+        body: &[u8],
+        _direction: BodyDirection,
+        _options: &BodyProcessorOptions<'_>,
+        out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        let message = format!("{}é{}", "x".repeat(255), "x".repeat(1_000_000));
+        let name = format!("{}é{}", "N".repeat(255), "N".repeat(1_000_000));
+        out.set_processor(&name);
+        if body == b"set-error" {
+            out.set_error(&message);
+            Ok(())
+        } else {
+            Err(message)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OversizedOutputKind {
     Argument,
@@ -552,6 +574,44 @@ fn custom_request_and_response_processors_receive_their_direction_and_truncation
 }
 
 #[test]
+fn custom_request_truncation_option_tracks_discarded_bytes_at_the_limit_boundary() {
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().request_body_limit = 4;
+    parser.config_mut().request_body_limit_action = BodyLimitAction::ProcessPartial;
+    parser.register_body_processor(
+        "request-state",
+        Arc::new({
+            let states = Arc::clone(&states);
+            move || Box::new(OptionsRecorder("request", Arc::clone(&states)))
+        }),
+    );
+    parser
+        .from_string("SecAction \"id:1,phase:1,ctl:requestBodyProcessor=request-state,pass\"")
+        .unwrap();
+    let waf = parser.compile().unwrap();
+
+    for (body, truncated) in [(&b"1234"[..], false), (&b"12345"[..], true)] {
+        let tx = request_transaction(&waf, body, b"text/plain");
+        assert_eq!(tx.request_body_stats().truncated, truncated);
+        // Go's >= boundary still reports a data error for an exact-limit body.
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+    }
+
+    assert_eq!(
+        *states.lock().unwrap(),
+        [
+            ("request", BodyDirection::Request, false, true),
+            ("request", BodyDirection::Request, true, true)
+        ]
+    );
+}
+
+#[test]
 fn custom_files_use_engine_temp_paths_and_xml_keeps_its_path() {
     let directory = tempfile::tempdir().unwrap();
     let mut parser = Parser::new();
@@ -763,6 +823,33 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
         tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
         Some("JSON: returned parse failure")
     );
+}
+
+#[test]
+fn custom_processor_errors_and_names_are_bounded_before_storage_and_formatting() {
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.register_body_processor("large-errors", Arc::new(|| Box::new(LargeErrors)));
+    parser
+        .from_string("SecAction \"id:1,phase:1,ctl:requestBodyProcessor=large-errors,pass\"")
+        .unwrap();
+    let waf = parser.compile().unwrap();
+    let expected_message = "x".repeat(255);
+    let expected_name = "N".repeat(255);
+
+    for body in [b"set-error".as_slice(), b"returned-error".as_slice()] {
+        let tx = request_transaction(&waf, body, b"application/x-custom");
+        let processor_error = tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).unwrap();
+        let error_message = tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).unwrap();
+        let processor_name = tx.get_variable(RuleVariable::ReqbodyProcessor, None).unwrap();
+
+        assert_eq!(&*processor_error, expected_message);
+        assert_eq!(&*error_message, format!("{expected_name}: {expected_message}"));
+        assert_eq!(&*processor_name, expected_name);
+        assert!(processor_error.len() <= 256);
+        assert!(processor_name.len() <= 256);
+        assert!(error_message.len() <= 2 * 256 + 2);
+    }
 }
 
 #[test]

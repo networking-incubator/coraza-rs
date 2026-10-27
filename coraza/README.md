@@ -207,6 +207,10 @@ resolved MIME, argument and upload limits, upload directory/mode/retention polic
 and request/response truncation and data-error state. Recursion limits are
 advisory for custom processors and enforced only by built-ins; a truncated body
 passed to a processor is the prefix retained by the engine.
+`truncated` means bytes were actually discarded; reaching a body limit at the
+`>=` boundary can still set the direction's data-error flag. Processor errors
+and reported names are capped at 256 UTF-8 bytes to retain useful diagnostic
+context while bounding transaction and log storage.
 
 Processors can publish arguments, files, XML paths, a processor name, and an
 error through `BodyProcessorOutput`; they do not receive `Transaction` access.
