@@ -375,7 +375,7 @@
         "go_reference": "internal/transformations/md5.go",
         "fixtures": [],
         "differences": [
-          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+          "Go returns the input unchanged with an error under FIPS 140-3 mode; the Rust `fips` Cargo profile mirrors that, and `--no-default-features --features fips` also drops the digest crates. The entry stays available in the default build, so no `requires_features` is claimed."
         ]
       },
       "none": {
@@ -453,7 +453,7 @@
         "go_reference": "internal/transformations/sha1.go",
         "fixtures": [],
         "differences": [
-          "Go can return errors and retain the untransformed value under a FIPS profile; Rust has no equivalent declared profile (F13)."
+          "Go returns the input unchanged with an error under FIPS 140-3 mode; the Rust `fips` Cargo profile mirrors that, and `--no-default-features --features fips` also drops the digest crates. The entry stays available in the default build, so no `requires_features` is claimed."
         ]
       },
       "trim": {
