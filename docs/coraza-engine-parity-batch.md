@@ -2,7 +2,7 @@
 
 Measured on 2026-10-27 against base `2bf7fd50f861bbb17e9866448eae86fa5ab69d9a`.
 The detector benchmark candidate was clean revision
-`31ffac3d72c6a2808355d47e83926a8a8c79ccbd` (the batch runtime changes are at
+`a34fa67c4dd02c76e2f7cbaf078483d145b1ee79` (the batch runtime changes are at
 `1d04033`). The final branch later received `3788252`, a test/lint-only HTTPS
 helper gate; it does not change production runtime behavior. The base and
 candidate have no `libperfusion/` source differences.
@@ -92,7 +92,10 @@ per case; debug logging and multiphase were off. The full paired per-workload
 medians and ranges are in
 [`performance/coraza-engine-parity-batch.tsv`](performance/coraza-engine-parity-batch.tsv);
 raw detector logs and all six `run.json` files are in
-[`performance/coraza-engine-parity-batch/raw/`](performance/coraza-engine-parity-batch/raw/).
+[`performance/coraza-engine-parity-batch.tsv`](performance/coraza-engine-parity-batch.tsv).
+Only the per-workload summary and the multiphase-on profile run are retained;
+the raw benchmark logs and per-run JSON dumps were not kept, because they repeat
+the same numbers at megabyte scale and carry machine-local paths.
 
 Detector commands were `taskset -c 3 env RUSTUP_TOOLCHAIN=1.99.1
 CARGO_BUILD_JOBS=6 CARGO_TARGET_DIR=<revision-target> LIBINJECTION_DIR=<pinned-C>
