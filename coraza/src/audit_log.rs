@@ -80,6 +80,72 @@ pub struct AuditLog {
     pub messages: Vec<AuditMessage>,
 }
 
+/// Formats an audit entry for an embedder-provided audit sink.
+pub trait AuditLogFormatter: Send + Sync {
+    /// Return the serialized entry.
+    fn format(&self, entry: &AuditLog) -> Vec<u8>;
+
+    /// MIME type associated with the serialized entry.
+    fn mime(&self) -> &'static str;
+}
+
+/// Writes an audit entry produced by [`AuditLogFormatter`].
+pub trait AuditLogWriter: Send + Sync {
+    /// Write `formatted`, while retaining access to the source entry's metadata.
+    ///
+    /// # Errors
+    ///
+    /// Return the sink's I/O failure so `Transaction::finish` can report it.
+    fn write(&self, entry: &AuditLog, formatted: &[u8]) -> io::Result<()>;
+
+    /// Release resources owned by this writer.
+    ///
+    /// # Errors
+    ///
+    /// Return a resource-release failure to the caller.
+    fn close(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Builds a custom writer when the WAF activates its audit sink.
+///
+/// The factory receives the resolved WAF configuration and must defer opening files or
+/// sockets until it is called; it is called only by `Waf::activate` or the first audit
+/// write.
+pub type AuditLogWriterFactory = Arc<dyn Fn(&WafConfig) -> io::Result<Box<dyn AuditLogWriter>> + Send + Sync>;
+
+/// Parser-scoped audit extensions; resolved selections are cloned into the WAF.
+#[derive(Clone, Default)]
+pub(crate) struct AuditLogRegistry {
+    /// Writer factories keyed by lower-case SecLang name.
+    writers: BTreeMap<String, AuditLogWriterFactory>,
+    /// Formatters keyed by lower-case SecLang name.
+    formatters: BTreeMap<String, Arc<dyn AuditLogFormatter>>,
+}
+
+impl AuditLogRegistry {
+    /// Register a writer factory, replacing a case-insensitive duplicate.
+    pub(crate) fn register_writer(&mut self, name: &str, factory: AuditLogWriterFactory) {
+        self.writers.insert(name.to_ascii_lowercase(), factory);
+    }
+
+    /// Register a formatter, replacing a case-insensitive duplicate.
+    pub(crate) fn register_formatter(&mut self, name: &str, formatter: Arc<dyn AuditLogFormatter>) {
+        self.formatters.insert(name.to_ascii_lowercase(), formatter);
+    }
+
+    /// The writer factory registered under `name`.
+    pub(crate) fn writer(&self, name: &str) -> Option<&AuditLogWriterFactory> {
+        self.writers.get(&name.to_ascii_lowercase())
+    }
+
+    /// The formatter registered under `name`.
+    pub(crate) fn formatter(&self, name: &str) -> Option<&Arc<dyn AuditLogFormatter>> {
+        self.formatters.get(&name.to_ascii_lowercase())
+    }
+}
+
 /// The transaction an [`AuditLog`] is about.
 #[derive(Debug, Clone, Default)]
 pub struct AuditTransaction {
@@ -912,14 +978,61 @@ pub(crate) fn mime_type_of(name: &str) -> &'static str {
     }
 }
 
+/// The MIME type returned by each built-in audit formatter.
+const fn audit_log_mime(format: AuditLogFormat) -> &'static str {
+    match format {
+        AuditLogFormat::Native => "application/x-coraza-auditlog-native",
+        AuditLogFormat::Json | AuditLogFormat::JsonLegacy => "application/json; charset=utf-8",
+        AuditLogFormat::Ocsf => "application/json",
+    }
+}
+
+/// The selected formatter; built-ins retain their allocation-compatible path.
+#[derive(Clone)]
+enum SelectedFormatter {
+    /// The built-in formatter retains its existing path.
+    Builtin(AuditLogFormat),
+    /// The formatter selected from the parser registry.
+    Custom(Arc<dyn AuditLogFormatter>),
+}
+
+impl fmt::Debug for SelectedFormatter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin(format) => f.debug_tuple("Builtin").field(format).finish(),
+            Self::Custom(_) => f.write_str("Custom"),
+        }
+    }
+}
+
+impl SelectedFormatter {
+    /// Format one entry, reusing the built-in String allocation as its byte buffer.
+    fn format(&self, entry: &AuditLog) -> Vec<u8> {
+        match self {
+            Self::Builtin(format) => entry.format(*format).into_bytes(),
+            Self::Custom(formatter) => formatter.format(entry),
+        }
+    }
+
+    /// The MIME type of this formatter.
+    fn mime(&self) -> &'static str {
+        match self {
+            Self::Builtin(format) => audit_log_mime(*format),
+            Self::Custom(formatter) => formatter.mime(),
+        }
+    }
+}
+
 /// Writes audit log entries in `SecAuditLogFormat` where `SecAuditLogType` says, and
 /// knows which transactions `SecAuditEngine RelevantOnly` keeps.
 #[derive(Debug)]
 pub(crate) struct AuditLogger {
     /// Format used for each audit entry.
-    format: AuditLogFormat,
+    formatter: SelectedFormatter,
     /// `SecAuditLogRelevantStatus`, if set
     relevant_status: Option<Regex>,
+    /// Custom writer factory selected from the parser registry, if any.
+    custom_writer: Option<CustomWriterPlan>,
     /// How the writer is built when first needed, validated without opening it.
     plan: WriterPlan,
     /// Serialises writer construction, so concurrent first uses open exactly one writer.
@@ -993,7 +1106,6 @@ fn connect_deadline(configured: Option<Duration>, internal: bool) -> Option<Dura
 }
 
 /// How to build the audit writer once, without opening or connecting anything yet.
-#[derive(Debug)]
 enum WriterPlan {
     /// Nowhere: without `SecAuditLog`, as in Go Coraza
     Discard,
@@ -1032,6 +1144,41 @@ enum WriterPlan {
     },
 }
 
+impl fmt::Debug for WriterPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discard => f.write_str("Discard"),
+            Self::Serial { .. } => f.write_str("Serial"),
+            Self::Concurrent { .. } => f.write_str("Concurrent"),
+            Self::Syslog { .. } => f.write_str("Syslog"),
+            #[cfg(feature = "https-audit")]
+            Self::Https { .. } => f.write_str("Https"),
+        }
+    }
+}
+
+/// A custom writer factory and its configuration, kept separate from built-in plans so
+/// the source-derived audit-writer manifest remains limited to built-ins.
+struct CustomWriterPlan {
+    /// Factory selected while the parser's registry was frozen into the WAF.
+    factory: AuditLogWriterFactory,
+    /// Configuration passed to the factory when the sink is activated.
+    config: Box<WafConfig>,
+}
+
+impl fmt::Debug for CustomWriterPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Custom")
+    }
+}
+
+impl CustomWriterPlan {
+    /// Construct the custom sink only when the audit logger activates it.
+    fn open(&self) -> io::Result<Writer> {
+        (self.factory)(self.config.as_ref()).map(Writer::Custom)
+    }
+}
+
 /// Where a serial audit writer sends its entries.
 #[derive(Debug)]
 enum SerialTarget {
@@ -1048,9 +1195,9 @@ impl WriterPlan {
     ///
     /// `internal` selects the connect default: an internal activation attempt bounds a
     /// syslog dial the configuration left unbounded.
-    fn open(&self, format: AuditLogFormat, internal: bool) -> io::Result<Writer> {
+    fn open(&self, mime: &'static str, internal: bool) -> io::Result<Writer> {
         #[cfg(not(feature = "https-audit"))]
-        let _ = format;
+        let _ = mime;
         Ok(match self {
             Self::Discard => Writer::Discard,
             Self::Serial { target, file_mode } => Writer::Serial(Mutex::new(match target {
@@ -1080,9 +1227,7 @@ impl WriterPlan {
                 Writer::Syslog(Mutex::new(syslog))
             },
             #[cfg(feature = "https-audit")]
-            Self::Https { target } => {
-                Writer::Https(https::HttpsWriter::open(target, format).map_err(io::Error::other)?)
-            },
+            Self::Https { target } => Writer::Https(https::HttpsWriter::open(target, mime).map_err(io::Error::other)?),
         })
     }
 }
@@ -1109,6 +1254,8 @@ enum Writer {
     /// One POST each, to an HTTP endpoint
     #[cfg(feature = "https-audit")]
     Https(https::HttpsWriter),
+    /// An embedder-provided sink.
+    Custom(Box<dyn AuditLogWriter>),
 }
 
 impl fmt::Debug for Writer {
@@ -1120,13 +1267,14 @@ impl fmt::Debug for Writer {
             Self::Syslog(_) => f.write_str("Syslog"),
             #[cfg(feature = "https-audit")]
             Self::Https(_) => f.write_str("Https"),
+            Self::Custom(_) => f.write_str("Custom"),
         }
     }
 }
 
 impl Writer {
     /// Write one formatted entry to this writer.
-    fn write(&self, formatted: &str, entry: &AuditLog) -> io::Result<()> {
+    fn write(&self, formatted: &[u8], entry: &AuditLog) -> io::Result<()> {
         match self {
             Self::Discard => Ok(()),
             #[cfg(feature = "https-audit")]
@@ -1137,7 +1285,8 @@ impl Writer {
                 .send(formatted, entry.transaction.is_interrupted),
             Self::Serial(output) => {
                 let mut output = output.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                writeln!(output, "{formatted}")?;
+                output.write_all(formatted)?;
+                output.write_all(b"\n")?;
                 output.flush()
             },
             Self::Concurrent {
@@ -1159,7 +1308,7 @@ impl Writer {
                     at.second,
                     std::process::id()
                 ));
-                write_new(&path, formatted.as_bytes(), *file_mode)?;
+                write_new(&path, formatted, *file_mode)?;
 
                 // The index lines, as Go Coraza's logger writes them
                 let mut index = index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1189,16 +1338,102 @@ impl Writer {
                 )?;
                 index.flush()
             },
+            Self::Custom(writer) => writer.write(entry, formatted),
         }
     }
+}
+
+/// Resolve the custom or built-in sink plan without opening it.
+///
+/// # Errors
+///
+/// Returns a configuration error for an unregistered custom writer name.
+fn prepare_writer_plan(
+    config: &WafConfig,
+    registry: &AuditLogRegistry,
+) -> Result<(Option<CustomWriterPlan>, WriterPlan), String> {
+    let Some(name) = &config.audit_log_custom_type else {
+        return Ok((None, prepare_builtin_writer_plan(config)?));
+    };
+    let factory = registry
+        .writer(name)
+        .ok_or_else(|| format!("invalid audit log type: {name}"))?;
+    Ok((
+        Some(CustomWriterPlan {
+            factory: Arc::clone(factory),
+            config: Box::new(config.clone()),
+        }),
+        WriterPlan::Discard,
+    ))
+}
+
+/// Build a built-in sink plan without opening its target.
+///
+/// # Errors
+///
+/// Returns configuration errors for invalid syslog or HTTPS targets and missing
+/// concurrent storage directories.
+fn prepare_builtin_writer_plan(config: &WafConfig) -> Result<WriterPlan, String> {
+    let target = config.audit_log.as_str();
+    if config.audit_log_type == AuditLogType::Concurrent
+        && !target.is_empty()
+        && config.audit_log_storage_dir.is_empty()
+    {
+        return Err("SecAuditLogStorageDir is required for concurrent audit logs".to_owned());
+    }
+    let plan = match (config.audit_log_type, target) {
+        #[cfg(feature = "https-audit")]
+        (AuditLogType::Https, target) => {
+            https::validate_target(target)?;
+            WriterPlan::Https {
+                target: target.to_owned(),
+            }
+        },
+        #[cfg(not(feature = "https-audit"))]
+        (AuditLogType::Https, _) => {
+            return Err(
+                "audit log type HTTPS is not supported in this build; enable the \"https-audit\" crate feature"
+                    .to_owned(),
+            );
+        },
+        (AuditLogType::Syslog, target) => {
+            validate_syslog_target(target)?;
+            WriterPlan::Syslog {
+                target: target.to_owned(),
+                connect_timeout: config.audit_log_connect_timeout,
+                write_timeout: config.audit_log_write_timeout,
+            }
+        },
+        (_, "") => WriterPlan::Discard,
+        (AuditLogType::Serial, "/dev/stdout") => WriterPlan::Serial {
+            target: SerialTarget::Stdout,
+            file_mode: config.audit_log_file_mode,
+        },
+        (AuditLogType::Serial, "/dev/stderr") => WriterPlan::Serial {
+            target: SerialTarget::Stderr,
+            file_mode: config.audit_log_file_mode,
+        },
+        (AuditLogType::Serial, path) => WriterPlan::Serial {
+            target: SerialTarget::File(path.to_owned()),
+            file_mode: config.audit_log_file_mode,
+        },
+        (AuditLogType::Concurrent, path) => WriterPlan::Concurrent {
+            index: path.to_owned(),
+            dir: PathBuf::from(&config.audit_log_storage_dir),
+            dir_mode: config.audit_log_dir_mode,
+            file_mode: config.audit_log_file_mode,
+        },
+    };
+    Ok(plan)
 }
 
 impl AuditLogger {
     /// Create a logger that discards audit entries.
     pub(crate) fn discard() -> Self {
         Self {
-            format: AuditLogFormat::Native,
+            formatter: SelectedFormatter::Builtin(AuditLogFormat::Native),
             relevant_status: None,
+            custom_writer: None,
             plan: WriterPlan::Discard,
             gate: Mutex::new(()),
             state: RwLock::new(ActivationState::default()),
@@ -1216,66 +1451,26 @@ impl AuditLogger {
     /// of a concurrent log is missing, a syslog target has an unsupported scheme or an
     /// empty address, or the writer is `HTTPS` and the `https-audit` feature is disabled
     /// or the target isn't a valid URI.
-    pub(crate) fn prepare(config: &WafConfig) -> Result<Self, String> {
+    pub(crate) fn prepare(config: &WafConfig, registry: &AuditLogRegistry) -> Result<Self, String> {
         let relevant_status = match config.audit_log_relevant_status.as_str() {
             "" => None,
             pattern => {
                 Some(Regex::new(pattern).map_err(|e| format!("invalid SecAuditLogRelevantStatus {pattern:?}: {e}"))?)
             },
         };
-        let target = config.audit_log.as_str();
-        if config.audit_log_type == AuditLogType::Concurrent
-            && !target.is_empty()
-            && config.audit_log_storage_dir.is_empty()
-        {
-            return Err("SecAuditLogStorageDir is required for concurrent audit logs".to_owned());
-        }
-        let plan = match (config.audit_log_type, target) {
-            #[cfg(feature = "https-audit")]
-            (AuditLogType::Https, target) => {
-                https::validate_target(target)?;
-                WriterPlan::Https {
-                    target: target.to_owned(),
-                }
-            },
-            #[cfg(not(feature = "https-audit"))]
-            (AuditLogType::Https, _) => {
-                return Err(
-                    "audit log type HTTPS is not supported in this build; enable the \"https-audit\" crate feature"
-                        .to_owned(),
-                );
-            },
-            (AuditLogType::Syslog, target) => {
-                validate_syslog_target(target)?;
-                WriterPlan::Syslog {
-                    target: target.to_owned(),
-                    connect_timeout: config.audit_log_connect_timeout,
-                    write_timeout: config.audit_log_write_timeout,
-                }
-            },
-            (_, "") => WriterPlan::Discard,
-            (AuditLogType::Serial, "/dev/stdout") => WriterPlan::Serial {
-                target: SerialTarget::Stdout,
-                file_mode: config.audit_log_file_mode,
-            },
-            (AuditLogType::Serial, "/dev/stderr") => WriterPlan::Serial {
-                target: SerialTarget::Stderr,
-                file_mode: config.audit_log_file_mode,
-            },
-            (AuditLogType::Serial, path) => WriterPlan::Serial {
-                target: SerialTarget::File(path.to_owned()),
-                file_mode: config.audit_log_file_mode,
-            },
-            (AuditLogType::Concurrent, path) => WriterPlan::Concurrent {
-                index: path.to_owned(),
-                dir: PathBuf::from(&config.audit_log_storage_dir),
-                dir_mode: config.audit_log_dir_mode,
-                file_mode: config.audit_log_file_mode,
-            },
+        let formatter = match &config.audit_log_custom_format {
+            Some(name) => SelectedFormatter::Custom(Arc::clone(
+                registry
+                    .formatter(name)
+                    .ok_or_else(|| format!("invalid audit log format: {name}"))?,
+            )),
+            None => SelectedFormatter::Builtin(config.audit_log_format),
         };
+        let (custom_writer, plan) = prepare_writer_plan(config, registry)?;
         Ok(Self {
-            format: config.audit_log_format,
+            formatter,
             relevant_status,
+            custom_writer,
             plan,
             gate: Mutex::new(()),
             state: RwLock::new(ActivationState::default()),
@@ -1371,7 +1566,10 @@ impl AuditLogger {
 
     /// Open the planned writer outside the state lock; the activation gate is held.
     fn install(&self, internal: bool) -> io::Result<()> {
-        let opened = self.plan.open(self.format, internal);
+        let opened = match &self.custom_writer {
+            Some(custom_writer) => custom_writer.open(),
+            None => self.plan.open(self.formatter.mime(), internal),
+        };
         let mut state = self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(test)]
         {
@@ -1451,7 +1649,7 @@ impl AuditLogger {
     /// If [`AuditLogger::prepare`] or [`AuditLogger::activate`] fails.
     #[cfg(test)]
     pub(crate) fn open(config: &WafConfig) -> Result<Self, String> {
-        let logger = Self::prepare(config)?;
+        let logger = Self::prepare(config, &AuditLogRegistry::default())?;
         logger.activate().map_err(|error| error.to_string())?;
         Ok(logger)
     }
@@ -1472,7 +1670,7 @@ impl AuditLogger {
     ///
     /// If the writer cannot be activated or writing fails.
     pub(crate) fn write(&self, entry: &AuditLog) -> io::Result<()> {
-        let formatted = entry.format(self.format);
+        let formatted = self.formatter.format(entry);
         if formatted.is_empty() {
             return Ok(());
         }
@@ -1664,7 +1862,7 @@ impl Syslog {
 
     /// Sends `message` at severity `err` if `error`, `info` otherwise, framed as Go's
     /// `log/syslog` does.
-    fn send(&mut self, message: &str, error: bool) -> io::Result<()> {
+    fn send(&mut self, message: &[u8], error: bool) -> io::Result<()> {
         // local0 (16) times 8, plus the severity
         let priority = 16 * 8 + if error { 3 } else { 6 };
         let now = std::time::SystemTime::now()
@@ -1672,18 +1870,39 @@ impl Syslog {
             .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
         let at = LocalTime::from_unix(now);
         let tag = format!("com.coraza.waf[{}]", std::process::id());
-        let newline = if message.ends_with('\n') { "" } else { "\n" };
-        let framed = if self.local {
-            format!("<{priority}>{} {tag}: {message}{newline}", at.syslog_stamp())
+        if let Ok(message) = std::str::from_utf8(message) {
+            let newline = if message.ends_with('\n') { "" } else { "\n" };
+            let framed = if self.local {
+                format!("<{priority}>{} {tag}: {message}{newline}", at.syslog_stamp())
+            } else {
+                format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
+            };
+            return self.send_frame(framed.as_bytes());
+        }
+
+        // Custom formatters may emit arbitrary bytes; preserve those without lossy UTF-8 conversion.
+        let prefix = if self.local {
+            format!("<{priority}>{} {tag}: ", at.syslog_stamp())
         } else {
-            format!("<{priority}>{} {} {tag}: {message}{newline}", at.rfc3339(), hostname())
+            format!("<{priority}>{} {} {tag}: ", at.rfc3339(), hostname())
         };
-        if self.socket.write_frame(framed.as_bytes()).is_err() {
+        let mut framed = Vec::with_capacity(prefix.len() + message.len() + 1);
+        framed.extend_from_slice(prefix.as_bytes());
+        framed.extend_from_slice(message);
+        if !message.ends_with(b"\n") {
+            framed.push(b'\n');
+        }
+        self.send_frame(&framed)
+    }
+
+    /// Send one framed message, reconnecting once when the original socket fails.
+    fn send_frame(&mut self, framed: &[u8]) -> io::Result<()> {
+        if self.socket.write_frame(framed).is_err() {
             // A reconnect happens on the request path, so it is always bounded even when
             // the explicit initial dial was not; the new socket stores that deadline.
             let connect_timeout = connect_deadline(self.connect_timeout, true);
             *self = Self::connect(&self.target, connect_timeout, self.write_timeout)?;
-            self.socket.write_frame(framed.as_bytes())?;
+            self.socket.write_frame(framed)?;
         }
         Ok(())
     }
@@ -1731,6 +1950,7 @@ fn hostname() -> String {
 mod https {
     use std::{io, time::Duration};
 
+    use super::audit_log_mime;
     use crate::types::AuditLogFormat;
 
     /// `User-Agent` Go Coraza's HTTPS writer sends with every entry.
@@ -1786,16 +2006,16 @@ mod https {
         /// writer is built with the WAF, and a dropped transaction ignores audit
         /// writer errors, so a target that cannot be posted to would silently
         /// lose entries.
-        pub(super) fn open(target: &str, format: AuditLogFormat) -> Result<Self, String> {
+        pub(super) fn open(target: &str, content_type: &'static str) -> Result<Self, String> {
             validate_target(target)?;
-            Ok(Self::with_exchange(target, format, Box::new(UreqExchange::new())))
+            Ok(Self::with_exchange(target, content_type, Box::new(UreqExchange::new())))
         }
 
         /// A writer sending through `exchange`.
-        fn with_exchange(target: &str, format: AuditLogFormat, exchange: Box<dyn HttpExchange>) -> Self {
+        fn with_exchange(target: &str, content_type: &'static str, exchange: Box<dyn HttpExchange>) -> Self {
             Self {
                 url: target.to_owned(),
-                content_type: format_mime(format),
+                content_type,
                 exchange,
             }
         }
@@ -1805,13 +2025,13 @@ mod https {
         /// # Errors
         ///
         /// If the request fails or the response status isn't 2xx.
-        pub(super) fn write(&self, body: &str) -> io::Result<()> {
+        pub(super) fn write(&self, body: &[u8]) -> io::Result<()> {
             let post = HttpPost {
                 method: "POST",
                 url: &self.url,
                 user_agent: USER_AGENT,
                 content_type: self.content_type,
-                body: body.as_bytes(),
+                body,
                 timeout: TIMEOUT,
             };
             let status = self.exchange.post(&post).map_err(io::Error::other)?;
@@ -1914,11 +2134,7 @@ mod https {
 
     /// The `Content-Type` of entries in `format`, as Go Coraza's formatters report it.
     fn format_mime(format: AuditLogFormat) -> &'static str {
-        match format {
-            AuditLogFormat::Native => "application/x-coraza-auditlog-native",
-            AuditLogFormat::Json | AuditLogFormat::JsonLegacy => "application/json; charset=utf-8",
-            AuditLogFormat::Ocsf => "application/json",
-        }
+        audit_log_mime(format)
     }
 
     #[cfg(test)]
@@ -1930,7 +2146,7 @@ mod https {
             time::Duration,
         };
 
-        use super::{HttpExchange, HttpPost, HttpsWriter, TIMEOUT};
+        use super::{HttpExchange, HttpPost, HttpsWriter, TIMEOUT, format_mime};
         use crate::types::AuditLogFormat;
 
         /// An [`HttpExchange`] that records requests and returns scripted responses.
@@ -1997,7 +2213,7 @@ mod https {
         ) -> (HttpsWriter, ScriptedExchange) {
             let exchange = ScriptedExchange::new(responses);
             (
-                HttpsWriter::with_exchange(target, format, Box::new(exchange.clone())),
+                HttpsWriter::with_exchange(target, format_mime(format), Box::new(exchange.clone())),
                 exchange,
             )
         }
@@ -2005,7 +2221,7 @@ mod https {
         #[test]
         fn writer_posts_the_entry_as_go_does() {
             let (writer, exchange) = scripted_writer("http://127.0.0.1:8080/audit", AuditLogFormat::Json, [Ok(200)]);
-            writer.write("{\"transaction\":{}}").unwrap();
+            writer.write(b"{\"transaction\":{}}").unwrap();
 
             let requests = exchange.recorded();
             assert_eq!(requests.len(), 1);
@@ -2027,7 +2243,7 @@ mod https {
                 (AuditLogFormat::Ocsf, "application/json"),
             ] {
                 let (writer, exchange) = scripted_writer("https://example.com/audit", format, [Ok(200)]);
-                writer.write("entry").unwrap();
+                writer.write(b"entry").unwrap();
                 let requests = exchange.recorded();
                 let request = requests.first().unwrap();
                 assert_eq!(request.content_type, mime);
@@ -2039,7 +2255,7 @@ mod https {
             for status in [200, 201, 204, 299] {
                 let (writer, _exchange) =
                     scripted_writer("https://example.com/audit", AuditLogFormat::Native, [Ok(status)]);
-                writer.write("entry").unwrap();
+                writer.write(b"entry").unwrap();
             }
         }
 
@@ -2048,7 +2264,7 @@ mod https {
             for status in [199, 300, 301, 400, 404, 500] {
                 let (writer, _exchange) =
                     scripted_writer("https://example.com/audit", AuditLogFormat::Native, [Ok(status)]);
-                let error = writer.write("entry").unwrap_err();
+                let error = writer.write(b"entry").unwrap_err();
                 assert_eq!(error.to_string(), format!("unexpected status code {status}"));
             }
         }
@@ -2060,7 +2276,7 @@ mod https {
                 AuditLogFormat::Native,
                 [Err("connection refused".to_owned())],
             );
-            let error = writer.write("entry").unwrap_err();
+            let error = writer.write(b"entry").unwrap_err();
             assert!(error.to_string().contains("connection refused"), "{error}");
         }
 
@@ -2080,14 +2296,17 @@ mod https {
                 "http://[::1]/audit",
                 "http://user:pass@collector.example/audit",
             ] {
-                assert!(HttpsWriter::open(target, AuditLogFormat::Json).is_ok(), "{target}");
+                assert!(
+                    HttpsWriter::open(target, format_mime(AuditLogFormat::Json)).is_ok(),
+                    "{target}"
+                );
             }
         }
 
         #[test]
         fn open_accepts_an_uppercase_scheme() {
-            assert!(HttpsWriter::open("HTTP://example.com/audit", AuditLogFormat::Json).is_ok());
-            assert!(HttpsWriter::open("HtTpS://example.com/audit", AuditLogFormat::Json).is_ok());
+            assert!(HttpsWriter::open("HTTP://example.com/audit", format_mime(AuditLogFormat::Json)).is_ok());
+            assert!(HttpsWriter::open("HtTpS://example.com/audit", format_mime(AuditLogFormat::Json)).is_ok());
         }
 
         #[test]
@@ -2099,7 +2318,9 @@ mod https {
                 "//example.com/audit",
                 "https://:8080/audit",
             ] {
-                let error = HttpsWriter::open(target, AuditLogFormat::Json).err().unwrap();
+                let error = HttpsWriter::open(target, format_mime(AuditLogFormat::Json))
+                    .err()
+                    .unwrap();
                 assert!(
                     error.starts_with(&format!("invalid HTTPS audit log target {target:?}:")),
                     "{error}"
@@ -2120,7 +2341,9 @@ mod https {
                 "http://[::1]:abc/audit",
                 "http://user:pass@collector.example:abc/audit",
             ] {
-                let error = HttpsWriter::open(target, AuditLogFormat::Json).err().unwrap();
+                let error = HttpsWriter::open(target, format_mime(AuditLogFormat::Json))
+                    .err()
+                    .unwrap();
                 assert!(
                     error.starts_with(&format!("invalid HTTPS audit log target {target:?}:")),
                     "{error}"
@@ -2134,7 +2357,7 @@ mod https {
 
         #[test]
         fn open_rejects_an_invalid_target() {
-            let error = HttpsWriter::open("http://exa mple.com/audit", AuditLogFormat::Json)
+            let error = HttpsWriter::open("http://exa mple.com/audit", format_mime(AuditLogFormat::Json))
                 .err()
                 .unwrap();
             assert!(error.contains("invalid HTTPS audit log target"), "{error}");
@@ -2312,7 +2535,7 @@ mod tests {
             audit_log: "unix:///nonexistent/coraza-audit.sock".to_owned(),
             ..WafConfig::default()
         };
-        let logger = std::sync::Arc::new(AuditLogger::prepare(&config).unwrap());
+        let logger = std::sync::Arc::new(AuditLogger::prepare(&config, &super::AuditLogRegistry::default()).unwrap());
         assert!(logger.ensure_activated().is_err());
         logger.expire_backoff();
         let gate = logger.gate.lock().unwrap();
@@ -2364,7 +2587,7 @@ mod tests {
             audit_log: "unix:///nonexistent/coraza-audit.sock".to_owned(),
             ..WafConfig::default()
         };
-        let logger = AuditLogger::prepare(&config).unwrap();
+        let logger = AuditLogger::prepare(&config, &super::AuditLogRegistry::default()).unwrap();
         assert_eq!(
             logger.next_backoff_window(),
             ACTIVATION_RETRY_BACKOFF,
@@ -2596,7 +2819,7 @@ mod tests {
 
         let mut syslog = Syslog::connect(&target, None, None).unwrap();
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        syslog.send("reconnected", false).unwrap();
+        syslog.send(b"reconnected", false).unwrap();
 
         let message = server.join().unwrap().unwrap();
         assert!(message.ends_with(b"reconnected\n"));
@@ -2624,7 +2847,7 @@ mod tests {
         // send until the failure triggers the reconnect; the listener keeps accepting.
         let mut result = Ok(());
         for _ in 0..50 {
-            result = syslog.send("reconnect", false);
+            result = syslog.send(b"reconnect", false);
             if syslog.connect_timeout.is_some() {
                 break;
             }
@@ -2688,7 +2911,7 @@ mod tests {
         let mut result: io::Result<()> = Ok(());
         // Bounded chunks keep the test independent of the platform's socket buffers.
         while started.elapsed() < bound {
-            result = syslog.send(&chunk, false);
+            result = syslog.send(chunk.as_bytes(), false);
             if result.is_err() {
                 break;
             }
@@ -2725,7 +2948,9 @@ mod tests {
                 audit_log: target.to_owned(),
                 ..WafConfig::default()
             };
-            let error = AuditLogger::prepare(&config).err().unwrap();
+            let error = AuditLogger::prepare(&config, &super::AuditLogRegistry::default())
+                .err()
+                .unwrap();
             assert!(error.contains("invalid syslog target"), "{target}: {error}");
         }
     }
@@ -2738,7 +2963,10 @@ mod tests {
                 audit_log: target.to_owned(),
                 ..WafConfig::default()
             };
-            assert!(AuditLogger::prepare(&config).is_ok(), "{target}");
+            assert!(
+                AuditLogger::prepare(&config, &super::AuditLogRegistry::default()).is_ok(),
+                "{target}"
+            );
         }
         #[cfg(unix)]
         for target in ["unix:///dev/log", "unixgram:///dev/log"] {
@@ -2747,7 +2975,10 @@ mod tests {
                 audit_log: target.to_owned(),
                 ..WafConfig::default()
             };
-            assert!(AuditLogger::prepare(&config).is_ok(), "{target}");
+            assert!(
+                AuditLogger::prepare(&config, &super::AuditLogRegistry::default()).is_ok(),
+                "{target}"
+            );
         }
     }
 }

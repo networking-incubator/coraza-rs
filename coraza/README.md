@@ -71,6 +71,15 @@ startup, or the one `/etc/localtime` records. The JSON `unix_timestamp`, the
 OCSF `time`, `start_time` and `metadata.logged_time`, and `TIME_EPOCH` remain
 absolute epoch values.
 
+Embedders can register parser-scoped `AuditLogFormatter` and `AuditLogWriter`
+implementations with `Parser::register_audit_log_formatter` and
+`Parser::register_audit_log_writer`. Names are case-insensitive, and a custom
+registration wins over a built-in name. The writer factory receives the
+resolved `WafConfig` and is called only on `Waf::activate` or the first audit
+write; it must not open a file or socket before then. Writers receive both the
+`AuditLog` and its already-formatted bytes. This crate supplies no custom writer
+for WASI; an embedder must provide one that avoids filesystem and socket calls.
+
 `SecAuditLogType HTTPS` requires the `https-audit` crate feature; without it the
 WAF is built with that writer rejected, never silently replaced by another one.
 With the feature, each entry is POSTed to `SecAuditLog` with a one-second

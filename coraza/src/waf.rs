@@ -26,7 +26,7 @@ use std::sync::{
 };
 
 use crate::{
-    audit_log::{AuditLogger, ErrorLog},
+    audit_log::{AuditLogRegistry, AuditLogger, ErrorLog},
     config::{UploadKeepFiles, WafConfig},
     rules::RuleGroup,
     transaction::Transaction,
@@ -74,7 +74,7 @@ impl Waf {
     /// Returns an error for invalid limits, incompatible upload settings, or invalid
     /// audit logging configuration. Audit writers are not opened here.
     pub fn new(config: WafConfig) -> Result<Self, ConfigError> {
-        Self::with_rules(config, RuleGroup::new(), None)
+        Self::with_rules(config, RuleGroup::new(), None, &AuditLogRegistry::default())
     }
 
     /// Create a WAF from configuration and compiled rules.
@@ -94,6 +94,7 @@ impl Waf {
         config: WafConfig,
         rules: RuleGroup,
         error_log: Option<ErrorLog>,
+        audit_log_registry: &AuditLogRegistry,
     ) -> Result<Self, ConfigError> {
         validate_config(&config)?;
         if let Some(compiled) = rules.compiled_case_sensitive_args_keys()
@@ -114,7 +115,7 @@ impl Waf {
                 config.multiphase_evaluation
             )));
         }
-        let audit_logger = AuditLogger::prepare(&config).map_err(ConfigError)?;
+        let audit_logger = AuditLogger::prepare(&config, audit_log_registry).map_err(ConfigError)?;
         Ok(Self {
             config: Arc::new(config),
             rules: Arc::new(rules),

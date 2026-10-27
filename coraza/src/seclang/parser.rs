@@ -54,7 +54,7 @@ use winnow::{
 };
 
 use crate::{
-    audit_log::{ErrorLog, MatchedRule},
+    audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
     config::{UploadKeepFiles, WafConfig},
     operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
     rules::{Rule, RuleGroup},
@@ -152,6 +152,9 @@ struct DirectiveOptions<'a> {
     /// Operator factories registered on the parser
     custom_operators: &'a CustomOperators,
 
+    /// Audit log implementations registered on the parser
+    audit_log_registry: &'a AuditLogRegistry,
+
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
@@ -212,6 +215,9 @@ pub struct Parser {
     /// Operator factories registered by the embedder, consulted before built-ins
     custom_operators: CustomOperators,
 
+    /// Audit writer/formatter implementations registered by the embedder.
+    audit_log_registry: AuditLogRegistry,
+
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
@@ -236,6 +242,7 @@ impl Parser {
             default_actions: DefaultActions::default(),
             datasets: Datasets::new(),
             custom_operators: CustomOperators::new(),
+            audit_log_registry: AuditLogRegistry::default(),
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -263,6 +270,24 @@ impl Parser {
         self.custom_operators.insert(name.to_owned(), factory);
     }
 
+    /// Register a custom audit writer factory under `name`, matched case-insensitively.
+    ///
+    /// A custom name takes precedence over a built-in writer of the same name. The
+    /// factory is resolved while compiling this parser and called only by
+    /// [`Waf::activate`] or the first audit write, never while parsing.
+    pub fn register_audit_log_writer(&mut self, name: &str, factory: AuditLogWriterFactory) {
+        self.audit_log_registry.register_writer(name, factory);
+    }
+
+    /// Register an audit formatter under `name`, matched case-insensitively.
+    ///
+    /// A custom name takes precedence over a built-in formatter of the same name. The
+    /// selected formatter is frozen into the WAF at [`Parser::compile`]; registrations on
+    /// another parser cannot change it.
+    pub fn register_audit_log_formatter(&mut self, name: &str, formatter: std::sync::Arc<dyn AuditLogFormatter>) {
+        self.audit_log_registry.register_formatter(name, formatter);
+    }
+
     /// Number of rules compiled so far.
     pub fn rule_count(&self) -> usize {
         self.rules.count()
@@ -280,7 +305,7 @@ impl Parser {
     /// Returns an error when the parsed configuration is invalid for WAF construction.
     pub fn compile(mut self) -> Result<Waf, ConfigError> {
         self.rules.finalize_multiphase(self.waf_config.multiphase_evaluation);
-        Waf::with_rules(self.waf_config, self.rules, self.error_log)
+        Waf::with_rules(self.waf_config, self.rules, self.error_log, &self.audit_log_registry)
     }
 
     /// Consume the parser and build a WAF from its configuration and compiled rules.
@@ -534,6 +559,7 @@ impl Parser {
                 default_actions: &mut self.default_actions,
                 datasets: &mut self.datasets,
                 custom_operators: &self.custom_operators,
+                audit_log_registry: &self.audit_log_registry,
                 skip_failed: &mut self.skip_failed,
             }),
         };
@@ -1170,7 +1196,14 @@ fn directive_sec_audit_log(options: &mut DirectiveOptions<'_>) -> Result<(), Str
 
 /// `SecAuditLogFormat` Native|JSON|JSONLegacy|OCSF
 fn directive_sec_audit_log_format(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    options.waf_config.audit_log_format = AuditLogFormat::from_str(&options.opts).map_err(|e| e.to_string())?;
+    if options.audit_log_registry.formatter(&options.opts).is_some() {
+        options.waf_config.audit_log_custom_format = Some(options.opts.to_ascii_lowercase());
+        options.waf_config.audit_log_format = AuditLogFormat::Native;
+    } else {
+        let format = AuditLogFormat::from_str(&options.opts).map_err(|e| e.to_string())?;
+        options.waf_config.audit_log_custom_format = None;
+        options.waf_config.audit_log_format = format;
+    }
     Ok(())
 }
 
@@ -1182,7 +1215,14 @@ fn directive_sec_audit_log_parts(options: &mut DirectiveOptions<'_>) -> Result<(
 
 /// `SecAuditLogType` Serial|Concurrent|HTTPS|Syslog
 fn directive_sec_audit_log_type(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    options.waf_config.audit_log_type = AuditLogType::from_str(&options.opts).map_err(|e| e.to_string())?;
+    if options.audit_log_registry.writer(&options.opts).is_some() {
+        options.waf_config.audit_log_custom_type = Some(options.opts.to_ascii_lowercase());
+        options.waf_config.audit_log_type = AuditLogType::Serial;
+    } else {
+        let log_type = AuditLogType::from_str(&options.opts).map_err(|e| e.to_string())?;
+        options.waf_config.audit_log_custom_type = None;
+        options.waf_config.audit_log_type = log_type;
+    }
     Ok(())
 }
 
@@ -1323,6 +1363,8 @@ fn directive_sec_collection_timeout(options: &mut DirectiveOptions<'_>) -> Resul
     reason = "parser tests use fixed directives and temporary fixtures"
 )]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -1420,7 +1462,7 @@ mod tests {
         let mut parser = Parser::new();
         parser.register_operator(
             "equals",
-            std::sync::Arc::new(|argument: &str| {
+            Arc::new(|argument: &str| {
                 let operator: Box<dyn Operator> = Box::new(Equals(argument.to_owned()));
                 Ok(operator)
             }),
@@ -1504,7 +1546,7 @@ mod tests {
             ..parser.config().clone()
         };
 
-        let error = Waf::with_rules(config, parser.rules, None).unwrap_err();
+        let error = Waf::with_rules(config, parser.rules, None, &parser.audit_log_registry).unwrap_err();
 
         assert!(error.to_string().contains("case_sensitive_args_keys"));
     }

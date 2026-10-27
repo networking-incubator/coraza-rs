@@ -163,6 +163,14 @@ pub struct WafConfig {
     /// Where audit log entries are written (`SecAuditLogType`).
     pub audit_log_type: AuditLogType,
 
+    /// Registered `SecAuditLogType` name, selected before the built-in enum.
+    #[doc(hidden)]
+    pub audit_log_custom_type: Option<String>,
+
+    /// Registered `SecAuditLogFormat` name, selected before the built-in enum.
+    #[doc(hidden)]
+    pub audit_log_custom_format: Option<String>,
+
     /// Regular expression of the response statuses that make a transaction relevant to
     /// `SecAuditEngine RelevantOnly`; empty for none (`SecAuditLogRelevantStatus`).
     pub audit_log_relevant_status: String,
@@ -295,6 +303,8 @@ impl Default for WafConfig {
                 AuditLogPart::EndMarker,
             ],
             audit_log_type: AuditLogType::Serial,
+            audit_log_custom_type: None,
+            audit_log_custom_format: None,
             audit_log_relevant_status: String::new(),
             audit_log_dir_mode: 0o755,
             audit_log_file_mode: 0o644,
@@ -368,5 +378,17 @@ mod tests {
     #[test]
     fn new_returns_default_configuration() {
         assert_eq!(WafConfig::new(), WafConfig::default());
+    }
+
+    #[test]
+    fn custom_audit_names_keep_config_clone_and_equality() {
+        let config = WafConfig {
+            audit_log_custom_type: Some("capture".to_owned()),
+            audit_log_custom_format: Some("json-v2".to_owned()),
+            ..WafConfig::default()
+        };
+
+        assert_eq!(config.clone(), config);
+        assert_ne!(config, WafConfig::default());
     }
 }
