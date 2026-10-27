@@ -58,12 +58,12 @@ use winnow::{
 };
 
 use crate::{
-    actions::ActionCompileContext,
+    actions::{ActionCompileContext, RuleMetadata},
     audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
     config::{UploadKeepFiles, WafConfig},
     debug_log::DebugLogger,
     operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
-    rules::{Rule, RuleGroup},
+    rules::{Rule, RuleGroup, RuleObserver},
     seclang::{
         CompileError, parse_actions,
         rule_compiler::{
@@ -165,6 +165,9 @@ struct DirectiveOptions<'a> {
     /// Custom transformation implementations registered on the parser.
     action_compile_context: ActionCompileContext<'a>,
 
+    /// Rule observer registered on the parser.
+    rule_observer: Option<&'a RuleObserver>,
+
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
@@ -231,6 +234,9 @@ pub struct Parser {
     /// Custom transformations keyed by lower-case SecLang name.
     custom_transformations: BTreeMap<String, Arc<dyn CustomTransformation>>,
 
+    /// Optional callback invoked after each rule is inserted during parsing.
+    rule_observer: Option<Arc<RuleObserver>>,
+
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
@@ -260,6 +266,7 @@ impl Parser {
             custom_operators: CustomOperators::new(),
             audit_log_registry: AuditLogRegistry::default(),
             custom_transformations: BTreeMap::new(),
+            rule_observer: None,
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -376,6 +383,18 @@ impl Parser {
     /// Set a callback that receives each rule with the `log` action when it matches.
     pub fn on_error_log(&mut self, log: impl Fn(&MatchedRule) + Send + Sync + 'static) {
         self.error_log = Some(ErrorLog::new(log));
+    }
+
+    /// Observe each rule after it has been inserted while parsing SecLang.
+    ///
+    /// The host callback runs synchronously during [`Parser::from_string`] or
+    /// [`Parser::from_file`], receives the inserted rule's metadata, and is not
+    /// retained by the compiled [`Waf`]. It must not panic: a panic propagates to
+    /// the caller of the parsing method. It must not attempt to mutate the rule
+    /// set. Rules rejected during parsing are not observed; chain members are
+    /// observed individually in source order.
+    pub fn on_rule(&mut self, observer: impl Fn(&RuleMetadata) + Send + Sync + 'static) {
+        self.rule_observer = Some(Arc::new(observer));
     }
 
     /// Makes later parsing skip directives that fail, instead of stopping at the first one.
@@ -614,6 +633,7 @@ impl Parser {
                 custom_operators: &self.custom_operators,
                 audit_log_registry: &self.audit_log_registry,
                 action_compile_context: ActionCompileContext::with_transformations(&self.custom_transformations),
+                rule_observer: self.rule_observer.as_deref(),
                 skip_failed: &mut self.skip_failed,
             }),
         };
@@ -787,7 +807,7 @@ fn add_rule(options: &mut DirectiveOptions<'_>, rule: Result<Rule, CompileError>
     options.raw.clone_into(&mut metadata.raw);
     let multiphase_evaluation = options.waf_config.multiphase_evaluation;
     options.rules.record_multiphase_evaluation(multiphase_evaluation)?;
-    options.rules.add(rule, multiphase_evaluation)
+    options.rules.add(rule, multiphase_evaluation, options.rule_observer)
 }
 
 /// `SecRule` VARIABLES "OPERATOR" "ACTIONS"
@@ -1422,7 +1442,7 @@ fn directive_sec_collection_timeout(options: &mut DirectiveOptions<'_>) -> Resul
     reason = "parser tests use fixed directives and temporary fixtures"
 )]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -1455,6 +1475,67 @@ mod tests {
     fn test_parse_empty_string() {
         let mut parser = Parser::new();
         assert!(parser.from_string("").is_ok());
+    }
+
+    #[test]
+    fn rule_observer_sees_top_level_and_chain_rules_in_source_order() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = Arc::clone(&ids);
+        let mut parser = Parser::new();
+        parser.on_rule(move |metadata| observed_ids.lock().unwrap().push(metadata.id()));
+
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,log,chain\"\n\
+                 SecRule ARGS \"@contains c\" \"id:3,phase:1,log\"\n\
+                 SecAction \"id:4,pass\"",
+            )
+            .unwrap();
+
+        assert_eq!(*ids.lock().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rule_observer_does_not_see_a_rejected_duplicate() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = Arc::clone(&ids);
+        let mut parser = Parser::new();
+        parser.on_rule(move |metadata| observed_ids.lock().unwrap().push(metadata.id()));
+
+        let error = parser
+            .from_string("SecAction \"id:1,pass\"\nSecAction \"id:1,pass\"")
+            .unwrap_err();
+
+        assert!(error.message.contains("duplicated rule id 1"));
+        assert_eq!(*ids.lock().unwrap(), [1]);
+    }
+
+    #[test]
+    fn rules_parse_and_run_without_an_observer() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"@contains match\" \"id:1,phase:1,pass\"")
+            .unwrap();
+        assert_eq!(parser.rule_count(), 1);
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("no-rule-observer");
+        tx.add_get_argument("q", "match");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
+    }
+
+    #[test]
+    fn rule_observer_panics_propagate_to_the_parser_caller() {
+        let mut parser = Parser::new();
+        parser.on_rule(|_| std::panic::resume_unwind(Box::new("observer panic")));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.from_string("SecAction \"id:1,pass\"")
+        }));
+
+        assert!(panic.is_err(), "the parser swallowed the observer panic");
     }
 
     #[test]

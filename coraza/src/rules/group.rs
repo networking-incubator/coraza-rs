@@ -20,7 +20,10 @@
 
 //! Ordered storage and mutation of compiled rules.
 
-use crate::rules::Rule;
+use crate::{actions::RuleMetadata, rules::Rule};
+
+/// Callback invoked synchronously after a rule is inserted.
+pub(crate) type RuleObserver = dyn Fn(&RuleMetadata) + Send + Sync;
 
 /// Rules compiled so far, in SecLang order.
 #[derive(Debug, Default)]
@@ -97,7 +100,12 @@ impl RuleGroup {
     }
 
     /// Add a rule, attaching it to an open chain when needed.
-    pub(crate) fn add(&mut self, mut rule: Rule, multiphase_evaluation: bool) -> Result<(), String> {
+    pub(crate) fn add(
+        &mut self,
+        mut rule: Rule,
+        multiphase_evaluation: bool,
+        observer: Option<&RuleObserver>,
+    ) -> Result<(), String> {
         if multiphase_evaluation {
             rule.split_args_variables();
         }
@@ -116,10 +124,15 @@ impl RuleGroup {
             return Err(format!("duplicated rule id {id}"));
         }
 
-        if let Some(parent) = self.open_chain() {
+        let inserted = if let Some(parent) = self.open_chain() {
             parent.chain.push(rule);
+            parent.chain.last()
         } else {
             self.rules.push(rule);
+            self.rules.last()
+        };
+        if let (Some(observer), Some(inserted)) = (observer, inserted) {
+            observer(inserted.metadata());
         }
         Ok(())
     }
@@ -226,10 +239,10 @@ mod tests {
     #[test]
     fn rejects_duplicate_nonzero_ids() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", ""), false).unwrap();
+        group.add(rule("1", ""), false, None).unwrap();
         assert!(
             group
-                .add(rule("1", ""), false)
+                .add(rule("1", ""), false, None)
                 .unwrap_err()
                 .contains("duplicated rule id 1")
         );
@@ -238,11 +251,11 @@ mod tests {
     #[test]
     fn duplicate_chain_member_id_leaves_the_open_chain_unchanged() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", "chain"), false).unwrap();
+        group.add(rule("1", "chain"), false, None).unwrap();
 
         assert!(
             group
-                .add(rule("1", ""), false)
+                .add(rule("1", ""), false, None)
                 .unwrap_err()
                 .contains("duplicated rule id 1")
         );
@@ -253,12 +266,12 @@ mod tests {
     #[test]
     fn chains_rules_and_discards_an_incomplete_chain() {
         let mut group = RuleGroup::new();
-        group.add(rule("1", "chain"), false).unwrap();
+        group.add(rule("1", "chain"), false, None).unwrap();
         assert!(group.discard_open_chain());
         assert_eq!(group.count(), 0);
 
-        group.add(rule("1", "chain"), false).unwrap();
-        group.add(rule("", ""), false).unwrap();
+        group.add(rule("1", "chain"), false, None).unwrap();
+        group.add(rule("", ""), false, None).unwrap();
         assert_eq!(group.count(), 1);
         assert_eq!(group.rules()[0].chain.len(), 1);
         assert!(!group.discard_open_chain());
@@ -267,12 +280,12 @@ mod tests {
     #[test]
     fn disruptive_chain_member_error_precedes_duplicate_id() {
         let mut group = RuleGroup::new();
-        group.add(rule("42", "chain"), false).unwrap();
+        group.add(rule("42", "chain"), false, None).unwrap();
         let mut member = rule("42", "deny");
         member.explicit_disruptive = true;
 
         assert_eq!(
-            group.add(member, false).unwrap_err(),
+            group.add(member, false, None).unwrap_err(),
             "disruptive actions can only be specified in the chain starter rule (parent id: 42)"
         );
         assert_eq!(group.count(), 0);
@@ -284,8 +297,8 @@ mod tests {
         let mut tagged = rule("2", "");
         tagged.metadata_mut().msg = Some(crate::operators::Macro::new("blocked").unwrap());
         tagged.metadata_mut().tags.push("attack".to_owned());
-        group.add(tagged, false).unwrap();
-        group.add(rule("3", ""), false).unwrap();
+        group.add(tagged, false, None).unwrap();
+        group.add(rule("3", ""), false, None).unwrap();
 
         group.delete_by_msg("blocked");
         assert!(group.find_by_id(2).is_none());
@@ -299,17 +312,17 @@ mod tests {
         let mut parent = rule("1", "chain");
         parent.metadata_mut().phase = RulePhase::RequestBody;
         parent = parent.add_variable(VariableSpec::new(RuleVariable::RequestURI));
-        group.add(parent, true).unwrap();
+        group.add(parent, true, None).unwrap();
 
         let mut first_link = Rule::new();
         first_link.metadata_mut().has_chain = true;
         first_link = first_link
             .add_variable(VariableSpec::new(RuleVariable::TX))
             .add_variable(VariableSpec::new(RuleVariable::RequestBody));
-        group.add(first_link, true).unwrap();
+        group.add(first_link, true, None).unwrap();
 
         let last_link = Rule::new().add_variable(VariableSpec::new(RuleVariable::ResponseHeaders));
-        group.add(last_link, true).unwrap();
+        group.add(last_link, true, None).unwrap();
         group.finalize_multiphase(true);
 
         let root = group.rules().first().expect("parent rule exists");

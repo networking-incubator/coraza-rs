@@ -194,6 +194,15 @@ neither a timeout nor an output-size bound, and a transformation can panic or
 block its caller. Registrations must be trusted host code; the host must bound
 its own work and output and avoid panics.
 
+## Rule observer
+
+`Parser::on_rule` registers a parser-scoped host callback for rule metadata. It is
+called synchronously after each rule is inserted during parsing, including each
+chain member in source order. Rejected rules are not observed. The compiled
+`Waf` retains only its compiled rules; the observer does not run after
+compilation. The callback must not panic (a panic propagates to the caller of
+`Parser::from_string`) or attempt to mutate the rule set.
+
 ## Operators
 
 The default build compiles the built-in operators. Three upstream operators

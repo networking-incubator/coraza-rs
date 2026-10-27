@@ -27,7 +27,7 @@ mod rule;
 mod transformation;
 mod variable;
 
-pub(crate) use group::RuleGroup;
+pub(crate) use group::{RuleGroup, RuleObserver};
 pub(crate) use operator::RuleOperator;
 pub(crate) use rule::Rule;
 pub use transformation::TransformationChain;
