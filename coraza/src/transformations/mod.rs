@@ -50,6 +50,15 @@ pub type TransformationResult = (Vec<u8>, bool, Option<TransformationError>);
 /// A transformation function used by a rule's transformation chain.
 pub type Transformation = fn(&[u8]) -> TransformationResult;
 
+/// A transformation supplied by an embedder and selected with a SecLang `t:` action.
+///
+/// Implementations receive untrusted input bytes. An error leaves the current value
+/// unchanged and does not stop later transformations in the chain.
+pub trait CustomTransformation: Send + Sync {
+    /// Transform `input`, returning bytes, whether they changed, and an optional error.
+    fn transform(&self, input: &[u8]) -> TransformationResult;
+}
+
 /// Returns bytes as text, borrowing valid UTF-8 and replacing invalid sequences.
 pub(crate) fn text_of(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     match std::str::from_utf8(bytes) {

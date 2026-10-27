@@ -20,15 +20,33 @@
 
 //! SecLang action compilation and transaction-phase runtime effects.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
     operators::{Macro, MacroError},
     rules::TransformationChain,
     transaction::Transaction,
-    transformations,
+    transformations::{self, CustomTransformation},
     types::{RulePhase, RuleSeverity},
 };
+
+/// Parser-scoped host implementations visible while actions are compiled.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ActionCompileContext<'a> {
+    /// Registered transformations to consult before built-ins, when compiling parser rules.
+    custom_transformations: Option<&'a BTreeMap<String, Arc<dyn CustomTransformation>>>,
+}
+
+impl<'a> ActionCompileContext<'a> {
+    /// Builds a context over the parser's registered transformations.
+    pub(crate) fn with_transformations(
+        custom_transformations: &'a BTreeMap<String, Arc<dyn CustomTransformation>>,
+    ) -> Self {
+        Self {
+            custom_transformations: Some(custom_transformations),
+        }
+    }
+}
 
 /// Errors while compiling an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +238,7 @@ impl RuleMetadata {
     }
 }
 
-/// Compile a parsed action, updating rule metadata or retaining a runtime action.
+/// Compile a parsed action, resolving custom transformations from `context` before built-ins.
 #[expect(
     clippy::too_many_lines,
     reason = "one dispatch keeps SecLang action validation in source order"
@@ -229,6 +247,7 @@ pub(crate) fn compile_action(
     name: &str,
     argument: &str,
     metadata: &mut RuleMetadata,
+    context: ActionCompileContext<'_>,
 ) -> Result<Option<CompiledAction>, ActionError> {
     let name = name.to_ascii_lowercase();
     let action = match name.as_str() {
@@ -325,7 +344,15 @@ pub(crate) fn compile_action(
         },
         "t" => {
             require_argument(argument)?;
-            if argument.eq_ignore_ascii_case("none") {
+            let custom = context
+                .custom_transformations
+                .and_then(|registry| registry.get(&argument.to_ascii_lowercase()));
+            if let Some(transformation) = custom {
+                metadata
+                    .transformations
+                    .add_custom(argument, Arc::clone(transformation))
+                    .map_err(ActionError::InvalidArguments)?;
+            } else if argument.eq_ignore_ascii_case("none") {
                 metadata.transformations.clear();
             } else {
                 let function = transformation_by_name(argument)
@@ -596,17 +623,30 @@ fn transformation_by_name(name: &str) -> Option<transformations::Transformation>
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "action tests use fixed inputs")]
 mod tests {
-    use super::{ActionType, RuleMetadata, compile_action};
+    use super::{ActionCompileContext, ActionType, RuleMetadata, compile_action};
     use crate::types::{RulePhase, RuleSeverity};
 
     #[test]
     fn metadata_actions_update_rule_metadata() {
         let mut metadata = RuleMetadata::new();
-        assert!(compile_action("ID", "15", &mut metadata).unwrap().is_none());
-        assert!(compile_action("phase", "1", &mut metadata).unwrap().is_none());
-        assert!(compile_action("severity", "CRITICAL", &mut metadata).unwrap().is_none());
-        assert!(compile_action("tag", "attack", &mut metadata).unwrap().is_none());
-        assert!(compile_action("t", "lowercase", &mut metadata).unwrap().is_none());
+        let context = ActionCompileContext::default();
+        assert!(compile_action("ID", "15", &mut metadata, context).unwrap().is_none());
+        assert!(compile_action("phase", "1", &mut metadata, context).unwrap().is_none());
+        assert!(
+            compile_action("severity", "CRITICAL", &mut metadata, context)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            compile_action("tag", "attack", &mut metadata, context)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            compile_action("t", "lowercase", &mut metadata, context)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(metadata.id, 15);
         assert_eq!(metadata.phase, RulePhase::RequestHeaders);
         assert_eq!(metadata.severity, Some(RuleSeverity::Critical));
@@ -617,20 +657,26 @@ mod tests {
     #[test]
     fn runtime_actions_are_validated_and_classified() {
         let mut metadata = RuleMetadata::new();
-        let action = compile_action("deny", "", &mut metadata).unwrap().unwrap();
+        let context = ActionCompileContext::default();
+        let action = compile_action("deny", "", &mut metadata, context).unwrap().unwrap();
         assert_eq!(action.action_type(), ActionType::Disruptive);
-        let action = compile_action("skipAfter", "NEXT", &mut metadata).unwrap().unwrap();
+        let action = compile_action("skipAfter", "NEXT", &mut metadata, context)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action_type(), ActionType::Flow);
-        let action = compile_action("setvar", "TX.score=+1", &mut metadata).unwrap().unwrap();
+        let action = compile_action("setvar", "TX.score=+1", &mut metadata, context)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action_type(), ActionType::Nondisruptive);
-        assert!(compile_action("deny", "403", &mut metadata).is_err());
-        assert!(compile_action("skip", "0", &mut metadata).is_err());
-        assert!(compile_action("unknown", "", &mut metadata).is_err());
+        assert!(compile_action("deny", "403", &mut metadata, context).is_err());
+        assert!(compile_action("skip", "0", &mut metadata, context).is_err());
+        assert!(compile_action("unknown", "", &mut metadata, context).is_err());
     }
 
     #[test]
     fn ctl_validates_body_processors_and_rule_targets() {
         let mut metadata = RuleMetadata::new();
+        let context = ActionCompileContext::default();
         for argument in [
             "requestBodyProcessor=JSON",
             "responseBodyLimit=0",
@@ -639,7 +685,10 @@ mod tests {
             "ruleRemoveByTag=",
             "hashEngine=anything",
         ] {
-            assert!(compile_action("ctl", argument, &mut metadata).is_ok(), "{argument}");
+            assert!(
+                compile_action("ctl", argument, &mut metadata, context).is_ok(),
+                "{argument}"
+            );
         }
         for argument in [
             "requestBodyProcessor=YAML",
@@ -650,14 +699,25 @@ mod tests {
             "ruleRemoveTargetByTag=attack;REQUEST_URI:key",
             "ruleRemoveTargetByTag=attack;ARGS:/[/",
         ] {
-            assert!(compile_action("ctl", argument, &mut metadata).is_err(), "{argument}");
+            assert!(
+                compile_action("ctl", argument, &mut metadata, context).is_err(),
+                "{argument}"
+            );
         }
     }
 
     #[test]
     fn redirect_accepts_the_written_target_without_macro_parsing() {
         let mut metadata = RuleMetadata::new();
-        assert!(compile_action("redirect", "%{unfinished", &mut metadata).is_ok());
+        assert!(
+            compile_action(
+                "redirect",
+                "%{unfinished",
+                &mut metadata,
+                ActionCompileContext::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

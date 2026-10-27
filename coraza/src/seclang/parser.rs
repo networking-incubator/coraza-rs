@@ -40,10 +40,14 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     ops::RangeInclusive,
     path::Path,
     str::FromStr as _,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use winnow::{
@@ -54,6 +58,7 @@ use winnow::{
 };
 
 use crate::{
+    actions::ActionCompileContext,
     audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
     config::{UploadKeepFiles, WafConfig},
     debug_log::DebugLogger,
@@ -66,6 +71,7 @@ use crate::{
         },
         variable_parser::VariableList,
     },
+    transformations::CustomTransformation,
     types::{
         AuditEngineStatus, AuditLogFormat, AuditLogType, BodyLimitAction, RuleEngineStatus, parse_audit_log_parts,
     },
@@ -156,6 +162,9 @@ struct DirectiveOptions<'a> {
     /// Audit log implementations registered on the parser
     audit_log_registry: &'a AuditLogRegistry,
 
+    /// Custom transformation implementations registered on the parser.
+    action_compile_context: ActionCompileContext<'a>,
+
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
@@ -219,6 +228,9 @@ pub struct Parser {
     /// Audit writer/formatter implementations registered by the embedder.
     audit_log_registry: AuditLogRegistry,
 
+    /// Custom transformations keyed by lower-case SecLang name.
+    custom_transformations: BTreeMap<String, Arc<dyn CustomTransformation>>,
+
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
@@ -232,7 +244,7 @@ pub struct Parser {
     error_log: Option<ErrorLog>,
 
     /// Optional host-provided debug sink.
-    debug_logger: Option<std::sync::Arc<dyn DebugLogger>>,
+    debug_logger: Option<Arc<dyn DebugLogger>>,
 }
 
 impl Parser {
@@ -247,6 +259,7 @@ impl Parser {
             datasets: Datasets::new(),
             custom_operators: CustomOperators::new(),
             audit_log_registry: AuditLogRegistry::default(),
+            custom_transformations: BTreeMap::new(),
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -280,9 +293,20 @@ impl Parser {
     /// `WafConfig::debug_log_level` still filters events, and the logger is shared by
     /// transactions created from the compiled WAF.
     #[must_use]
-    pub fn with_debug_logger(mut self, logger: std::sync::Arc<dyn DebugLogger>) -> Self {
+    pub fn with_debug_logger(mut self, logger: Arc<dyn DebugLogger>) -> Self {
         self.debug_logger = Some(logger);
         self
+    }
+
+    /// Register a custom transformation under `name`, matched case-insensitively.
+    ///
+    /// A custom transformation takes precedence over a built-in of the same name.
+    /// It is resolved when a rule is compiled, so registering it does not change
+    /// transformations already compiled into rules. Registering the same name again
+    /// replaces the earlier implementation.
+    pub fn register_transformation(&mut self, name: &str, transformation: Arc<dyn CustomTransformation>) {
+        self.custom_transformations
+            .insert(name.to_ascii_lowercase(), transformation);
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.
@@ -307,7 +331,7 @@ impl Parser {
     /// a `SecAuditLogFormat` that selects it: selection is resolved while parsing. If
     /// parsing failed for an unknown name, register the formatter and re-parse those
     /// directives.
-    pub fn register_audit_log_formatter(&mut self, name: &str, formatter: std::sync::Arc<dyn AuditLogFormatter>) {
+    pub fn register_audit_log_formatter(&mut self, name: &str, formatter: Arc<dyn AuditLogFormatter>) {
         self.audit_log_registry.register_formatter(name, formatter);
     }
 
@@ -590,6 +614,7 @@ impl Parser {
                 datasets: &mut self.datasets,
                 custom_operators: &self.custom_operators,
                 audit_log_registry: &self.audit_log_registry,
+                action_compile_context: ActionCompileContext::with_transformations(&self.custom_transformations),
                 skip_failed: &mut self.skip_failed,
             }),
         };
@@ -777,13 +802,18 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
     options
         .rules
         .record_case_sensitive_args_keys(case_sensitive_args_keys)?;
-    let rule = compile_sec_rule_in(&options.opts, &context, options.default_actions);
+    let rule = compile_sec_rule_in(
+        &options.opts,
+        &context,
+        options.default_actions,
+        options.action_compile_context,
+    );
     add_rule(options, rule)
 }
 
 /// `SecAction` "ACTIONS"
 fn directive_sec_action(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    let rule = compile_sec_action_in(&options.opts, options.default_actions);
+    let rule = compile_sec_action_in(&options.opts, options.default_actions, options.action_compile_context);
     add_rule(options, rule)
 }
 
@@ -875,7 +905,7 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
-            apply_actions(rule, &actions, true, false).map_err(|e| e.message)?;
+            apply_actions(rule, &actions, true, false, options.action_compile_context).map_err(|e| e.message)?;
             found = true;
         }
         if !found && range.start() == range.end() {

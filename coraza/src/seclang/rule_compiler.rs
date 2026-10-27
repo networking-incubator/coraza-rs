@@ -32,7 +32,7 @@ use winnow::{
 };
 
 use crate::{
-    actions::{ActionType, RuleMetadata, compile_action},
+    actions::{ActionCompileContext, ActionType, RuleMetadata, compile_action},
     operators::OperatorContext,
     rules::Rule,
     seclang::{
@@ -50,7 +50,12 @@ type CompileResult<T> = Result<T, CompileError>;
 /// configuration without `SecDefaultAction`.
 #[cfg(test)]
 pub(crate) fn compile_sec_rule(input: &str) -> CompileResult<Rule> {
-    compile_sec_rule_in(input, &OperatorContext::default(), &DefaultActions::default())
+    compile_sec_rule_in(
+        input,
+        &OperatorContext::default(),
+        &DefaultActions::default(),
+        ActionCompileContext::default(),
+    )
 }
 
 /// Compiles the arguments of a `SecRule` directive (`VARIABLES OPERATOR ACTIONS`, without
@@ -60,6 +65,7 @@ pub(crate) fn compile_sec_rule_in(
     input: &str,
     context: &OperatorContext<'_>,
     defaults: &DefaultActions,
+    action_context: ActionCompileContext<'_>,
 ) -> CompileResult<Rule> {
     let RuleArguments {
         variables: vars,
@@ -89,19 +95,23 @@ pub(crate) fn compile_sec_rule_in(
 
     rule = rule.with_operator(rule_operator);
 
-    add_actions(rule, &parsed_actions, defaults)
+    add_actions(rule, &parsed_actions, defaults, action_context)
 }
 
 /// [`compile_sec_action_in`] with the built-in default actions, as in a configuration
 /// without `SecDefaultAction`.
 #[cfg(test)]
 pub(crate) fn compile_sec_action(input: &str) -> CompileResult<Rule> {
-    compile_sec_action_in(input, &DefaultActions::default())
+    compile_sec_action_in(input, &DefaultActions::default(), ActionCompileContext::default())
 }
 
 /// Compiles the actions of a `SecAction` directive (without `SecAction`) into a rule
 /// without operator, which always matches, merging them with `defaults`.
-pub(crate) fn compile_sec_action_in(input: &str, defaults: &DefaultActions) -> CompileResult<Rule> {
+pub(crate) fn compile_sec_action_in(
+    input: &str,
+    defaults: &DefaultActions,
+    action_context: ActionCompileContext<'_>,
+) -> CompileResult<Rule> {
     // Remove quotes from actions
     let actions = remove_matching_quotes(input.trim());
 
@@ -110,7 +120,7 @@ pub(crate) fn compile_sec_action_in(input: &str, defaults: &DefaultActions) -> C
         .map_err(|error| CompileError::new(format!("failed to parse actions '{actions}': {error}")))?;
 
     // Build rule (no operator, no variables)
-    add_actions(Rule::new(), &parsed_actions, defaults)
+    add_actions(Rule::new(), &parsed_actions, defaults, action_context)
 }
 
 /// Applies a rule's parsed actions to `rule`, merged with the defaults of its phase.
@@ -119,20 +129,25 @@ pub(crate) fn compile_sec_action_in(input: &str, defaults: &DefaultActions) -> C
 /// then the rule's own, but for `block`. The defaults' disruptive action applies last,
 /// if the rule has no other. Without defaults for its phase, a rule keeps its actions
 /// as written, `block` included (which then does nothing).
-fn add_actions(mut rule: Rule, parsed_actions: &[ParsedAction], defaults: &DefaultActions) -> CompileResult<Rule> {
+fn add_actions(
+    mut rule: Rule,
+    parsed_actions: &[ParsedAction],
+    defaults: &DefaultActions,
+    action_context: ActionCompileContext<'_>,
+) -> CompileResult<Rule> {
     let Some(defaults) = defaults.for_phase(phase_of(parsed_actions)?) else {
-        apply_actions(&mut rule, parsed_actions, true, false)?;
+        apply_actions(&mut rule, parsed_actions, true, false, action_context)?;
         return Ok(rule);
     };
 
-    apply_actions(&mut rule, &defaults.others, false, false)?;
-    apply_actions(&mut rule, parsed_actions, true, true)?;
+    apply_actions(&mut rule, &defaults.others, false, false, action_context)?;
+    apply_actions(&mut rule, parsed_actions, true, true, action_context)?;
     if !rule
         .actions()
         .iter()
         .any(|action| action.action_type() == ActionType::Disruptive)
     {
-        apply_actions(&mut rule, [&defaults.disruptive], false, false)?;
+        apply_actions(&mut rule, [&defaults.disruptive], false, false, action_context)?;
     }
     Ok(rule)
 }
@@ -144,9 +159,10 @@ pub(crate) fn apply_actions<'a>(
     parsed_actions: impl IntoIterator<Item = &'a ParsedAction>,
     explicit: bool,
     defer_block: bool,
+    action_context: ActionCompileContext<'_>,
 ) -> CompileResult<()> {
     for parsed in parsed_actions {
-        if let Some(action) = compile_action(&parsed.key, &parsed.value, rule.metadata_mut())? {
+        if let Some(action) = compile_action(&parsed.key, &parsed.value, rule.metadata_mut(), action_context)? {
             if explicit && action.action_type() == ActionType::Disruptive {
                 rule.explicit_disruptive = true;
             }
@@ -163,7 +179,12 @@ pub(crate) fn apply_actions<'a>(
 fn phase_of(actions: &[ParsedAction]) -> CompileResult<RulePhase> {
     let mut metadata = RuleMetadata::new();
     for action in actions.iter().filter(|a| a.key == "phase") {
-        compile_action(&action.key, &action.value, &mut metadata)?;
+        compile_action(
+            &action.key,
+            &action.value,
+            &mut metadata,
+            ActionCompileContext::default(),
+        )?;
     }
     Ok(metadata.phase)
 }
@@ -215,7 +236,12 @@ impl DefaultActions {
                     "SecDefaultAction must not contain transformations (t)".to_owned(),
                 ));
             }
-            let action = compile_action(&parsed.key, &parsed.value, &mut metadata)?;
+            let action = compile_action(
+                &parsed.key,
+                &parsed.value,
+                &mut metadata,
+                ActionCompileContext::default(),
+            )?;
             if parsed.key == "phase" {
                 has_phase = true;
             } else if action.is_some_and(|a| a.action_type() == ActionType::Disruptive) {
@@ -491,15 +517,26 @@ mod tests {
         defaults.add("phase:1,log,auditlog,deny,status:403").unwrap();
         let context = OperatorContext::default();
 
-        let rule =
-            compile_sec_rule_in("ARGS \"@contains attack\" \"id:1,phase:1,block\"", &context, &defaults).unwrap();
+        let rule = compile_sec_rule_in(
+            "ARGS \"@contains attack\" \"id:1,phase:1,block\"",
+            &context,
+            &defaults,
+            ActionCompileContext::default(),
+        )
+        .unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
         assert_eq!(names, ["deny"]);
         assert!(rule.metadata().log);
         assert!(rule.metadata().audit_log);
         assert_eq!(rule.metadata().status, 403);
 
-        let rule = compile_sec_rule_in("ARGS \"@contains attack\" \"id:2\"", &context, &defaults).unwrap();
+        let rule = compile_sec_rule_in(
+            "ARGS \"@contains attack\" \"id:2\"",
+            &context,
+            &defaults,
+            ActionCompileContext::default(),
+        )
+        .unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
         assert_eq!(names, ["pass"]);
         assert!(rule.metadata().log);
