@@ -19,6 +19,10 @@ extend-exclude = [
 extend-ignore-re = [
   '<XML ID="xss"><I><B>&lt;IMG SRC="javas<!-- -->cript:javascript:alert\(1\)"&gt;</B></I></XML><SPAN DATASRC="#xss" DATAFLD="B" DATAFORMATAS="HTML"></SPAN>',
   'x:ontimer=.*cript\$x:alert\(1\)',
+  # Historical seven-character Git revision; "ba" is not prose here.
+  'base `557ba71` was',
+  # Byte-identical Go Coraza fixture, verified by go-fixtures-check --provenance.
+  'check wether they are triggered or not',
 ]
 
 [default.extend-identifiers]
