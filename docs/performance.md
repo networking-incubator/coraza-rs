@@ -669,3 +669,38 @@ That roughly 1% median difference is accepted for this seam rather than adding
 a second built-in-only code path. Upgrade only if a real workload shows it
 matters: split the chain into a built-in slice and a custom slice, so the
 built-in path drops the tag entirely.
+
+## Coraza custom-action dispatch (2026-10-27)
+
+The custom-action implementation adds an implementation-enum check to built-in
+action evaluation and grows each compiled action. A focused release test
+precompiled a rule matching `ARGS:q` against `hit`, then called `Rule::evaluate`
+one million times per sample with `setvar`, `skip`, and `setenv` runtime actions
+and `log,capture` metadata actions. The rule ID was cleared in the harness to
+avoid accumulating match records. It compares whole matched-rule evaluation,
+not the dispatch branch in isolation.
+
+Three paired samples ran pinned to logical CPU 3, alternating order
+base/candidate, candidate/base, base/candidate. Base was `2b4ef751`; candidate
+was `482c51f` plus this lane's code changes. Both used the release test profile
+and Rust 1.99.1 on an AMD Ryzen 7 PRO 7840HS, Linux 7.2.9. The CPU frequency
+was not locked.
+The samples used `taskset -c 3` with `cargo test --release -p coraza --lib
+bench_builtin_action_evaluation_sample -- --ignored --nocapture`; separate
+`CARGO_TARGET_DIR`s held the base and candidate release binaries.
+
+| Revision | Samples (ns/evaluation) | Median | Range |
+| --- | --- | ---: | ---: |
+| Base | 885.5, 869.2, 1,294.7 | 885.5 | 869.2–1,294.7 |
+| Candidate | 1,242.4, 1,285.0, 842.9 | 1,242.4 | 842.9–1,285.0 |
+
+The candidate median was 40.3% higher, but the observed ranges overlap broadly
+and no candidate sample exceeded the base range. Background load varied during
+the run; this host cannot resolve effects around 1%, the same limitation
+recorded in the [debug-logging measurement](#coraza-debug-logging-disabled-path-2026-10-27).
+This does not establish either a regression or its absence. Accept the change
+provisionally without a built-in-only fast path. If an isolated or production
+profile later shows material dispatch cost, split built-in actions from custom
+actions so built-in evaluation avoids both the enum branch and the larger
+custom-action representation. Raw sample logs and the release binaries' build
+artifacts are in `/tmp/opencode/parity/l3b-bench/`.

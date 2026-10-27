@@ -40,6 +40,7 @@ pub use audit_log::{
 };
 pub use debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, LevelFilter, Noop, Writer};
 pub use rules::TransformationChain;
+pub use transaction::AllowScope;
 pub use types::{
     AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, RuleEngineStatus, RulePhase, RuleSeverity,
     RuleVariable,

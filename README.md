@@ -138,5 +138,17 @@ build and run the optional filter.
 The [Coraza crate guide](coraza/README.md) describes SecLang processing and
 audit logging.
 
+### Custom actions
+
+`coraza::seclang::Parser::register_action` registers a parser-scoped action
+factory. `ActionType` selects when an action runs; it is not a capability
+boundary. The engine does not prevent a custom action from interrupting,
+allowing, or skipping rules regardless of its declared type, so hosts must keep
+the implementation's effects consistent with that type. Metadata-only action
+names are reserved and registration returns an error for: `accuracy`,
+`auditlog`, `capture`, `chain`, `id`, `log`, `logdata`, `maturity`, `msg`,
+`multimatch`, `noauditlog`, `nolog`, `phase`, `rev`, `severity`, `status`, `t`,
+`tag`, and `ver`.
+
 The [FTW runner guide](ftw-runner/README.md) explains how to build the Coraza
 test server and run go-ftw tests against a CRS checkout.

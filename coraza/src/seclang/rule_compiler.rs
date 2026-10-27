@@ -503,7 +503,7 @@ mod tests {
     fn test_last_disruptive_action_wins() {
         let rule = compile_sec_action("id:1,deny,setvar:tx.a=1,drop").unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
-        assert_eq!(names, ["setvar", "drop"]);
+        assert_eq!(names, ["drop", "setvar"]);
     }
 
     #[test]

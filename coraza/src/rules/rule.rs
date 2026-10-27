@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// A rule compiled from SecLang for transaction evaluation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Rule {
     /// Rule metadata compiled from actions.
     metadata: RuleMetadata,
@@ -92,9 +92,14 @@ impl Rule {
 
     /// Adds an action, replacing any earlier disruptive action.
     pub(crate) fn push_action(&mut self, action: CompiledAction) {
-        if action.action_type() == ActionType::Disruptive {
-            self.actions
-                .retain(|existing| existing.action_type() != ActionType::Disruptive);
+        if action.action_type() == ActionType::Disruptive
+            && let Some(existing) = self
+                .actions
+                .iter_mut()
+                .find(|existing| existing.action_type() == ActionType::Disruptive)
+        {
+            *existing = action;
+            return;
         }
         self.actions.push(action);
     }
@@ -482,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn later_disruptive_action_replaces_the_previous_one() {
+    fn later_disruptive_action_replaces_the_previous_one_in_place() {
         let mut rule = Rule::new();
         rule.push_action(CompiledAction {
             name: "deny".to_owned(),
@@ -508,7 +513,7 @@ mod tests {
                 .iter()
                 .map(|action| action.name.as_str())
                 .collect::<Vec<_>>(),
-            ["setvar", "pass"]
+            ["pass", "setvar"]
         );
     }
 
