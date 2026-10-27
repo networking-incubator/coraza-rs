@@ -156,6 +156,15 @@ impl Transaction {
             Some(_) => return,
             None => VariableException::new_string(key),
         };
+        let (target_variables, target_count) = if self.multiphase_evaluation() {
+            match variable {
+                RuleVariable::Args => ([RuleVariable::ArgsGet, RuleVariable::ArgsPost], 2),
+                RuleVariable::ArgsNames => ([RuleVariable::ArgsGetNames, RuleVariable::ArgsPostNames], 2),
+                _ => ([variable, variable], 1),
+            }
+        } else {
+            ([variable, variable], 1)
+        };
         let ids = match command {
             "ruleRemoveTargetById" => parse_id_range(selector)
                 .map(|range| {
@@ -182,9 +191,11 @@ impl Transaction {
         };
         for id in ids {
             let targets = self.removed_rule_targets.entry(id).or_default();
-            let target = (variable, exception.clone());
-            if !targets.contains(&target) {
-                targets.push(target);
+            for target_variable in target_variables.iter().copied().take(target_count) {
+                let target = (target_variable, exception.clone());
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
             }
         }
     }
@@ -251,6 +262,28 @@ mod tests {
             Some(81),
             "only the removed key is skipped"
         );
+    }
+
+    #[test]
+    fn multiphase_ctl_splits_args_and_args_names_targets() {
+        let rules = "SecRequestBodyAccess On\n\
+                     SecAction \"id:80,phase:1,pass,ctl:ruleRemoveTargetById=81;ARGS:fbclid,ctl:ruleRemoveTargetById=82;ARGS_NAMES:fbclid\"\n\
+                     SecRule ARGS \"@contains bad\" \"id:81,phase:2,deny\"\n\
+                     SecRule ARGS_NAMES \"@contains fbclid\" \"id:82,phase:2,deny\"";
+        let mut parser = crate::seclang::Parser::new();
+        parser.config_mut().multiphase_evaluation = true;
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut transaction = waf.new_transaction_with_id("ctl-multiphase-target");
+        transaction.process_uri("/?fbclid=bad", "POST", "HTTP/1.1");
+        transaction.add_request_header("content-type", "application/x-www-form-urlencoded");
+        transaction.process_request_headers();
+        transaction.process_request_body(b"fbclid=bad");
+
+        assert!(transaction.interruption().is_none());
+        assert!(transaction.matched_rules().iter().any(|matched| matched.rule.id == 80));
+        assert!(!transaction.matched_rules().iter().any(|matched| matched.rule.id == 81));
+        assert!(!transaction.matched_rules().iter().any(|matched| matched.rule.id == 82));
     }
 
     #[test]
