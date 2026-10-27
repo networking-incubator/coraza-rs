@@ -47,7 +47,7 @@ pub(crate) struct Rule {
     pub(crate) inferred_phases: u8,
     /// Earliest phase at which a complete chain can be evaluated.
     pub(crate) chain_min_phase: RulePhase,
-    /// Whether this rule or a chain link uses a phase-unknown variable.
+    /// Whether this rule's own variables include a phase-unknown variable.
     pub(crate) has_phase_unknown_variable: bool,
     /// Whether this rule explicitly declares a disruptive action, excluding inherited defaults.
     pub(crate) explicit_disruptive: bool,
@@ -126,7 +126,7 @@ impl Rule {
         self.variables = variables;
     }
 
-    /// Calculate per-rule inferred phases and return whether this subtree has an
+    /// Calculate per-rule inferred phases and return whether this rule has an
     /// unknown-phase variable.
     pub(crate) fn finalize_multiphase(&mut self) -> bool {
         self.inferred_phases = 1_u8 << self.metadata.phase.as_int();
@@ -140,8 +140,7 @@ impl Rule {
 
         let mut chain_min_phase = RulePhase::Unknown;
         for link in &mut self.chain {
-            let has_unknown = link.finalize_multiphase();
-            self.has_phase_unknown_variable |= has_unknown;
+            link.finalize_multiphase();
             if let Some(minimum) = link
                 .variables
                 .iter()
@@ -223,7 +222,7 @@ impl Rule {
         id: i32,
         phase: RulePhase,
         top_level: bool,
-        chain_level: u8,
+        chain_level: u16,
         collective_matched_values: &mut Vec<MatchData>,
     ) -> Vec<MatchData> {
         if self.metadata.sec_mark.is_some() {
@@ -240,8 +239,7 @@ impl Rule {
 
         let mut chain_level = chain_level;
         for link in &self.chain {
-            // shortcut: MatchData chain depth saturates at 255; widen its public field if deeper chains are supported.
-            chain_level = chain_level.saturating_add(1);
+            chain_level += 1;
             let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
             if link_matches.is_empty() {
                 return Vec::new();
@@ -269,7 +267,7 @@ impl Rule {
         id: i32,
         phase: RulePhase,
         top_level: bool,
-        chain_level: u8,
+        chain_level: u16,
         collective_matched_values: &mut Vec<MatchData>,
     ) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));

@@ -48,7 +48,7 @@ pub(crate) fn multiphase_skip_variable(rule: &Rule, variable: RuleVariable, phas
 }
 
 /// The last chain level represented in `matched_values`.
-pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> u8 {
+pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> u16 {
     matched_values
         .iter()
         .map(|matched| matched.chain_level)
@@ -59,7 +59,7 @@ pub(crate) fn matched_chain_depth(matched_values: &[MatchData]) -> u8 {
 /// Build every ordered chain from matches grouped by their chain level.
 pub(crate) fn generate_chain_matches(
     matched_values: &[MatchData],
-    current_depth: u8,
+    current_depth: u16,
     building: &mut Vec<MatchData>,
     result: &mut Vec<Vec<MatchData>>,
 ) {
@@ -72,7 +72,7 @@ pub(crate) fn generate_chain_matches(
         if current_depth == final_depth {
             result.push(building.clone());
         } else {
-            generate_chain_matches(matched_values, current_depth.saturating_add(1), building, result);
+            generate_chain_matches(matched_values, current_depth + 1, building, result);
         }
         drop(building.pop());
     }
@@ -98,6 +98,9 @@ pub(crate) fn is_multiphase_double_evaluation(
     matched: &MatchData,
 ) -> bool {
     collective_matched_values.push(matched.clone());
+    if matched.chain_level == 0 {
+        return false;
+    }
     let depth = matched_chain_depth(collective_matched_values);
     for previous in tx.matched_rules() {
         if previous.rule.id != parent_rule_id || matched_chain_depth(&previous.matches) != depth {
@@ -277,5 +280,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2]
         );
+    }
+
+    #[test]
+    fn top_level_match_runs_nondisruptive_actions_in_each_phase() {
+        let mut parser = Parser::new();
+        parser.config_mut().multiphase_evaluation = true;
+        parser
+            .from_string(
+                "SecRule REQUEST_URI \"@streq /\" \"id:1,phase:1,pass,setvar:tx.flag=yes\"\n\
+                 SecRule REQUEST_URI|TX:flag \"@streq yes\" \"id:2,phase:2,pass,setvar:tx.count=+1\"\n\
+                 SecRule TX:count \"@eq 2\" \"id:3,phase:2,deny,status:403\"",
+            )
+            .expect("test rules are valid");
+        let waf = parser.into_waf().expect("test WAF compiles");
+        let mut tx = waf.new_transaction_with_id("top-level-multiphase-actions");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+
+        let interruption = tx.process_request_body(b"").expect("counter rule interrupts");
+        assert_eq!(interruption.rule_id, 3);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("count")).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn chain_phase_unknown_variable_does_not_open_the_root_gate() {
+        let mut parser = Parser::new();
+        parser.config_mut().multiphase_evaluation = true;
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRule REQUEST_URI \"@streq /\" \"id:10,phase:1,pass,setvar:tx.flag=yes\"\n\
+                 SecRule ARGS_POST:foo \"@streq yes\" \"id:11,phase:2,pass,chain,setvar:tx.count=+1\"\n\
+                 SecRule TX:flag \"@streq yes\" \"t:none\"",
+            )
+            .expect("test rules are valid");
+        let waf = parser.into_waf().expect("test WAF compiles");
+        let mut tx = waf.new_transaction_with_id("chain-phase-unknown-gate");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        tx.add_post_argument("foo", "yes");
+
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().all(|matched| matched.rule_id() != 11));
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("count")), None);
+
+        tx.process_request_body(b"");
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule_id() == 11));
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("count")).as_deref(), Some("1"));
     }
 }

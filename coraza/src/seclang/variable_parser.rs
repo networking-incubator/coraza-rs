@@ -101,11 +101,13 @@ impl VariableList {
                             || (multiphase
                                 && matches!(
                                     (*variable, spec.variable()),
-                                    (RuleVariable::Args, RuleVariable::ArgsGet | RuleVariable::ArgsPost)
-                                        | (
-                                            RuleVariable::ArgsNames,
-                                            RuleVariable::ArgsGetNames | RuleVariable::ArgsPostNames
-                                        )
+                                    (
+                                        RuleVariable::Args | RuleVariable::ArgsNames,
+                                        RuleVariable::ArgsGet
+                                            | RuleVariable::ArgsPost
+                                            | RuleVariable::ArgsGetNames
+                                            | RuleVariable::ArgsPostNames
+                                    )
                                 ))
                     }) {
                         match key {
@@ -688,6 +690,22 @@ mod tests {
             assert_eq!(matches.first().map(|matched| matched.value.as_slice()), Some(&b"1"[..]));
             assert_eq!(matches.first().map(|matched| matched.key.as_str()), Some("/^user/"));
         }
+    }
+
+    #[test]
+    fn args_negation_excludes_cross_family_names_variants() {
+        let list = VariableList::parse("ARGS_GET_NAMES|!ARGS:foo").expect("test variable list is valid");
+        let mut variables = Vec::new();
+        list.apply_to(&mut variables, true);
+
+        let spec = variables.first().expect("name variable is present");
+        assert_eq!(spec.variable(), RuleVariable::ArgsGetNames);
+        let mut get_args = Map::new(RuleVariable::ArgsGet);
+        get_args.add("foo", b"bar");
+        assert!(
+            spec.get_matches(Some(CollectionView::Names(RuleVariable::ArgsGetNames, &get_args)))
+                .is_empty()
+        );
     }
 
     #[test]

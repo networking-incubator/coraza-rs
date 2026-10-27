@@ -56,8 +56,9 @@ pub struct MatchData {
     pub message: String,
     /// The rule's `logdata`, as expanded for this match; empty when not expanded or unset
     pub data: String,
-    /// Chain depth for this match (parent is 0); added before 1.0 for multiphase suppression.
-    pub chain_level: u8,
+    /// Chain depth for this match (parent is 0; maximum is `u16::MAX`).
+    /// Added before 1.0 for multiphase suppression.
+    pub chain_level: u16,
 }
 
 impl MatchData {

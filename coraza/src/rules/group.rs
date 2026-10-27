@@ -314,7 +314,8 @@ mod tests {
 
         let root = group.rules().first().expect("parent rule exists");
         assert_eq!(root.chain_min_phase, RulePhase::ResponseHeaders);
-        assert!(root.has_phase_unknown_variable);
+        assert!(!root.has_phase_unknown_variable);
+        assert!(root.chain[0].has_phase_unknown_variable);
         assert_eq!(root.inferred_phases, (1 << 1) | (1 << 2));
     }
 }
