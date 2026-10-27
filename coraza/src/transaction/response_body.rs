@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     audit_log::Failure,
-    body_processors::BodyDirection,
+    body_processors::{BodyDirection, truncate_custom_body_text},
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
 };
 
@@ -185,7 +185,8 @@ impl Transaction {
         if let Some(processors) = &mut self.computed.custom_body_processors {
             processors.response = None;
         }
-        self.res_body_processor.set(name.to_ascii_uppercase());
+        self.res_body_processor
+            .set(truncate_custom_body_text(&name.to_ascii_uppercase()));
     }
 
     /// Select a parser-resolved custom processor for response bodies.
