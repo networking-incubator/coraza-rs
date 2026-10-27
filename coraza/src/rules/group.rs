@@ -126,7 +126,7 @@ impl RuleGroup {
 
         let inserted = if let Some(parent) = self.open_chain() {
             parent.chain.push(rule);
-            parent.chain.last()
+            None
         } else {
             self.rules.push(rule);
             self.rules.last()

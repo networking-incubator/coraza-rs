@@ -385,14 +385,21 @@ impl Parser {
         self.error_log = Some(ErrorLog::new(log));
     }
 
-    /// Observe each rule after it has been inserted while parsing SecLang.
+    /// Observe each top-level rule after it has been inserted while parsing SecLang.
     ///
     /// The host callback runs synchronously during [`Parser::from_string`] or
     /// [`Parser::from_file`], receives the inserted rule's metadata, and is not
-    /// retained by the compiled [`Waf`]. It must not panic: a panic propagates to
-    /// the caller of the parsing method. It must not attempt to mutate the rule
-    /// set. Rules rejected during parsing are not observed; chain members are
-    /// observed individually in source order.
+    /// retained by the compiled [`Waf`]. A chain starter is observed once; chain
+    /// members are not observed. This reports insertion events, not the final
+    /// surviving rule set: with [`Parser::skip_failed_directives`], a starter
+    /// may already have been reported when a later failed link discards the
+    /// whole chain. Rejected rules are not observed. Calling this method again
+    /// replaces the previous callback.
+    ///
+    /// The callback must not panic or attempt to mutate the rule set. The engine
+    /// does not catch a panic; it propagates to the parsing caller, and partial
+    /// parser state may remain. Unwinding from [`Parser::from_string`] skips its
+    /// file/line restoration. Do not reuse a parser after an observer panic.
     pub fn on_rule(&mut self, observer: impl Fn(&RuleMetadata) + Send + Sync + 'static) {
         self.rule_observer = Some(Arc::new(observer));
     }
@@ -1478,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_observer_sees_top_level_and_chain_rules_in_source_order() {
+    fn rule_observer_sees_only_top_level_rules_in_source_order() {
         let ids = Arc::new(Mutex::new(Vec::new()));
         let observed_ids = Arc::clone(&ids);
         let mut parser = Parser::new();
@@ -1493,7 +1500,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(*ids.lock().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(*ids.lock().unwrap(), [1, 4]);
     }
 
     #[test]
@@ -1512,7 +1519,69 @@ mod tests {
     }
 
     #[test]
-    fn rules_parse_and_run_without_an_observer() {
+    fn rule_observer_does_not_see_a_disruptive_chain_link_or_discarded_links() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = Arc::clone(&ids);
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        parser.on_rule(move |metadata| observed_ids.lock().unwrap().push(metadata.id()));
+
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains a\" \"id:1,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains b\" \"id:2,phase:1,deny,chain\"\n\
+                 SecRule ARGS \"@contains c\" \"id:3,phase:1,pass\"\n\
+                 SecAction \"id:4,pass\"",
+            )
+            .unwrap();
+
+        assert_eq!(*ids.lock().unwrap(), [1, 4]);
+        assert!(parser.skipped()[0].message.contains("disruptive actions"));
+        assert_eq!(parser.skipped().len(), 2);
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(2).is_none());
+        assert!(parser.rules.find_by_id(3).is_none());
+        assert!(parser.rules.find_by_id(4).is_some());
+    }
+
+    #[test]
+    fn rule_observer_does_not_see_a_rule_with_another_compile_error() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = Arc::clone(&ids);
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        parser.on_rule(move |metadata| observed_ids.lock().unwrap().push(metadata.id()));
+
+        parser
+            .from_string(
+                "SecRule ARGS \"@nosuchop x\" \"id:1,phase:1,pass\"\n\
+                 SecAction \"id:2,pass\"",
+            )
+            .unwrap();
+
+        assert_eq!(parser.skipped().len(), 1);
+        assert!(parser.skipped()[0].message.contains("unknown operator"));
+        assert_eq!(*ids.lock().unwrap(), [2]);
+    }
+
+    #[test]
+    fn registering_rule_observer_replaces_the_previous_callback() {
+        let first_ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_first_ids = Arc::clone(&first_ids);
+        let second_ids = Arc::new(Mutex::new(Vec::new()));
+        let observed_second_ids = Arc::clone(&second_ids);
+        let mut parser = Parser::new();
+        parser.on_rule(move |metadata| observed_first_ids.lock().unwrap().push(metadata.id()));
+        parser.on_rule(move |metadata| observed_second_ids.lock().unwrap().push(metadata.id()));
+
+        parser.from_string("SecAction \"id:1,pass\"").unwrap();
+
+        assert!(first_ids.lock().unwrap().is_empty());
+        assert_eq!(*second_ids.lock().unwrap(), [1]);
+    }
+
+    #[test]
+    fn rule_observer_absence_preserves_parsing_and_execution_baseline() {
         let mut parser = Parser::new();
         parser
             .from_string("SecRule ARGS:q \"@contains match\" \"id:1,phase:1,pass\"")

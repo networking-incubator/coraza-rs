@@ -197,11 +197,18 @@ its own work and output and avoid panics.
 ## Rule observer
 
 `Parser::on_rule` registers a parser-scoped host callback for rule metadata. It is
-called synchronously after each rule is inserted during parsing, including each
-chain member in source order. Rejected rules are not observed. The compiled
-`Waf` retains only its compiled rules; the observer does not run after
-compilation. The callback must not panic (a panic propagates to the caller of
-`Parser::from_string`) or attempt to mutate the rule set.
+called synchronously after each top-level rule is inserted during parsing. A
+chain starter is observed once; its member links are not. This reports insertion
+events, not the final surviving set: with `skip_failed_directives`, a starter may
+already have been reported before a later failed link discards the whole chain.
+Rejected rules are not observed. Calling `on_rule` again replaces the previous
+callback. The compiled `Waf` retains only its compiled rules; the observer does
+not run after compilation.
+
+The callback must not panic or attempt to mutate the rule set. The engine does
+not catch a panic; partial parser state may remain, and unwinding from
+`Parser::from_string` skips file/line restoration. Do not reuse a parser after an
+observer panic.
 
 ## Operators
 
