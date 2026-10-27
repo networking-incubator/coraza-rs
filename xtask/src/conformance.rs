@@ -79,6 +79,15 @@ enum Source {
         /// Function signature.
         signature: &'static str,
     },
+    /// Variants of a source enum, excluding non-capability variants.
+    EnumVariants {
+        /// Source file.
+        file: &'static str,
+        /// Enum signature.
+        signature: &'static str,
+        /// Variants that are implementation details rather than writer names.
+        excluded: &'static [&'static str],
+    },
     /// The `VARIABLES` lookup table.
     Variables,
 }
@@ -103,7 +112,7 @@ struct GroupSpec {
     source: Source,
 }
 
-const GROUPS: [GroupSpec; 7] = [
+const GROUPS: [GroupSpec; 8] = [
     GroupSpec {
         key: "operators",
         producer: "coraza/src/operators/mod.rs:OperatorEnum::with_context",
@@ -166,6 +175,71 @@ const GROUPS: [GroupSpec; 7] = [
             ],
             extra: &[],
         },
+    },
+    GroupSpec {
+        key: "audit_writers",
+        producer: "coraza/src/audit_log.rs:AuditLogger::prepare",
+        evaluator: "coraza/src/audit_log.rs:Writer::write",
+        source: Source::EnumVariants {
+            file: "coraza/src/audit_log.rs",
+            signature: "enum WriterPlan",
+            excluded: &["Discard"],
+        },
+    },
+];
+
+/// Explicit source gates for capabilities whose availability depends on a Cargo feature.
+///
+/// Each row names the registry scope and item that must immediately follow its `cfg`
+/// attribute. Keep this map explicit: it makes a changed or removed source gate fail
+/// generation instead of silently inferring availability from prose or unrelated cfgs.
+struct FeatureGate {
+    /// Capability group.
+    group: &'static str,
+    /// Capability name, compared case-insensitively.
+    name: &'static str,
+    /// Cargo feature required by the source item.
+    feature: &'static str,
+    /// Source file containing the gated item.
+    file: &'static str,
+    /// Function or enum whose body holds the gate.
+    scope: &'static str,
+    /// Text that starts the gated registry arm or enum variant.
+    item: &'static str,
+}
+
+const FEATURE_GATES: [FeatureGate; 4] = [
+    FeatureGate {
+        group: "operators",
+        name: "inspectFile",
+        feature: "inspect-file",
+        file: "coraza/src/operators/mod.rs",
+        scope: "pub fn with_context",
+        item: "\"inspectfile\"",
+    },
+    FeatureGate {
+        group: "operators",
+        name: "rbl",
+        feature: "rbl",
+        file: "coraza/src/operators/mod.rs",
+        scope: "pub fn with_context",
+        item: "\"rbl\"",
+    },
+    FeatureGate {
+        group: "operators",
+        name: "validateSchema",
+        feature: "validate-schema",
+        file: "coraza/src/operators/mod.rs",
+        scope: "pub fn with_context",
+        item: "\"validateschema\"",
+    },
+    FeatureGate {
+        group: "audit_writers",
+        name: "https",
+        feature: "https-audit",
+        file: "coraza/src/audit_log.rs",
+        scope: "enum WriterPlan",
+        item: "Https {",
     },
 ];
 
@@ -277,6 +351,23 @@ fn variable_names(source: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Reads the variant names of an enum, preserving source order.
+fn enum_variant_names(source: &str, signature: &str, excluded: &[&str]) -> Result<Vec<String>, String> {
+    let body = function_body(source, signature)?;
+    let mut names = Vec::new();
+    for line in body.lines() {
+        let token = line
+            .trim_start()
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .next()
+            .unwrap_or_default();
+        if token.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) && !excluded.contains(&token) {
+            names.push(token.to_ascii_lowercase());
+        }
+    }
+    Ok(names)
+}
+
 /// Returns true for an upper-case ASCII identifier.
 fn is_upper_identifier(value: &str) -> bool {
     !value.is_empty()
@@ -301,6 +392,14 @@ fn source_names(root: &Path, spec: &GroupSpec) -> Result<Vec<String>, String> {
             let source = read_source(root, file)?;
             let body = function_body(&source, signature)?;
             all_string_literals(body)
+        },
+        Source::EnumVariants {
+            file,
+            signature,
+            excluded,
+        } => {
+            let source = read_source(root, file)?;
+            enum_variant_names(&source, signature, excluded)?
         },
         Source::Variables => {
             let source = read_source(root, "coraza/src/types/variables.rs")?;
@@ -711,12 +810,19 @@ fn verify_symbol(root: &Path, reference: &str) -> Result<(), String> {
 struct Entry {
     names: Vec<String>,
     state: String,
+    requires_features: Vec<String>,
     reference_revision: String,
     producer: Option<String>,
     evaluator: Option<String>,
     go_reference: Option<String>,
     fixtures: Vec<String>,
     differences: Vec<String>,
+}
+
+/// Shared profile inputs for entries in one generated manifest.
+struct GenerationContext<'a> {
+    go_commit: &'a str,
+    known_features: &'a BTreeSet<String>,
 }
 
 /// Reads a required string field.
@@ -754,13 +860,231 @@ fn optional_strings(value: &Value, field: &str, context: &str) -> Result<Vec<Str
         .collect()
 }
 
+/// Reads the actual feature names declared by `coraza/Cargo.toml`.
+fn cargo_feature_names(root: &Path) -> Result<BTreeSet<String>, String> {
+    let source = read_source(root, "coraza/Cargo.toml")?;
+    let manifest: toml::Value = toml::from_str(&source).map_err(|error| format!("coraza/Cargo.toml: {error}"))?;
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or("coraza/Cargo.toml has no [features] table")?;
+    Ok(features.keys().cloned().collect())
+}
+
+/// Reads an optional feature array, rejecting empty strings and unknown Cargo features.
+fn optional_features(
+    value: &Value,
+    context: &str,
+    known_features: &BTreeSet<String>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(items) = value.get("features") else {
+        return Ok(None);
+    };
+    let items = items
+        .as_array()
+        .ok_or_else(|| format!("{context} field features is not an array"))?;
+    let mut features = Vec::with_capacity(items.len());
+    for item in items {
+        let feature = item
+            .as_str()
+            .ok_or_else(|| format!("{context} field features contains a non-string"))?;
+        if feature.trim().is_empty() {
+            return Err(format!("{context} field features contains an empty string"));
+        }
+        if !known_features.contains(feature) {
+            return Err(format!("{context} requires unknown Cargo feature {feature}"));
+        }
+        features.push(feature.to_owned());
+    }
+    features.sort();
+    features.dedup();
+    Ok(Some(features))
+}
+
+/// Requires overrides to match the source-gate map exactly.
+fn resolve_source_features(
+    context: &str,
+    declared: Option<Vec<String>>,
+    source_features: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    if !source_features.is_empty() && declared.is_none() {
+        return Err(format!("{context} is source-gated and must declare features"));
+    }
+    let requires_features = declared.unwrap_or_default();
+    for feature in &requires_features {
+        if !source_features.contains(feature) {
+            return Err(format!("{context} claims feature {feature} without a source gate"));
+        }
+    }
+    for feature in source_features {
+        if !requires_features.contains(feature) {
+            return Err(format!("{context} is missing source-gated feature {feature}"));
+        }
+    }
+    Ok(requires_features)
+}
+
+/// Returns whether the named item immediately follows its explicit feature cfg.
+fn source_item_has_feature_gate(source: &str, scope: &str, feature: &str, item: &str) -> Result<bool, String> {
+    let body = function_body(source, scope)?;
+    let gate = format!("#[cfg(feature = \"{feature}\")]");
+    let mut lines = body.lines();
+    let mut previous = lines.next();
+    for line in lines {
+        if previous.is_some_and(|attribute| attribute.trim() == gate && line.trim_start().starts_with(item)) {
+            return Ok(true);
+        }
+        previous = Some(line);
+    }
+    Ok(false)
+}
+
+/// Lists adjacent feature-gated arms or variants in one registry scope.
+fn source_feature_gates(source: &str, scope: &str) -> Result<BTreeSet<(String, String)>, String> {
+    let body = function_body(source, scope)?;
+    let mut lines = body.lines();
+    let mut previous = lines.next();
+    let mut gates = BTreeSet::new();
+    for item in lines {
+        let Some(attribute) = previous else {
+            previous = Some(item);
+            continue;
+        };
+        let attribute = attribute.trim();
+        if !attribute.starts_with("#[cfg") {
+            previous = Some(item);
+            continue;
+        }
+        let feature = attribute
+            .strip_prefix("#[cfg(feature = \"")
+            .and_then(|value| value.strip_suffix("\")]"))
+            .ok_or_else(|| format!("unrecognized cfg gate in {scope}; update FEATURE_GATES"))?;
+        let item = item.trim_start();
+        let name = if item.starts_with('"') {
+            string_literals(item).into_iter().next().unwrap_or_default()
+        } else {
+            item.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        if name.is_empty() {
+            return Err(format!("feature gate in {scope} has no registry item"));
+        }
+        gates.insert((feature.to_owned(), name.to_ascii_lowercase()));
+        previous = Some(item);
+    }
+    Ok(gates)
+}
+
+/// Confirms every explicit source-gate map entry still matches source and Cargo metadata.
+fn validate_source_feature_gates(
+    root: &Path,
+    spec: &GroupSpec,
+    source_names: &[String],
+    known_features: &BTreeSet<String>,
+) -> Result<(), String> {
+    let source_names = source_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for gate in FEATURE_GATES.iter().filter(|gate| gate.group == spec.key) {
+        let context = format!("{} capability {}", spec.key, gate.name);
+        if !source_names.contains(&gate.name.to_ascii_lowercase()) {
+            return Err(format!("{context} is missing from its source registry"));
+        }
+        if !known_features.contains(gate.feature) {
+            return Err(format!("{context} uses undeclared Cargo feature {}", gate.feature));
+        }
+        let source = read_source(root, gate.file)?;
+        if !source_item_has_feature_gate(&source, gate.scope, gate.feature, gate.item)? {
+            return Err(format!("{context} is not gated by source feature {}", gate.feature));
+        }
+    }
+    // Compare every source gate in these registry scopes so a newly gated built-in cannot
+    // disappear from the hand-maintained map and receive an empty requirement list.
+    let expected = FEATURE_GATES
+        .iter()
+        .filter(|gate| gate.group == spec.key)
+        .map(|gate| (gate.feature.to_owned(), gate.name.to_ascii_lowercase()))
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for gate in FEATURE_GATES.iter().filter(|gate| gate.group == spec.key) {
+        let source = read_source(root, gate.file)?;
+        actual.extend(source_feature_gates(&source, gate.scope)?);
+    }
+    if actual != expected {
+        return Err(format!(
+            "{group} source feature gates differ from FEATURE_GATES: expected {expected:?}, found {actual:?}",
+            group = spec.key
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves one entry's feature list against the explicit source-gate map.
+fn entry_features(
+    spec: &GroupSpec,
+    names: &[String],
+    item: &Value,
+    context: &str,
+    known_features: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let declared = optional_features(item, context, known_features)?;
+    let source_features = names
+        .iter()
+        .flat_map(|name| {
+            FEATURE_GATES
+                .iter()
+                .filter(move |gate| gate.group == spec.key && gate.name.eq_ignore_ascii_case(name))
+                .map(|gate| gate.feature.to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    resolve_source_features(context, declared, &source_features)
+}
+
+/// Resolves producer and evaluator overrides for one capability entry.
+fn entry_symbols(
+    root: &Path,
+    spec: &GroupSpec,
+    item: &Value,
+    state: &str,
+    context: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let producer_override = optional_str(item, "producer", context)?;
+    let evaluator_override = optional_str(item, "evaluator", context)?;
+    if state == "unavailable" && (producer_override.is_some() || evaluator_override.is_some()) {
+        return Err(format!(
+            "{context} is unavailable and must not override producer or evaluator"
+        ));
+    }
+    if state == "unavailable" {
+        return Ok((None, None));
+    }
+    let producer = match producer_override {
+        Some(value) => {
+            verify_symbol(root, &value)?;
+            value
+        },
+        None => spec.producer.to_owned(),
+    };
+    let evaluator = match evaluator_override {
+        Some(value) => {
+            verify_symbol(root, &value)?;
+            value
+        },
+        None => spec.evaluator.to_owned(),
+    };
+    Ok((Some(producer), Some(evaluator)))
+}
+
 /// Builds one group's entries from source names and human overrides.
 fn build_entries(
     root: &Path,
     spec: &GroupSpec,
     source: &[String],
     overrides: &Value,
-    go_commit: &str,
+    generation: &GenerationContext<'_>,
 ) -> Result<Vec<Entry>, String> {
     let source_lower = source
         .iter()
@@ -779,15 +1103,10 @@ fn build_entries(
         if !STATES.contains(&state) {
             return Err(format!("{context} {name} has unknown state {state}"));
         }
-        let producer_override = optional_str(item, "producer", &context)?;
-        let evaluator_override = optional_str(item, "evaluator", &context)?;
-        if state == "unavailable" && (producer_override.is_some() || evaluator_override.is_some()) {
-            return Err(format!(
-                "{context} {name} is unavailable and must not override producer or evaluator"
-            ));
-        }
         let mut names = vec![name.clone()];
         names.extend(optional_strings(item, "aliases", &context)?);
+        let requires_features = entry_features(spec, &names, item, &context, generation.known_features)?;
+        let (producer, evaluator) = entry_symbols(root, spec, item, state, &context)?;
         let mut present = Vec::with_capacity(names.len());
         for value in &names {
             if value.is_empty() {
@@ -808,29 +1127,11 @@ fn build_entries(
                 "{context} {name} is marked unavailable but is present in source"
             ));
         }
-        let (producer, evaluator) = if state == "unavailable" {
-            (None, None)
-        } else {
-            let producer = match producer_override {
-                Some(value) => {
-                    verify_symbol(root, &value)?;
-                    value
-                },
-                None => spec.producer.to_owned(),
-            };
-            let evaluator = match evaluator_override {
-                Some(value) => {
-                    verify_symbol(root, &value)?;
-                    value
-                },
-                None => spec.evaluator.to_owned(),
-            };
-            (Some(producer), Some(evaluator))
-        };
         entries.push(Entry {
             names,
             state: state.to_owned(),
-            reference_revision: go_commit.to_owned(),
+            requires_features,
+            reference_revision: generation.go_commit.to_owned(),
             producer,
             evaluator,
             go_reference: optional_str(item, "go_reference", &context)?,
@@ -838,12 +1139,21 @@ fn build_entries(
             differences: optional_strings(item, "differences", &context)?,
         });
     }
+    for gate in FEATURE_GATES.iter().filter(|gate| gate.group == key) {
+        if !covered.contains(&gate.name.to_ascii_lowercase()) {
+            return Err(format!(
+                "{key} source-gated capability {} has no override with features",
+                gate.name
+            ));
+        }
+    }
     for name in source {
         if !covered.contains(&name.to_ascii_lowercase()) {
             entries.push(Entry {
                 names: vec![name.clone()],
                 state: "unavailable".to_owned(),
-                reference_revision: go_commit.to_owned(),
+                requires_features: Vec::new(),
+                reference_revision: generation.go_commit.to_owned(),
                 producer: None,
                 evaluator: None,
                 go_reference: Some(REVIEW_GO_REFERENCE.to_owned()),
@@ -882,6 +1192,11 @@ fn generate(root: &Path) -> Result<String, String> {
     let group_map = groups
         .as_object()
         .ok_or_else(|| format!("{OVERRIDES} groups is not an object"))?;
+    let known_features = cargo_feature_names(root)?;
+    let generation = GenerationContext {
+        go_commit,
+        known_features: &known_features,
+    };
     for key in group_map.keys() {
         if !GROUPS.iter().any(|spec| spec.key == key.as_str()) {
             return Err(format!("{OVERRIDES} has unknown group {key}"));
@@ -892,7 +1207,8 @@ fn generate(root: &Path) -> Result<String, String> {
         verify_symbol(root, spec.producer)?;
         verify_symbol(root, spec.evaluator)?;
         let source = source_names(root, spec)?;
-        let entries = build_entries(root, spec, &source, groups, go_commit)?;
+        validate_source_feature_gates(root, spec, &source, &known_features)?;
+        let entries = build_entries(root, spec, &source, groups, &generation)?;
         rendered.push((spec.key, entries));
     }
     render_manifest(reference, &rendered)
@@ -947,6 +1263,10 @@ fn push_entry(out: &mut String, entry: &Entry, indent: usize) {
     out.push_str(&field_pad);
     out.push_str("\"state\": ");
     push_json_string(out, &entry.state);
+    out.push_str(",\n");
+    out.push_str(&field_pad);
+    out.push_str("\"requires_features\": ");
+    push_string_array(out, &entry.requires_features, indent.saturating_add(2));
     out.push_str(",\n");
     out.push_str(&field_pad);
     out.push_str("\"reference_revision\": ");
@@ -1476,6 +1796,43 @@ mod tests {
     fn review_required_accepts_classified_entries() {
         let rendered = r#"{"capability_groups": {"operators": []}}"#;
         assert!(review_required(rendered).unwrap().is_empty());
+    }
+
+    #[test]
+    fn override_features_are_known_sorted_and_deduplicated() {
+        let known = BTreeSet::from(["inspect-file".to_owned(), "rbl".to_owned()]);
+        let value = serde_json::json!({"features": ["rbl", "inspect-file", "rbl"]});
+        assert_eq!(
+            optional_features(&value, "operators entry inspectFile", &known).unwrap(),
+            Some(vec!["inspect-file".to_owned(), "rbl".to_owned()])
+        );
+        let empty = serde_json::json!({"features": [""]});
+        assert!(optional_features(&empty, "operators entry inspectFile", &known).is_err());
+        let unknown = serde_json::json!({"features": ["async-server"]});
+        assert!(optional_features(&unknown, "operators entry inspectFile", &known).is_err());
+    }
+
+    #[test]
+    fn feature_claims_must_match_source_gates() {
+        let gate = BTreeSet::from(["inspect-file".to_owned()]);
+        assert!(resolve_source_features("inspectFile", None, &gate).is_err());
+        assert!(resolve_source_features("inspectFile", Some(vec!["rbl".to_owned()]), &gate).is_err());
+        assert_eq!(
+            resolve_source_features("inspectFile", Some(vec!["inspect-file".to_owned()]), &gate).unwrap(),
+            vec!["inspect-file".to_owned()]
+        );
+    }
+
+    #[test]
+    fn source_gate_must_be_adjacent_to_its_named_item() {
+        let source = r#"
+            fn registry() {
+                #[cfg(feature = "inspect-file")]
+                "inspectfile" => true,
+            }
+        "#;
+        assert!(source_item_has_feature_gate(source, "fn registry", "inspect-file", "\"inspectfile\"").unwrap());
+        assert!(!source_item_has_feature_gate(source, "fn registry", "rbl", "\"inspectfile\"").unwrap());
     }
 
     #[test]

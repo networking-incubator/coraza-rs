@@ -25,6 +25,7 @@
           "beginsWith"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:BeginsWith::evaluate",
@@ -37,6 +38,7 @@
           "contains"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Contains::evaluate",
@@ -49,6 +51,7 @@
           "detectSQLi"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/detection.rs:DetectSQLi::evaluate",
@@ -63,6 +66,7 @@
           "detectXSS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/detection.rs:DetectXSS::evaluate",
@@ -77,6 +81,7 @@
           "endsWith"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:EndsWith::evaluate",
@@ -89,6 +94,7 @@
           "eq"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Eq::evaluate",
@@ -101,6 +107,7 @@
           "ge"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Ge::evaluate",
@@ -112,14 +119,15 @@
         "names": [
           "geoLookup"
         ],
-        "state": "accepted_without_effect",
+        "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
         "go_reference": "internal/operators/geo_lookup.go",
         "fixtures": [],
         "differences": [
-          "Mapped to the unconditional-match operator. Go's built-in geo lookup is also a stub."
+          "Unconditional-match stub, as in Go."
         ]
       },
       {
@@ -127,6 +135,7 @@
           "gt"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Gt::evaluate",
@@ -139,6 +148,9 @@
           "inspectFile"
         ],
         "state": "implemented",
+        "requires_features": [
+          "inspect-file"
+        ],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/inspect_file.rs:InspectFile::evaluate",
@@ -160,6 +172,7 @@
           "ipMatch"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/ip.rs:IpMatch::evaluate",
@@ -172,6 +185,7 @@
           "ipMatchFromDataset"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/ip.rs:IpMatchFromDataset::evaluate",
@@ -185,6 +199,7 @@
           "ipMatchF"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/ip.rs:IpMatchFromFile::evaluate",
@@ -197,6 +212,7 @@
           "le"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Le::evaluate",
@@ -209,6 +225,7 @@
           "lt"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:Lt::evaluate",
@@ -221,6 +238,7 @@
           "noMatch"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:NoMatch::evaluate",
@@ -233,6 +251,7 @@
           "pm"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:Pm::evaluate",
@@ -245,6 +264,7 @@
           "pmFromDataset"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:PmFromDataset::evaluate",
@@ -258,6 +278,7 @@
           "pmf"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:PmFromFile::evaluate",
@@ -270,6 +291,9 @@
           "rbl"
         ],
         "state": "implemented",
+        "requires_features": [
+          "rbl"
+        ],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/rbl.rs:Rbl::evaluate",
@@ -288,6 +312,7 @@
           "restPath"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:RestPath::evaluate",
@@ -300,6 +325,7 @@
           "rx"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:Rx::evaluate",
@@ -314,6 +340,7 @@
           "streq"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/simple.rs:StrEq::evaluate",
@@ -326,6 +353,7 @@
           "strmatch"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:StrMatch::evaluate",
@@ -338,6 +366,7 @@
           "unconditionalMatch"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
@@ -350,6 +379,7 @@
           "validateByteRange"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:ValidateByteRange::evaluate",
@@ -362,6 +392,7 @@
           "validateNid"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:ValidateNid::evaluate",
@@ -374,6 +405,9 @@
           "validateSchema"
         ],
         "state": "implemented",
+        "requires_features": [
+          "validate-schema"
+        ],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validate_schema.rs:ValidateSchema::evaluate",
@@ -395,6 +429,7 @@
           "validateUrlEncoding"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:ValidateUrlEncoding::evaluate",
@@ -407,6 +442,7 @@
           "validateUtf8Encoding"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/validation.rs:ValidateUtf8Encoding::evaluate",
@@ -419,6 +455,7 @@
           "within"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/operators/mod.rs:OperatorEnum::with_context",
         "evaluator": "coraza/src/operators/pattern.rs:Within::evaluate",
@@ -433,6 +470,7 @@
           "base64Decode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:base64_decode",
@@ -445,6 +483,7 @@
           "base64DecodeExt"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:base64_decode_ext",
@@ -457,6 +496,7 @@
           "base64Encode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:base64_encode",
@@ -469,6 +509,7 @@
           "cmdLine"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:cmd_line",
@@ -481,6 +522,7 @@
           "compressWhitespace"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:compress_whitespace",
@@ -493,6 +535,7 @@
           "cssDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/escape.rs:css_decode",
@@ -505,6 +548,7 @@
           "escapeSeqDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/escape.rs:escape_seq_decode",
@@ -517,6 +561,7 @@
           "hexDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:hex_decode",
@@ -529,6 +574,7 @@
           "hexEncode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:hex_encode",
@@ -541,6 +587,7 @@
           "htmlEntityDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/complex.rs:html_entity_decode",
@@ -553,6 +600,7 @@
           "jsDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/escape.rs:js_decode",
@@ -565,6 +613,7 @@
           "length"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:length",
@@ -577,6 +626,7 @@
           "lowercase"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:lowercase",
@@ -589,6 +639,7 @@
           "md5"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:md5_hash",
@@ -603,6 +654,7 @@
           "none"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:none",
@@ -616,6 +668,7 @@
           "normalizePath"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/complex.rs:normalise_path",
@@ -629,6 +682,7 @@
           "normalizePathWin"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/complex.rs:normalise_path_win",
@@ -641,6 +695,7 @@
           "removeComments"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:remove_comments",
@@ -653,6 +708,7 @@
           "removeCommentsChar"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:remove_comments_char",
@@ -665,6 +721,7 @@
           "removeNulls"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:remove_nulls",
@@ -677,6 +734,7 @@
           "removeWhitespace"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:remove_whitespace",
@@ -689,6 +747,7 @@
           "replaceComments"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:replace_comments",
@@ -701,6 +760,7 @@
           "replaceNulls"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:replace_nulls",
@@ -713,6 +773,7 @@
           "sha1"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:sha1_hash",
@@ -727,6 +788,7 @@
           "trim"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:trim",
@@ -739,6 +801,7 @@
           "trimLeft"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:trim_left",
@@ -751,6 +814,7 @@
           "trimRight"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:trim_right",
@@ -763,6 +827,7 @@
           "uppercase"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:uppercase",
@@ -775,6 +840,7 @@
           "urlDecode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/simple.rs:url_decode",
@@ -787,6 +853,7 @@
           "urlDecodeUni"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/escape.rs:url_decode_uni",
@@ -799,6 +866,7 @@
           "urlEncode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/encoding.rs:url_encode",
@@ -811,6 +879,7 @@
           "utf8toUnicode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:transformation_by_name",
         "evaluator": "coraza/src/transformations/escape.rs:utf8_to_unicode",
@@ -825,6 +894,7 @@
           "accuracy"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -837,6 +907,7 @@
           "allow"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction.rs:Transaction::allow",
@@ -849,6 +920,7 @@
           "auditlog"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -861,6 +933,7 @@
           "block"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
@@ -875,6 +948,7 @@
           "capture"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -887,6 +961,7 @@
           "chain"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/seclang/rule_compiler.rs:add_actions",
@@ -899,6 +974,7 @@
           "ctl"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -911,6 +987,7 @@
           "deny"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -923,6 +1000,7 @@
           "drop"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -935,6 +1013,7 @@
           "exec"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -949,6 +1028,7 @@
           "expirevar"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -963,6 +1043,7 @@
           "id"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::id",
@@ -975,6 +1056,7 @@
           "initcol"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -989,6 +1071,7 @@
           "log"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1001,6 +1084,7 @@
           "logdata"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1013,6 +1097,7 @@
           "maturity"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1025,6 +1110,7 @@
           "msg"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::msg",
@@ -1037,6 +1123,7 @@
           "multiMatch"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1049,6 +1136,7 @@
           "noauditlog"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1061,6 +1149,7 @@
           "nolog"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1073,6 +1162,7 @@
           "pass"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1087,6 +1177,7 @@
           "phase"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1099,6 +1190,7 @@
           "redirect"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1111,6 +1203,7 @@
           "rev"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1123,6 +1216,7 @@
           "setenv"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction.rs:Transaction::apply_setenv",
@@ -1135,6 +1229,7 @@
           "setvar"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction.rs:Transaction::apply_setvar",
@@ -1149,6 +1244,7 @@
           "severity"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1161,6 +1257,7 @@
           "skip"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction.rs:Transaction::set_skip",
@@ -1173,6 +1270,7 @@
           "skipAfter"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/transaction.rs:Transaction::set_skip_after",
@@ -1185,6 +1283,7 @@
           "status"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1197,6 +1296,7 @@
           "t"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:transformation_by_name",
@@ -1209,6 +1309,7 @@
           "tag"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:RuleMetadata::tags",
@@ -1221,6 +1322,7 @@
           "ver"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:compile_action",
         "evaluator": "coraza/src/actions/mod.rs:CompiledAction::evaluate",
@@ -1235,6 +1337,7 @@
           "Include"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1249,6 +1352,7 @@
           "SecAction"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_action",
@@ -1261,6 +1365,7 @@
           "SecArgumentSeparator"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1275,6 +1380,7 @@
           "SecArgumentsLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_arguments_limit",
@@ -1287,6 +1393,7 @@
           "SecAuditEngine"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_engine",
@@ -1299,6 +1406,7 @@
           "SecAuditLog"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log",
@@ -1311,6 +1419,7 @@
           "SecAuditLogDirMode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_dir_mode",
@@ -1323,6 +1432,7 @@
           "SecAuditLogFileMode"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_file_mode",
@@ -1335,6 +1445,7 @@
           "SecAuditLogFormat"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_format",
@@ -1347,6 +1458,7 @@
           "SecAuditLogParts"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_parts",
@@ -1359,6 +1471,7 @@
           "SecAuditLogRelevantStatus"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_relevant_status",
@@ -1371,6 +1484,7 @@
           "SecAuditLogStorageDir"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_storage_dir",
@@ -1383,6 +1497,7 @@
           "SecAuditLogType"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_audit_log_type",
@@ -1397,6 +1512,7 @@
           "SecCollectionTimeout"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1411,6 +1527,7 @@
           "SecComponentSignature"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1423,6 +1540,7 @@
           "SecConnEngine"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1437,6 +1555,7 @@
           "SecConnReadStateLimit"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1451,6 +1570,7 @@
           "SecConnWriteStateLimit"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1465,6 +1585,7 @@
           "SecCookieFormat"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1479,6 +1600,7 @@
           "SecDataDir"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1493,6 +1615,7 @@
           "SecDataset"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_dataset",
@@ -1505,6 +1628,7 @@
           "SecDebugLog"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1519,6 +1643,7 @@
           "SecDebugLogLevel"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1533,6 +1658,7 @@
           "SecDefaultAction"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_default_action",
@@ -1545,6 +1671,7 @@
           "SecGsbLookupDb"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1559,6 +1686,7 @@
           "SecHashEngine"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1573,6 +1701,7 @@
           "SecHashKey"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1587,6 +1716,7 @@
           "SecHashMethodPm"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1601,6 +1731,7 @@
           "SecHashMethodRx"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1615,6 +1746,7 @@
           "SecHashParam"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1629,6 +1761,7 @@
           "SecHttpBlKey"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1643,6 +1776,7 @@
           "SecIgnoreRuleCompilationErrors"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_ignore_rule_compilation_errors",
@@ -1657,6 +1791,7 @@
           "SecMarker"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_marker",
@@ -1669,6 +1804,7 @@
           "SecPcreMatchLimit"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1683,6 +1819,7 @@
           "SecPcreMatchLimitRecursion"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1697,6 +1834,7 @@
           "SecRemoteRules"
         ],
         "state": "rejected",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules",
@@ -1711,6 +1849,7 @@
           "SecRemoteRulesFailAction"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_remote_rules_fail_action",
@@ -1725,6 +1864,7 @@
           "SecRequestBodyAccess"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_access",
@@ -1737,6 +1877,7 @@
           "SecRequestBodyInMemoryLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1751,6 +1892,7 @@
           "SecRequestBodyJsonDepthLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_json_depth_limit",
@@ -1763,6 +1905,7 @@
           "SecRequestBodyLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit",
@@ -1775,6 +1918,7 @@
           "SecRequestBodyLimitAction"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_request_body_limit_action",
@@ -1787,6 +1931,7 @@
           "SecRequestBodyNoFilesLimit"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1801,6 +1946,7 @@
           "SecResponseBodyAccess"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_access",
@@ -1813,6 +1959,7 @@
           "SecResponseBodyJsonDepthLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_json_depth_limit",
@@ -1825,6 +1972,7 @@
           "SecResponseBodyLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit",
@@ -1837,6 +1985,7 @@
           "SecResponseBodyLimitAction"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_limit_action",
@@ -1849,6 +1998,7 @@
           "SecResponseBodyMimeType"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_type",
@@ -1861,6 +2011,7 @@
           "SecResponseBodyMimeTypesClear"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_response_body_mime_types_clear",
@@ -1873,6 +2024,7 @@
           "SecRule"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule",
@@ -1885,6 +2037,7 @@
           "SecRuleEngine"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_engine",
@@ -1897,6 +2050,7 @@
           "SecRulePerfTime"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1911,6 +2065,7 @@
           "SecRuleRemoveById"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_id",
@@ -1923,6 +2078,7 @@
           "SecRuleRemoveByMsg"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_msg",
@@ -1935,6 +2091,7 @@
           "SecRuleRemoveByTag"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_remove_by_tag",
@@ -1947,6 +2104,7 @@
           "SecRuleScript"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1961,6 +2119,7 @@
           "SecRuleUpdateActionById"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_action_by_id",
@@ -1973,6 +2132,7 @@
           "SecRuleUpdateTargetById"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_id",
@@ -1985,6 +2145,7 @@
           "SecRuleUpdateTargetByMsg"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -1999,6 +2160,7 @@
           "SecRuleUpdateTargetByTag"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rule_update_target_by_tag",
@@ -2011,6 +2173,7 @@
           "SecRxPreFilter"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_rx_pre_filter",
@@ -2025,6 +2188,7 @@
           "SecSensorID"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2039,6 +2203,7 @@
           "SecServerSignature"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2053,6 +2218,7 @@
           "SecTmpDir"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2067,6 +2233,7 @@
           "SecUnicodeMap"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2081,6 +2248,7 @@
           "SecUploadDir"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_dir",
@@ -2093,6 +2261,7 @@
           "SecUploadFileLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_file_limit",
@@ -2105,6 +2274,7 @@
           "SecUploadFileMode"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2119,6 +2289,7 @@
           "SecUploadKeepFiles"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_upload_keep_files",
@@ -2131,6 +2302,7 @@
           "SecWebAppId"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/seclang/parser.rs:directive_handler",
         "evaluator": "coraza/src/seclang/parser.rs:Parser::evaluate_line",
@@ -2147,6 +2319,7 @@
           "ARGS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2159,6 +2332,7 @@
           "ARGS_COMBINED_SIZE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2171,6 +2345,7 @@
           "ARGS_GET"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2183,6 +2358,7 @@
           "ARGS_GET_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2195,6 +2371,7 @@
           "ARGS_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2207,6 +2384,7 @@
           "ARGS_PATH"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2219,6 +2397,7 @@
           "ARGS_POST"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2231,6 +2410,7 @@
           "ARGS_POST_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2243,6 +2423,7 @@
           "ARGUMENTS_LIMIT_REACHED"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2255,6 +2436,7 @@
           "AUTH_TYPE"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2269,6 +2451,7 @@
           "DURATION"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2281,6 +2464,7 @@
           "ENV"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2293,6 +2477,7 @@
           "FILES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2305,6 +2490,7 @@
           "FILES_COMBINED_SIZE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2317,6 +2503,7 @@
           "FILES_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2329,6 +2516,7 @@
           "FILES_SIZES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2341,6 +2529,7 @@
           "FILES_TMP_CONTENT"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2355,6 +2544,7 @@
           "FILES_TMPNAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2367,6 +2557,7 @@
           "FULL_REQUEST"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2381,6 +2572,7 @@
           "FULL_REQUEST_LENGTH"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2393,6 +2585,7 @@
           "GEO"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2407,6 +2600,7 @@
           "HIGHEST_SEVERITY"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2419,6 +2613,7 @@
           "INBOUND_DATA_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2431,6 +2626,7 @@
           "IP"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2445,6 +2641,7 @@
           "JSON"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2459,6 +2656,7 @@
           "MATCHED_VAR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2471,6 +2669,7 @@
           "MATCHED_VAR_NAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2483,6 +2682,7 @@
           "MATCHED_VARS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2495,6 +2695,7 @@
           "MATCHED_VARS_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2507,6 +2708,7 @@
           "MULTIPART_BOUNDARY_QUOTED"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2521,6 +2723,7 @@
           "MULTIPART_BOUNDARY_WHITESPACE"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2535,6 +2738,7 @@
           "MULTIPART_CRLF_LF_LINES"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2549,6 +2753,7 @@
           "MULTIPART_DATA_AFTER"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2561,6 +2766,7 @@
           "MULTIPART_DATA_BEFORE"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2575,6 +2781,7 @@
           "MULTIPART_DUPLICATE_PART_HEADER"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2587,6 +2794,7 @@
           "MULTIPART_FILE_LIMIT_EXCEEDED"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2601,6 +2809,7 @@
           "MULTIPART_FILENAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2613,6 +2822,7 @@
           "MULTIPART_FILENAME_CHARSET"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2625,6 +2835,7 @@
           "MULTIPART_FILENAME_LANGUAGE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2637,6 +2848,7 @@
           "MULTIPART_HEADER_FOLDING"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2651,6 +2863,7 @@
           "MULTIPART_INVALID_HEADER_FOLDING"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2665,6 +2878,7 @@
           "MULTIPART_INVALID_PART"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2679,6 +2893,7 @@
           "MULTIPART_INVALID_QUOTING"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2691,6 +2906,7 @@
           "MULTIPART_LF_LINE"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2705,6 +2921,7 @@
           "MULTIPART_MISSING_SEMICOLON"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2719,6 +2936,7 @@
           "MULTIPART_NAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2731,6 +2949,7 @@
           "MULTIPART_PART_HEADERS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2743,6 +2962,7 @@
           "MULTIPART_STRICT_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2755,6 +2975,7 @@
           "MULTIPART_UNMATCHED_BOUNDARY"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2769,6 +2990,7 @@
           "OUTBOUND_DATA_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2781,6 +3003,7 @@
           "PATH_INFO"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2795,6 +3018,7 @@
           "QUERY_STRING"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2807,6 +3031,7 @@
           "REMOTE_ADDR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2819,6 +3044,7 @@
           "REMOTE_HOST"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -2833,6 +3059,7 @@
           "REMOTE_PORT"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2845,6 +3072,7 @@
           "REQBODY_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2857,6 +3085,7 @@
           "REQBODY_ERROR_MSG"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2869,6 +3098,7 @@
           "REQBODY_PROCESSOR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2881,6 +3111,7 @@
           "REQBODY_PROCESSOR_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2893,6 +3124,7 @@
           "REQBODY_PROCESSOR_ERROR_MSG"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2905,6 +3137,7 @@
           "REQUEST_BASENAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2917,6 +3150,7 @@
           "REQUEST_BODY"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2929,6 +3163,7 @@
           "REQUEST_BODY_LENGTH"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2941,6 +3176,7 @@
           "REQUEST_COOKIES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2953,6 +3189,7 @@
           "REQUEST_COOKIES_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2965,6 +3202,7 @@
           "REQUEST_FILENAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2977,6 +3215,7 @@
           "REQUEST_HEADERS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -2989,6 +3228,7 @@
           "REQUEST_HEADERS_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3001,6 +3241,7 @@
           "REQUEST_LINE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3013,6 +3254,7 @@
           "REQUEST_METHOD"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3025,6 +3267,7 @@
           "REQUEST_PROTOCOL"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3037,6 +3280,7 @@
           "REQUEST_URI"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3049,6 +3293,7 @@
           "REQUEST_URI_RAW"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3061,6 +3306,7 @@
           "REQUEST_XML"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3078,6 +3324,7 @@
           "RES_BODY_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3090,6 +3337,7 @@
           "RES_BODY_ERROR_MSG"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3102,6 +3350,7 @@
           "RES_BODY_PROCESSOR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3114,6 +3363,7 @@
           "RES_BODY_PROCESSOR_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3126,6 +3376,7 @@
           "RES_BODY_PROCESSOR_ERROR_MSG"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3138,6 +3389,7 @@
           "RESPONSE_ARGS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3150,6 +3402,7 @@
           "RESPONSE_BODY"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3162,6 +3415,7 @@
           "RESPONSE_CONTENT_LENGTH"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3174,6 +3428,7 @@
           "RESPONSE_CONTENT_TYPE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3186,6 +3441,7 @@
           "RESPONSE_HEADERS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3198,6 +3454,7 @@
           "RESPONSE_HEADERS_NAMES"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3210,6 +3467,7 @@
           "RESPONSE_PROTOCOL"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3222,6 +3480,7 @@
           "RESPONSE_STATUS"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3234,6 +3493,7 @@
           "RESPONSE_XML"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3248,6 +3508,7 @@
           "RULE"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3260,6 +3521,7 @@
           "SERVER_ADDR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3272,6 +3534,7 @@
           "SERVER_NAME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3284,6 +3547,7 @@
           "SERVER_PORT"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3296,6 +3560,7 @@
           "SESSIONID"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -3310,6 +3575,7 @@
           "STATUS_LINE"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -3324,6 +3590,7 @@
           "TIME"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3336,6 +3603,7 @@
           "TIME_DAY"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3348,6 +3616,7 @@
           "TIME_EPOCH"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3360,6 +3629,7 @@
           "TIME_HOUR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3372,6 +3642,7 @@
           "TIME_MIN"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3384,6 +3655,7 @@
           "TIME_MON"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3396,6 +3668,7 @@
           "TIME_SEC"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3408,6 +3681,7 @@
           "TIME_WDAY"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3420,6 +3694,7 @@
           "TIME_YEAR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3432,6 +3707,7 @@
           "TX"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3446,6 +3722,7 @@
           "UNIQUE_ID"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3458,6 +3735,7 @@
           "UNKNOWN"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -3472,6 +3750,7 @@
           "URI_PARSE_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3484,6 +3763,7 @@
           "URLENCODED_ERROR"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3496,6 +3776,7 @@
           "USERID"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/types/variables.rs:RuleVariable",
         "evaluator": "coraza/src/transaction/variables.rs:variable_storage!",
@@ -3510,6 +3791,7 @@
           "XML"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:variable_storage!",
         "evaluator": "coraza/src/transaction/variables.rs:Transaction::get_variable",
@@ -3524,6 +3806,7 @@
           "JSON"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:BodyProcessor::parse",
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
@@ -3536,6 +3819,7 @@
           "MULTIPART"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:BodyProcessor::parse",
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
@@ -3550,6 +3834,7 @@
           "RAW"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:BodyProcessor::parse",
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
@@ -3562,6 +3847,7 @@
           "URLENCODED"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:BodyProcessor::parse",
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
@@ -3574,6 +3860,7 @@
           "XML"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/transaction/variables.rs:BodyProcessor::parse",
         "evaluator": "coraza/src/transaction/request_body.rs:process_request_body",
@@ -3590,6 +3877,7 @@
           "auditEngine"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3602,6 +3890,7 @@
           "auditLogParts"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3614,6 +3903,7 @@
           "debugLogLevel"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3628,6 +3918,7 @@
           "forceRequestBodyVariable"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3640,6 +3931,7 @@
           "forceResponseBodyVariable"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3652,6 +3944,7 @@
           "hashEnforcement"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3666,6 +3959,7 @@
           "hashEngine"
         ],
         "state": "accepted_without_effect",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3680,6 +3974,7 @@
           "requestBodyAccess"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3692,6 +3987,7 @@
           "requestBodyLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3704,6 +4000,7 @@
           "requestBodyProcessor"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/request_body.rs:Transaction::set_request_body_processor",
@@ -3716,6 +4013,7 @@
           "responseBodyAccess"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3728,6 +4026,7 @@
           "responseBodyLimit"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3740,6 +4039,7 @@
           "responseBodyProcessor"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/response_body.rs:Transaction::set_response_body_processor",
@@ -3752,6 +4052,7 @@
           "ruleEngine"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3764,6 +4065,7 @@
           "ruleRemoveById"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3776,6 +4078,7 @@
           "ruleRemoveByMsg"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3788,6 +4091,7 @@
           "ruleRemoveByTag"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_ctl",
@@ -3800,6 +4104,7 @@
           "ruleRemoveTargetById"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
@@ -3812,6 +4117,7 @@
           "ruleRemoveTargetByMsg"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
@@ -3824,9 +4130,66 @@
           "ruleRemoveTargetByTag"
         ],
         "state": "implemented",
+        "requires_features": [],
         "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
         "producer": "coraza/src/actions/mod.rs:validate_ctl",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      }
+    ],
+    "audit_writers": [
+      {
+        "names": [
+          "concurrent"
+        ],
+        "state": "implemented",
+        "requires_features": [],
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/audit_log.rs:AuditLogger::prepare",
+        "evaluator": "coraza/src/audit_log.rs:Writer::write",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "https"
+        ],
+        "state": "implemented",
+        "requires_features": [
+          "https-audit"
+        ],
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/audit_log.rs:AuditLogger::prepare",
+        "evaluator": "coraza/src/audit_log.rs:Writer::write",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "serial"
+        ],
+        "state": "implemented",
+        "requires_features": [],
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/audit_log.rs:AuditLogger::prepare",
+        "evaluator": "coraza/src/audit_log.rs:Writer::write",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      {
+        "names": [
+          "syslog"
+        ],
+        "state": "implemented",
+        "requires_features": [],
+        "reference_revision": "d9cc9befc2721fd217ce1660a0e91aca1157221d",
+        "producer": "coraza/src/audit_log.rs:AuditLogger::prepare",
+        "evaluator": "coraza/src/audit_log.rs:Writer::write",
         "go_reference": null,
         "fixtures": [],
         "differences": []

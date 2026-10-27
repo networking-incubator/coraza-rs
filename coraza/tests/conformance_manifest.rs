@@ -36,6 +36,7 @@ const PARSER_SOURCE: &str = include_str!("../src/seclang/parser.rs");
 const TRANSACTION_CTL_SOURCE: &str = include_str!("../src/transaction/ctl.rs");
 const TRANSACTION_VARIABLES_SOURCE: &str = include_str!("../src/transaction/variables.rs");
 const VARIABLES_SOURCE: &str = include_str!("../src/types/variables.rs");
+const AUDIT_LOG_SOURCE: &str = include_str!("../src/audit_log.rs");
 
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
 const GO_COMMIT: &str = "d9cc9befc2721fd217ce1660a0e91aca1157221d";
@@ -104,6 +105,50 @@ const REVIEWED_LEDGER: [(&str, &str); 16] = [
     (
         "xml-lowercase-selector",
         "f707b8592127823f559f353e1bed7900ec284294e55b9a1e56d47d6eececcad5",
+    ),
+];
+
+type SourceFeatureGate = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+const SOURCE_FEATURE_GATES: [SourceFeatureGate; 4] = [
+    (
+        "operators",
+        "inspectFile",
+        "inspect-file",
+        OPERATORS_SOURCE,
+        "pub fn with_context",
+        "\"inspectfile\"",
+    ),
+    (
+        "operators",
+        "rbl",
+        "rbl",
+        OPERATORS_SOURCE,
+        "pub fn with_context",
+        "\"rbl\"",
+    ),
+    (
+        "operators",
+        "validateSchema",
+        "validate-schema",
+        OPERATORS_SOURCE,
+        "pub fn with_context",
+        "\"validateschema\"",
+    ),
+    (
+        "audit_writers",
+        "https",
+        "https-audit",
+        AUDIT_LOG_SOURCE,
+        "enum WriterPlan",
+        "Https {",
     ),
 ];
 
@@ -215,6 +260,38 @@ fn manifest_group<'a>(manifest: &'a Value, group: &str) -> &'a Vec<Value> {
         .unwrap_or_else(|| panic!("manifest group {group} must be an array"))
 }
 
+fn manifest_entry<'a>(manifest: &'a Value, group: &str, name: &str) -> &'a Value {
+    manifest_group(manifest, group)
+        .iter()
+        .find(|entry| {
+            entry.get("names").and_then(Value::as_array).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|candidate| candidate.as_str().is_some_and(|value| value.eq_ignore_ascii_case(name)))
+            })
+        })
+        .unwrap_or_else(|| panic!("manifest has no {group} entry for {name}"))
+}
+
+fn required_features(manifest: &Value, group: &str, name: &str) -> BTreeSet<String> {
+    manifest_entry(manifest, group, name)
+        .get("requires_features")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{group} {name} has no requires_features array"))
+        .iter()
+        .map(|feature| feature.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn source_item_has_feature_gate(source: &str, scope: &str, feature: &str, item: &str) -> bool {
+    let body = function_body(source, scope);
+    let gate = format!("#[cfg(feature = \"{feature}\")]");
+    let lines = body.lines().collect::<Vec<_>>();
+    lines
+        .windows(2)
+        .any(|pair| pair[0].trim() == gate && pair[1].trim_start().starts_with(item))
+}
+
 fn manifest_names(manifest: &Value, group: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for entry in manifest_group(manifest, group) {
@@ -292,6 +369,7 @@ fn check_manifest_entries(manifest: &Value, go_commit: &str) {
         "variables",
         "body_processors",
         "runtime_controls",
+        "audit_writers",
     ];
     for group in groups {
         let mut group_names = BTreeSet::new();
@@ -307,6 +385,30 @@ fn check_manifest_entries(manifest: &Value, go_commit: &str) {
             assert!(
                 entry.get("fixtures").and_then(Value::as_array).is_some(),
                 "{group} entry has no fixtures array"
+            );
+            let features = entry
+                .get("requires_features")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("{group} entry has no requires_features array"));
+            let mut feature_names = features
+                .iter()
+                .map(|feature| {
+                    feature
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{group} requires_features contains a non-string"))
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                feature_names.iter().all(|feature| !feature.is_empty()),
+                "{group} requires_features contains an empty name"
+            );
+            let original_features = feature_names.clone();
+            feature_names.sort();
+            feature_names.dedup();
+            assert_eq!(
+                feature_names, original_features,
+                "{group} requires_features is not sorted and unique"
             );
             let producer = entry.get("producer").and_then(Value::as_str);
             let evaluator = entry.get("evaluator").and_then(Value::as_str);
@@ -427,6 +529,78 @@ fn manifest_is_pinned_and_classifies_factories() {
     check_manifest_entries(&manifest, go_commit);
     check_factories(&manifest);
     check_variables(&manifest);
+}
+
+#[test]
+fn build_features_are_classified_and_source_gated() {
+    let manifest = parse_json("capability-manifest.json", MANIFEST);
+    assert_eq!(
+        required_features(&manifest, "operators", "inspectFile"),
+        BTreeSet::from(["inspect-file".to_owned()])
+    );
+    assert_eq!(
+        required_features(&manifest, "operators", "rbl"),
+        BTreeSet::from(["rbl".to_owned()])
+    );
+    assert_eq!(
+        required_features(&manifest, "operators", "validateSchema"),
+        BTreeSet::from(["validate-schema".to_owned()])
+    );
+    let geo_lookup = manifest_entry(&manifest, "operators", "geoLookup");
+    assert_eq!(geo_lookup.get("state").and_then(Value::as_str), Some("implemented"));
+    assert!(
+        geo_lookup
+            .get("differences")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item.as_str() == Some("Unconditional-match stub, as in Go.")))
+    );
+
+    assert_eq!(
+        manifest_names(&manifest, "audit_writers"),
+        BTreeSet::from([
+            "concurrent".to_owned(),
+            "https".to_owned(),
+            "serial".to_owned(),
+            "syslog".to_owned(),
+        ])
+    );
+    assert_eq!(
+        required_features(&manifest, "audit_writers", "https"),
+        BTreeSet::from(["https-audit".to_owned()])
+    );
+
+    for (group, name, feature, source, scope, item) in SOURCE_FEATURE_GATES {
+        assert!(
+            source_item_has_feature_gate(source, scope, feature, item),
+            "{group} {name} must remain gated by {feature} in {scope}"
+        );
+    }
+    let groups = manifest.get("capability_groups").and_then(Value::as_object).unwrap();
+    for (group, entries) in groups {
+        for entry in entries.as_array().unwrap() {
+            let names = entry.get("names").and_then(Value::as_array).unwrap();
+            let expected = SOURCE_FEATURE_GATES
+                .iter()
+                .filter(|(gate_group, gate_name, ..)| {
+                    *gate_group == group.as_str()
+                        && names
+                            .iter()
+                            .any(|name| name.as_str().is_some_and(|value| value.eq_ignore_ascii_case(gate_name)))
+                })
+                .map(|(_, _, feature, ..)| (*feature).to_owned())
+                .collect::<BTreeSet<_>>();
+            let actual = entry
+                .get("requires_features")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|feature| feature.as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "{group} entry claims a feature without a source gate");
+        }
+    }
 }
 
 fn ledger_rows() -> Vec<(String, String)> {

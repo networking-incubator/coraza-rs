@@ -66,12 +66,12 @@
         "differences": []
       },
       "geoLookup": {
-        "state": "accepted_without_effect",
+        "state": "implemented",
         "evaluator": "coraza/src/operators/validation.rs:UnconditionalMatch::evaluate",
         "go_reference": "internal/operators/geo_lookup.go",
         "fixtures": [],
         "differences": [
-          "Mapped to the unconditional-match operator. Go's built-in geo lookup is also a stub."
+          "Unconditional-match stub, as in Go."
         ]
       },
       "gt": {
@@ -83,6 +83,9 @@
       },
       "inspectFile": {
         "state": "implemented",
+        "features": [
+          "inspect-file"
+        ],
         "evaluator": "coraza/src/operators/inspect_file.rs:InspectFile::evaluate",
         "go_reference": "internal/operators/inspect_file.go",
         "fixtures": [],
@@ -168,6 +171,9 @@
       },
       "rbl": {
         "state": "implemented",
+        "features": [
+          "rbl"
+        ],
         "evaluator": "coraza/src/operators/rbl.rs:Rbl::evaluate",
         "go_reference": "internal/operators/rbl.go",
         "fixtures": [],
@@ -232,6 +238,9 @@
       },
       "validateSchema": {
         "state": "implemented",
+        "features": [
+          "validate-schema"
+        ],
         "evaluator": "coraza/src/operators/validate_schema.rs:ValidateSchema::evaluate",
         "go_reference": "internal/operators/validate_schema.go",
         "fixtures": [],
@@ -2315,6 +2324,35 @@
       "ruleRemoveTargetByTag": {
         "state": "implemented",
         "evaluator": "coraza/src/transaction/ctl.rs:Transaction::apply_rule_target_removal",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      }
+    },
+    "audit_writers": {
+      "concurrent": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "https": {
+        "state": "implemented",
+        "features": [
+          "https-audit"
+        ],
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "serial": {
+        "state": "implemented",
+        "go_reference": null,
+        "fixtures": [],
+        "differences": []
+      },
+      "syslog": {
+        "state": "implemented",
         "go_reference": null,
         "fixtures": [],
         "differences": []
