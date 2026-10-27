@@ -56,9 +56,9 @@ pub struct MatchData {
     pub message: String,
     /// The rule's `logdata`, as expanded for this match; empty when not expanded or unset
     pub data: String,
-    /// Chain depth for this match (parent is 0; maximum is `u16::MAX`).
+    /// Chain depth for this match (parent is 0), matching Go's `int` depth.
     /// Added before 1.0 for multiphase suppression.
-    pub chain_level: u16,
+    pub chain_level: usize,
 }
 
 impl MatchData {
