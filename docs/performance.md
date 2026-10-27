@@ -713,8 +713,9 @@ representation. The raw per-pair samples were not retained; the per-pair
 medians above are the record of that run.
 
 CPU-3-pinned release pairs measured one million `CompiledAction::evaluate`
-calls per sample (`ctl:requestBodyAccess=On`): base `557ba71` was 6.8 ns/eval
-(6.5–7.4), and candidate `b2ab026` plus this review fix was 6.2 (6.1–6.5).
+calls per sample (`ctl:requestBodyAccess=On`): the base was 6.8 ns/eval
+(6.5–7.4), and the candidate (custom body processors plus that review fix) 6.2
+(6.1–6.5).
 Alternating base/candidate pairs were 6.8/6.1, 7.4/6.2, and 6.5/6.5 ns/eval.
 Rust 1.99.1 ran on the AMD Ryzen 7 PRO 7840HS under Linux 7.2.12 with CPU
 frequency unlocked. The 0.91 candidate/base median ratio is within the base's
