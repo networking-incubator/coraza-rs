@@ -29,7 +29,10 @@ use std::{
 
 use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyProcessor};
 use crate::{
-    body_processors::{multipart, xml},
+    body_processors::{
+        BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorFile, BodyProcessorOptions,
+        BodyProcessorOutput, multipart, xml,
+    },
     transformations::url_decode,
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
 };
@@ -110,7 +113,13 @@ impl Transaction {
 
             // Without a selected processor there is nothing to replay the buffer for;
             // audit capture above reads the retained bytes independently.
-            if self.request_body_processor.is_some() {
+            if self.request_body_processor.is_some()
+                || self
+                    .computed
+                    .custom_body_processors
+                    .as_ref()
+                    .is_some_and(|processors| processors.request.is_some())
+            {
                 // Go reads a body that reached the limit as a partial body instead of a
                 // malformed one (`internal/bodyprocessors/multipart.go`'s
                 // `flagUnexpectedEOF`, and `WriteRequestBody`'s `>=` check). The limit
@@ -147,6 +156,16 @@ impl Transaction {
     /// `truncated` reports that the body limit discarded supplied bytes, which makes a
     /// multipart body that ends mid-part a partial body rather than a malformed one.
     fn inspect_request_body(&mut self, body: &[u8], truncated: bool) {
+        if let Some(processor) = self
+            .computed
+            .custom_body_processors
+            .as_ref()
+            .and_then(|processors| processors.request.as_ref())
+            .map(std::sync::Arc::clone)
+        {
+            process_custom_body_processor(self, body, BodyDirection::Request, processor.as_ref());
+            return;
+        }
         let Some(processor) = self.request_body_processor else {
             return;
         };
@@ -314,8 +333,164 @@ impl Transaction {
     /// implement that processor.
     pub(super) fn set_request_body_processor(&mut self, name: &str) {
         self.request_body_processor = BodyProcessor::parse(name);
+        if let Some(processors) = &mut self.computed.custom_body_processors {
+            processors.request = None;
+        }
         self.reqbody_processor.set(name.to_ascii_uppercase());
     }
+
+    /// Select a parser-resolved custom processor for request bodies.
+    pub(super) fn set_request_custom_body_processor(
+        &mut self,
+        name: &str,
+        processor: std::sync::Arc<dyn CustomBodyProcessor>,
+    ) {
+        self.request_body_processor = None;
+        let processors = self
+            .computed
+            .custom_body_processors
+            .get_or_insert_with(|| Box::new(super::CustomBodyProcessors::default()));
+        processors.request = Some(processor);
+        self.reqbody_processor.set(name.to_ascii_uppercase());
+    }
+}
+
+/// Process a custom body and merge its narrow output through transaction insertion paths.
+pub(super) fn process_custom_body_processor(
+    tx: &mut Transaction,
+    body: &[u8],
+    direction: BodyDirection,
+    processor: &dyn CustomBodyProcessor,
+) {
+    let upload_dir = if tx.config.upload_dir.is_empty() {
+        std::env::temp_dir()
+    } else {
+        PathBuf::from(&tx.config.upload_dir)
+    };
+    let mime = match direction {
+        BodyDirection::Request => tx.request_headers.first("content-type").unwrap_or_default(),
+        BodyDirection::Response => tx.response_content_type.get_bytes(),
+    };
+    let current_argument_count = match direction {
+        BodyDirection::Request => tx.args_post.value_count(),
+        BodyDirection::Response => tx.response_args.value_count(),
+    };
+    let mut output = BodyProcessorOutput::new(
+        tx.config.argument_limit.saturating_sub(current_argument_count),
+        tx.config.upload_file_limit.saturating_sub(tx.files.value_count()),
+        !cfg!(target_os = "wasi"),
+    );
+    let options = BodyProcessorOptions {
+        mime,
+        upload_dir: &upload_dir,
+        upload_file_limit: tx.config.upload_file_limit,
+        upload_file_mode: tx.config.upload_file_mode,
+        upload_keep_files: tx.config.upload_keep_files,
+        argument_limit: tx.config.argument_limit,
+        request_body_recursion_limit: tx.config.request_body_json_depth_limit,
+        response_body_recursion_limit: tx.config.response_body_json_depth_limit,
+    };
+    let mut error = processor
+        .process(body, direction, &options, &mut output)
+        .err()
+        .or_else(|| output.error.take());
+
+    if let Some(name) = output.processor.take() {
+        match direction {
+            BodyDirection::Request => tx.reqbody_processor.set(name),
+            BodyDirection::Response => tx.res_body_processor.set(name),
+        }
+    }
+    if output.argument_limit_reached {
+        tx.arguments_limit_reached.set("1");
+    }
+    if output.file_limit_reached {
+        tx.multipart_strict_error.set("1");
+    }
+
+    for (name, value) in output.arguments {
+        match direction {
+            BodyDirection::Request => tx.add_post_argument(name, value),
+            BodyDirection::Response => add_response_body_argument(tx, &name, &value),
+        }
+    }
+    for (path, value) in output.xml {
+        match direction {
+            BodyDirection::Request => tx.request_xml.add_bytes(&path, &value),
+            BodyDirection::Response => tx.response_xml.add_bytes(&path, &value),
+        }
+    }
+    for file in &output.files {
+        if let Err(message) = add_body_processor_file(tx, &upload_dir, file) {
+            if error.is_none() {
+                error = Some(message);
+            }
+            break;
+        }
+    }
+
+    if let Some(message) = error {
+        let request = direction == BodyDirection::Request;
+        let processor_name = match direction {
+            BodyDirection::Request => tx.reqbody_processor.get().into_owned(),
+            BodyDirection::Response => tx.res_body_processor.get().into_owned(),
+        };
+        tx.log_body_processor_error(request, &processor_name, &message);
+        match direction {
+            BodyDirection::Request => {
+                tx.reqbody_error.set("1");
+                tx.reqbody_error_msg.set(format!("{processor_name}: {message}"));
+                tx.reqbody_processor_error.set("1");
+                tx.reqbody_processor_error_msg.set(message);
+            },
+            BodyDirection::Response => {
+                tx.res_body_error.set("1");
+                tx.res_body_error_msg.set(format!("{processor_name}: {message}"));
+                tx.res_body_processor_error.set("1");
+                tx.res_body_processor_error_msg.set(message);
+            },
+        }
+    }
+}
+
+/// Publish response arguments under the same per-collection argument limit as JSON.
+fn add_response_body_argument(tx: &mut Transaction, name: &[u8], value: &[u8]) {
+    if tx.response_args.value_count() < tx.config.argument_limit {
+        tx.response_args.add_bytes(name, value);
+    } else {
+        tx.arguments_limit_reached.set("1");
+    }
+}
+
+/// Store a custom file using the same private temporary-file path as multipart uploads.
+fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyProcessorFile) -> Result<(), String> {
+    if tx.uploaded_paths.len() >= tx.config.upload_file_limit {
+        tx.multipart_strict_error.set("1");
+        return Ok(());
+    }
+    let size = u64::try_from(file.bytes.len()).map_err(|error| format!("upload size overflow: {error}"))?;
+    let current_size = std::str::from_utf8(tx.files_combined_size.get_bytes())
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let total_size = current_size
+        .checked_add(size)
+        .ok_or_else(|| "upload size overflow".to_owned())?;
+    let path = save_to_temp(upload_dir, &file.bytes)?;
+
+    let mut content_type = Vec::with_capacity(file.content_type.len().saturating_add(14));
+    content_type.extend_from_slice(b"Content-Type: ");
+    content_type.extend_from_slice(&file.content_type);
+    tx.multipart_part_headers.add_bytes(&file.name, content_type);
+    tx.files_tmp_names.add_bytes(b"", path.to_string_lossy().as_bytes());
+    tx.uploaded_paths.push(path);
+    tx.files.add_bytes(b"", &file.filename);
+    tx.multipart_name.add_bytes(&file.name, &file.name);
+    tx.multipart_filename.add_bytes(&file.name, &file.filename);
+    tx.files_sizes.set_index(&file.filename, 0, size.to_string());
+    tx.files_names.add_bytes(b"", &file.name);
+    tx.files_combined_size.set(total_size.to_string());
+    Ok(())
 }
 
 /// Store an upload in a new private temporary file and return its path.

@@ -23,11 +23,12 @@
 use super::{
     Interruption, Transaction,
     body_buffer::BodyBuffer,
-    request_body::{publish_json_arguments, read_json_body},
+    request_body::{process_custom_body_processor, publish_json_arguments, read_json_body},
     variables::BodyProcessor,
 };
 use crate::{
     audit_log::Failure,
+    body_processors::{BodyDirection, BodyProcessor as CustomBodyProcessor},
     types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
 };
 
@@ -144,6 +145,16 @@ impl Transaction {
     /// `internal/corazawaf/transaction.go:1399-1423`). Other processors keep the
     /// existing contract.
     fn inspect_response_body(&mut self, body: &[u8]) {
+        if let Some(processor) = self
+            .computed
+            .custom_body_processors
+            .as_ref()
+            .and_then(|processors| processors.response.as_ref())
+            .map(std::sync::Arc::clone)
+        {
+            process_custom_body_processor(self, body, BodyDirection::Response, processor.as_ref());
+            return;
+        }
         if let Some(BodyProcessor::Json) = self.response_body_processor {
             // Arguments are published before the error is checked so a valid
             // prefix stays inspectable; see Go Coraza `json.go:74-97`.
@@ -174,6 +185,24 @@ impl Transaction {
     /// Select a response body processor for phase 4.
     pub(super) fn set_response_body_processor(&mut self, name: &str) {
         self.response_body_processor = BodyProcessor::parse(name);
+        if let Some(processors) = &mut self.computed.custom_body_processors {
+            processors.response = None;
+        }
+        self.res_body_processor.set(name.to_ascii_uppercase());
+    }
+
+    /// Select a parser-resolved custom processor for response bodies.
+    pub(super) fn set_response_custom_body_processor(
+        &mut self,
+        name: &str,
+        processor: std::sync::Arc<dyn CustomBodyProcessor>,
+    ) {
+        self.response_body_processor = None;
+        let processors = self
+            .computed
+            .custom_body_processors
+            .get_or_insert_with(|| Box::new(super::CustomBodyProcessors::default()));
+        processors.response = Some(processor);
         self.res_body_processor.set(name.to_ascii_uppercase());
     }
 }

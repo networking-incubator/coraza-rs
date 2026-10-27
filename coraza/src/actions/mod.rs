@@ -23,6 +23,7 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
+    body_processors::BodyProcessorFactory,
     operators::{Macro, MacroError},
     rules::TransformationChain,
     transaction::{AllowScope, Transaction},
@@ -57,6 +58,8 @@ pub(crate) struct ActionCompileContext<'a> {
     custom_transformations: Option<&'a BTreeMap<String, Arc<dyn CustomTransformation>>>,
     /// Registered actions to consult before built-ins, when compiling parser rules.
     custom_actions: Option<&'a BTreeMap<String, CustomActionFactory>>,
+    /// Registered body processors that can be selected by a `ctl` action.
+    custom_body_processors: Option<&'a BTreeMap<String, BodyProcessorFactory>>,
 }
 
 impl<'a> ActionCompileContext<'a> {
@@ -67,12 +70,22 @@ impl<'a> ActionCompileContext<'a> {
         Self {
             custom_transformations: Some(custom_transformations),
             custom_actions: None,
+            custom_body_processors: None,
         }
     }
 
     /// Adds the parser's custom actions to this compile context.
     pub(crate) fn with_actions(mut self, custom_actions: &'a BTreeMap<String, CustomActionFactory>) -> Self {
         self.custom_actions = Some(custom_actions);
+        self
+    }
+
+    /// Adds body processors that can be selected by a `ctl` action.
+    pub(crate) fn with_body_processors(
+        mut self,
+        custom_body_processors: &'a BTreeMap<String, BodyProcessorFactory>,
+    ) -> Self {
+        self.custom_body_processors = Some(custom_body_processors);
         self
     }
 }
@@ -147,6 +160,8 @@ pub(crate) enum ActionImplementation {
     Builtin,
     /// Dispatch to the parser-resolved host action.
     Custom(Arc<dyn CustomAction>),
+    /// Dispatch a processor factory captured by a compiled `ctl` action.
+    BodyProcessor(BodyProcessorFactory),
 }
 
 impl fmt::Debug for CompiledAction {
@@ -178,6 +193,10 @@ impl CompiledAction {
     pub(crate) fn evaluate(&self, rule: &RuleMetadata, tx: &mut Transaction) {
         if let ActionImplementation::Custom(action) = &self.implementation {
             action.evaluate(rule, tx);
+            return;
+        }
+        if let ActionImplementation::BodyProcessor(factory) = &self.implementation {
+            tx.apply_ctl_with_body_processor(&self.argument, factory);
             return;
         }
 
@@ -523,8 +542,12 @@ pub(crate) fn compile_action(
             Some(compiled(name, argument, ActionType::Nondisruptive))
         },
         "ctl" => {
-            validate_ctl(argument)?;
-            Some(compiled(name, argument, ActionType::Nondisruptive))
+            validate_ctl(argument, context.custom_body_processors)?;
+            let mut action = compiled(name, argument, ActionType::Nondisruptive);
+            if let Some(factory) = custom_body_processor_for_ctl(argument, context.custom_body_processors) {
+                action.implementation = ActionImplementation::BodyProcessor(Arc::clone(factory));
+            }
+            Some(action)
         },
         "setenv" => {
             require_argument(argument)?;
@@ -617,7 +640,10 @@ fn validate_setvar(argument: &str) -> Result<(), ActionError> {
 }
 
 /// Validates a `ctl` command without applying its runtime effect.
-fn validate_ctl(argument: &str) -> Result<(), ActionError> {
+fn validate_ctl(
+    argument: &str,
+    custom_body_processors: Option<&BTreeMap<String, BodyProcessorFactory>>,
+) -> Result<(), ActionError> {
     require_argument(argument)?;
     let (name, value) = argument
         .split_once('=')
@@ -628,7 +654,10 @@ fn validate_ctl(argument: &str) -> Result<(), ActionError> {
             is_on_or_off(value)
         },
         "requestBodyLimit" | "responseBodyLimit" => value.parse::<i64>().is_ok_and(|limit| limit >= 0),
-        "requestBodyProcessor" | "responseBodyProcessor" => is_body_processor(value),
+        "requestBodyProcessor" | "responseBodyProcessor" => {
+            is_body_processor(value)
+                || custom_body_processors.is_some_and(|registry| registry.contains_key(&value.to_lowercase()))
+        },
         "ruleRemoveById" => parse_id_range(value).is_ok(),
         // Go reports malformed debug levels at runtime instead of rejecting the rule.
         "ruleRemoveByTag" | "ruleRemoveByMsg" | "hashEngine" | "hashEnforcement" | "debugLogLevel" => true,
@@ -647,6 +676,18 @@ fn validate_ctl(argument: &str) -> Result<(), ActionError> {
     } else {
         Err(ActionError::InvalidArguments(format!("invalid ctl command: {name}")))
     }
+}
+
+/// Resolve a custom factory for a literal body-processor `ctl` during rule compilation.
+fn custom_body_processor_for_ctl<'a>(
+    argument: &str,
+    custom_body_processors: Option<&'a BTreeMap<String, BodyProcessorFactory>>,
+) -> Option<&'a BodyProcessorFactory> {
+    let (command, value) = argument.split_once('=')?;
+    if !matches!(command, "requestBodyProcessor" | "responseBodyProcessor") {
+        return None;
+    }
+    custom_body_processors?.get(&value.to_lowercase())
 }
 
 /// Checks for the accepted `On` and `Off` values.
