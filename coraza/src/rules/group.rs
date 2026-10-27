@@ -109,7 +109,12 @@ impl RuleGroup {
         if multiphase_evaluation {
             rule.split_args_variables();
         }
-        let open_parent_id = self.open_chain().map(|parent| parent.metadata().id());
+        let is_marker = rule.metadata().sec_mark.is_some();
+        let open_parent_id = if is_marker {
+            None
+        } else {
+            self.open_chain().map(|parent| parent.metadata().id())
+        };
         if let Some(parent_id) = open_parent_id
             && rule.explicit_disruptive
         {
@@ -124,7 +129,10 @@ impl RuleGroup {
             return Err(format!("duplicated rule id {id}"));
         }
 
-        let inserted = if let Some(parent) = self.open_chain() {
+        let inserted = if is_marker {
+            self.rules.push(rule);
+            self.rules.last()
+        } else if let Some(parent) = self.open_chain() {
             parent.chain.push(rule);
             None
         } else {
