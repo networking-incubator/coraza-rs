@@ -501,7 +501,7 @@ pub(crate) fn compile_action(
             Some(compiled(name, argument, ActionType::Disruptive))
         },
         "allow" => {
-            if !matches!(argument, "" | "all" | "phase" | "request") {
+            if !matches!(argument, "" | "phase" | "request") {
                 return Err(ActionError::InvalidArguments(format!("invalid argument {argument:?}")));
             }
             Some(compiled(name, argument, ActionType::Disruptive))

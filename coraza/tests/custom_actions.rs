@@ -247,13 +247,20 @@ fn transaction_allow_scopes_match_their_seclang_actions() {
     }
 
     for (scope, action) in [
-        (AllowScope::All, "allow:all"),
+        (AllowScope::All, "allow"),
         (AllowScope::Phase, "allow:phase"),
         (AllowScope::Request, "allow:request"),
     ] {
         assert_eq!(run_policy(action, None), run_policy(action, Some(scope)));
     }
-    assert_eq!(run_policy("allow:all", None), (None, None, None));
+    assert_eq!(run_policy("allow", None), (None, None, None));
+    let mut parser = Parser::new();
+    assert!(
+        parser
+            .from_string("SecRule ARGS \"@streq hit\" \"id:405,phase:1,allow:all\"")
+            .is_err(),
+        "Go rejects allow:all"
+    );
     assert_eq!(
         run_policy("allow:phase", None),
         (None, Some("ran".to_owned()), Some("ran".to_owned()))
