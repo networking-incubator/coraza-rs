@@ -1906,8 +1906,8 @@ impl Syslog {
     /// Sends `message` at severity `err` if `error`, `info` otherwise, framed as Go's
     /// `log/syslog` does.
     fn send(&mut self, message: &[u8], error: bool) -> io::Result<()> {
-        // shortcut: syslog validates UTF-8 for each audit entry; accepted because writes
-        // are I/O-bound, revisit if audit throughput becomes a target.
+        // shortcut: syslog validates UTF-8 for each audit entry and that added pass is
+        // unmeasured; revisit if audit throughput becomes a target.
         if let Ok(message) = std::str::from_utf8(message) {
             return self.send_text(message, error);
         }
