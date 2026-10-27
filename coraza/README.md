@@ -194,6 +194,38 @@ neither a timeout nor an output-size bound, and a transformation can panic or
 block its caller. Registrations must be trusted host code; the host must bound
 its own work and output and avoid panics.
 
+## Custom body processors
+
+Implement `coraza::BodyProcessor` and register a factory with
+`Parser::register_body_processor`. Names are case-insensitive, custom names
+override built-ins when selected by `ctl:requestBodyProcessor` or
+`ctl:responseBodyProcessor`, and each selecting rule captures the factory when
+compiled. A later registration does not rewrite an existing rule or WAF.
+Content-Type selection remains built-in (URLENCODED and MULTIPART); it never
+selects a custom processor. `BodyProcessorOptions` supplies the transaction's
+resolved MIME, argument and upload limits, upload directory/mode/retention policy,
+and request/response recursion limits.
+
+Processors can publish arguments, files, XML paths, a processor name, and an
+error through `BodyProcessorOutput`; they do not receive `Transaction` access.
+Request arguments enter `ARGS_POST` and `ARGS`, response arguments enter
+`RESPONSE_ARGS`, and XML values enter `REQUEST_XML` or `RESPONSE_XML` by
+direction. File bytes are written by the engine to its private temporary-file
+path and populate `FILES`, `FILES_NAMES`, `FILES_SIZES`, `FILES_TMPNAMES`,
+`FILES_COMBINED_SIZE`, `MULTIPART_NAME`, `MULTIPART_FILENAME`, and
+`MULTIPART_PART_HEADERS`; the processor cannot supply a path. Argument/file
+limit drops follow the transaction's existing flags. A
+processor error (returned or set with `set_error`) sets the corresponding
+`REQBODY_*` or response body error variables while retaining output already
+published. Body processor errors do not set `TX.inspection_incomplete`, which
+is reserved for detector inputs that could not be inspected.
+
+**Security and host hazard:** the factory and processor run synchronously on the
+request path over attacker-controlled body bytes. The engine provides no timeout
+and does not catch panics. Factories and processors must not panic, must bound
+their own work, and must respect the supplied limits. File output is rejected on
+WASI until a connector supplies a memory-backed sink.
+
 ## Rule observer
 
 `Parser::on_rule` registers a parser-scoped host callback for rule metadata. It is

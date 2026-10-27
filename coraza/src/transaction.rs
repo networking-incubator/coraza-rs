@@ -51,6 +51,7 @@ use crate::{
         AuditFile, AuditLog, AuditLogger, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse,
         AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
+    body_processors::BodyProcessor as CustomBodyProcessor,
     collection::{Map, MatchData, Single},
     config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
@@ -60,6 +61,15 @@ use crate::{
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
     utils::time::LocalTime,
 };
+
+/// Optional custom processor instances selected by request/response `ctl` actions.
+#[derive(Default)]
+struct CustomBodyProcessors {
+    /// Selected request-body processor.
+    request: Option<Arc<dyn CustomBodyProcessor>>,
+    /// Selected response-body processor.
+    response: Option<Arc<dyn CustomBodyProcessor>>,
+}
 
 /// URI derivatives and start-time values, boxed so `Transaction` stays small.
 struct ComputedVariables {
@@ -101,6 +111,8 @@ struct ComputedVariables {
     time_wday: Single,
     /// Transaction start four-digit year.
     time_year: Single,
+    /// Custom processors are boxed here so built-in transactions do not grow.
+    custom_body_processors: Option<Box<CustomBodyProcessors>>,
 }
 
 /// A disruptive action selected by a matching rule.
@@ -508,6 +520,7 @@ impl Transaction {
                 time_sec: text(RuleVariable::TimeSec, format!("{:02}", at.second)),
                 time_wday: text(RuleVariable::TimeWday, at.weekday.to_string()),
                 time_year: text(RuleVariable::TimeYear, at.year.to_string()),
+                custom_body_processors: None,
             }),
             request_method: Single::new(RuleVariable::RequestMethod),
             request_protocol: Single::new(RuleVariable::RequestProtocol),

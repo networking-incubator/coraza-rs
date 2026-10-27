@@ -20,12 +20,13 @@
 
 //! Transaction-scoped `ctl` action handling.
 
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use regex::Regex;
 
 use super::Transaction;
 use crate::{
+    body_processors::BodyProcessorFactory,
     debug_log::{DebugField, DebugLevel},
     rules::{VariableException, lowercase_like_go},
     types::{AuditEngineStatus, RuleEngineStatus, RulePhase, RuleVariable},
@@ -129,6 +130,22 @@ impl Transaction {
             },
             "ruleRemoveTargetById" | "ruleRemoveTargetByTag" | "ruleRemoveTargetByMsg" => {
                 self.apply_rule_target_removal(name, value, expression);
+            },
+            _ => {},
+        }
+    }
+
+    /// Select a processor factory captured while compiling this custom body-processor ctl.
+    pub(crate) fn apply_ctl_with_body_processor(&mut self, expression: &str, factory: &BodyProcessorFactory) {
+        let Some((name, value)) = expression.split_once('=') else {
+            return;
+        };
+        match name {
+            "requestBodyProcessor" if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody) => {
+                self.set_request_custom_body_processor(value, Arc::from(factory()));
+            },
+            "responseBodyProcessor" if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody) => {
+                self.set_response_custom_body_processor(value, Arc::from(factory()));
             },
             _ => {},
         }

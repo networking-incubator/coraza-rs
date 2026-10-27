@@ -60,6 +60,7 @@ use winnow::{
 use crate::{
     actions::{ActionCompileContext, CustomActionFactory, RuleMetadata},
     audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
+    body_processors::BodyProcessorFactory,
     config::{UploadKeepFiles, WafConfig},
     debug_log::DebugLogger,
     operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
@@ -262,6 +263,9 @@ pub struct Parser {
     /// Custom actions keyed by lower-case SecLang name.
     custom_actions: BTreeMap<String, CustomActionFactory>,
 
+    /// Body processor factories keyed by lower-case SecLang name.
+    custom_body_processors: BTreeMap<String, BodyProcessorFactory>,
+
     /// Whether a failing directive is recorded in `skipped` instead of returned
     skip_failed: bool,
 
@@ -293,6 +297,7 @@ impl Parser {
             custom_transformations: BTreeMap::new(),
             rule_observer: None,
             custom_actions: BTreeMap::new(),
+            custom_body_processors: BTreeMap::new(),
             skip_failed: false,
             dropping_chain: false,
             skipped: Vec::new(),
@@ -360,6 +365,18 @@ impl Parser {
         }
         self.custom_actions.insert(name, factory);
         Ok(())
+    }
+
+    /// Register a [`crate::body_processors::BodyProcessor`] factory under `name`, matched case-insensitively.
+    ///
+    /// A custom registration takes precedence over a built-in processor with the same
+    /// name, but only when selected by `ctl:requestBodyProcessor` or
+    /// `ctl:responseBodyProcessor`; Content-Type selection remains built-in. The factory
+    /// is captured when each selecting rule is compiled, so later registrations do not
+    /// rewrite compiled rules or WAFs. Factories run synchronously when their `ctl` action
+    /// executes, on the request path, and must not panic or block indefinitely.
+    pub fn register_body_processor(&mut self, name: &str, factory: BodyProcessorFactory) {
+        self.custom_body_processors.insert(name.to_lowercase(), factory);
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.
@@ -687,7 +704,8 @@ impl Parser {
                 custom_operators: &self.custom_operators,
                 audit_log_registry: &self.audit_log_registry,
                 action_compile_context: ActionCompileContext::with_transformations(&self.custom_transformations)
-                    .with_actions(&self.custom_actions),
+                    .with_actions(&self.custom_actions)
+                    .with_body_processors(&self.custom_body_processors),
                 rule_observer: self.rule_observer.as_deref(),
                 skip_failed: &mut self.skip_failed,
             }),
