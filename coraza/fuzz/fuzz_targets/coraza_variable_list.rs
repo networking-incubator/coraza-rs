@@ -72,6 +72,19 @@ mod rules {
             self.variable
         }
 
+        pub(crate) fn split_args(self) -> Result<[Self; 2], Self> {
+            let variables = match self.variable {
+                RuleVariable::Args => [RuleVariable::ArgsGet, RuleVariable::ArgsPost],
+                RuleVariable::ArgsNames => [RuleVariable::ArgsGetNames, RuleVariable::ArgsPostNames],
+                _ => return Err(self),
+            };
+            let mut get = self.clone();
+            get.variable = variables[0];
+            let mut post = self;
+            post.variable = variables[1];
+            Ok([get, post])
+        }
+
         pub(crate) fn fingerprint(&self) -> usize {
             let selected_key_len = self.key.as_ref().map_or(0, key_len);
             let exception_len = self.exceptions.iter().map(key_len).sum::<usize>();
@@ -130,6 +143,15 @@ fuzz_target!(|data: &[u8]| {
             .map(rules::VariableSpec::fingerprint)
             .fold(0_usize, usize::saturating_add)
     });
+    let multiphase_outcome = variable_parser::VariableList::parse(&input).map(|list| {
+        let mut specs = Vec::new();
+        list.apply_to(&mut specs, true);
+        specs
+            .iter()
+            .map(rules::VariableSpec::fingerprint)
+            .fold(0_usize, usize::saturating_add)
+    });
     let outcome = outcome.map_err(|error| error.message.len());
-    let _ = std::hint::black_box(outcome);
+    let multiphase_outcome = multiphase_outcome.map_err(|error| error.message.len());
+    let _ = std::hint::black_box((outcome, multiphase_outcome));
 });
