@@ -228,6 +228,12 @@ and sets the direction's data-error and body-processor error variables.
 from the name selected by `ctl`, and the reported name is also used in body-error
 message prefixes.
 
+Custom files cannot reproduce a built-in multipart file's wire part headers:
+the deliberately narrow `add_file(name, filename, content_type, bytes)` API has
+no raw-part-header input, so `MULTIPART_PART_HEADERS` contains only
+`Content-Type: <content_type>`. Rules that depend on wire part headers, including
+`Content-Disposition`, must use the built-in multipart processor.
+
 **Security and host hazard:** factories and processors run synchronously on the
 transaction path, with no timeout and no panic catching. The zero-argument
 factory receives no body; the processor receives attacker-controlled body bytes.

@@ -22,6 +22,7 @@
 
 use std::{
     fs,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -29,8 +30,8 @@ use std::{
 };
 
 use coraza::{
-    BodyDirection, BodyProcessor, BodyProcessorOptions, BodyProcessorOutput, RuleVariable, seclang::Parser,
-    transaction::Transaction,
+    BodyDirection, BodyLimitAction, BodyProcessor, BodyProcessorOptions, BodyProcessorOutput, RuleVariable,
+    config::UploadKeepFiles, seclang::Parser, transaction::Transaction,
 };
 
 struct JsonLines;
@@ -174,9 +175,9 @@ impl BodyProcessor for OversizedOutput {
     }
 }
 
-type RecordedOptions = Arc<Mutex<Vec<(BodyDirection, bool, bool)>>>;
+type RecordedOptions = Arc<Mutex<Vec<(&'static str, BodyDirection, bool, bool)>>>;
 
-struct OptionsRecorder(RecordedOptions);
+struct OptionsRecorder(&'static str, RecordedOptions);
 
 impl BodyProcessor for OptionsRecorder {
     fn process(
@@ -186,10 +187,10 @@ impl BodyProcessor for OptionsRecorder {
         options: &BodyProcessorOptions<'_>,
         _out: &mut BodyProcessorOutput,
     ) -> Result<(), String> {
-        self.0
+        self.1
             .lock()
             .unwrap()
-            .push((direction, options.truncated, options.data_error));
+            .push((self.0, direction, options.truncated, options.data_error));
         Ok(())
     }
 }
@@ -205,6 +206,66 @@ impl BodyProcessor for ResponseFile {
         out: &mut BodyProcessorOutput,
     ) -> Result<(), String> {
         out.add_file(b"response", b"response.txt", b"text/plain", b"response file");
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecordedBodyOptions {
+    direction: BodyDirection,
+    mime: Vec<u8>,
+    argument_limit: usize,
+    upload_dir: PathBuf,
+    upload_file_limit: usize,
+    upload_file_mode: u32,
+    upload_keep_files: UploadKeepFiles,
+    truncated: bool,
+    data_error: bool,
+}
+
+struct FullOptionsRecorder(Arc<Mutex<Option<RecordedBodyOptions>>>);
+
+impl BodyProcessor for FullOptionsRecorder {
+    fn process(
+        &self,
+        _body: &[u8],
+        direction: BodyDirection,
+        options: &BodyProcessorOptions<'_>,
+        _out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        *self.0.lock().unwrap() = Some(RecordedBodyOptions {
+            direction,
+            mime: options.mime.to_vec(),
+            argument_limit: options.argument_limit,
+            upload_dir: options.upload_dir.to_path_buf(),
+            upload_file_limit: options.upload_file_limit,
+            upload_file_mode: options.upload_file_mode,
+            upload_keep_files: options.upload_keep_files,
+            truncated: options.truncated,
+            data_error: options.data_error,
+        });
+        Ok(())
+    }
+}
+
+struct ResponseOutputs;
+
+impl BodyProcessor for ResponseOutputs {
+    fn process(
+        &self,
+        body: &[u8],
+        _direction: BodyDirection,
+        _options: &BodyProcessorOptions<'_>,
+        out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        out.add_argument(b"result", b"ok");
+        out.add_xml(b"/root/item", b"xml value");
+        match body {
+            b"file" => out.add_file(b"response", b"response.txt", b"text/plain", b"response file"),
+            b"set-error" => out.set_error("response failure"),
+            b"returned-error" => return Err("response failure".to_owned()),
+            _ => {},
+        }
         Ok(())
     }
 }
@@ -258,6 +319,51 @@ fn json_lines_processor_selected_by_ctl_survives_waf_compile_and_runs_rules() {
     assert_eq!(
         tx.get_variable(RuleVariable::TX, Some("custom")).as_deref(),
         Some("matched")
+    );
+}
+
+#[test]
+fn custom_processors_receive_resolved_non_default_body_options() {
+    let directory = tempfile::tempdir().unwrap();
+    let observed = Arc::new(Mutex::new(None));
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().request_body_limit = 4;
+    parser.config_mut().request_body_limit_action = BodyLimitAction::ProcessPartial;
+    parser.config_mut().argument_limit = 17;
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.config_mut().upload_file_limit = 3;
+    parser.config_mut().upload_file_mode = 0o640;
+    parser.config_mut().upload_keep_files = UploadKeepFiles::On;
+    parser.register_body_processor(
+        "options",
+        Arc::new({
+            let observed = Arc::clone(&observed);
+            move || Box::new(FullOptionsRecorder(Arc::clone(&observed)))
+        }),
+    );
+    parser
+        .from_string("SecAction \"id:1,phase:1,ctl:requestBodyProcessor=options,pass\"")
+        .unwrap();
+
+    let _tx = request_transaction(
+        &parser.compile().unwrap(),
+        b"longer than limit",
+        b"application/x-options",
+    );
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(RecordedBodyOptions {
+            direction: BodyDirection::Request,
+            mime: b"application/x-options".to_vec(),
+            argument_limit: 17,
+            upload_dir: directory.path().to_path_buf(),
+            upload_file_limit: 3,
+            upload_file_mode: 0o640,
+            upload_keep_files: UploadKeepFiles::On,
+            truncated: true,
+            data_error: true,
+        })
     );
 }
 
@@ -390,7 +496,7 @@ fn output_byte_budget_covers_arguments_files_and_xml_and_keeps_the_prefix() {
 }
 
 #[test]
-fn custom_processors_receive_request_and_response_truncation_state() {
+fn custom_request_and_response_processors_receive_their_direction_and_truncation_state() {
     let states = Arc::new(Mutex::new(Vec::new()));
     let mut parser = Parser::new();
     parser.config_mut().request_body_access = true;
@@ -400,10 +506,17 @@ fn custom_processors_receive_request_and_response_truncation_state() {
         .response_body_mime_types
         .push("text/plain".to_owned());
     parser.register_body_processor(
-        "state",
+        "request-state",
         Arc::new({
             let states = Arc::clone(&states);
-            move || Box::new(OptionsRecorder(Arc::clone(&states)))
+            move || Box::new(OptionsRecorder("request", Arc::clone(&states)))
+        }),
+    );
+    parser.register_body_processor(
+        "response-state",
+        Arc::new({
+            let states = Arc::clone(&states);
+            move || Box::new(OptionsRecorder("response", Arc::clone(&states)))
         }),
     );
     parser
@@ -412,8 +525,8 @@ fn custom_processors_receive_request_and_response_truncation_state() {
              SecRequestBodyLimitAction ProcessPartial\n\
              SecResponseBodyLimit 4\n\
              SecResponseBodyLimitAction ProcessPartial\n\
-             SecAction \"id:1,phase:1,ctl:requestBodyProcessor=state,pass\"\n\
-             SecAction \"id:2,phase:3,ctl:responseBodyProcessor=state,pass\"",
+             SecAction \"id:1,phase:1,ctl:requestBodyProcessor=request-state,pass\"\n\
+             SecAction \"id:2,phase:3,ctl:responseBodyProcessor=response-state,pass\"",
         )
         .unwrap();
     let waf = parser.compile().unwrap();
@@ -421,6 +534,10 @@ fn custom_processors_receive_request_and_response_truncation_state() {
     tx.add_request_header("Content-Type", "text/plain");
     tx.process_request_headers();
     tx.process_request_body(b"request-body");
+    assert_eq!(
+        *states.lock().unwrap(),
+        [("request", BodyDirection::Request, true, true)]
+    );
     tx.add_response_header("Content-Type", "text/plain");
     tx.process_response_headers(200, "HTTP/1.1");
     tx.process_response_body(b"response-body");
@@ -428,8 +545,8 @@ fn custom_processors_receive_request_and_response_truncation_state() {
     assert_eq!(
         *states.lock().unwrap(),
         [
-            (BodyDirection::Request, true, true),
-            (BodyDirection::Response, true, true)
+            ("request", BodyDirection::Request, true, true),
+            ("response", BodyDirection::Response, true, true)
         ]
     );
 }
@@ -487,6 +604,20 @@ fn custom_files_use_engine_temp_paths_and_xml_keeps_its_path() {
     assert_eq!(fs::read(&*path).unwrap(), b"file bytes");
     tx.finish().unwrap();
     assert!(!std::path::Path::new(&*path).exists());
+
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.from_string("SecRequestBodyAccess On").unwrap();
+    let tx = request_transaction(
+        &parser.compile().unwrap(),
+        b"--boundary\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"payload.txt\"\r\nContent-Type: text/plain\r\n\r\nfile bytes\r\n--boundary--",
+        b"multipart/form-data; boundary=boundary",
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::MultipartPartHeaders, Some("upload"))
+            .as_deref(),
+        Some("Content-Disposition: form-data; name=\"upload\"; filename=\"payload.txt\"")
+    );
 }
 
 #[test]
@@ -635,24 +766,38 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
 }
 
 #[test]
-fn custom_response_processor_populates_response_args() {
+fn custom_response_processor_populates_outputs_and_matches_request_error_semantics() {
+    let directory = tempfile::tempdir().unwrap();
     let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
     parser.config_mut().response_body_access = true;
     parser
         .config_mut()
         .response_body_mime_types
         .push("text/plain".to_owned());
-    parser.register_body_processor("reply", Arc::new(|| Box::new(JsonLines)));
+    parser.config_mut().upload_file_limit = 1;
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.register_body_processor("reply", Arc::new(|| Box::new(ResponseOutputs)));
     parser
         .from_string("SecAction \"id:1,phase:3,ctl:responseBodyProcessor=reply,pass\"")
         .unwrap();
     let waf = parser.compile().unwrap();
-    let mut tx = waf.new_transaction();
-    tx.add_response_header("Content-Type", "text/plain");
-    tx.process_request_headers();
-    tx.process_request_body(b"");
-    tx.process_response_headers(200, "HTTP/1.1");
-    tx.process_response_body(br#"{"name":"result","value":"ok"}"#);
+    let process_response = |request_content_type: &[u8], request_body: &[u8], response_body: &[u8]| {
+        let mut tx = waf.new_transaction();
+        tx.add_request_header("Content-Type", request_content_type);
+        tx.process_request_headers();
+        tx.process_request_body(request_body);
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.process_response_body(response_body);
+        tx
+    };
+
+    let mut tx = process_response(
+        b"multipart/form-data; boundary=boundary",
+        b"--boundary\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"request.txt\"\r\nContent-Type: text/plain\r\n\r\nrequest file\r\n--boundary--",
+        b"file",
+    );
 
     assert_eq!(
         tx.get_variable(RuleVariable::ResBodyProcessor, None).as_deref(),
@@ -662,6 +807,48 @@ fn custom_response_processor_populates_response_args() {
         tx.get_variable(RuleVariable::ResponseArgs, Some("result")).as_deref(),
         Some("ok")
     );
+    assert_eq!(
+        tx.get_variable(RuleVariable::ResponseXML, Some("/root/item"))
+            .as_deref(),
+        Some("xml value")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
+        Some("request.txt")
+    );
+    assert_eq!(tx.get_variable(RuleVariable::FilesSizes, Some("response.txt")), None);
+    assert_eq!(
+        tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+        Some("1")
+    );
+    tx.finish().unwrap();
+
+    for body in [b"returned-error".as_slice(), b"set-error".as_slice()] {
+        let tx = process_response(b"text/plain", b"", body);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseArgs, Some("result")).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResponseXML, Some("/root/item"))
+                .as_deref(),
+            Some("xml value")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ResBodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyErrorMsg, None).as_deref(),
+            Some("REPLY: response failure")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyProcessorError, None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyProcessorErrorMsg, None).as_deref(),
+            Some("response failure")
+        );
+        assert!(!tx.inspection_incomplete());
+    }
 }
 
 #[test]
