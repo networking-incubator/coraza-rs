@@ -88,7 +88,8 @@ code receives the full `AuditLog` entry, including `ARGS` even when those parts
 are not selected. The host is trusted code and must redact sensitive data itself.
 The writer factory receives the resolved `WafConfig` and is called only on
 `Waf::activate` or the first audit write; it must not open a file or socket
-before then. Writers receive both the `AuditLog` and its already-formatted bytes.
+before then. Writers receive the `AuditLog`, its already-formatted bytes, and the
+MIME type declared by the formatter that produced those bytes.
 The engine drops a writer with its audit logger and does not call fallible
 teardown; a host that needs fallible teardown must own the sink outside the
 `AuditLogWriter` trait. This crate supplies no custom writer for WASI; an embedder

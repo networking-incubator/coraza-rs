@@ -102,10 +102,13 @@ pub trait AuditLogFormatter: Send + Sync {
 pub trait AuditLogWriter: Send + Sync {
     /// Write `formatted`, while retaining access to the source entry's metadata.
     ///
+    /// `mime` is the declared payload type returned by the formatter that produced
+    /// `formatted`.
+    ///
     /// # Errors
     ///
     /// Return the sink's I/O failure so `Transaction::finish` can report it.
-    fn write(&self, entry: &AuditLog, formatted: &[u8]) -> io::Result<()>;
+    fn write(&self, entry: &AuditLog, formatted: &[u8], mime: &'static str) -> io::Result<()>;
 }
 
 /// Builds a custom writer when the WAF activates its audit sink.
@@ -1292,7 +1295,7 @@ impl fmt::Debug for Writer {
 
 impl Writer {
     /// Write one formatted entry to this writer.
-    fn write(&self, formatted: &FormattedAudit, entry: &AuditLog) -> io::Result<()> {
+    fn write(&self, formatted: &FormattedAudit, entry: &AuditLog, mime: &'static str) -> io::Result<()> {
         let bytes = formatted.as_bytes();
         match self {
             Self::Discard => Ok(()),
@@ -1360,7 +1363,7 @@ impl Writer {
                 )?;
                 index.flush()
             },
-            Self::Custom(writer) => writer.write(entry, bytes),
+            Self::Custom(writer) => writer.write(entry, bytes, mime),
         }
     }
 }
@@ -1700,7 +1703,7 @@ impl AuditLogger {
         let Some(writer) = self.writer() else {
             return Err(io::Error::other("audit log writer is not activated"));
         };
-        writer.write(&formatted, entry)
+        writer.write(&formatted, entry, self.formatter.mime())
     }
 }
 
