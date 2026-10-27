@@ -1039,3 +1039,28 @@ fn custom_body_processor_contract_is_send_and_sync() {
     assert_send_sync::<JsonLines>();
     assert_send_sync::<Arc<dyn BodyProcessor>>();
 }
+
+#[test]
+fn oversized_selected_processor_names_stay_bounded_in_the_reported_variable() {
+    let long_name = "n".repeat(4096);
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.register_body_processor(&long_name, Arc::new(|| Box::new(Literal("value"))));
+    parser
+        .from_string(&format!(
+            "SecRequestBodyAccess On\n\
+             SecAction \"id:1,phase:1,ctl:requestBodyProcessor={long_name},pass\""
+        ))
+        .unwrap();
+
+    let waf = parser.compile().unwrap();
+    let tx = request_transaction(&waf, b"{}", b"application/x-custom");
+    let reported = tx.get_variable(RuleVariable::ReqbodyProcessor, None);
+    let reported = reported.as_deref().unwrap_or_default();
+
+    assert!(
+        !reported.is_empty() && reported.len() <= 256,
+        "reported processor name must be bounded, got {} bytes",
+        reported.len()
+    );
+}
