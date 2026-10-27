@@ -158,6 +158,7 @@ impl Transaction {
             }
             match parsed.error {
                 Some(message) => {
+                    self.log_body_processor_error(false, "JSON", &message);
                     self.res_body_error.set("1");
                     self.res_body_error_msg.set(format!("JSON: {message}"));
                     self.res_body_processor_error.set("1");

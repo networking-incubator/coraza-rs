@@ -22,12 +22,13 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::{
     audit_log::{AuditLogRegistry, AuditLogger, ErrorLog},
     config::{UploadKeepFiles, WafConfig},
+    debug_log::{DebugEvent, DebugLevel, DebugLogger, Writer, noop_logger},
     rules::RuleGroup,
     transaction::Transaction,
 };
@@ -54,7 +55,6 @@ impl std::error::Error for ConfigError {}
 /// upload files. Response bodies support raw storage and JSON argument parsing. Audit
 /// logging is available through the configured writer. The deferred `exec`,
 /// `initcol`, and `expirevar` effects are not implemented.
-#[derive(Debug)]
 pub struct Waf {
     /// Configuration inherited by each transaction.
     config: Arc<WafConfig>,
@@ -64,6 +64,24 @@ pub struct Waf {
     audit_logger: Arc<AuditLogger>,
     /// Optional connector callback for rules with the `log` action.
     error_log: Option<ErrorLog>,
+    /// Debug sink shared with transactions.
+    debug_logger: Arc<dyn DebugLogger>,
+    /// Built-in file sink, retained so activation failures can be returned and inspected.
+    debug_writer: Option<Arc<Writer>>,
+    /// Delay the construction event until after `Parser::compile` has returned.
+    construction_logged: AtomicBool,
+}
+
+impl std::fmt::Debug for Waf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waf")
+            .field("config", &self.config)
+            .field("rules", &self.rules)
+            .field("audit_logger", &self.audit_logger)
+            .field("error_log", &self.error_log)
+            .field("debug_writer", &self.debug_writer)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Waf {
@@ -72,9 +90,9 @@ impl Waf {
     /// # Errors
     ///
     /// Returns an error for invalid limits, incompatible upload settings, or invalid
-    /// audit logging configuration. Audit writers are not opened here.
+    /// audit logging configuration. Log sinks are not opened here.
     pub fn new(config: WafConfig) -> Result<Self, ConfigError> {
-        Self::with_rules(config, RuleGroup::new(), None, &AuditLogRegistry::default())
+        Self::with_rules(config, RuleGroup::new(), None, None, &AuditLogRegistry::default())
     }
 
     /// Create a WAF from configuration and compiled rules.
@@ -88,12 +106,14 @@ impl Waf {
     /// recorded when rules are compiled and cannot be changed for the resulting WAF.
     ///
     /// Audit sinks are validated but not opened: [`Waf::activate`] or the first
-    /// [`Transaction::finish`] that writes an entry opens them, so a candidate policy can
-    /// be compiled and discarded without creating files or connecting.
+    /// [`Transaction::finish`] that writes an entry opens them. The debug sink is also
+    /// deferred until activation or its first enabled event, so a candidate policy can be
+    /// compiled and discarded without creating log files or connecting.
     pub(crate) fn with_rules(
         config: WafConfig,
         rules: RuleGroup,
         error_log: Option<ErrorLog>,
+        debug_logger: Option<Arc<dyn DebugLogger>>,
         audit_log_registry: &AuditLogRegistry,
     ) -> Result<Self, ConfigError> {
         validate_config(&config)?;
@@ -116,31 +136,77 @@ impl Waf {
             )));
         }
         let audit_logger = AuditLogger::prepare(&config, audit_log_registry).map_err(ConfigError)?;
+        let debug_writer = (debug_logger.is_none() && !config.debug_log.is_empty())
+            .then(|| Arc::new(Writer::new(config.debug_log.clone())));
+        let debug_logger: Arc<dyn DebugLogger> = match debug_logger {
+            Some(logger) => logger,
+            None => match &debug_writer {
+                Some(writer) => {
+                    let writer = Arc::clone(writer);
+                    let logger: Arc<dyn DebugLogger> = writer;
+                    logger
+                },
+                None => noop_logger(),
+            },
+        };
         Ok(Self {
             config: Arc::new(config),
             rules: Arc::new(rules),
             audit_logger: Arc::new(audit_logger),
             error_log,
+            debug_logger,
+            debug_writer,
+            construction_logged: AtomicBool::new(false),
         })
     }
 
-    /// Open the audit writer, if one is configured, without creating a transaction.
+    /// Use a host-provided debug sink instead of the configured file sink.
     ///
-    /// Idempotent and thread-safe: the first successful call opens the writer and later
-    /// calls return `Ok(())` without opening it again. This is the only path that retries
-    /// a failed activation immediately; internal callers wait for the writer's retry
-    /// backoff before trying again. A syslog dial the configuration leaves unbounded
-    /// stays unbounded here, unlike the internal path, which bounds it.
+    /// The configured `debug_log_level` remains the WAF-wide threshold. Transactions
+    /// created before this call retain their existing logger.
+    #[must_use]
+    pub fn with_debug_logger(mut self, logger: Arc<dyn DebugLogger>) -> Self {
+        self.debug_logger = logger;
+        self.debug_writer = None;
+        self
+    }
+
+    /// Open configured debug and audit sinks without creating a transaction.
+    ///
+    /// Idempotent and thread-safe. The debug file opens once; audit activation retains its
+    /// existing retry behavior: this explicit path retries a failed audit activation
+    /// immediately, while internal callers wait for the audit writer's backoff. A syslog
+    /// dial the configuration leaves unbounded stays unbounded here, unlike the internal
+    /// path, which bounds it.
     ///
     /// # Errors
     ///
-    /// Returns the writer's own [`std::io::Error`], with its kind, when the configured
-    /// audit writer cannot be opened or connected. A dial failure is not a configuration
+    /// Returns the sink's own [`std::io::Error`], with its kind, when a configured debug
+    /// or audit sink cannot be opened or connected. A sink failure is not a configuration
     /// error: those are reported by [`Waf::new`] and [`Parser::compile`].
     ///
     /// [`Parser::compile`]: crate::seclang::Parser::compile
     pub fn activate(&self) -> std::io::Result<()> {
-        self.audit_logger.activate()
+        let debug_result = self.debug_writer.as_ref().map_or(Ok(()), |writer| writer.activate());
+        let audit_result = self.audit_logger.activate();
+        if audit_result.is_err() {
+            self.log_waf_event(DebugLevel::Error, "Audit log activation failed");
+        }
+        audit_result?;
+        if let Err(error) = debug_result {
+            self.log_waf_event(DebugLevel::Error, "Debug log activation failed");
+            return Err(error);
+        }
+        if !self.config.audit_log.is_empty() {
+            self.log_waf_event(DebugLevel::Info, "Audit log activated");
+        }
+        self.log_waf_created_once();
+        Ok(())
+    }
+
+    /// The most recent built-in debug sink open or write failure, if any.
+    pub fn debug_log_error(&self) -> Option<(std::io::ErrorKind, String)> {
+        self.debug_writer.as_ref().and_then(|writer| writer.activation_error())
     }
 
     /// The audit writer failure from the last activation attempt, with its error kind.
@@ -163,21 +229,44 @@ impl Waf {
     /// Create a transaction with a caller-supplied identifier.
     ///
     /// Does not open the audit writer: [`Transaction::finish`] activates it on the first
-    /// entry it writes, and [`Waf::activate`] opens it explicitly. Creating a transaction
-    /// never blocks on a sink, so a connector's request path does not pay for a dial.
+    /// entry it writes, and [`Waf::activate`] opens it explicitly. A configured debug
+    /// writer opens only if this transaction's first enabled event is logged. Creating a
+    /// transaction never blocks on an audit connection.
     ///
-    /// The constructor is infallible, so an activation failure surfaces from
-    /// [`Transaction::finish`], or through [`Waf::activation_error`]. The transaction
-    /// layer does not retry it: internal callers wait for the writer's growing retry
-    /// backoff, and the syslog writer reconnects and re-sends a frame after a write
-    /// failure.
+    /// Audit activation failures surface from [`Transaction::finish`] or through
+    /// [`Waf::activation_error`]. Debug sink failures are available through
+    /// [`Waf::debug_log_error`]. The transaction layer does not retry audit activation:
+    /// internal callers wait for the writer's growing retry backoff, and the syslog
+    /// writer reconnects and re-sends a frame after a write failure.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
+        self.log_waf_created_once();
         let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
+        transaction.set_debug_logger(Arc::clone(&self.debug_logger));
         if let Some(error_log) = &self.error_log {
             transaction.set_error_log(error_log.clone());
         }
+        transaction.debug_log(DebugLevel::Debug, "Transaction started", || []);
         transaction
+    }
+
+    /// Whether the WAF's configured threshold and sink accept `level`.
+    fn debug_level_enabled(&self, level: DebugLevel) -> bool {
+        self.config.debug_log_level >= level.as_u8() && self.debug_logger.enabled(level)
+    }
+
+    /// Emit a WAF event without constructing fields when it is filtered out.
+    fn log_waf_event(&self, level: DebugLevel, message: &'static str) {
+        if self.debug_level_enabled(level) {
+            self.debug_logger.log(level, &DebugEvent { message, fields: &[] });
+        }
+    }
+
+    /// Defer the WAF-created event until activation or the first transaction.
+    fn log_waf_created_once(&self) {
+        if !self.construction_logged.swap(true, Ordering::AcqRel) {
+            self.log_waf_event(DebugLevel::Debug, "A new WAF instance was created");
+        }
     }
 
     /// Return the WAF configuration.
@@ -199,6 +288,9 @@ impl Default for Waf {
             rules: Arc::new(RuleGroup::new()),
             audit_logger: Arc::new(AuditLogger::discard()),
             error_log: None,
+            debug_logger: noop_logger(),
+            debug_writer: None,
+            construction_logged: AtomicBool::new(false),
         }
     }
 }

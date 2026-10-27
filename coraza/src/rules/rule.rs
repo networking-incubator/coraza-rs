@@ -23,13 +23,14 @@
 use crate::{
     actions::{ActionType, CompiledAction, RuleMetadata},
     collection::MatchData,
+    debug_log::{DebugField, DebugLevel},
     operators::{OperatorOutcome, Outputs},
     rules::{
         RuleOperator, VariableSpec,
         multiphase::{is_multiphase_double_evaluation, multiphase_skip_variable},
     },
     transaction::Transaction,
-    types::RulePhase,
+    types::{RulePhase, RuleVariable},
 };
 
 /// A rule compiled from SecLang for transaction evaluation.
@@ -173,9 +174,15 @@ impl Rule {
 
     /// Evaluate this rule and its chain against a transaction.
     pub(crate) fn evaluate(&self, tx: &mut Transaction, phase: RulePhase) {
+        tx.debug_log(DebugLevel::Debug, "Evaluating rule", || {
+            [DebugField::RuleId(self.metadata.id), DebugField::Phase(phase.as_int())]
+        });
         let mut collective_matched_values = Vec::new();
         let matched_values = self.matches_chain(tx, self.metadata.id, phase, true, 0, &mut collective_matched_values);
         if matched_values.is_empty() {
+            tx.debug_log(DebugLevel::Debug, "Rule evaluation finished without a match", || {
+                [DebugField::RuleId(self.metadata.id)]
+            });
             return;
         }
 
@@ -206,9 +213,15 @@ impl Rule {
 
         for action in &self.actions {
             if action.action_type() != ActionType::Nondisruptive {
+                tx.debug_log(DebugLevel::Debug, "Evaluating action", || {
+                    [DebugField::RuleId(self.metadata.id), DebugField::Text(&action.name)]
+                });
                 action.evaluate(&self.metadata, tx);
             }
         }
+        tx.debug_log(DebugLevel::Debug, "Finished rule evaluation", || {
+            [DebugField::RuleId(self.metadata.id)]
+        });
     }
 
     /// Match this rule and its chain, running nondisruptive actions at each link.
@@ -298,18 +311,17 @@ impl Rule {
             if multiphase && top_level && multiphase_skip_variable(self, variable.variable(), phase) {
                 continue;
             }
+            tx.debug_log(DebugLevel::Debug, "Selecting rule variable", || {
+                [DebugField::RuleId(id), DebugField::Variable(variable.variable().name())]
+            });
             for value in tx.find_matches_for_rule(variable, id) {
-                // shortcut: transformation errors are dropped here; L2a's debug logger is
-                // the upgrade point (Go internal/corazawaf/rule.go:272-279 warn path).
-                let candidates = if self.metadata.multi_match {
-                    self.metadata.transformations.apply_multimatch(&value.value).0
-                } else {
-                    vec![self.metadata.transformations.apply(&value.value).0]
-                };
+                let candidates = self.transform_candidates(tx, id, value.variable, &value.value);
                 for candidate in candidates {
+                    Self::log_operator_argument(tx, id, value.variable, &candidate);
                     let mut outputs = Outputs::new(self.metadata.capture);
                     let outcome = operator.evaluate_outcome(tx, &candidate, &mut outputs);
                     tx.store_operator_outputs(&mut outputs);
+                    Self::log_operator_outcome(tx, id, value.variable, outcome);
                     match outcome {
                         OperatorOutcome::Matched => {
                             let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
@@ -339,6 +351,58 @@ impl Rule {
         matched_values
     }
 
+    /// Transform one selected value and warn once with all transformation errors.
+    fn transform_candidates(
+        &self,
+        tx: &Transaction,
+        rule_id: i32,
+        variable: RuleVariable,
+        input: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let (candidates, errors) = if self.metadata.multi_match {
+            self.metadata.transformations.apply_multimatch(input)
+        } else {
+            let (candidate, errors) = self.metadata.transformations.apply(input);
+            (vec![candidate], errors)
+        };
+        if !errors.is_empty() {
+            tx.debug_log_fields(DebugLevel::Warn, "Error transforming argument for rule", || {
+                let mut fields = Vec::with_capacity(errors.len().saturating_add(2));
+                fields.push(DebugField::RuleId(rule_id));
+                fields.push(DebugField::Variable(variable.name()));
+                fields.extend(errors.iter().map(|error| DebugField::Text(error.message())));
+                fields
+            });
+        }
+        candidates
+    }
+
+    /// Log an operator argument only at Trace level, where value exposure is explicit.
+    fn log_operator_argument(tx: &Transaction, rule_id: i32, variable: RuleVariable, input: &[u8]) {
+        if tx.debug_level_enabled(DebugLevel::Trace) {
+            let text = crate::transformations::text_of(input);
+            tx.debug_log(DebugLevel::Trace, "Evaluating operator argument", || {
+                [
+                    DebugField::RuleId(rule_id),
+                    DebugField::Variable(variable.name()),
+                    DebugField::Text(&text),
+                ]
+            });
+        }
+    }
+
+    /// Record the operator's match verdict without including the inspected value.
+    fn log_operator_outcome(tx: &Transaction, rule_id: i32, variable: RuleVariable, outcome: OperatorOutcome) {
+        let message = if outcome == OperatorOutcome::Matched {
+            "Evaluating operator: MATCH"
+        } else {
+            "Evaluating operator: NO MATCH"
+        };
+        tx.debug_log(DebugLevel::Debug, message, || {
+            [DebugField::RuleId(rule_id), DebugField::Variable(variable.name())]
+        });
+    }
+
     /// Expand this rule's `msg` and `logdata` against the current matched variables.
     fn describe_match(&self, tx: &Transaction) -> (String, String) {
         let expand =
@@ -350,6 +414,9 @@ impl Rule {
     fn run_nondisruptive_actions(&self, tx: &mut Transaction) {
         for action in &self.actions {
             if action.action_type() == ActionType::Nondisruptive {
+                tx.debug_log(DebugLevel::Debug, "Evaluating action", || {
+                    [DebugField::RuleId(self.metadata.id), DebugField::Text(&action.name)]
+                });
                 action.evaluate(&self.metadata, tx);
             }
         }

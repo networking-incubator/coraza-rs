@@ -25,6 +25,7 @@ pub mod audit_log;
 mod body_processors;
 pub mod collection;
 pub mod config;
+pub mod debug_log;
 pub mod operators;
 mod rules;
 pub mod seclang;
@@ -37,6 +38,7 @@ pub mod waf;
 pub use audit_log::{
     AuditFile, AuditLog, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse, AuditTransaction,
 };
+pub use debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, LevelFilter, Noop, Writer};
 pub use rules::TransformationChain;
 pub use types::{
     AuditEngineStatus, AuditLogPart, AuditLogParts, BodyLimitAction, RuleEngineStatus, RulePhase, RuleSeverity,

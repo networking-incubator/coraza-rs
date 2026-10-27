@@ -53,6 +53,7 @@ use crate::{
     },
     collection::{Map, MatchData, Single},
     config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
+    debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
     operators::Macro,
     rules::{RuleGroup, VariableException},
     transformations::text_of,
@@ -166,6 +167,10 @@ pub struct Transaction {
     audit_log_parts: AuditLogParts,
     /// Audit resources inherited from the WAF.
     audit_logger: Option<Arc<AuditLogger>>,
+    /// Debug sink inherited from the WAF.
+    debug_logger: Arc<dyn DebugLogger>,
+    /// Transaction-local override set by `ctl:debugLogLevel`.
+    debug_log_level: Option<u8>,
     /// Optional connector callback for rules with the `log` action.
     error_log: Option<ErrorLog>,
     /// Rules matched by this transaction.
@@ -409,6 +414,8 @@ impl Transaction {
             audit_engine: config.audit_engine,
             audit_log_parts: config.audit_log_parts.clone(),
             audit_logger: None,
+            debug_logger: noop_logger(),
+            debug_log_level: None,
             error_log: None,
             matched_rules: Vec::new(),
             started,
@@ -543,6 +550,69 @@ impl Transaction {
     /// Attach the WAF's shared audit writer.
     pub(crate) fn set_audit_logger(&mut self, logger: Arc<AuditLogger>) {
         self.audit_logger = Some(logger);
+    }
+
+    /// Attach the WAF's shared debug sink.
+    pub(crate) fn set_debug_logger(&mut self, logger: Arc<dyn DebugLogger>) {
+        self.debug_logger = logger;
+    }
+
+    /// Apply a debug event only after checking both transaction and sink filters.
+    pub(crate) fn debug_log<'a, const N: usize>(
+        &'a self,
+        level: DebugLevel,
+        message: &'static str,
+        fields: impl FnOnce() -> [DebugField<'a>; N],
+    ) {
+        if self.debug_level_enabled(level) {
+            let fields = fields();
+            self.debug_logger.log(
+                level,
+                &DebugEvent {
+                    message,
+                    fields: &fields,
+                },
+            );
+        }
+    }
+
+    /// Apply an event with a dynamic number of fields, allocating only when enabled.
+    pub(crate) fn debug_log_fields<'a>(
+        &'a self,
+        level: DebugLevel,
+        message: &'static str,
+        fields: impl FnOnce() -> Vec<DebugField<'a>>,
+    ) {
+        if self.debug_level_enabled(level) {
+            let fields = fields();
+            self.debug_logger.log(
+                level,
+                &DebugEvent {
+                    message,
+                    fields: &fields,
+                },
+            );
+        }
+    }
+
+    /// Whether the transaction and its sink both accept `level`.
+    pub(crate) fn debug_level_enabled(&self, level: DebugLevel) -> bool {
+        self.debug_log_level.unwrap_or(self.config.debug_log_level) >= level.as_u8() && self.debug_logger.enabled(level)
+    }
+
+    /// Log a body processor failure without exposing its error text below Trace.
+    pub(crate) fn log_body_processor_error(&self, request: bool, processor: &str, error: &str) {
+        let message = if request {
+            "Request body processor failed"
+        } else {
+            "Response body processor failed"
+        };
+        self.debug_log(DebugLevel::Error, message, || [DebugField::Text(processor)]);
+        if self.debug_level_enabled(DebugLevel::Trace) {
+            self.debug_log(DebugLevel::Trace, "Body processor failure detail", || {
+                [DebugField::Text(error)]
+            });
+        }
     }
 
     /// Attach the connector's matched-rule callback.
@@ -738,6 +808,7 @@ impl Transaction {
                     )));
                 }
             }
+            self.log_finalization();
         }
         if let Some(error) = self.audit_error.as_ref() {
             return Err(error.to_error());
@@ -757,6 +828,25 @@ impl Transaction {
             .collect::<Vec<_>>()
             .join("\n");
         Some(std::io::Error::other(format!("transaction close failed: {messages}")))
+    }
+
+    /// Log finalization and expose failure details only at Trace level.
+    fn log_finalization(&self) {
+        self.debug_log(DebugLevel::Debug, "Transaction finalized", || []);
+        if !self.finalization_errors.is_empty() {
+            self.debug_log(DebugLevel::Error, "Transaction finalization failed", || []);
+            if self.debug_level_enabled(DebugLevel::Trace) {
+                let details = self
+                    .finalization_errors
+                    .iter()
+                    .map(|failure| failure.to_error().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.debug_log(DebugLevel::Trace, "Finalization failure detail", || {
+                    [DebugField::Text(&details)]
+                });
+            }
+        }
     }
 
     /// Return the combined finalization failure stored by [`Transaction::finish`], if any.
@@ -810,7 +900,18 @@ impl Transaction {
             },
         };
         if should_log {
-            logger.write(&self.audit_log())?;
+            self.debug_log(DebugLevel::Debug, "Transaction marked for audit logging", || []);
+            if let Err(error) = logger.write(&self.audit_log()) {
+                self.debug_log(DebugLevel::Error, "Failed to write audit log", || []);
+                if self.debug_level_enabled(DebugLevel::Trace) {
+                    let details = error.to_string();
+                    self.debug_log(DebugLevel::Trace, "Audit log failure detail", || {
+                        [DebugField::Text(&details)]
+                    });
+                }
+                return Err(error);
+            }
+            self.debug_log(DebugLevel::Info, "Audit log entry written", || []);
         }
         Ok(())
     }
@@ -1000,6 +1101,9 @@ impl Transaction {
 
     /// Evaluate rules assigned to `phase` in directive order.
     fn run_phase(&mut self, phase: RulePhase) {
+        self.debug_log(DebugLevel::Debug, "Processing phase started", || {
+            [DebugField::Phase(phase.as_int())]
+        });
         let rules = Arc::clone(&self.rules);
 
         for rule in rules.iter() {
@@ -1033,6 +1137,9 @@ impl Transaction {
         if self.allow == AllowType::Phase {
             self.allow = AllowType::Unset;
         }
+        self.debug_log(DebugLevel::Debug, "Processing phase finished", || {
+            [DebugField::Phase(phase.as_int())]
+        });
     }
 
     /// Whether an earlier allow action skips rules in `phase`.
@@ -1046,6 +1153,14 @@ impl Transaction {
 
     /// Apply a disruptive action according to the transaction's engine mode.
     pub(crate) fn interrupt(&mut self, rule_id: i32, action: &str, status: i32, data: &str) {
+        self.debug_log(DebugLevel::Warn, "Transaction interruption requested", || {
+            [DebugField::RuleId(rule_id), DebugField::Text(action)]
+        });
+        if self.debug_level_enabled(DebugLevel::Trace) {
+            self.debug_log(DebugLevel::Trace, "Transaction interruption detail", || {
+                [DebugField::Text(data)]
+            });
+        }
         let interruption = Interruption {
             rule_id,
             action: action.to_owned(),

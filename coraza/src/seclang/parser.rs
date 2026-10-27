@@ -56,6 +56,7 @@ use winnow::{
 use crate::{
     audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
     config::{UploadKeepFiles, WafConfig},
+    debug_log::DebugLogger,
     operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
     rules::{Rule, RuleGroup},
     seclang::{
@@ -229,6 +230,9 @@ pub struct Parser {
 
     /// Optional callback for rules with the `log` action.
     error_log: Option<ErrorLog>,
+
+    /// Optional host-provided debug sink.
+    debug_logger: Option<std::sync::Arc<dyn DebugLogger>>,
 }
 
 impl Parser {
@@ -247,6 +251,7 @@ impl Parser {
             dropping_chain: false,
             skipped: Vec::new(),
             error_log: None,
+            debug_logger: None,
         }
     }
 
@@ -268,6 +273,16 @@ impl Parser {
     /// they resolved.
     pub fn register_operator(&mut self, name: &str, factory: CustomOperatorFactory) {
         self.custom_operators.insert(name.to_owned(), factory);
+    }
+
+    /// Use a host-provided debug sink instead of the configured file sink.
+    ///
+    /// `WafConfig::debug_log_level` still filters events, and the logger is shared by
+    /// transactions created from the compiled WAF.
+    #[must_use]
+    pub fn with_debug_logger(mut self, logger: std::sync::Arc<dyn DebugLogger>) -> Self {
+        self.debug_logger = Some(logger);
+        self
     }
 
     /// Register a custom audit writer factory under `name`, matched case-insensitively.
@@ -303,17 +318,24 @@ impl Parser {
 
     /// Consume the parser and build a WAF without activating its audit resources.
     ///
-    /// Files are not created and sockets are not connected: the audit writer is opened
-    /// by [`Waf::activate`] or by the first
-    /// [`Transaction::finish`](crate::transaction::Transaction::finish). This is the entry
-    /// point for validating a candidate policy before deciding to use it.
+    /// Log files are not created and sockets are not connected: audit sinks open by
+    /// [`Waf::activate`] or the first
+    /// [`Transaction::finish`](crate::transaction::Transaction::finish), and the debug
+    /// sink opens by activation or the first enabled event. This is the entry point for
+    /// validating a candidate policy before deciding to use it.
     ///
     /// # Errors
     ///
     /// Returns an error when the parsed configuration is invalid for WAF construction.
     pub fn compile(mut self) -> Result<Waf, ConfigError> {
         self.rules.finalize_multiphase(self.waf_config.multiphase_evaluation);
-        Waf::with_rules(self.waf_config, self.rules, self.error_log, &self.audit_log_registry)
+        Waf::with_rules(
+            self.waf_config,
+            self.rules,
+            self.error_log,
+            self.debug_logger,
+            &self.audit_log_registry,
+        )
     }
 
     /// Consume the parser and build a WAF from its configuration and compiled rules.
@@ -1407,18 +1429,31 @@ mod tests {
     }
 
     #[test]
-    fn compile_does_not_create_the_audit_log_file() {
+    fn compile_does_not_open_audit_or_debug_log_files() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.log");
+        let audit_path = dir.path().join("audit.log");
+        let debug_path = dir.path().join("debug.log");
         let mut parser = Parser::new();
         parser
-            .from_string(&format!("SecAuditEngine On\nSecAuditLog {}", path.to_string_lossy()))
+            .from_string(&format!(
+                "SecAuditEngine On\nSecAuditLog {}\nSecDebugLog {}\nSecDebugLogLevel 4",
+                audit_path.display(),
+                debug_path.display()
+            ))
             .unwrap();
 
         let waf = parser.compile().unwrap();
-        assert!(!path.exists(), "compiling activated the audit writer");
+        assert!(!audit_path.exists(), "compiling activated the audit writer");
+        assert!(!debug_path.exists(), "compiling opened the debug writer");
+        let _transaction = waf.new_transaction_with_id("debug-activation");
+        assert!(
+            !audit_path.exists(),
+            "creating a transaction activated the audit writer"
+        );
+        let debug_log = std::fs::read_to_string(&debug_path).unwrap();
+        assert!(debug_log.contains("A new WAF instance was created"));
         waf.activate().unwrap();
-        assert!(path.exists(), "activation did not open the audit writer");
+        assert!(audit_path.exists(), "activation did not open the audit writer");
     }
 
     #[test]
@@ -1554,7 +1589,7 @@ mod tests {
             ..parser.config().clone()
         };
 
-        let error = Waf::with_rules(config, parser.rules, None, &parser.audit_log_registry).unwrap_err();
+        let error = Waf::with_rules(config, parser.rules, None, None, &parser.audit_log_registry).unwrap_err();
 
         assert!(error.to_string().contains("case_sensitive_args_keys"));
     }

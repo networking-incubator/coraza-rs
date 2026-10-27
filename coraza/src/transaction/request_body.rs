@@ -165,6 +165,7 @@ impl Transaction {
             },
             BodyProcessor::Multipart => {
                 if let Err(message) = self.process_multipart_body(body, truncated) {
+                    self.log_body_processor_error(true, "MULTIPART", &message);
                     self.reqbody_error.set("1");
                     self.reqbody_error_msg.set(format!("MULTIPART: {message}"));
                     self.reqbody_processor_error.set("1");
@@ -185,6 +186,7 @@ impl Transaction {
                 }
                 match parsed.error {
                     Some(message) => {
+                        self.log_body_processor_error(true, "JSON", &message);
                         self.reqbody_error.set("1");
                         self.reqbody_error_msg.set(format!("JSON: {message}"));
                         self.reqbody_processor_error.set("1");
@@ -203,6 +205,7 @@ impl Transaction {
                     }
                 },
                 Err(message) => {
+                    self.log_body_processor_error(true, "XML", &message);
                     // Go stores the processor's own error unchanged, which for XML is
                     // `encoding/xml`'s `XML syntax error on line N: ...`
                     // (`internal/corazawaf/transaction.go:1780-1786`, v3.8.1).
