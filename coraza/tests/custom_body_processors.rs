@@ -1064,3 +1064,34 @@ fn oversized_selected_processor_names_stay_bounded_in_the_reported_variable() {
         reported.len()
     );
 }
+
+#[test]
+fn oversized_selected_response_processor_names_stay_bounded() {
+    let long_name = "r".repeat(4096);
+    let mut parser = Parser::new();
+    parser.config_mut().response_body_access = true;
+    parser.register_body_processor(&long_name, Arc::new(|| Box::new(Literal("value"))));
+    parser
+        .from_string(&format!(
+            "SecResponseBodyAccess On\n\
+             SecAction \"id:1,phase:3,ctl:responseBodyProcessor={long_name},pass\""
+        ))
+        .unwrap();
+
+    let waf = parser.compile().unwrap();
+    let mut tx = waf.new_transaction_with_id("oversized-response-name");
+    tx.process_uri("/", "GET", "HTTP/1.1");
+    tx.process_request_headers();
+    tx.process_request_body(b"");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.process_response_body(b"{}");
+
+    let reported = tx.get_variable(RuleVariable::ResBodyProcessor, None);
+    let reported = reported.as_deref().unwrap_or_default();
+
+    assert!(
+        !reported.is_empty() && reported.len() <= 256,
+        "reported response processor name must be bounded, got {} bytes",
+        reported.len()
+    );
+}
