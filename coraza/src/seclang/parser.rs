@@ -373,8 +373,9 @@ impl Parser {
     /// name, but only when selected by `ctl:requestBodyProcessor` or
     /// `ctl:responseBodyProcessor`; Content-Type selection remains built-in. The factory
     /// is captured when each selecting rule is compiled, so later registrations do not
-    /// rewrite compiled rules or WAFs. Factories run synchronously when their `ctl` action
-    /// executes, on the request path, and must not panic or block indefinitely.
+    /// rewrite compiled rules or WAFs. The zero-argument factory runs synchronously only
+    /// when the selected body is first processed; it receives no body bytes and must not
+    /// panic or block indefinitely.
     pub fn register_body_processor(&mut self, name: &str, factory: BodyProcessorFactory) {
         self.custom_body_processors.insert(name.to_lowercase(), factory);
     }

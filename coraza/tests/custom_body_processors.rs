@@ -20,7 +20,13 @@
 
 //! End-to-end tests for parser-registered body processors.
 
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use coraza::{
     BodyDirection, BodyProcessor, BodyProcessorOptions, BodyProcessorOutput, RuleVariable, seclang::Parser,
@@ -129,13 +135,77 @@ impl BodyProcessor for ErrorProcessor {
         out: &mut BodyProcessorOutput,
     ) -> Result<(), String> {
         out.add_argument(b"partial", b"retained");
-        out.set_processor("reported-name");
+        out.set_processor("JSON");
         if body == b"set-error" {
             out.set_error("reported parse failure");
             Ok(())
         } else {
             Err("returned parse failure".to_owned())
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OversizedOutputKind {
+    Argument,
+    File,
+    Xml,
+}
+
+struct OversizedOutput(OversizedOutputKind);
+
+impl BodyProcessor for OversizedOutput {
+    fn process(
+        &self,
+        _body: &[u8],
+        _direction: BodyDirection,
+        _options: &BodyProcessorOptions<'_>,
+        out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        const TOO_LARGE: [u8; 128] = [b'x'; 128];
+        out.add_argument(b"kept", b"yes");
+        match self.0 {
+            OversizedOutputKind::Argument => out.add_argument(b"large", &TOO_LARGE),
+            OversizedOutputKind::File => out.add_file(b"upload", b"large.txt", b"text/plain", &TOO_LARGE),
+            OversizedOutputKind::Xml => out.add_xml(b"/large", &TOO_LARGE),
+        }
+        out.add_argument(b"after-limit", b"dropped");
+        Ok(())
+    }
+}
+
+type RecordedOptions = Arc<Mutex<Vec<(BodyDirection, bool, bool)>>>;
+
+struct OptionsRecorder(RecordedOptions);
+
+impl BodyProcessor for OptionsRecorder {
+    fn process(
+        &self,
+        _body: &[u8],
+        direction: BodyDirection,
+        options: &BodyProcessorOptions<'_>,
+        _out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((direction, options.truncated, options.data_error));
+        Ok(())
+    }
+}
+
+struct ResponseFile;
+
+impl BodyProcessor for ResponseFile {
+    fn process(
+        &self,
+        _body: &[u8],
+        _direction: BodyDirection,
+        _options: &BodyProcessorOptions<'_>,
+        out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        out.add_file(b"response", b"response.txt", b"text/plain", b"response file");
+        Ok(())
     }
 }
 
@@ -226,6 +296,145 @@ fn custom_processors_override_builtins_only_when_selected_by_ctl() {
 }
 
 #[test]
+fn processor_factories_are_lazy_and_multiple_selectors_construct_once() {
+    let constructions = Arc::new(AtomicUsize::new(0));
+    let mut parser = Parser::new();
+    let factory_count = Arc::clone(&constructions);
+    parser.register_body_processor(
+        "counted",
+        Arc::new(move || {
+            factory_count.fetch_add(1, Ordering::SeqCst);
+            Box::new(Literal("counted"))
+        }),
+    );
+    parser
+        .from_string("SecAction \"id:1,phase:1,ctl:requestBodyProcessor=counted,pass\"")
+        .unwrap();
+    let tx = request_transaction(&parser.compile().unwrap(), b"ignored", b"text/plain");
+    assert_eq!(constructions.load(Ordering::SeqCst), 0);
+    drop(tx);
+
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    let factory_count = Arc::clone(&constructions);
+    parser.register_body_processor(
+        "counted",
+        Arc::new(move || {
+            factory_count.fetch_add(1, Ordering::SeqCst);
+            Box::new(Literal("counted"))
+        }),
+    );
+    parser
+        .from_string(
+            "SecAction \"id:2,phase:1,ctl:requestBodyProcessor=counted,pass\"\n\
+             SecAction \"id:3,phase:1,ctl:requestBodyProcessor=counted,pass\"",
+        )
+        .unwrap();
+    let tx = request_transaction(&parser.compile().unwrap(), b"processed", b"text/plain");
+    assert_eq!(constructions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tx.get_variable(RuleVariable::ArgsPost, Some("source")).as_deref(),
+        Some("counted")
+    );
+}
+
+#[test]
+fn output_byte_budget_covers_arguments_files_and_xml_and_keeps_the_prefix() {
+    for (name, kind) in [
+        ("oversized-argument", OversizedOutputKind::Argument),
+        ("oversized-file", OversizedOutputKind::File),
+        ("oversized-xml", OversizedOutputKind::Xml),
+    ] {
+        let mut parser = Parser::new();
+        parser.config_mut().request_body_access = true;
+        parser.config_mut().request_body_limit = 128;
+        parser.register_body_processor(name, Arc::new(move || Box::new(OversizedOutput(kind))));
+        parser
+            .from_string(&format!(
+                "SecAction \"id:1,phase:1,ctl:requestBodyProcessor={name},pass\""
+            ))
+            .unwrap();
+        let tx = request_transaction(&parser.compile().unwrap(), b"small", b"text/plain");
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("kept")).as_deref(),
+            Some("yes")
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("after-limit")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::InboundDataError, None).as_deref(),
+            Some("1")
+        );
+        let expected_error = match name {
+            "oversized-argument" => "OVERSIZED-ARGUMENT: custom body processor output exceeded byte limit",
+            "oversized-file" => "OVERSIZED-FILE: custom body processor output exceeded byte limit",
+            _ => "OVERSIZED-XML: custom body processor output exceeded byte limit",
+        };
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+            Some(expected_error)
+        );
+        match kind {
+            OversizedOutputKind::Argument => {
+                assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("large")), None);
+            },
+            OversizedOutputKind::File => {
+                assert_eq!(tx.get_variable(RuleVariable::FilesSizes, Some("large.txt")), None);
+            },
+            OversizedOutputKind::Xml => {
+                assert_eq!(tx.get_variable(RuleVariable::RequestXML, Some("/large")), None);
+            },
+        }
+    }
+}
+
+#[test]
+fn custom_processors_receive_request_and_response_truncation_state() {
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().response_body_access = true;
+    parser
+        .config_mut()
+        .response_body_mime_types
+        .push("text/plain".to_owned());
+    parser.register_body_processor(
+        "state",
+        Arc::new({
+            let states = Arc::clone(&states);
+            move || Box::new(OptionsRecorder(Arc::clone(&states)))
+        }),
+    );
+    parser
+        .from_string(
+            "SecRequestBodyLimit 4\n\
+             SecRequestBodyLimitAction ProcessPartial\n\
+             SecResponseBodyLimit 4\n\
+             SecResponseBodyLimitAction ProcessPartial\n\
+             SecAction \"id:1,phase:1,ctl:requestBodyProcessor=state,pass\"\n\
+             SecAction \"id:2,phase:3,ctl:responseBodyProcessor=state,pass\"",
+        )
+        .unwrap();
+    let waf = parser.compile().unwrap();
+    let mut tx = waf.new_transaction();
+    tx.add_request_header("Content-Type", "text/plain");
+    tx.process_request_headers();
+    tx.process_request_body(b"request-body");
+    tx.add_response_header("Content-Type", "text/plain");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.process_response_body(b"response-body");
+
+    assert_eq!(
+        *states.lock().unwrap(),
+        [
+            (BodyDirection::Request, true, true),
+            (BodyDirection::Response, true, true)
+        ]
+    );
+}
+
+#[test]
 fn custom_files_use_engine_temp_paths_and_xml_keeps_its_path() {
     let directory = tempfile::tempdir().unwrap();
     let mut parser = Parser::new();
@@ -308,6 +517,58 @@ fn custom_files_obey_the_transaction_upload_file_limit() {
 }
 
 #[test]
+fn response_file_capacity_counts_stored_uploads_not_alternate_filenames() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().response_body_access = true;
+    parser
+        .config_mut()
+        .response_body_mime_types
+        .push("text/plain".to_owned());
+    parser.config_mut().upload_file_limit = 2;
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.register_body_processor("response-file", Arc::new(|| Box::new(ResponseFile)));
+    parser
+        .from_string("SecAction \"id:1,phase:3,ctl:responseBodyProcessor=response-file,pass\"")
+        .unwrap();
+    let waf = parser.compile().unwrap();
+    let mut tx = waf.new_transaction();
+    tx.add_request_header("Content-Type", "multipart/form-data; boundary=boundary");
+    tx.process_request_headers();
+    tx.process_request_body(
+        b"--boundary\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"legacy.txt\"; filename*=UTF-8'en'payload.txt\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+payload\r\n\
+--boundary--",
+    );
+
+    assert_eq!(
+        tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
+        Some("payload.txt")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("legacy.txt")).as_deref(),
+        Some("7")
+    );
+    tx.add_response_header("Content-Type", "text/plain");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.process_response_body(b"response");
+
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("response.txt"))
+            .as_deref(),
+        Some("13")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
+        Some("0")
+    );
+}
+
+#[test]
 fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
     let mut parser = Parser::new();
     parser.config_mut().request_body_access = true;
@@ -345,12 +606,12 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
     );
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref(),
-        Some("REPORTED-NAME")
+        Some("JSON")
     );
     assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
-        Some("REPORTED-NAME: reported parse failure")
+        Some("JSON: reported parse failure")
     );
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
@@ -369,7 +630,7 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
     );
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
-        Some("REPORTED-NAME: returned parse failure")
+        Some("JSON: returned parse failure")
     );
 }
 

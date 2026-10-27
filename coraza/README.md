@@ -204,7 +204,9 @@ compiled. A later registration does not rewrite an existing rule or WAF.
 Content-Type selection remains built-in (URLENCODED and MULTIPART); it never
 selects a custom processor. `BodyProcessorOptions` supplies the transaction's
 resolved MIME, argument and upload limits, upload directory/mode/retention policy,
-and request/response recursion limits.
+and request/response truncation and data-error state. Recursion limits are
+advisory for custom processors and enforced only by built-ins; a truncated body
+passed to a processor is the prefix retained by the engine.
 
 Processors can publish arguments, files, XML paths, a processor name, and an
 error through `BodyProcessorOutput`; they do not receive `Transaction` access.
@@ -219,12 +221,19 @@ processor error (returned or set with `set_error`) sets the corresponding
 `REQBODY_*` or response body error variables while retaining output already
 published. Body processor errors do not set `TX.inspection_incomplete`, which
 is reserved for detector inputs that could not be inspected.
+The engine caps cumulative output bytes at the applicable request or response
+body limit; exceeding it stops further output, keeps output already accepted,
+and sets the direction's data-error and body-processor error variables.
+`set_processor` is host-reported and not authoritative: it may differ
+from the name selected by `ctl`, and the reported name is also used in body-error
+message prefixes.
 
-**Security and host hazard:** the factory and processor run synchronously on the
-request path over attacker-controlled body bytes. The engine provides no timeout
-and does not catch panics. Factories and processors must not panic, must bound
-their own work, and must respect the supplied limits. File output is rejected on
-WASI until a connector supplies a memory-backed sink.
+**Security and host hazard:** factories and processors run synchronously on the
+transaction path, with no timeout and no panic catching. The zero-argument
+factory receives no body; the processor receives attacker-controlled body bytes.
+Both must not panic or block indefinitely, and processors must bound their own
+work and honor the supplied limits. File output is rejected on WASI until a
+connector supplies a memory-backed sink.
 
 ## Rule observer
 

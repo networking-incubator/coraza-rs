@@ -142,10 +142,10 @@ impl Transaction {
         };
         match name {
             "requestBodyProcessor" if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody) => {
-                self.set_request_custom_body_processor(value, Arc::from(factory()));
+                self.set_request_custom_body_processor(value, Arc::clone(factory));
             },
             "responseBodyProcessor" if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody) => {
-                self.set_response_custom_body_processor(value, Arc::from(factory()));
+                self.set_response_custom_body_processor(value, Arc::clone(factory));
             },
             _ => {},
         }
