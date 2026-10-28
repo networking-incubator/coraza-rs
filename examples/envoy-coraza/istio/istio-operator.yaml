@@ -1,0 +1,33 @@
+# IstioOperator overlay applied on top of the minimal profile by test-istio.sh:
+#   istioctl install -y -f istio-operator.yaml
+#
+# * hub docker.io/istio: pin the proxy image registry so the running
+#   istio-proxy digest can be compared against the pinned digests recorded in
+#   test-istio.sh (Istio defaults to registry.istio.io/release).
+# * proxyStatsMatcher inclusion prefixes: Envoy on Istio only records stats
+#   matching the inclusion list, which would drop every waf_filter stat the
+#   coraza filter emits (waf_filter.tx.total, waf_filter_errors_total, ...).
+#   The required Istio defaults are always appended by the agent.
+#
+# Note: meshConfig extraStatTags is NOT set. The istio-agent bootstrap
+# generates the regex (tag=\.=(.*?);\.;) for extra stat tags, which only
+# matches the mixer/telemetry wasm naming convention and cannot extract this
+# filter's waf_filter.tx.interruptions_ruleid=N_phase=X_suite=Y naming, so
+# rule_id/phase/suite surface only in the raw admin /stats text (asserted by
+# the harness) and not as prometheus tags. Fixing that would require a custom
+# proxy bootstrap template, out of MVP scope.
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: coraza-istio-mvp
+spec:
+  profile: minimal
+  values:
+    global:
+      hub: docker.io/istio
+  meshConfig:
+    defaultConfig:
+      proxyStatsMatcher:
+        inclusionPrefixes:
+          - waf_filter.
+          - waf_filter_

@@ -1,0 +1,38 @@
+# Deterministic backend reused from the standalone Envoy harness
+# (examples/envoy-coraza/backend.go + Dockerfile). The harness builds the image
+# `coraza-envoy-backend:istio-test` from examples/envoy-coraza and loads it
+# into the Kind node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coraza-backend
+  namespace: coraza-istio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coraza-backend
+  template:
+    metadata:
+      labels:
+        app: coraza-backend
+    spec:
+      containers:
+        - name: backend
+          image: coraza-envoy-backend:istio-test
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coraza-backend
+  namespace: coraza-istio
+spec:
+  selector:
+    app: coraza-backend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

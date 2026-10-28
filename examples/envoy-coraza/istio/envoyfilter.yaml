@@ -1,0 +1,189 @@
+# EnvoyFilter that inserts the envoy-coraza Rust Proxy-Wasm filter into the
+# Istio gateway created from gateway.yaml.
+#
+# Layout verified against Istio 1.30.5/1.30.7 (Envoy 1.38.x-dev):
+#   listener 0.0.0.0_80 -> filter chain -> network filter
+#   envoy.filters.network.http_connection_manager with http_filters
+#   [istio.metadata_exchange, envoy.filters.http.grpc_stats, istio.alpn,
+#    envoy.filters.http.fault, envoy.filters.http.cors, istio.stats,
+#    envoy.filters.http.router]
+#
+# The wasm filter is inserted immediately BEFORE envoy.filters.http.router
+# (last filter before routing, after Istio's own filters). EnvoyFilter has no
+# separate failure-strategy field, so failure_policy: FAIL_CLOSED is set
+# inside the wasm config itself, semantically identical to
+# examples/envoy-coraza/envoy.yaml.
+#
+# All patches are scoped to listener port 80 (the only traffic listener of the
+# Gateway in gateway.yaml; Istio's health/metrics listeners 15021/15090 must
+# not run the WAF). A second listener on the Gateway would NOT be covered:
+# test-istio.sh fails if the Gateway has more than one listener, and the README
+# documents the footgun.
+#
+# Artifact delivery: code.remote + sha256. Envoy 1.38's HttpUri only accepts
+# an explicit cluster as http_upstream_type (no local-DNS option), so the
+# first patch adds a STATIC fetch cluster pointing at the host's Kind bridge
+# gateway address, where the harness serves the digest-pinned artifact over
+# plain HTTP.
+#
+# The harness substitutes __FILTER_NAME__, __WASM_URI__, __WASM_SHA256__,
+# __WASM_FETCH_ADDRESS__ and __WASM_FETCH_PORT__ before applying.
+#
+# Istio 1.30 serves EnvoyFilter only as networking.istio.io/v1alpha3.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: __FILTER_NAME__
+  namespace: coraza-istio
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: coraza-gateway
+  configPatches:
+    # Listener: raise the per-connection buffer limit to 16 MiB, mirroring the
+    # standalone envoy.yaml. This matters only while the filter holds response
+    # headers stopped (phase-4 header rules): Envoy buffers the body against
+    # the listener's default ~1 MiB limit and aborts the 1 MiB+1 response with
+    # a 500 (response_payload_too_large). Freely streamed responses are
+    # unaffected (verified both ways on Istio 1.30.5). This is a harness
+    # convenience, not a production recommendation: the ceiling is a memory
+    # cost for every connection on the listener.
+    - applyTo: LISTENER
+      match:
+        context: GATEWAY
+        listener:
+          portNumber: 80
+      patch:
+        operation: MERGE
+        value:
+          per_connection_buffer_limit_bytes: 16777216
+    # Cluster used by Envoy's remote-data fetcher for the wasm artifact.
+    - applyTo: CLUSTER
+      match:
+        context: GATEWAY
+      patch:
+        operation: ADD
+        value:
+          name: coraza-wasm-fetch
+          type: STATIC
+          connect_timeout: 5s
+          load_assignment:
+            cluster_name: coraza-wasm-fetch
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: __WASM_FETCH_ADDRESS__
+                          port_value: __WASM_FETCH_PORT__
+    # HCM: enable HTTP/1.1 request trailers (the standalone harness runs Envoy
+    # with http_protocol_options.enable_trailers) and append a file access log
+    # that dumps the coraza filter-state keys, mirroring envoy.yaml.
+    - applyTo: NETWORK_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          portNumber: 80
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: MERGE
+        value:
+          name: envoy.filters.network.http_connection_manager
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            http_protocol_options:
+              enable_trailers: true
+            access_log:
+              - name: envoy.access_loggers.file
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                  path: /dev/stdout
+                  log_format:
+                    text_format_source:
+                      inline_string: "path=%REQ(:PATH)% coraza_observability event=%FILTER_STATE(wasm.io.coraza.waf.event:PLAIN)% rule_id=%FILTER_STATE(wasm.io.coraza.waf.rule_id:PLAIN)% phase=%FILTER_STATE(wasm.io.coraza.waf.phase:PLAIN)% action=%FILTER_STATE(wasm.io.coraza.waf.action:PLAIN)% status=%FILTER_STATE(wasm.io.coraza.waf.status:PLAIN)% reason=%FILTER_STATE(wasm.io.coraza.waf.v1.inspection_reason:PLAIN)% outcome=%FILTER_STATE(wasm.io.coraza.waf.v1.terminal_outcome:PLAIN)% complete=%FILTER_STATE(wasm.io.coraza.waf.v1.inspection_complete:PLAIN)% generation=%FILTER_STATE(wasm.io.coraza.waf.v1.policy_generation:PLAIN)% request_truncated=%FILTER_STATE(wasm.io.coraza.waf.v1.request_body_truncated:PLAIN)% response_truncated=%FILTER_STATE(wasm.io.coraza.waf.v1.response_body_truncated:PLAIN)% telemetry_failed=%FILTER_STATE(wasm.io.coraza.waf.v1.telemetry_publish_failed:PLAIN)% details=%RESPONSE_CODE_DETAILS%\n"
+    # The wasm HTTP filter, immediately before the router.
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          portNumber: 80
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.wasm
+          typed_config:
+            "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+            type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+            value:
+              config:
+                name: __FILTER_NAME__
+                root_id: __FILTER_NAME__
+                failure_policy: FAIL_CLOSED
+                allow_on_headers_stop_iteration: true
+                vm_config:
+                  runtime: envoy.wasm.runtime.v8
+                  code:
+                    remote:
+                      http_uri:
+                        uri: __WASM_URI__
+                        timeout: 120s
+                        cluster: coraza-wasm-fetch
+                      sha256: __WASM_SHA256__
+                      # Bounded retries for the artifact fetch; without a
+                      # retry policy a single transient fetch failure leaves
+                      # the VM failed (FAIL_CLOSED rejects traffic with 503
+                      # until the config is re-pushed or the pod restarts).
+                      retry_policy:
+                        retry_back_off:
+                          base_interval: 1s
+                          max_interval: 10s
+                        num_retries: 5
+                configuration:
+                  "@type": type.googleapis.com/google.protobuf.StringValue
+                  value: |
+                    {
+                      "directives_map": {
+                        "main": [
+                          "SecRuleEngine On",
+                          "SecAuditEngine RelevantOnly",
+                          "SecAuditLogFormat JSON",
+                          "SecRequestBodyAccess On",
+                          "SecRequestBodyLimit 32",
+                          "SecRequestBodyLimitAction ProcessPartial",
+                          "SecResponseBodyAccess On",
+                          "SecResponseBodyLimit 32",
+                          "SecResponseBodyLimitAction ProcessPartial",
+                          "SecResponseBodyMimeType text/plain",
+                          "SecRule REQUEST_URI \"@streq /phase1-deny\" \"id:101,phase:1,deny,status:403,auditlog,msg:'test blocked'\"",
+                          "SecRule ARGS_POST \"@contains block\" \"id:102,phase:2,deny,status:403\"",
+                          "SecRule RESPONSE_BODY \"@contains secret\" \"id:103,phase:4,deny,status:502\"",
+                          "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:104,phase:4,deny,status:502\""
+                        ],
+                        "reject": [
+                          "SecRuleEngine On",
+                          "SecRequestBodyAccess On",
+                          "SecRequestBodyLimit 32",
+                          "SecRequestBodyLimitAction Reject",
+                          "SecResponseBodyAccess On",
+                          "SecResponseBodyLimit 32",
+                          "SecResponseBodyLimitAction Reject",
+                          "SecResponseBodyMimeType text/plain"
+                        ],
+                        "response-off": [
+                          "SecRuleEngine On",
+                          "SecResponseBodyAccess Off",
+                          "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:105,phase:4,deny,status:502\""
+                        ]
+                      },
+                      "default_directives": "main",
+                      "enable_filter_state_logs": true,
+                      "metric_labels": {"suite": "envoy-harness"},
+                      "per_authority_directives": {"reject.local": "reject", "off.local": "response-off"}
+                    }
