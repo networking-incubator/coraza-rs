@@ -50,6 +50,13 @@ only); any other value must be an existing file, checked before the cluster is
 touched, and an explicitly empty value is rejected rather than silently
 re-defaulting.
 
+The filter build this harness currently pins publishes filter-state properties
+and bounded logs only; it does not define Envoy/Prometheus counters or gauges.
+On the current artifact pins, both Istio hosts (1.30.5 and 1.30.7) passed 52
+gating assertions and four oracle checks. `ORACLE_WASM=none` passes the gating
+assertions and skips the oracle; the corrupt-artifact control passes gating and
+reports two failed oracle requests with no oracle PASS lines.
+
 The harness is idempotent: it uninstalls any previously installed Istio first
 and tears everything down on exit unless `KEEP=1`. With `KEEP=1` the Rust
 filter is restored and the gateway restarted after the oracle smoke, so the

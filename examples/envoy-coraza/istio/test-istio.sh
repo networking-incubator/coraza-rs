@@ -71,10 +71,10 @@ BINARYEN_DIR=/tmp/binaryen-version_123
 # Istio versions, update these constants, and re-record the results
 # (see README.md, "Updating the artifact pins").
 EXPECTED_UNPATCHED_SHA256=dbe01dd7d581fcc70c9226079f5a3d49394091bb8d43eede37f0e267108a9d36
-EXPECTED_ISTIO_SHA256=TO_BE_RECORDED
+EXPECTED_ISTIO_SHA256=2aa02d1b6bff8499ccf04d88e274330cafcd9e3942e9cda45d86e1585ee16d5e
 
 # Total gating PASS lines the harness must emit (the oracle smoke records up
-# to five more PASS lines through `oracle_pass`, and never gates). A mismatch means an assertion
+# to four more PASS lines through `oracle_pass`, and never gates). A mismatch means an assertion
 # was added or lost; update the constant together with the documented results.
 EXPECTED_GATING_ASSERTIONS=52
 
