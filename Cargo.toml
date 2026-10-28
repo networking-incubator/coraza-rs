@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["coraza", "envoy-libperfusion", "libperfusion", "xtask"]
+members = [
+  "coraza",
+  "envoy-coraza",
+  "envoy-libperfusion",
+  "libperfusion",
+  "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
