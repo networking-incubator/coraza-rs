@@ -21,7 +21,7 @@
 //!
 //! The filter compiles immutable policy generations, pins one to each stream,
 //! enforces request and response phases, and finalizes one transaction per stream.
-//! Terminal data, filter-state properties, metrics, and selected audit records
+//! Terminal data, filter-state properties, and selected audit records
 //! are published through checked Proxy-Wasm hostcalls.
 
 mod config;
@@ -84,8 +84,6 @@ impl CorazaRoot {
             .ok_or_else(|| "configuration generation id exhausted".to_owned())?;
         let mut generation = Generation::compile(config).map_err(|error| error.to_string())?;
         generation.set_id(next_id);
-        #[cfg(target_arch = "wasm32")]
-        generation.initialize_metrics();
         self.generation = Some(Rc::new(generation));
         self.next_generation_id = next_id;
         Ok(())

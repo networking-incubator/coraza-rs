@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded, per-generation Proxy-Wasm state, metric, and log publication.
+//! Bounded Proxy-Wasm filter-state and log publication.
 
 use std::{
-    collections::BTreeMap,
     fmt::Write as _,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use coraza::{
@@ -28,8 +24,6 @@ use coraza::{
     transaction::{Interruption, Transaction},
     types::AuditLogFormat,
 };
-#[cfg(target_arch = "wasm32")]
-use proxy_wasm::types::MetricType;
 use proxy_wasm::{hostcalls, types::LogLevel};
 
 /// Maximum rule-error log message size in bytes.
@@ -64,222 +58,6 @@ impl Diagnostics {
     }
 }
 
-#[derive(Debug, Default)]
-/// Metric IDs defined by one policy generation.
-struct MetricIds {
-    /// Total transactions.
-    tx_total: Option<u32>,
-    /// Transactions ending with an error.
-    errors_total: Option<u32>,
-    /// Transactions with incomplete inspection.
-    incomplete_total: Option<u32>,
-    /// Telemetry publication failures.
-    telemetry_failures_total: Option<u32>,
-    /// Currently active streams.
-    active_streams: Option<u32>,
-    /// Bytes retained for request and response inspection.
-    retained_body_bytes: Option<u32>,
-    /// Interruption counters keyed by phase and rule ID.
-    #[cfg(target_arch = "wasm32")]
-    interruptions: BTreeMap<(String, i32), u32>,
-}
-
-/// Metric names use only configured static labels and IDs compiled into the generation.
-#[derive(Debug)]
-pub(crate) struct Metrics {
-    /// Configured labels appended to interruption metric names.
-    #[cfg(target_arch = "wasm32")]
-    labels: Vec<(String, String)>,
-    /// IDs of the bounded counters and gauges.
-    ids: Mutex<MetricIds>,
-    /// Whether any metric definition failed during initialization.
-    initialization_failed: AtomicBool,
-}
-
-impl Metrics {
-    /// Creates metric state for one generation.
-    pub(crate) fn new(labels: &BTreeMap<String, String>) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = labels;
-        Self {
-            #[cfg(target_arch = "wasm32")]
-            labels: labels.iter().map(|(key, value)| (key.clone(), value.clone())).collect(),
-            ids: Mutex::new(MetricIds::default()),
-            initialization_failed: AtomicBool::new(false),
-        }
-    }
-
-    /// Defines the bounded counters and gauges once for this generation.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn initialize(&self, diagnostics: &Diagnostics) {
-        let mut ids = self.ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        ids.tx_total = Self::define(MetricType::Counter, "waf_filter.tx.total", diagnostics);
-        ids.errors_total = Self::define(MetricType::Counter, "waf_filter_errors_total", diagnostics);
-        ids.incomplete_total = Self::define(
-            MetricType::Counter,
-            "waf_filter_incomplete_inspections_total",
-            diagnostics,
-        );
-        ids.telemetry_failures_total =
-            Self::define(MetricType::Counter, "waf_filter_telemetry_failures_total", diagnostics);
-        ids.active_streams = Self::define(MetricType::Gauge, "waf_filter_active_streams", diagnostics);
-        ids.retained_body_bytes = Self::define(MetricType::Gauge, "waf_filter_retained_body_bytes", diagnostics);
-        let failed = [
-            ids.tx_total,
-            ids.errors_total,
-            ids.incomplete_total,
-            ids.telemetry_failures_total,
-            ids.active_streams,
-            ids.retained_body_bytes,
-        ]
-        .into_iter()
-        .any(|id| id.is_none());
-        self.initialization_failed.store(failed, Ordering::Relaxed);
-        if failed {
-            if let Some(id) = ids.telemetry_failures_total {
-                if hostcalls::increment_metric(id, 1).is_err() {
-                    diagnostics.hostcall_failure("metric definition failure counter");
-                }
-            }
-        }
-    }
-
-    /// Returns whether any metric definition failed during initialization.
-    pub(crate) fn initialization_failed(&self) -> bool {
-        self.initialization_failed.load(Ordering::Relaxed)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    /// Defines one host metric and records a diagnostic on failure.
-    fn define(kind: MetricType, name: &str, diagnostics: &Diagnostics) -> Option<u32> {
-        if let Ok(id) = hostcalls::define_metric(kind, name) {
-            Some(id)
-        } else {
-            diagnostics.hostcall_failure("metric definition");
-            None
-        }
-    }
-
-    /// Increments the transaction counter.
-    pub(crate) fn transaction(&self, diagnostics: &Diagnostics) -> bool {
-        Self::increment(self.metric_id(|ids| ids.tx_total), diagnostics, "transaction metric")
-    }
-
-    /// Increments the phase and rule interruption counter.
-    pub(crate) fn interruption(metrics: &Self, phase: &'static str, rule_id: i32, diagnostics: &Diagnostics) -> bool {
-        let key = (phase.to_owned(), rule_id);
-        #[cfg(target_arch = "wasm32")]
-        let id = {
-            // Do not hold the id lock across the define hostcall.
-            let cached = metrics
-                .ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .interruptions
-                .get(&key)
-                .copied();
-            if let Some(id) = cached {
-                Some(id)
-            } else {
-                let name = interruption_metric_name(phase, rule_id, &metrics.labels);
-                if let Ok(id) = hostcalls::define_metric(MetricType::Counter, &name) {
-                    metrics
-                        .ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .interruptions
-                        .insert(key, id);
-                    Some(id)
-                } else {
-                    diagnostics.hostcall_failure("interruption metric definition");
-                    None
-                }
-            }
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        let id = {
-            drop((metrics, key));
-            None
-        };
-        Self::increment(id, diagnostics, "interruption metric")
-    }
-
-    /// Increments terminal error and incomplete-inspection counters as needed.
-    pub(crate) fn terminal(&self, inspection_complete: bool, is_error: bool, diagnostics: &Diagnostics) -> bool {
-        let mut success = true;
-        if is_error {
-            success &= Self::increment(self.metric_id(|ids| ids.errors_total), diagnostics, "error metric");
-        }
-        if !inspection_complete {
-            success &= Self::increment(
-                self.metric_id(|ids| ids.incomplete_total),
-                diagnostics,
-                "incomplete inspection metric",
-            );
-        }
-        success
-    }
-
-    /// Increments the telemetry-failure counter.
-    pub(crate) fn telemetry_failure(&self, diagnostics: &Diagnostics) -> bool {
-        Self::increment(
-            self.metric_id(|ids| ids.telemetry_failures_total),
-            diagnostics,
-            "telemetry failure metric",
-        )
-    }
-
-    /// Adjusts the active-stream gauge.
-    pub(crate) fn active_stream_delta(&self, delta: i64, diagnostics: &Diagnostics) -> bool {
-        Self::adjust(
-            self.metric_id(|ids| ids.active_streams),
-            delta,
-            diagnostics,
-            "active stream gauge",
-        )
-    }
-
-    /// Adjusts the retained-body-byte gauge.
-    pub(crate) fn retained_body_delta(&self, delta: i64, diagnostics: &Diagnostics) -> bool {
-        Self::adjust(
-            self.metric_id(|ids| ids.retained_body_bytes),
-            delta,
-            diagnostics,
-            "retained body gauge",
-        )
-    }
-
-    /// Reads one metric ID while holding the ID map lock.
-    fn metric_id(&self, get: impl FnOnce(&MetricIds) -> Option<u32>) -> Option<u32> {
-        let ids = self.ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        get(&ids)
-    }
-
-    /// Adds one to a metric when its host ID is available.
-    fn increment(id: Option<u32>, diagnostics: &Diagnostics, operation: &'static str) -> bool {
-        Self::adjust(id, 1, diagnostics, operation)
-    }
-
-    /// Applies a signed metric delta and reports hostcall failures.
-    fn adjust(id: Option<u32>, delta: i64, diagnostics: &Diagnostics, operation: &'static str) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let Some(id) = id else {
-                return false;
-            };
-            if hostcalls::increment_metric(id, delta).is_err() {
-                diagnostics.hostcall_failure(operation);
-                return false;
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = (id, delta, diagnostics, operation);
-        }
-        true
-    }
-}
-
 /// One of the four legacy interruption phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptionPhase {
@@ -303,34 +81,19 @@ impl InterruptionPhase {
             Self::ResponseBody => "http_response_body",
         }
     }
-
-    /// Returns the legacy metric tag for this phase.
-    fn metric(self) -> &'static str {
-        match self {
-            Self::RequestHeaders => "http_request_headers_identifier",
-            Self::RequestBody => "http_request_body_identifier",
-            Self::ResponseHeaders => "http_response_headers_identifier",
-            Self::ResponseBody => "http_response_body_identifier",
-        }
-    }
 }
 
 /// Publishes the PR #20 interruption properties before local replies or response rewriting.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The pinned interruption callback needs its transaction, phase, metric, and diagnostics values explicitly."
-)]
 pub(crate) fn interruption(
     enabled: bool,
     transaction: &Transaction,
     interruption: &Interruption,
     phase: InterruptionPhase,
-    metrics: &Metrics,
     diagnostics: &Diagnostics,
 ) -> bool {
-    let mut failed = !Metrics::interruption(metrics, phase.metric(), interruption.rule_id, diagnostics);
+    let mut failed = false;
     if !enabled {
-        return failed;
+        return false;
     }
 
     let matched = transaction
@@ -371,9 +134,6 @@ pub(crate) fn interruption(
             diagnostics.hostcall_failure("filter state property");
         }
     }
-    if failed {
-        let _ = metrics.telemetry_failure(diagnostics);
-    }
     failed
 }
 
@@ -400,8 +160,8 @@ pub(crate) struct HealthState<'a> {
     pub(crate) telemetry_publish_failed: bool,
 }
 
-/// Publishes the additive v1 fields; failures are counted without affecting enforcement.
-pub(crate) fn health(enabled: bool, state: HealthState<'_>, metrics: &Metrics, diagnostics: &Diagnostics) -> bool {
+/// Publishes the additive v1 fields; failures do not affect enforcement.
+pub(crate) fn health(enabled: bool, state: HealthState<'_>, diagnostics: &Diagnostics) -> bool {
     if !enabled {
         return state.telemetry_publish_failed;
     }
@@ -424,9 +184,6 @@ pub(crate) fn health(enabled: bool, state: HealthState<'_>, metrics: &Metrics, d
         failed = true;
         diagnostics.hostcall_failure("telemetry failure property");
     }
-    if failed && !state.telemetry_publish_failed {
-        let _ = metrics.telemetry_failure(diagnostics);
-    }
     failed
 }
 
@@ -437,23 +194,21 @@ fn publish_property(prefix: &str, field: &str, value: &str) -> Result<(), proxy_
 }
 
 /// Emits Coraza's existing bounded and sanitized rule error log line.
-pub(crate) fn error_log(matched: &MatchedRule, metrics: &Metrics, diagnostics: &Diagnostics) {
+pub(crate) fn error_log(matched: &MatchedRule, diagnostics: &Diagnostics) {
     let message = bounded(&matched.error_log(), MAX_ERROR_LOG_BYTES);
     if hostcalls::log(LogLevel::Warn, &message).is_err() {
-        let _ = metrics.telemetry_failure(diagnostics);
         diagnostics.hostcall_failure("rule error log");
     }
 }
 
 /// Emits one selected Coraza audit entry using configured parts and format.
-pub(crate) fn audit_log(entry: &AuditLog, format: AuditLogFormat, metrics: &Metrics, diagnostics: &Diagnostics) {
+pub(crate) fn audit_log(entry: &AuditLog, format: AuditLogFormat, diagnostics: &Diagnostics) {
     let (formatted, truncated) = entry.format_bounded(format, MAX_AUDIT_LOG_BYTES);
     if formatted.is_empty() {
         return;
     }
     let message = sanitize_audit(&formatted, MAX_AUDIT_LOG_BYTES, truncated);
     if hostcalls::log(LogLevel::Critical, &message).is_err() {
-        let _ = metrics.telemetry_failure(diagnostics);
         diagnostics.hostcall_failure("audit log");
     }
 }
@@ -554,21 +309,11 @@ fn category(tags: &[String]) -> String {
     "other".to_owned()
 }
 
-/// Keep the metric FQN used by the pinned connector; Envoy extracts the tags from its suffix.
-#[cfg(any(target_arch = "wasm32", test))]
-fn interruption_metric_name(phase: &str, rule_id: i32, labels: &[(String, String)]) -> String {
-    let mut name = format!("waf_filter.tx.interruptions_ruleid={rule_id}_phase={phase}");
-    for (key, value) in labels {
-        write!(name, "_{key}={value}").unwrap_or(());
-    }
-    name
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded, category, interruption_metric_name, sanitize_audit, InterruptionPhase, MAX_AUDIT_LOG_BYTES,
-        MAX_ERROR_LOG_BYTES, TRUNCATION_MARKER,
+        bounded, category, sanitize_audit, InterruptionPhase, MAX_AUDIT_LOG_BYTES, MAX_ERROR_LOG_BYTES,
+        TRUNCATION_MARKER,
     };
 
     #[test]
@@ -595,37 +340,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_interruption_metric_fqn_preserves_upstream_separator_and_tags() {
-        let labels = vec![("suite".to_owned(), "contract".to_owned())];
-        assert_eq!(
-            interruption_metric_name("http_request_headers_identifier", 1042, &labels),
-            "waf_filter.tx.interruptions_ruleid=1042_phase=http_request_headers_identifier_suite=contract"
-        );
-        assert_eq!(
-            interruption_metric_name("http_response_body_identifier", -2, &[]),
-            "waf_filter.tx.interruptions_ruleid=-2_phase=http_response_body_identifier"
-        );
-    }
-
-    #[test]
-    fn interruption_phase_values_keep_state_and_stat_tag_semantics_distinct() {
+    fn interruption_phase_values_match_filter_state_contract() {
         assert_eq!(InterruptionPhase::RequestHeaders.state(), "http_request_headers");
-        assert_eq!(
-            InterruptionPhase::RequestHeaders.metric(),
-            "http_request_headers_identifier"
-        );
         assert_eq!(InterruptionPhase::RequestBody.state(), "http_request_body");
-        assert_eq!(InterruptionPhase::RequestBody.metric(), "http_request_body_identifier");
         assert_eq!(InterruptionPhase::ResponseHeaders.state(), "http_response_headers");
-        assert_eq!(
-            InterruptionPhase::ResponseHeaders.metric(),
-            "http_response_headers_identifier"
-        );
         assert_eq!(InterruptionPhase::ResponseBody.state(), "http_response_body");
-        assert_eq!(
-            InterruptionPhase::ResponseBody.metric(),
-            "http_response_body_identifier"
-        );
     }
 
     #[test]

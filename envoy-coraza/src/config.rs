@@ -39,9 +39,8 @@
 //!   `default_directives`, only when `directives_map` is empty; otherwise its result is ignored, though the value is
 //!   still validated. It must be an array of scalars or a single scalar; `null`, an object or a container inside the
 //!   array is rejected.
-//! * `metric_labels` is an object of static label name to value, coerced like a directive. Non-scalar values are
-//!   skipped. At most [`MAX_METRIC_LABELS`] labels are accepted, with names of at most [`MAX_METRIC_LABEL_NAME_BYTES`]
-//!   bytes and values of at most [`MAX_METRIC_LABEL_VALUE_BYTES`] bytes.
+//! * `metric_labels` is accepted and ignored for upstream configuration compatibility; this build publishes no
+//!   Prometheus metrics.
 //! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`.
 //! * `rule_data` is this connector's additive map of file name to file bytes for the file-based operators and
 //!   `Include`. Names are bounded like the engine's in-memory rule data source: see [`RULE_DATA_LIMITS`]. A non-string
@@ -62,8 +61,8 @@
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
 //!   `directives_map` (including a duplicate policy name inside it), `default_directives`, `per_authority_directives`,
-//!   `metric_labels`, `enable_filter_state_logs`, `rules` and `rule_data`. A dropped duplicate `directives_map` entry
-//!   can therefore drop an entire policy's rules.
+//!   `enable_filter_state_logs`, `rules` and `rule_data`. `metric_labels` is ignored. A dropped duplicate
+//!   `directives_map` entry can therefore drop an entire policy's rules.
 //! * `serde_json` renders a number with its shortest round-trip form, where `gjson`'s `String()` re-renders floats
 //!   through `strconv.FormatFloat`, so exponent notation can differ. `1e30` is frozen as `1e+30`.
 //! * An array or object inside a `directives_map` directive array is rejected, naming the policy and element index,
@@ -73,11 +72,11 @@
 //!   including one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic.
 //!   Upstream would compile the rest of the policy and serve it; a policy that silently loses a rule line is a
 //!   fail-open, so this build keeps strict compilation.
-//! * A present `directives_map`, `per_authority_directives` or `metric_labels` that is not an object is rejected.
-//!   Upstream's `ForEach` on `null` iterates once and on an array iterates its elements, so such a document does
-//!   something rather than nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is
-//!   read as empty instead: it is the one object-valued key where a wrong type is not rejected, because the key only
-//!   supplies file bytes to this connector's own rule-data sources.
+//! * A present `directives_map` or `per_authority_directives` that is not an object is rejected. Upstream's `ForEach`
+//!   on `null` iterates once and on an array iterates its elements, so such a document does something rather than
+//!   nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is read as empty instead:
+//!   it is the one object-valued key where a wrong type is not rejected, because the key only supplies file bytes to
+//!   this connector's own rule-data sources.
 //! * A `directives_map` policy value that is an object is rejected, where upstream's `ForEach` reads it as a single
 //!   stringified directive. Drifting into one opaque rule line is a silent fail-open.
 //! * `rules` must be an array of scalars or a scalar. `rules: null` is rejected with `rules must be an array or string,
@@ -88,8 +87,6 @@
 //!   absent or stringifies them.
 //! * `per_authority_directives` values must be scalars; a non-scalar is rejected where upstream stringifies it. The
 //!   document is rejected because an unusable authority entry would otherwise drop enforcement for that authority.
-//! * `metric_labels` values must be scalars; non-scalars are skipped as before, but a label over its cap is rejected
-//!   rather than truncated.
 //! * `serde_json` rejects JSON nested deeper than 128 levels, invalid UTF-8 and numbers outside its range, where
 //!   `gjson` accepts them or re-renders them. The failure is reported as `invalid json: `.
 //! * Error text is this crate's: it names the offending policy, authority, label or file and the bound that failed,
@@ -101,8 +98,7 @@
 //!   `MAX_RULES_PER_GENERATION` (60,000) rules, passed to the engine parser as a rule budget so an `Include` expansion
 //!   or a newline-packed directive string stops at the limit; `MAX_RULE_DATA_FILES`, `MAX_RULE_DATA_FILE_BYTES`,
 //!   `MAX_RULE_DATA_TOTAL_BYTES`, `MAX_RULE_DATA_READ_BYTES` and `MAX_NAME_BYTES` (4096, with the engine's 64-component
-//!   rule) for rule-data names; `MAX_AUTHORITIES`; `MAX_METRIC_LABELS`, `MAX_METRIC_LABEL_NAME_BYTES` and
-//!   `MAX_METRIC_LABEL_VALUE_BYTES`; and `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's
+//!   rule) for rule-data names; `MAX_AUTHORITIES`; and `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's
 //!   `MAX_INCLUDED_FILES` is per top-level parse, so here it applies per policy. Stock CRS's `SecRequestBodyLimit
 //!   13107200` is under the `MAX_REQUEST_BODY_LIMIT` WASM ceiling, so it is accepted as written. The rule caps are low
 //!   because rule insertion scans for duplicate ids, so collecting one policy is quadratic: 30,000 flat rules measured
@@ -159,15 +155,6 @@ const MAX_RULE_DATA_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 /// Most authorities one configuration may map.
 const MAX_AUTHORITIES: usize = 4096;
 
-/// Most static metric labels one configuration may set.
-const MAX_METRIC_LABELS: usize = 64;
-
-/// Longest metric label name, in bytes.
-const MAX_METRIC_LABEL_NAME_BYTES: usize = 128;
-
-/// Longest metric label value, in bytes.
-const MAX_METRIC_LABEL_VALUE_BYTES: usize = 256;
-
 /// Bounds applied while reading `rule_data`.
 ///
 /// A value rather than bare constants so the checks can be exercised with small
@@ -198,8 +185,6 @@ pub(crate) struct Config {
     pub(crate) default_directives: Option<String>,
     /// Authority to policy name.
     pub(crate) per_authority_directives: BTreeMap<String, String>,
-    /// Static metric labels.
-    pub(crate) metric_labels: BTreeMap<String, String>,
     /// Whether the fork's filter-state log lines are enabled.
     pub(crate) enable_filter_state_logs: bool,
     /// File name to file bytes, for file-based rule operators.
@@ -266,15 +251,6 @@ pub(crate) enum ConfigError {
     EmptyPolicyName {
         /// Authority the entry is for.
         authority: String,
-    },
-    /// `metric_labels` is present but not an object.
-    MetricLabelsNotObject,
-    /// A metric label breaks a bound.
-    MetricLabel {
-        /// Offending label name.
-        name: String,
-        /// Which bound it breaks.
-        reason: String,
     },
     /// A `rule_data` entry breaks a bound.
     RuleData {
@@ -346,10 +322,6 @@ impl Display for ConfigError {
                     display_name(authority)
                 )
             },
-            Self::MetricLabelsNotObject => f.write_str("metric_labels must be an object"),
-            Self::MetricLabel { name, reason } => {
-                write!(f, "metric_labels {}: {reason}", display_name(name))
-            },
             Self::RuleData { name, reason } => write!(f, "rule_data {}: {reason}", display_name(name)),
         }
     }
@@ -381,7 +353,6 @@ impl Config {
             directives_map: parse_directives_map(object)?,
             default_directives: parse_default_directives(object)?,
             per_authority_directives: parse_per_authority_directives(object)?,
-            metric_labels: parse_metric_labels(object)?,
             enable_filter_state_logs: object
                 .get("enable_filter_state_logs")
                 .and_then(Value::as_bool)
@@ -562,43 +533,6 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
     Ok(authorities)
 }
 
-/// Reads `metric_labels`, bounded by the label caps.
-fn parse_metric_labels(object: &Map<String, Value>) -> Result<BTreeMap<String, String>, ConfigError> {
-    let Some(value) = object.get("metric_labels") else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(entries) = value.as_object() else {
-        return Err(ConfigError::MetricLabelsNotObject);
-    };
-    let mut labels = BTreeMap::new();
-    for (name, value) in entries {
-        let Some(text) = scalar_text(value) else {
-            continue;
-        };
-        let reject = |reason: String| ConfigError::MetricLabel {
-            name: name.clone(),
-            reason,
-        };
-        if labels.len() >= MAX_METRIC_LABELS {
-            return Err(reject(format!("more than {MAX_METRIC_LABELS} labels")));
-        }
-        if name.len() > MAX_METRIC_LABEL_NAME_BYTES {
-            return Err(reject(format!(
-                "name is {} bytes, over the {MAX_METRIC_LABEL_NAME_BYTES}-byte limit",
-                name.len()
-            )));
-        }
-        if text.len() > MAX_METRIC_LABEL_VALUE_BYTES {
-            return Err(reject(format!(
-                "value is {} bytes, over the {MAX_METRIC_LABEL_VALUE_BYTES}-byte limit",
-                text.len()
-            )));
-        }
-        labels.insert(name.clone(), text);
-    }
-    Ok(labels)
-}
-
 /// Reads and validates `rules`, returning its directives even when it is ignored.
 fn parse_deprecated_rules(object: &Map<String, Value>) -> Result<Option<Vec<String>>, ConfigError> {
     let Some(value) = object.get("rules") else {
@@ -729,8 +663,8 @@ mod tests {
 
     use super::{
         add_rule_data, check_json_value_count, check_rule_data_name, display_name, Config, ConfigError, RuleDataLimits,
-        MAX_AUTHORITIES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_METRIC_LABELS, MAX_METRIC_LABEL_NAME_BYTES,
-        MAX_METRIC_LABEL_VALUE_BYTES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES, MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
+        MAX_AUTHORITIES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES,
+        MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
     };
 
     /// Parses a document that must be accepted.
@@ -798,7 +732,7 @@ mod tests {
             "invalid UTF-8 is rejected"
         );
 
-        let out_of_range = parse_error(r#"{"metric_labels": {"n": 1e400}}"#);
+        let out_of_range = parse_error(r#"{"unknown": {"n": 1e400}}"#);
         assert!(
             out_of_range.starts_with("invalid json: "),
             "an out-of-range number is rejected: {out_of_range:?}"
@@ -822,7 +756,6 @@ mod tests {
                 "directives_map": {"p1": ["SecRuleEngine On", "SecAction \"id:1\""], "p2": []},
                 "default_directives": "p2",
                 "per_authority_directives": {"a.example": "p1"},
-                "metric_labels": {"env": "test", "weight": 3},
                 "enable_filter_state_logs": true,
                 "rule_data": {"data.txt": "attack\n"}
             }"#,
@@ -837,16 +770,6 @@ mod tests {
             config.per_authority_directives.get("a.example").map(String::as_str),
             Some("p1"),
             "authority policy"
-        );
-        assert_eq!(
-            config.metric_labels.get("env").map(String::as_str),
-            Some("test"),
-            "label"
-        );
-        assert_eq!(
-            config.metric_labels.get("weight").map(String::as_str),
-            Some("3"),
-            "number label"
         );
         assert!(config.enable_filter_state_logs, "state logs enabled");
         assert_eq!(
@@ -1052,45 +975,12 @@ mod tests {
     }
 
     #[test]
-    fn metric_labels_skip_containers_and_are_capped() {
-        let config = parse(r#"{"metric_labels": {"env": "test", "nested": {"a": 1}, "list": [1]}}"#);
-        assert_eq!(config.metric_labels.get("env").map(String::as_str), Some("test"));
-        assert_eq!(config.metric_labels.len(), 1, "non-scalar values are skipped");
-
-        assert_eq!(
-            parse_error(r#"{"metric_labels": 7}"#),
-            "metric_labels must be an object"
-        );
-
-        let mut labels = serde_json::Map::new();
-        for index in 0..=MAX_METRIC_LABELS {
-            labels.insert(format!("l{index}"), serde_json::Value::String("v".to_owned()));
+    fn metric_labels_are_ignored_for_configuration_compatibility() {
+        for labels in [r#"{"env": "test"}"#, "7", "null", r#"{"env": {"nested": true}}"#] {
+            let input = format!(r#"{{"directives_map": {{"p": []}}, "metric_labels": {labels}}}"#);
+            let config = parse(&input);
+            assert!(config.directives_map.contains_key("p"), "{input}");
         }
-        let error = Config::parse(serde_json::json!({"metric_labels": labels}).to_string().as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(&format!("more than {MAX_METRIC_LABELS} labels")),
-            "the cap names the label: {error:?}"
-        );
-        assert!(
-            error.starts_with("metric_labels \""),
-            "the cap names the label: {error:?}"
-        );
-
-        let long_name = "a".repeat(MAX_METRIC_LABEL_NAME_BYTES + 1);
-        let error = parse_error(&format!(r#"{{"metric_labels": {{"{long_name}": "v"}}}}"#));
-        assert!(
-            error.contains(&format!("over the {MAX_METRIC_LABEL_NAME_BYTES}-byte limit")),
-            "message was {error:?}"
-        );
-
-        let long_value = "a".repeat(MAX_METRIC_LABEL_VALUE_BYTES + 1);
-        let error = parse_error(&format!(r#"{{"metric_labels": {{"k": "{long_value}"}}}}"#));
-        assert!(
-            error.contains(&format!("over the {MAX_METRIC_LABEL_VALUE_BYTES}-byte limit")),
-            "message was {error:?}"
-        );
     }
 
     #[test]

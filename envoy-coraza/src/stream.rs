@@ -128,6 +128,7 @@ impl TerminalOutcome {
         }
     }
 
+    #[cfg(test)]
     fn is_error(&self) -> bool {
         matches!(
             self,
@@ -296,7 +297,7 @@ impl Lifecycle {
 /// One HTTP stream, sharing the generation that was current when it started.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Independent callback outcomes, truncation flags, and once-only metric guards are tracked across host events."
+    reason = "Independent callback outcomes and truncation flags are tracked across host events."
 )]
 pub(crate) struct CorazaHttp {
     generation: Option<Rc<Generation>>,
@@ -311,8 +312,6 @@ pub(crate) struct CorazaHttp {
     telemetry_publish_failed: bool,
     request_body_truncated: bool,
     response_body_truncated: bool,
-    active_metric_recorded: bool,
-    transaction_metric_recorded: bool,
     request_mode: RequestMode,
     request_method: String,
     request_protocol: String,
@@ -332,7 +331,7 @@ pub(crate) struct CorazaHttp {
 
 impl CorazaHttp {
     pub(crate) fn new(generation: Option<Rc<Generation>>, root_retained_bytes: Rc<Cell<usize>>) -> Self {
-        let mut stream = Self {
+        Self {
             generation,
             root_retained_bytes,
             retained_bytes: 0,
@@ -345,8 +344,6 @@ impl CorazaHttp {
             telemetry_publish_failed: false,
             request_body_truncated: false,
             response_body_truncated: false,
-            active_metric_recorded: false,
-            transaction_metric_recorded: false,
             request_mode: RequestMode::Inspect,
             request_method: String::new(),
             request_protocol: String::new(),
@@ -362,18 +359,7 @@ impl CorazaHttp {
             response_mutation_failed: false,
             response_block_body: RESPONSE_BLOCK_BODY,
             response_interruption: None,
-        };
-        if let Some(generation) = stream.generation.clone() {
-            if generation.metrics().initialization_failed() {
-                stream.telemetry_publish_failed = true;
-            }
-            if generation.metrics().active_stream_delta(1, generation.diagnostics()) {
-                stream.active_metric_recorded = true;
-            } else {
-                stream.mark_telemetry_failure();
-            }
         }
-        stream
     }
 
     #[cfg(test)]
@@ -389,13 +375,6 @@ impl CorazaHttp {
     #[expect(dead_code, reason = "Stage E publishes the selected policy and finalization result")]
     pub(crate) fn finalization_failed(&self) -> bool {
         self.finalization_result == FinalizationResult::Failed
-    }
-
-    fn mark_telemetry_failure(&mut self) {
-        self.telemetry_publish_failed = true;
-        if let Some(generation) = self.generation.as_ref() {
-            let _ = generation.metrics().telemetry_failure(generation.diagnostics());
-        }
     }
 
     fn diagnostic_count(&self) -> Option<u64> {
@@ -414,47 +393,19 @@ impl CorazaHttp {
         }
     }
 
-    fn record_transaction(&mut self) {
-        if self.transaction_metric_recorded {
-            return;
-        }
-        self.transaction_metric_recorded = true;
-        if let Some(generation) = self.generation.clone() {
-            if !generation.metrics().transaction(generation.diagnostics()) {
-                self.mark_telemetry_failure();
-            }
-        }
-    }
-
     fn record_interruption(
         generation: &Generation,
         transaction: &Transaction,
         interruption: &Interruption,
         phase: InterruptionPhase,
     ) -> bool {
-        if observability::interruption(
+        observability::interruption(
             generation.enable_filter_state_logs(),
             transaction,
             interruption,
             phase,
-            generation.metrics(),
             generation.diagnostics(),
-        ) {
-            return true;
-        }
-        false
-    }
-
-    fn deactivate_stream_metric(&mut self) {
-        if !self.active_metric_recorded {
-            return;
-        }
-        self.active_metric_recorded = false;
-        if let Some(generation) = self.generation.clone() {
-            if !generation.metrics().active_stream_delta(-1, generation.diagnostics()) {
-                self.mark_telemetry_failure();
-            }
-        }
+        )
     }
 
     fn begin_request(&mut self, num_headers: usize, end_of_stream: bool) -> Action {
@@ -549,7 +500,6 @@ impl CorazaHttp {
         };
         self.selected_policy = Some(policy_name.to_owned());
         self.tx = Some(Box::new(policy.waf.new_transaction()));
-        self.record_transaction();
 
         let Some(metadata) = request_metadata(headers) else {
             return self.reject_request(
@@ -1423,13 +1373,6 @@ impl CorazaHttp {
             TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
         ) && !self.request_body_truncated
             && !self.response_body_truncated;
-        let is_error = final_outcome.is_error() || self.finalization_result == FinalizationResult::Failed;
-        if !generation
-            .metrics()
-            .terminal(inspection_complete, is_error, generation.diagnostics())
-        {
-            self.mark_telemetry_failure();
-        }
         let reason = if self.finalization_result == FinalizationResult::Failed {
             "finalization_error"
         } else {
@@ -1451,7 +1394,6 @@ impl CorazaHttp {
                 terminal_outcome: terminal,
                 telemetry_publish_failed: self.telemetry_publish_failed,
             },
-            generation.metrics(),
             generation.diagnostics(),
         ) {
             self.telemetry_publish_failed = true;
@@ -1515,14 +1457,11 @@ impl CorazaHttp {
             return false;
         }
         self.root_retained_bytes.set(total);
-        let prior = self.retained_bytes;
         self.retained_bytes = next;
-        self.record_retained_metric(prior, next);
         true
     }
 
     fn release_accounting(&mut self) {
-        let prior = self.retained_bytes;
         let used = self.root_retained_bytes.get();
         self.root_retained_bytes.set(used.saturating_sub(self.retained_bytes));
         self.retained_bytes = 0;
@@ -1532,27 +1471,6 @@ impl CorazaHttp {
         self.response_copy_bytes = 0;
         self.request_engine_bytes = 0;
         self.response_engine_bytes = 0;
-        self.record_retained_metric(prior, 0);
-    }
-
-    fn record_retained_metric(&mut self, prior: usize, next: usize) {
-        if prior == next {
-            return;
-        }
-        let magnitude = next.abs_diff(prior);
-        let Ok(magnitude) = i64::try_from(magnitude) else {
-            self.mark_telemetry_failure();
-            return;
-        };
-        let delta = if next > prior { magnitude } else { -magnitude };
-        if let Some(generation) = self.generation.clone() {
-            if !generation
-                .metrics()
-                .retained_body_delta(delta, generation.diagnostics())
-            {
-                self.mark_telemetry_failure();
-            }
-        }
     }
 
     fn incomplete_outcome(&self) -> TerminalOutcome {
@@ -1575,7 +1493,6 @@ impl Context for CorazaHttp {
     /// Proxy-Wasm SDK 0.2.5 exposes stream completion as `on_done`.
     fn on_done(&mut self) -> bool {
         self.finish_once(self.incomplete_outcome());
-        self.deactivate_stream_metric();
         true
     }
 }
@@ -1611,7 +1528,6 @@ impl Drop for CorazaHttp {
         if !self.lifecycle.finalized {
             self.finish_once(self.incomplete_outcome());
         }
-        self.deactivate_stream_metric();
         self.tx.take();
         self.release_accounting();
     }
