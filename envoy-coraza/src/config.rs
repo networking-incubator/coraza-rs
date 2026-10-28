@@ -44,7 +44,14 @@
 //!   `Include`. Names are bounded like the engine's in-memory rule data source: see [`RULE_DATA_LIMITS`]. A non-string
 //!   value is ignored, but its name is still validated. A build with the `embed-crs` feature seeds the fetched CRS tree
 //!   under `crs/`, through the same checks; a configured entry with an embedded file's normalized name wins.
-//! * Unknown keys are ignored.
+//! * `config_gzip_b64` replaces the plain document with that document gzip-compressed and base64-encoded, for a control
+//!   plane that will not carry the plain JSON. Inside that wrapper it is the only accepted top-level key: any other
+//!   key, known or unknown, rejects the document. Its value must be one line of standard padded base64, and the
+//!   decompressed document is parsed by every rule above, capped at [`MAX_CONFIGURATION_BYTES`]. A blank or non-object
+//!   decompressed document yields the same empty [`Config`] as the plain path, and one that itself holds
+//!   `config_gzip_b64` is rejected rather than nested. Exactly one gzip member is accepted: its deflate stream must end
+//!   where its trailer begins, and nothing may follow the trailer.
+//! * Unknown keys are ignored in a plain document.
 //!
 //! # Known divergences from upstream
 //!
@@ -60,8 +67,8 @@
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
 //!   `directives_map` (including a duplicate policy name inside it), `default_directives`, `per_authority_directives`,
-//!   `enable_filter_state_logs` and `rule_data`. `metric_labels` is ignored. A dropped duplicate `directives_map` entry
-//!   can therefore drop an entire policy's rules.
+//!   `enable_filter_state_logs`, `rule_data` and `config_gzip_b64`. `metric_labels` is ignored. A dropped duplicate
+//!   `directives_map` entry can therefore drop an entire policy's rules.
 //! * `serde_json` renders a number with its shortest round-trip form, where `gjson`'s `String()` re-renders floats
 //!   through `strconv.FormatFloat`, so exponent notation can differ. `1e30` is frozen as `1e+30`.
 //! * An array or object inside a `directives_map` directive array is rejected, naming the policy and element index,
@@ -91,18 +98,18 @@
 //!   or silently continue.
 //! * Bounds that upstream does not enforce, by constant: `MAX_POLICIES` policies; `MAX_JSON_VALUES` value separators
 //!   per document, checked before `serde_json` builds a `Value` tree; `MAX_CONFIGURATION_BYTES` of plugin
-//!   configuration, which also bounds the directive text it can carry; `MAX_RULES_PER_POLICY` (30,000) and
-//!   `MAX_RULES_PER_GENERATION` (60,000) rules, passed to the engine parser as a rule budget so an `Include` expansion
-//!   or a newline-packed directive string stops at the limit; `MAX_RULE_DATA_FILES`, `MAX_RULE_DATA_FILE_BYTES`,
-//!   `MAX_RULE_DATA_TOTAL_BYTES`, `MAX_RULE_DATA_READ_BYTES` and `MAX_NAME_BYTES` (4096, with the engine's 64-component
-//!   rule) for rule-data names; `MAX_AUTHORITIES`; and `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's
-//!   `MAX_INCLUDED_FILES` is per top-level parse, so here it applies per policy. CRS 4.30 sets no request-body limit,
-//!   so its engine default (128 `MiB`) is over the `MAX_REQUEST_BODY_LIMIT` WASM ceiling; a CRS policy must set
-//!   `SecRequestBodyLimit` explicitly, as the embedded-CRS example in `envoy-coraza/README.md` does. The rule caps are
-//!   low because rule insertion scans for duplicate ids, so collecting one policy is quadratic: 30,000 flat rules
-//!   measured about 0.8 s natively (1.2 s with a realistic shape) and 3.3 s of configure-plus-start in an Envoy 1.40 V8
-//!   worker, with 5.4 s at the generation cap. Re-measure before raising them. Stock CRS is about 6,000 rules, so the
-//!   cap is ample.
+//!   configuration, which also bounds the directive text it can carry, and the decompressed size when `config_gzip_b64`
+//!   is used; `MAX_RULES_PER_POLICY` (30,000) and `MAX_RULES_PER_GENERATION` (60,000) rules, passed to the engine
+//!   parser as a rule budget so an `Include` expansion or a newline-packed directive string stops at the limit;
+//!   `MAX_RULE_DATA_FILES`, `MAX_RULE_DATA_FILE_BYTES`, `MAX_RULE_DATA_TOTAL_BYTES`, `MAX_RULE_DATA_READ_BYTES` and
+//!   `MAX_NAME_BYTES` (4096, with the engine's 64-component rule) for rule-data names; `MAX_AUTHORITIES`; and
+//!   `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's `MAX_INCLUDED_FILES` is per top-level parse, so
+//!   here it applies per policy. CRS 4.30 sets no request-body limit, so its engine default (128 `MiB`) is over the
+//!   `MAX_REQUEST_BODY_LIMIT` WASM ceiling; a CRS policy must set `SecRequestBodyLimit` explicitly, as the embedded-CRS
+//!   example in `envoy-coraza/README.md` does. The rule caps are low because rule insertion scans for duplicate ids, so
+//!   collecting one policy is quadratic: 30,000 flat rules measured about 0.8 s natively (1.2 s with a realistic shape)
+//!   and 3.3 s of configure-plus-start in an Envoy 1.40 V8 worker, with 5.4 s at the generation cap. Re-measure before
+//!   raising them. Stock CRS is about 6,000 rules, so the cap is ample.
 //! * The body ceilings are host policy, not policy syntax: they are installed as
 //!   `WafConfig::max_request_body_limit`/`max_response_body_limit` so a request-time `ctl:requestBodyLimit`,
 //!   `ctl:responseBodyLimit`, `ctl:requestBodyAccess=On` or `ctl:responseBodyAccess=On` cannot raise the effective
@@ -121,6 +128,11 @@ use std::{
     path::Path,
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use miniz_oxide::{
+    inflate::stream::{inflate, InflateState},
+    DataFormat, MZFlush, MZStatus,
+};
 use serde_json::{Map, Value};
 
 /// Longest policy, authority or `rule_data` name, in bytes.
@@ -128,6 +140,13 @@ const MAX_NAME_BYTES: usize = 4096;
 
 /// Longest config-controlled name embedded in an error or warning, in bytes.
 const MAX_DISPLAY_NAME_BYTES: usize = 128;
+
+/// Largest plugin configuration, in bytes, one `on_configure` call accepts.
+///
+/// `serde` cannot produce more directive text than the document's own bytes, so
+/// this single bound covers both the document and the directives it carries.
+/// For `config_gzip_b64` it bounds the decompressed document.
+pub(crate) const MAX_CONFIGURATION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Most JSON value separators and structural bytes one configuration may hold.
 ///
@@ -251,6 +270,18 @@ pub(crate) enum ConfigError {
         /// Which bound it breaks.
         reason: String,
     },
+    /// `config_gzip_b64` is empty, whitespace or not a string.
+    EmptyBase64,
+    /// `config_gzip_b64` is not standard padded base64.
+    InvalidBase64,
+    /// `config_gzip_b64` does not hold a valid gzip member.
+    InvalidGzip,
+    /// The decompressed document is over [`MAX_CONFIGURATION_BYTES`].
+    DecompressedTooLarge,
+    /// `config_gzip_b64` was supplied alongside another top-level key.
+    MixedEncodings,
+    /// A decompressed document itself holds `config_gzip_b64`.
+    NestedCompression,
 }
 
 impl Display for ConfigError {
@@ -317,6 +348,17 @@ impl Display for ConfigError {
                 )
             },
             Self::RuleData { name, reason } => write!(f, "rule_data {}: {reason}", display_name(name)),
+            Self::EmptyBase64 => f.write_str("config_gzip_b64 must be a non-empty base64 string"),
+            Self::InvalidBase64 => f.write_str("config_gzip_b64 is not standard padded base64; use `base64 -w0`"),
+            Self::InvalidGzip => f.write_str("config_gzip_b64 is not a valid gzip stream"),
+            Self::DecompressedTooLarge => write!(
+                f,
+                "decompressed plugin configuration is over the {MAX_CONFIGURATION_BYTES}-byte limit"
+            ),
+            Self::MixedEncodings => f.write_str("config_gzip_b64 cannot be combined with any other configuration key"),
+            Self::NestedCompression => {
+                f.write_str("the decompressed configuration holds config_gzip_b64; nesting is not allowed")
+            },
         }
     }
 }
@@ -326,22 +368,68 @@ impl std::error::Error for ConfigError {}
 impl Config {
     /// Parses a plugin configuration.
     ///
+    /// A top-level `config_gzip_b64` value is base64-decoded and inflated, then
+    /// parsed by the plain path so every bound applies to the document it
+    /// carries.
+    ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidJson`] for malformed JSON, or a typed error
-    /// for a key whose shape, authority or `rule_data` entry breaks a
-    /// bound. Policy references are resolved during compilation, not here.
+    /// Returns [`ConfigError::InvalidJson`] for malformed JSON, a typed error
+    /// for a key whose shape, authority or `rule_data` entry breaks a bound, or
+    /// one of the `config_gzip_b64` errors. Policy references are resolved
+    /// during compilation, not here.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Self::default());
-        }
-        check_json_value_count(bytes)?;
-        let value: Value = serde_json::from_slice(bytes).map_err(ConfigError::InvalidJson)?;
-        let Some(object) = value.as_object() else {
-            // Every key upstream reads from a non-object document is absent.
+        let Some(object) = Self::parse_object(bytes)? else {
             return Ok(Self::default());
         };
+        let Some(encoded) = object.get("config_gzip_b64") else {
+            return Self::from_plain(&object);
+        };
+        if object.len() > 1 {
+            return Err(ConfigError::MixedEncodings);
+        }
+        let encoded = encoded
+            .as_str()
+            .map(str::trim)
+            .filter(|encoded| !encoded.is_empty())
+            .ok_or(ConfigError::EmptyBase64)?;
+        let compressed = STANDARD.decode(encoded).map_err(|_error| ConfigError::InvalidBase64)?;
+        Self::parse_plain(&gunzip(&compressed)?)
+    }
 
+    /// Parses a document that must not be compressed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::parse`], with [`ConfigError::NestedCompression`] for a
+    /// document that itself holds `config_gzip_b64`.
+    fn parse_plain(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let Some(object) = Self::parse_object(bytes)? else {
+            return Ok(Self::default());
+        };
+        if object.contains_key("config_gzip_b64") {
+            return Err(ConfigError::NestedCompression);
+        }
+        Self::from_plain(&object)
+    }
+
+    /// Parses a document into its top-level object, if it has one.
+    ///
+    /// A non-object document yields `None`, because every key upstream reads
+    /// from such a document is absent.
+    fn parse_object(bytes: &[u8]) -> Result<Option<Map<String, Value>>, ConfigError> {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        check_json_value_count(bytes)?;
+        match serde_json::from_slice(bytes).map_err(ConfigError::InvalidJson)? {
+            Value::Object(object) => Ok(Some(object)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Builds a configuration from a plain, uncompressed top-level object.
+    fn from_plain(object: &Map<String, Value>) -> Result<Self, ConfigError> {
         if object.contains_key("rules") {
             return Err(ConfigError::LegacyRulesUnsupported);
         }
@@ -357,6 +445,157 @@ impl Config {
         };
         Ok(config)
     }
+}
+
+/// The fixed part of a gzip member header, before its optional fields.
+const GZIP_HEADER_BYTES: usize = 10;
+
+/// The gzip member trailer: CRC-32 and size modulo 2^32 of the uncompressed data.
+const GZIP_TRAILER_BYTES: usize = 8;
+
+/// The output slice one inflate call may fill before the cap is checked again.
+const INFLATE_CHUNK_BYTES: usize = 32 * 1024;
+
+/// Inflates one gzip member, capped at [`MAX_CONFIGURATION_BYTES`].
+///
+/// `miniz_oxide` inflates raw deflate and zlib streams but not the gzip
+/// wrapper, so the member's header and trailer are handled here. The inflate
+/// stream must end exactly where the trailer begins: another member or junk
+/// before the trailer would otherwise pass as an unchecked suffix.
+fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, ConfigError> {
+    let header = gzip_header_len(bytes)?;
+    let trailer = bytes
+        .len()
+        .checked_sub(GZIP_TRAILER_BYTES)
+        .ok_or(ConfigError::InvalidGzip)?;
+    let deflate = bytes.get(header..trailer).ok_or(ConfigError::InvalidGzip)?;
+    let (output, consumed) = inflate_bounded(deflate)?;
+    if header + consumed != trailer {
+        return Err(ConfigError::InvalidGzip);
+    }
+    check_gzip_trailer(bytes.get(trailer..).ok_or(ConfigError::InvalidGzip)?, &output)?;
+    Ok(output)
+}
+
+/// Inflates one raw deflate stream, capped at [`MAX_CONFIGURATION_BYTES`].
+///
+/// Returns the inflated bytes and the number of input bytes the stream
+/// consumed. Inflating in chunks keeps the cap effective while decompressing,
+/// so a bomb is rejected instead of being materialized and checked afterwards.
+fn inflate_bounded(deflate: &[u8]) -> Result<(Vec<u8>, usize), ConfigError> {
+    let mut state = InflateState::new_boxed(DataFormat::Raw);
+    let mut chunk = vec![0_u8; INFLATE_CHUNK_BYTES];
+    let mut output = Vec::new();
+    let mut input = deflate;
+    let mut consumed = 0_usize;
+    loop {
+        let result = inflate(&mut state, input, &mut chunk, MZFlush::None);
+        consumed += result.bytes_consumed;
+        input = input.get(result.bytes_consumed..).ok_or(ConfigError::InvalidGzip)?;
+        let written = chunk.get(..result.bytes_written).ok_or(ConfigError::InvalidGzip)?;
+        if output.len().saturating_add(written.len()) > MAX_CONFIGURATION_BYTES {
+            return Err(ConfigError::DecompressedTooLarge);
+        }
+        output.extend_from_slice(written);
+        match result.status {
+            Ok(MZStatus::StreamEnd) => return Ok((output, consumed)),
+            Ok(MZStatus::Ok) => {
+                // No input and no output means the stream is truncated.
+                if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    return Err(ConfigError::InvalidGzip);
+                }
+            },
+            Ok(MZStatus::NeedDict) | Err(_) => return Err(ConfigError::InvalidGzip),
+        }
+    }
+}
+
+/// The offset of the deflate stream in a gzip member, after its header.
+///
+/// Optional header fields (extra, name, comment, header CRC) are skipped
+/// without being interpreted; RFC 1952 only requires knowing their length.
+fn gzip_header_len(bytes: &[u8]) -> Result<usize, ConfigError> {
+    /// Deflate compression method.
+    const CM_DEFLATE: u8 = 8;
+    /// Extra field present.
+    const FEXTRA: u8 = 0x04;
+    /// File name present.
+    const FNAME: u8 = 0x08;
+    /// Comment present.
+    const FCOMMENT: u8 = 0x10;
+    /// Header CRC present.
+    const FHCRC: u8 = 0x02;
+    /// Reserved flag bits, which must be zero.
+    const RESERVED: u8 = 0xE0;
+
+    if !bytes.starts_with(&[0x1F, 0x8B]) || bytes.get(2) != Some(&CM_DEFLATE) {
+        return Err(ConfigError::InvalidGzip);
+    }
+    let flags = *bytes.get(3).ok_or(ConfigError::InvalidGzip)?;
+    if flags & RESERVED != 0 {
+        return Err(ConfigError::InvalidGzip);
+    }
+    let mut offset = GZIP_HEADER_BYTES;
+    if flags & FEXTRA != 0 {
+        let xlen: [u8; 2] = bytes
+            .get(offset..offset + 2)
+            .ok_or(ConfigError::InvalidGzip)?
+            .try_into()
+            .map_err(|_error| ConfigError::InvalidGzip)?;
+        offset += 2 + usize::from(u16::from_le_bytes(xlen));
+    }
+    for flag in [FNAME, FCOMMENT] {
+        if flags & flag != 0 {
+            let terminator = bytes
+                .get(offset..)
+                .ok_or(ConfigError::InvalidGzip)?
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or(ConfigError::InvalidGzip)?;
+            offset += terminator + 1;
+        }
+    }
+    if flags & FHCRC != 0 {
+        offset += 2;
+    }
+    Ok(offset)
+}
+
+/// Checks the CRC-32 and size a gzip trailer records for the inflated data.
+fn check_gzip_trailer(trailer: &[u8], output: &[u8]) -> Result<(), ConfigError> {
+    let [c0, c1, c2, c3, s0, s1, s2, s3] = trailer else {
+        return Err(ConfigError::InvalidGzip);
+    };
+    let crc = u32::from_le_bytes([*c0, *c1, *c2, *c3]);
+    let size = u32::from_le_bytes([*s0, *s1, *s2, *s3]);
+    if crc != crc32(output) || !u32::try_from(output.len()).is_ok_and(|len| len == size) {
+        return Err(ConfigError::InvalidGzip);
+    }
+    Ok(())
+}
+
+/// CRC-32 (IEEE 802.3) of `bytes`, the checksum a gzip trailer carries.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// A gzip member wrapping `bytes`, for tests that build `config_gzip_b64` input.
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "Test fixtures stay far below the u32 size range.")]
+pub(crate) fn gzip_fixture(bytes: &[u8]) -> Vec<u8> {
+    let mut member = vec![0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF];
+    member.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(bytes, 6));
+    member.extend_from_slice(&crc32(bytes).to_le_bytes());
+    member.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+    member
 }
 
 /// Renders a JSON scalar the way upstream's `gjson` `String()` reads it.
@@ -645,10 +884,13 @@ pub(crate) fn normalize_rule_data_name(name: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
     use super::{
-        add_rule_data, check_json_value_count, check_rule_data_name, display_name, Config, ConfigError, RuleDataLimits,
-        MAX_AUTHORITIES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES,
-        MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
+        add_rule_data, check_json_value_count, check_rule_data_name, crc32, display_name, gzip_fixture, Config,
+        ConfigError, RuleDataLimits, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES, MAX_CONFIGURATION_BYTES,
+        MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES, MAX_RULE_DATA_FILE_BYTES,
+        RULE_DATA_LIMITS,
     };
 
     /// Parses a document that must be accepted.
@@ -659,6 +901,30 @@ mod tests {
     /// Renders a parsed configuration error.
     fn parse_error(json: &str) -> String {
         Config::parse(json.as_bytes()).unwrap_err().to_string()
+    }
+
+    /// The plugin configuration an operator builds with `gzip -c config.json | base64 -w0`.
+    fn compressed(json: &str) -> String {
+        format!(
+            r#"{{"config_gzip_b64": "{}"}}"#,
+            STANDARD.encode(gzip_fixture(json.as_bytes()))
+        )
+    }
+
+    /// The error parsing `bytes` as a `config_gzip_b64` payload produces.
+    fn compressed_error(bytes: &[u8]) -> ConfigError {
+        let encoded = STANDARD.encode(bytes);
+        Config::parse(format!(r#"{{"config_gzip_b64": "{encoded}"}}"#).as_bytes()).unwrap_err()
+    }
+
+    /// A gzip member split into its header, deflate stream and trailer.
+    fn gzip_parts(member: &[u8]) -> (&[u8], &[u8], &[u8]) {
+        let trailer = member.len() - GZIP_TRAILER_BYTES;
+        (
+            member.get(..GZIP_HEADER_BYTES).unwrap(),
+            member.get(GZIP_HEADER_BYTES..trailer).unwrap(),
+            member.get(trailer..).unwrap(),
+        )
     }
 
     /// The directive list of `name`, for readable assertions.
@@ -1277,5 +1543,279 @@ mod tests {
         let json = serde_json::json!({"directives_map": {"p": [directive]}}).to_string();
         let config = Config::parse(json.as_bytes()).unwrap();
         assert_eq!(directives(&config, "p"), [directive]);
+    }
+
+    #[test]
+    fn a_compressed_document_parses_like_the_plain_document() {
+        let plain_json = r#"{
+            "directives_map": {"p1": ["SecRuleEngine On", "SecAction \"id:1\""], "p2": []},
+            "default_directives": "p2",
+            "per_authority_directives": {"a.example": "p1"},
+            "enable_filter_state_logs": true,
+            "rule_data": {"data.txt": "attack\n"}
+        }"#;
+        let plain = parse(plain_json);
+        let compressed = Config::parse(compressed(plain_json).as_bytes()).unwrap();
+        assert_eq!(compressed.directives_map, plain.directives_map, "policies");
+        assert_eq!(
+            compressed.default_directives, plain.default_directives,
+            "default policy"
+        );
+        assert_eq!(
+            compressed.per_authority_directives, plain.per_authority_directives,
+            "authorities"
+        );
+        assert_eq!(
+            compressed.enable_filter_state_logs, plain.enable_filter_state_logs,
+            "state logs"
+        );
+        assert_eq!(compressed.rule_data, plain.rule_data, "rule data");
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_rejected_at_the_decompressed_cap() {
+        let bomb = STANDARD.encode(gzip_fixture(&vec![b'a'; MAX_CONFIGURATION_BYTES + 1]));
+        let error = Config::parse(format!(r#"{{"config_gzip_b64": "{bomb}"}}"#).as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::DecompressedTooLarge),
+            "message was {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("over the {MAX_CONFIGURATION_BYTES}-byte limit")),
+            "the operator sees the cap: {error}"
+        );
+    }
+
+    #[test]
+    fn the_decompressed_document_is_validated_like_the_plain_document() {
+        let crowded = format!("[{}1]", "1,".repeat(MAX_JSON_VALUES));
+        let error = Config::parse(compressed(&crowded).as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::TooManyValues),
+            "the value pre-scan runs on decompressed bytes: {error:?}"
+        );
+
+        let error = Config::parse(compressed(r#"{"rules": []}"#).as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::LegacyRulesUnsupported),
+            "the plain key rules are rejected after decompression too: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_decompressed_cap_accepts_the_edge_and_rejects_one_more() {
+        let empty = serde_json::json!({"directives_map": {"p": [""]}}).to_string();
+        let padding = MAX_CONFIGURATION_BYTES - empty.len();
+        let at_limit = serde_json::json!({"directives_map": {"p": ["a".repeat(padding)]}}).to_string();
+        assert_eq!(
+            at_limit.len(),
+            MAX_CONFIGURATION_BYTES,
+            "the fixture is exactly at the decompressed cap"
+        );
+        let config = Config::parse(compressed(&at_limit).as_bytes()).unwrap();
+        assert_eq!(
+            directives(&config, "p").first().map(|directive| directive.len()),
+            Some(padding),
+            "exactly {MAX_CONFIGURATION_BYTES} decompressed bytes are accepted"
+        );
+
+        let over = serde_json::json!({"directives_map": {"p": ["a".repeat(padding + 1)]}}).to_string();
+        let error = Config::parse(compressed(&over).as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::DecompressedTooLarge),
+            "one byte over the cap is rejected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_compressed_values_map_to_typed_errors() {
+        for value in [r#""""#, r#""   ""#, r#""\n\t ""#, "7", "null"] {
+            let input = format!(r#"{{"config_gzip_b64": {value}}}"#);
+            let error = Config::parse(input.as_bytes()).unwrap_err();
+            assert!(matches!(error, ConfigError::EmptyBase64), "{input} reported {error:?}");
+        }
+
+        let member = STANDARD.encode(gzip_fixture(br#"{"directives_map": {"p": []}}"#));
+        for encoded in ["not base64!", "QQ"] {
+            let input = format!(r#"{{"config_gzip_b64": "{encoded}"}}"#);
+            let error = Config::parse(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::InvalidBase64),
+                "value {encoded:?} reported {error:?}"
+            );
+        }
+
+        // GNU base64's default column wrapping, as a JSON-escaped newline.
+        let split = member.len() / 2;
+        let wrapped = format!(r"{}\n{}", member.get(..split).unwrap(), member.get(split..).unwrap());
+        let error = Config::parse(format!(r#"{{"config_gzip_b64": "{wrapped}"}}"#).as_bytes()).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidBase64),
+            "line-wrapped base64 reported {error:?}"
+        );
+
+        let not_gzip = STANDARD.encode(b"not a gzip member");
+        let error = Config::parse(format!(r#"{{"config_gzip_b64": "{not_gzip}"}}"#).as_bytes()).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidGzip), "message was {error:?}");
+
+        let member = gzip_fixture(br#"{"directives_map": {"p": []}}"#);
+        let trailer = member.len() - GZIP_TRAILER_BYTES;
+        for (offset, field) in [(trailer, "CRC-32"), (trailer + 4, "size")] {
+            let mut corrupted = member.clone();
+            *corrupted.get_mut(offset).unwrap() ^= 0xFF;
+            let error = compressed_error(&corrupted);
+            assert!(
+                matches!(error, ConfigError::InvalidGzip),
+                "a corrupted {field} field was not rejected: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_gzip_b64_is_the_only_allowed_key() {
+        let encoded = STANDARD.encode(gzip_fixture(br#"{"directives_map": {"p": []}}"#));
+        for extra in [
+            r#""directives_map": {}"#,
+            r#""metric_labels": {}"#,
+            r#""unknown": 1"#,
+            r#""rules": []"#,
+        ] {
+            let input = format!(r#"{{"config_gzip_b64": "{encoded}", {extra}}}"#);
+            let error = Config::parse(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::MixedEncodings),
+                "{input} reported {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_compression_is_rejected() {
+        let inner = compressed("{}");
+        let error = Config::parse(compressed(&inner).as_bytes()).unwrap_err();
+        assert!(matches!(error, ConfigError::NestedCompression), "message was {error:?}");
+    }
+
+    #[test]
+    fn bytes_after_the_deflate_stream_are_rejected() {
+        let member = gzip_fixture(br#"{"directives_map": {"p": []}}"#);
+        let (header, deflate, trailer) = gzip_parts(&member);
+
+        let mut duplicate_trailer = member.clone();
+        duplicate_trailer.extend_from_slice(trailer);
+
+        let mut junk_before_trailer = header.to_vec();
+        junk_before_trailer.extend_from_slice(deflate);
+        junk_before_trailer.extend_from_slice(b"junk");
+        junk_before_trailer.extend_from_slice(trailer);
+
+        let mut replaced_trailer = header.to_vec();
+        replaced_trailer.extend_from_slice(deflate);
+        replaced_trailer.extend_from_slice(b"BADBADBA");
+        replaced_trailer.extend_from_slice(trailer);
+
+        let mut concatenated_member = member.clone();
+        concatenated_member.extend_from_slice(&member);
+
+        for (case, bytes) in [
+            ("a duplicate trailer", duplicate_trailer),
+            ("junk before the trailer", junk_before_trailer),
+            ("a replaced trailer", replaced_trailer),
+            ("a concatenated second member", concatenated_member),
+        ] {
+            let error = compressed_error(&bytes);
+            assert!(
+                matches!(error, ConfigError::InvalidGzip),
+                "{case} was not rejected: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_and_malformed_gzip_members_are_rejected_without_panicking() {
+        let member = gzip_fixture(br#"{"directives_map": {"p": []}}"#);
+        for end in 0..member.len() {
+            let error = compressed_error(member.get(..end).unwrap());
+            if end == 0 {
+                assert!(
+                    matches!(error, ConfigError::EmptyBase64),
+                    "an empty payload reported {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, ConfigError::InvalidGzip),
+                    "truncation at {end} of {} reported {error:?}",
+                    member.len()
+                );
+            }
+        }
+
+        for (case, bytes) in [
+            (
+                "FEXTRA XLEN overrun",
+                vec![0x1F, 0x8B, 8, 0x04, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF],
+            ),
+            (
+                "unterminated FNAME",
+                vec![0x1F, 0x8B, 8, 0x08, 0, 0, 0, 0, 0, 0xFF, b'n', b'o', b'n', b'e'],
+            ),
+            ("FHCRC past the trailer", vec![0x1F, 0x8B, 8, 0x02, 0, 0, 0, 0, 0, 0xFF]),
+        ] {
+            let error = compressed_error(&bytes);
+            assert!(
+                matches!(error, ConfigError::InvalidGzip),
+                "{case} was not rejected: {error:?}"
+            );
+        }
+
+        // A reserved FLG bit on an otherwise valid member must be rejected by the guard itself.
+        let mut reserved_flag = gzip_fixture(br#"{"directives_map": {"p": []}}"#);
+        *reserved_flag.get_mut(3).unwrap() |= 0x20;
+        let error = compressed_error(&reserved_flag);
+        assert!(
+            matches!(error, ConfigError::InvalidGzip),
+            "a reserved FLG bit was not rejected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_system_gzip_document_is_accepted() {
+        // `printf '{"directives_map": {"p": []}}' | gzip -c | base64 -w0`, gzip 1.14.
+        // Unlike the fixture, this header carries the file name `gzip -c` records.
+        let encoded = "H4sICBuB4moAA2NvbmZpZy5qc29uAKtWSsksSk0uySxLLY7PTSxQslKoVgKR0bG1tQBDmca8HQAAAA==";
+        let config = Config::parse(format!(r#"{{"config_gzip_b64": "{encoded}"}}"#).as_bytes()).unwrap();
+        assert!(
+            config.directives_map.contains_key("p"),
+            "the operator's `gzip -c config.json | base64 -w0` output is accepted"
+        );
+    }
+
+    #[test]
+    fn gzip_extra_name_and_comment_header_fields_are_skipped() {
+        let member = gzip_fixture(br#"{"directives_map": {"p": []}}"#);
+        // FTEXT is absent; FEXTRA, FNAME, FCOMMENT and FHCRC are all set.
+        let mut flagged = vec![0x1F, 0x8B, 8, 0x04 | 0x08 | 0x10 | 0x02, 0, 0, 0, 0, 0, 0xFF];
+        flagged.extend_from_slice(&[2, 0, 0xAA, 0xBB]);
+        flagged.extend_from_slice(b"config.json\0");
+        flagged.extend_from_slice(b"comment\0");
+        flagged.extend_from_slice(&[0, 0]);
+        flagged.extend_from_slice(member.get(10..).unwrap());
+        let encoded = STANDARD.encode(flagged);
+        let config = Config::parse(format!(r#"{{"config_gzip_b64": "{encoded}"}}"#).as_bytes()).unwrap();
+        assert!(
+            config.directives_map.contains_key("p"),
+            "optional header fields do not hide the document"
+        );
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(
+            crc32(b"123456789"),
+            0xCBF4_3926,
+            "the trailer CRC is the standard reflected CRC-32"
+        );
     }
 }
