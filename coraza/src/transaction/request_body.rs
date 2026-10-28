@@ -299,14 +299,14 @@ impl Transaction {
             }
 
             let size = u64::try_from(part.data.len()).map_err(|error| format!("multipart size overflow: {error}"))?;
-            total_size = total_size
-                .checked_add(size)
-                .ok_or_else(|| "multipart size overflow".to_owned())?;
 
             // Go promotes `altFilename` when the primary filename is empty and treats a
             // part with no non-empty filename as a field, which is what an empty file
             // input sends (`internal/bodyprocessors/multipart.go:106-115`, v3.8.1).
             if let Some(filename) = filename.or(alt_filename) {
+                total_size = total_size
+                    .checked_add(size)
+                    .ok_or_else(|| "multipart size overflow".to_owned())?;
                 if file_count >= self.config.upload_file_limit {
                     self.multipart_strict_error.set("1");
                     continue;
@@ -1906,7 +1906,7 @@ post-attack\r\n\
         assert_eq!(tx.files.first(""), Some(&b"x.txt"[..]));
         assert_eq!(tx.files_names.first(""), Some(&b"upload"[..]));
         assert_eq!(tx.files.value_count(), 1, "the configured file limit still applies");
-        assert_eq!(tx.files_combined_size.get(), "33");
+        assert_eq!(tx.files_combined_size.get(), "12");
         assert_eq!(tx.files_tmp_names.value_count(), 0);
         assert!(tx.uploaded_paths.is_empty());
         assert_eq!(

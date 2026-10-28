@@ -2849,7 +2849,7 @@ payload\r\n\
         );
         assert_eq!(
             tx.get_variable(RuleVariable::FilesCombinedSize, None).as_deref(),
-            Some("12")
+            Some("7")
         );
         assert_eq!(
             tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
