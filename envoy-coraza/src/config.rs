@@ -35,10 +35,8 @@
 //!   [`MAX_AUTHORITIES`] authorities are accepted.
 //! * Policy, authority and `rule_data` names are at most [`MAX_NAME_BYTES`] bytes; a configured name over the limit is
 //!   rejected rather than embedded in a log line.
-//! * `rules` is the deprecated flat directive list. It becomes policy `default`, which also becomes
-//!   `default_directives`, only when `directives_map` is empty; otherwise its result is ignored, though the value is
-//!   still validated. It must be an array of scalars or a single scalar; `null`, an object or a container inside the
-//!   array is rejected.
+//! * The legacy flat `rules` key is unsupported. Its presence is rejected with guidance to use `directives_map` and
+//!   `default_directives`; it is never silently ignored.
 //! * `metric_labels` is accepted and ignored for upstream configuration compatibility; this build publishes no
 //!   Prometheus metrics.
 //! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`.
@@ -61,8 +59,8 @@
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
 //!   `directives_map` (including a duplicate policy name inside it), `default_directives`, `per_authority_directives`,
-//!   `enable_filter_state_logs`, `rules` and `rule_data`. `metric_labels` is ignored. A dropped duplicate
-//!   `directives_map` entry can therefore drop an entire policy's rules.
+//!   `enable_filter_state_logs` and `rule_data`. `metric_labels` is ignored. A dropped duplicate `directives_map` entry
+//!   can therefore drop an entire policy's rules.
 //! * `serde_json` renders a number with its shortest round-trip form, where `gjson`'s `String()` re-renders floats
 //!   through `strconv.FormatFloat`, so exponent notation can differ. `1e30` is frozen as `1e+30`.
 //! * An array or object inside a `directives_map` directive array is rejected, naming the policy and element index,
@@ -79,10 +77,8 @@
 //!   this connector's own rule-data sources.
 //! * A `directives_map` policy value that is an object is rejected, where upstream's `ForEach` reads it as a single
 //!   stringified directive. Drifting into one opaque rule line is a silent fail-open.
-//! * `rules` must be an array of scalars or a scalar. `rules: null` is rejected with `rules must be an array or string,
-//!   not null`; upstream's `Exists` check is true for an explicit `null`, so it creates and selects a zero-rule
-//!   `default` policy and every request passes uninspected. A container inside the array is rejected rather than
-//!   stringified.
+//! * The legacy flat `rules` key is rejected for every value. Configurations must use `directives_map` and
+//!   `default_directives`.
 //! * `default_directives` must be a string; `null`, arrays and objects are rejected where upstream treats them as
 //!   absent or stringifies them.
 //! * `per_authority_directives` values must be scalars; a non-scalar is rejected where upstream stringifies it. The
@@ -124,9 +120,6 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-
-/// Policy name the deprecated `rules` list creates, as upstream.
-const DEPRECATED_POLICY: &str = "default";
 
 /// Longest policy, authority or `rule_data` name, in bytes.
 const MAX_NAME_BYTES: usize = 4096;
@@ -219,16 +212,8 @@ pub(crate) enum ConfigError {
         /// Offending name.
         name: String,
     },
-    /// `rules` is present but is neither an array nor a scalar.
-    RulesNotArrayOrString {
-        /// JSON type that was found.
-        found: &'static str,
-    },
-    /// An element of the `rules` array is an array or object.
-    RulesElementNotScalar {
-        /// Index of the offending element.
-        index: usize,
-    },
+    /// The unsupported legacy flat `rules` key was supplied.
+    LegacyRulesUnsupported,
     /// `default_directives` is present but not a string.
     DefaultDirectivesNotString {
         /// JSON type that was found.
@@ -291,11 +276,8 @@ impl Display for ConfigError {
                 display_name(name),
                 name.len()
             ),
-            Self::RulesNotArrayOrString { found } => {
-                write!(f, "rules must be an array or string, not {found}")
-            },
-            Self::RulesElementNotScalar { index } => {
-                write!(f, "rules[{index}] must be a scalar")
+            Self::LegacyRulesUnsupported => {
+                f.write_str("rules is no longer supported; use directives_map and default_directives")
             },
             Self::DefaultDirectivesNotString { found } => {
                 write!(f, "default_directives must be a string, not {found}")
@@ -335,7 +317,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError::InvalidJson`] for malformed JSON, or a typed error
-    /// for a key whose shape, authority, label or `rule_data` entry breaks a
+    /// for a key whose shape, authority or `rule_data` entry breaks a
     /// bound. Policy references are resolved during compilation, not here.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
         if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -348,8 +330,10 @@ impl Config {
             return Ok(Self::default());
         };
 
-        let deprecated = parse_deprecated_rules(object)?;
-        let mut config = Self {
+        if object.contains_key("rules") {
+            return Err(ConfigError::LegacyRulesUnsupported);
+        }
+        let config = Self {
             directives_map: parse_directives_map(object)?,
             default_directives: parse_default_directives(object)?,
             per_authority_directives: parse_per_authority_directives(object)?,
@@ -359,12 +343,6 @@ impl Config {
                 .unwrap_or(false),
             rule_data: parse_rule_data(object)?,
         };
-        if config.directives_map.is_empty() {
-            if let Some(directives) = deprecated {
-                config.directives_map.insert(DEPRECATED_POLICY.to_owned(), directives);
-                config.default_directives = Some(DEPRECATED_POLICY.to_owned());
-            }
-        }
         Ok(config)
     }
 }
@@ -531,24 +509,6 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
         authorities.insert(authority.clone(), policy);
     }
     Ok(authorities)
-}
-
-/// Reads and validates `rules`, returning its directives even when it is ignored.
-fn parse_deprecated_rules(object: &Map<String, Value>) -> Result<Option<Vec<String>>, ConfigError> {
-    let Some(value) = object.get("rules") else {
-        return Ok(None);
-    };
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| scalar_text(item).ok_or(ConfigError::RulesElementNotScalar { index }))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Value::Object(_) => Err(ConfigError::RulesNotArrayOrString { found: "object" }),
-        Value::Null => Err(ConfigError::RulesNotArrayOrString { found: "null" }),
-        scalar => Ok(Some(vec![scalar_text(scalar).unwrap_or_default()])),
-    }
 }
 
 /// Reads `rule_data` within [`RULE_DATA_LIMITS`].
@@ -852,51 +812,20 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_rules_create_the_default_policy_only_without_a_directive_map() {
-        let legacy = parse(r#"{"rules": ["SecRuleEngine On", "SecRule ARGS \"@contains x\" \"id:1\""]}"#);
-        assert_eq!(
-            directives(&legacy, "default"),
-            ["SecRuleEngine On", "SecRule ARGS \"@contains x\" \"id:1\""],
-            "the deprecated list becomes the default policy"
-        );
-        assert_eq!(
-            legacy.default_directives.as_deref(),
-            Some("default"),
-            "the deprecated list becomes the default selection"
-        );
-
-        let scalar_rules = parse(r#"{"rules": "SecRuleEngine On"}"#);
-        assert_eq!(
-            directives(&scalar_rules, "default"),
-            ["SecRuleEngine On"],
-            "a scalar rules value is one directive"
-        );
-
-        let with_map = parse(r#"{"directives_map": {"p": []}, "rules": ["SecRuleEngine On"]}"#);
-        assert!(
-            with_map.default_directives.is_none(),
-            "rules are ignored beside a directive map"
-        );
-        assert!(
-            !with_map.directives_map.contains_key("default"),
-            "no synthetic policy is created beside a directive map"
-        );
-    }
-
-    #[test]
-    fn null_and_container_rules_are_rejected() {
-        assert_eq!(
-            parse_error(r#"{"rules": null}"#),
-            "rules must be an array or string, not null"
-        );
-        assert_eq!(
-            parse_error(r#"{"rules": {"a": 1}}"#),
-            "rules must be an array or string, not object"
-        );
-        assert_eq!(
-            parse_error(r#"{"rules": ["ok", ["nested"]]}"#),
-            "rules[1] must be a scalar"
-        );
+    fn legacy_rules_key_is_rejected_regardless_of_its_value() {
+        for value in [
+            r#"["SecRuleEngine On"]"#,
+            r#""SecRuleEngine On""#,
+            "null",
+            r#"{"a": 1}"#,
+        ] {
+            let input = format!(r#"{{"rules": {value}}}"#);
+            assert_eq!(
+                parse_error(&input),
+                "rules is no longer supported; use directives_map and default_directives",
+                "{input}"
+            );
+        }
     }
 
     #[test]
