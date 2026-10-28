@@ -41,7 +41,7 @@ use coraza::{
 
 use crate::{
     config::{display_name, Config},
-    observability::{self, Diagnostics, Metrics},
+    observability::{self, Diagnostics},
 };
 
 /// Most policies one generation may hold.
@@ -180,8 +180,6 @@ pub(crate) struct Generation {
     default_policy: Option<String>,
     /// Whether the fork's filter-state log lines are enabled.
     enable_filter_state_logs: bool,
-    /// Per-generation metric IDs and bounded interruption series.
-    metrics: Arc<Metrics>,
     /// Shared rate-limited diagnostics for telemetry failures.
     diagnostics: Arc<Diagnostics>,
     /// Monotonic plugin configuration generation identifier.
@@ -332,8 +330,6 @@ impl RuleBudget {
 struct PolicyCompiler {
     /// Rule data source shared by the generation.
     rule_data: Arc<dyn RuleData>,
-    /// Metric callbacks installed on compiled rules.
-    metrics: Arc<Metrics>,
     /// Diagnostics used by telemetry callbacks.
     diagnostics: Arc<Diagnostics>,
 }
@@ -351,10 +347,9 @@ impl PolicyCompiler {
             .with_rule_limit(rule_budget.parser_limit());
         parser.config_mut().multiphase_evaluation = true;
         parser.config_mut().audit_engine_locked = false;
-        let error_metrics = Arc::clone(&self.metrics);
         let error_diagnostics = Arc::clone(&self.diagnostics);
         parser.on_error_log(move |matched| {
-            observability::error_log(matched, &error_metrics, &error_diagnostics);
+            observability::error_log(matched, &error_diagnostics);
         });
         let text = directives.join("\n");
         let failure = |message: String| CompileError::Directive {
@@ -375,10 +370,9 @@ impl PolicyCompiler {
         }
         let count = parser.total_rule_count();
         let audit_format = parser.config().audit_log_format;
-        let audit_metrics = Arc::clone(&self.metrics);
         let audit_diagnostics = Arc::clone(&self.diagnostics);
         parser.on_audit_log(move |entry| {
-            observability::audit_log(entry, audit_format, &audit_metrics, &audit_diagnostics);
+            observability::audit_log(entry, audit_format, &audit_diagnostics);
         });
         // Host policy: `ctl` must not raise the effective body limits past what this host
         // buffers; connector audit output uses the configured Proxy-Wasm log callback.
@@ -459,11 +453,9 @@ impl Generation {
             directives_map,
             default_directives,
             per_authority_directives,
-            metric_labels,
             enable_filter_state_logs,
             rule_data,
         } = config;
-        let metrics = Arc::new(Metrics::new(&metric_labels));
         let diagnostics = Arc::new(Diagnostics::default());
         let mut warnings = Vec::new();
         if directives_map.is_empty() {
@@ -481,7 +473,6 @@ impl Generation {
         ));
         let compiler = PolicyCompiler {
             rule_data: source,
-            metrics: Arc::clone(&metrics),
             diagnostics: Arc::clone(&diagnostics),
         };
         let mut policies = BTreeMap::new();
@@ -513,7 +504,6 @@ impl Generation {
             authority_policies: per_authority_directives,
             default_policy: default_directives,
             enable_filter_state_logs,
-            metrics,
             diagnostics,
             generation_id: 0,
             warnings,
@@ -549,11 +539,6 @@ impl Generation {
         self.enable_filter_state_logs
     }
 
-    /// Returns metrics scoped to this generation.
-    pub(crate) fn metrics(&self) -> &Metrics {
-        &self.metrics
-    }
-
     /// Returns diagnostics scoped to this generation.
     pub(crate) fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
@@ -567,12 +552,6 @@ impl Generation {
     /// Assigns the ID after the generation compiles successfully.
     pub(crate) fn set_id(&mut self, generation_id: u64) {
         self.generation_id = generation_id;
-    }
-
-    /// Defines this generation's metrics in the Proxy-Wasm host.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn initialize_metrics(&self) {
-        self.metrics.initialize(&self.diagnostics);
     }
 }
 

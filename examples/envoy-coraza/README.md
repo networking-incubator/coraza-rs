@@ -62,15 +62,11 @@ Proxy-Wasm SDK does not distinguish an upstream reset from other early
 failure/cancellation endings, so they share the stable value
 `upstream_failure_or_cancellation`.
 
-Metric names `waf_filter_tx_total` and
-`waf_filter_tx_interruptions{phase,rule_id,...}` retain the pinned connector's
-metric FQNs and phase values. The example's Envoy `stats_tags` extract the
-`phase` and `rule_id` tags and its configured static `suite` label from the
-upstream-compatible interruption suffix. `waf_filter_tx_total` remains
-untagged. Additive untagged metrics are `waf_filter_errors_total`,
-`waf_filter_incomplete_inspections_total`,
-`waf_filter_telemetry_failures_total`, `waf_filter_active_streams`, and
-`waf_filter_retained_body_bytes`. No metric uses request-derived labels.
+This build does not publish Envoy/Prometheus counters or gauges. It publishes
+only the optional PR #20 interruption filter-state properties, additive bounded
+health filter-state properties, and bounded error/audit log lines. The standalone
+harness checks the formatted health state and audit/error logs; there is no
+`stats_tags` configuration or Prometheus metric assertion.
 
 Telemetry hostcall failures do not change enforcement. Diagnostics use fixed
 operation names and emit at failure counts 1, 2, 4, 8, and so on. Selected
@@ -84,7 +80,7 @@ serialized prefix and appends the plain-text marker, so the result may not parse
 as JSON. Parser-compatible truncation remains an open follow-up.
 
 The standalone harness observed a formatted v1 health record on an allowed
-stream and checked actual stat-tag extraction. Its HCM log capture did not
+stream. Its HCM log capture did not
 produce per-request lines for local replies, so formatter visibility of the
 PR #20 interruption properties and per-stream isolation across deny/allow
 streams remain unproven. A no-Wasm Envoy control showed the same access-log
@@ -95,4 +91,4 @@ The standalone harness also does not prove the Istio 1.30.5 or 1.30.7 proxy
 configuration; those host runs remain separate evidence requirements.
 
 This harness proves the listed standalone Envoy cases only. Istio 1.30.5 and
-1.30.7 formatter and stat-tag evidence must come from matching proxy hosts.
+1.30.7 filter-state formatter evidence must come from matching proxy hosts.

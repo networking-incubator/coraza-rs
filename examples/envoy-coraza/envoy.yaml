@@ -4,15 +4,6 @@ admin:
       address: 0.0.0.0
       port_value: 9901
 
-stats_config:
-  stats_tags:
-    - tag_name: rule_id
-      regex: "(_ruleid=([0-9]+))"
-    - tag_name: phase
-      regex: "(_phase=(http_request_headers_identifier|http_request_body_identifier|http_response_headers_identifier|http_response_body_identifier))"
-    - tag_name: suite
-      regex: "(_suite=([A-Za-z0-9-]+))"
-
 static_resources:
   listeners:
     - name: ingress
@@ -107,7 +98,6 @@ static_resources:
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "metric_labels": {"suite": "envoy-harness"},
                                 "per_authority_directives": {"reject.local": "reject", "off.local": "response-off"}
                               }
                   - name: envoy.filters.http.router

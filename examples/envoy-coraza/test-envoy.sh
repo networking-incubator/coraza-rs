@@ -344,40 +344,4 @@ envoy_logs >"$temp_dir/envoy.log"
 grep --quiet --fixed-strings 'test blocked' "$temp_dir/envoy.log" \
     || fail 'RelevantOnly audit output did not reach the bounded Proxy-Wasm log sink'
 
-curl --silent --show-error 'http://127.0.0.1:9901/stats?format=prometheus' >"$temp_dir/envoy-stats.prom"
-grep --extended-regexp '^(# TYPE waf_filter_tx_interruptions|waf_filter_tx_interruptions)' \
-    "$temp_dir/envoy-stats.prom"
-python3 - "$temp_dir/envoy-stats.prom" <<'PY'
-import re
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stats_file:
-    lines = [line.strip() for line in stats_file if "waf_filter" in line]
-
-def value(name):
-    pattern = re.compile(rf"^{re.escape(name)}(?:\{{\}})? ([0-9]+)$")
-    for line in lines:
-        match = pattern.match(line)
-        if match:
-            return int(match.group(1))
-    raise AssertionError(f"missing untagged metric {name}; observed {lines}")
-
-assert value("waf_filter_tx_total") > 0, "legacy transaction counter did not increment"
-assert value("waf_filter_errors_total") > 0, "error counter did not include incomplete/error terminals"
-assert value("waf_filter_incomplete_inspections_total") > 0, "incomplete counter did not increment"
-assert value("waf_filter_active_streams") == 0, "active stream gauge was not released"
-assert value("waf_filter_retained_body_bytes") == 0, "retained body gauge was not released"
-
-interruptions = [line for line in lines if line.startswith("waf_filter_tx_interruptions{")]
-expected_tags = (
-    'phase="http_request_headers_identifier"',
-    'rule_id="101"',
-    'suite="envoy-harness"',
-)
-assert any(all(tag in line for tag in expected_tags) and re.search(r"\} [1-9][0-9]*$", line) for line in interruptions), (
-    "legacy interruption counter lost its upstream phase/rule/static-label tags",
-    interruptions,
-)
-PY
-
 printf 'Envoy 1.40 Coraza connector lifecycle checks passed\n'
