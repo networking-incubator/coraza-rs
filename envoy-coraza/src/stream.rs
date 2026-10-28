@@ -541,10 +541,16 @@ impl CorazaHttp {
                 TerminalOutcome::Unsupported("request-content-encoding"),
             );
         }
-        if end_of_stream {
-            return self.complete_request_body(0);
+        self.request_body_action_after_headers(body_access, end_of_stream)
+    }
+
+    /// Complete phase 2 at headers when the engine will not ingest the request body.
+    fn request_body_action_after_headers(&mut self, body_access: bool, end_of_stream: bool) -> Action {
+        if !body_access || end_of_stream {
+            self.complete_request_body(0)
+        } else {
+            Action::Pause
         }
-        Action::Pause
     }
 
     fn complete_request_body(&mut self, body_size: usize) -> Action {
@@ -726,10 +732,11 @@ impl CorazaHttp {
                 Action::Continue
             };
         }
-        if self.request_mode == RequestMode::Uninspected || self.lifecycle.request == RequestStage::Complete {
+        if self.request_mode == RequestMode::Uninspected {
             return Action::Continue;
         }
-        if !matches!(self.lifecycle.request, RequestStage::Headers | RequestStage::Body) {
+        let request_complete = self.lifecycle.request == RequestStage::Complete;
+        if !request_complete && !matches!(self.lifecycle.request, RequestStage::Headers | RequestStage::Body) {
             return self.reject_request(
                 503,
                 REQUEST_INCOMPLETE_BODY,
@@ -769,7 +776,11 @@ impl CorazaHttp {
                 },
             );
         }
-        self.complete_request_body(self.request_body_size)
+        if request_complete {
+            Action::Continue
+        } else {
+            self.complete_request_body(self.request_body_size)
+        }
     }
 
     fn response_headers(&mut self, num_headers: usize, end_of_stream: bool) -> Action {
@@ -1641,7 +1652,7 @@ fn headers_within_limits(headers: &[(String, Vec<u8>)], reported_count: usize) -
         .is_some_and(|total| total <= MAX_HEADERS_BYTES)
 }
 
-fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
+pub(crate) fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
     let authority = str::from_utf8(authority).ok()?;
     if authority.is_empty() {
         return Some(String::new());
@@ -1795,7 +1806,7 @@ mod tests {
 
     use super::{
         normalize_authority, request_authority, CorazaHttp, Lifecycle, RequestMode, RequestStage, ResponseStage,
-        TerminalOutcome, MAX_ROOT_RETAINED_BODY_BYTES,
+        TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES,
     };
     use crate::{config::Config, policy::Generation};
 
@@ -1865,7 +1876,83 @@ mod tests {
     }
 
     #[test]
+    fn request_body_access_off_completes_phase_two_at_headers_without_retaining_body() {
+        let config = Config::parse(
+            br#"{"directives_map":{"p":["SecRequestBodyAccess Off","SecRule REQUEST_METHOD \"@streq POST\" \"id:91,phase:2,pass\""]},"default_directives":"p"}"#,
+        )
+        .expect("configuration is valid");
+        let generation = Rc::new(Generation::compile(config).expect("policy compiles"));
+        let policy = generation.select("example.test").expect("default policy selected");
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri("/", "POST", "HTTP/1.1");
+        transaction.process_request_headers();
+
+        let root = Rc::new(Cell::new(0));
+        let mut stream = CorazaHttp::new(Some(generation), Rc::clone(&root));
+        stream.tx = Some(Box::new(transaction));
+        assert!(stream.lifecycle.begin_request());
+
+        assert_eq!(stream.request_body_action_after_headers(false, false), Action::Continue);
+        assert_eq!(stream.lifecycle.request, RequestStage::Complete);
+        let tx = stream.tx.as_deref().expect("transaction remains available");
+        assert!(
+            tx.matched_rules().iter().any(|matched| matched.rule_id() == 91),
+            "phase 2 ran with the empty body"
+        );
+        assert_eq!(tx.request_body_stats().retained, 0, "the request body was not retained");
+        assert_eq!(stream.request_host_bytes, 0, "no host body buffer is charged");
+        assert_eq!(stream.request_copy_bytes, 0, "no guest body copy is charged");
+        let retained_before = root.get();
+
+        let matches_before = tx.matched_rules().len();
+        assert_eq!(stream.request_body(MAX_REQUEST_BODY_BYTES + 1, true), Action::Continue);
+        assert_eq!(
+            stream
+                .tx
+                .as_deref()
+                .expect("transaction remains available")
+                .matched_rules()
+                .len(),
+            matches_before
+        );
+        assert_eq!(
+            root.get(),
+            retained_before,
+            "later body callbacks add no retained bytes"
+        );
+    }
+
+    #[test]
+    fn request_trailers_are_validated_after_body_phase_completed() {
+        let mut stream = CorazaHttp::new(None, Rc::new(Cell::new(0)));
+        stream.lifecycle.request = RequestStage::Complete;
+
+        let action = stream.request_trailers(MAX_HEADER_COUNT + 1);
+
+        assert_eq!(action, Action::Pause, "failed local reply mutation stays paused");
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::Incomplete {
+                phase: "request-trailers",
+                status: 431,
+            }),
+            "the trailer limit is checked even after phase 2 completed"
+        );
+        assert!(stream.lifecycle.finalized);
+    }
+
+    #[test]
     fn authority_normalization_covers_case_default_ports_and_ipv6() {
+        assert_eq!(
+            normalize_authority(b"a.example:80", b"https").as_deref(),
+            Some("a.example:80"),
+            "port 80 is not default for HTTPS"
+        );
+        assert_eq!(
+            normalize_authority(b"a.example:443", b"http").as_deref(),
+            Some("a.example:443"),
+            "port 443 is not default for HTTP"
+        );
         assert_eq!(
             normalize_authority(b"WAF.EXAMPLE:80", b"http").as_deref(),
             Some("waf.example")
