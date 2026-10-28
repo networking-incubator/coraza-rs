@@ -52,10 +52,11 @@ re-defaulting.
 
 The filter build this harness currently pins publishes filter-state properties
 and bounded logs only; it does not define Envoy/Prometheus counters or gauges.
-On the current artifact pins, both Istio hosts (1.30.5 and 1.30.7) passed 52
-gating assertions and four oracle checks. `ORACLE_WASM=none` passes the gating
-assertions and skips the oracle; the corrupt-artifact control passes gating and
-reports two failed oracle requests with no oracle PASS lines.
+The current unpatched wasm artifact is `ca1c35d3…` and the Istio-served,
+stub-merged artifact is `20585afb…`. On these pins both Istio hosts (1.30.5 and
+1.30.7) passed 52 gating assertions and four oracle checks. `ORACLE_WASM=none`
+passes the gating assertions and skips the oracle; the corrupt-artifact control
+passes gating and reports two failed oracle requests with no oracle PASS lines.
 
 The harness is idempotent: it uninstalls any previously installed Istio first
 and tears everything down on exit unless `KEEP=1`. With `KEEP=1` the Rust
@@ -84,6 +85,9 @@ the per-version results directory.
   `default_directives: main`, 32-byte body limits, `failure_policy:
   FAIL_CLOSED`, `allow_on_headers_stop_iteration: true`, filter-state logs,
   `per_authority_directives`). It also:
+  The legacy top-level `rules` shorthand is rejected; configure policies with
+  `directives_map` and select them with `default_directives` or
+  `per_authority_directives`.
   - raises the listener `per_connection_buffer_limit_bytes` to 16 MiB, matching
     the standalone `envoy.yaml`. This matters only while the filter holds
     response headers stopped (phase-4 header rules): Envoy buffers the body
