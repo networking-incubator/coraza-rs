@@ -232,16 +232,18 @@ impl Transaction {
     fn process_multipart_body(&mut self, body: &[u8], truncated: bool) -> Result<(), String> {
         let content_type = self.request_headers.first("content-type").unwrap_or_default().to_vec();
         let (parts, failure) = multipart::parse(&content_type, body, truncated);
-        if self.config.reject_multipart_file_uploads
+        let reject_uploads = self.config.reject_multipart_file_uploads
             && parts.iter().any(|part| {
                 part.filename.as_deref().is_some_and(|name| !name.is_empty())
                     || part.alt_filename.as_deref().is_some_and(|name| !name.is_empty())
-            })
-        {
+            });
+        if reject_uploads {
             self.multipart_strict_error.set("1");
             self.inbound_data_error.set("1");
             self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
-            return Ok(());
+            if self.interruption.is_some() {
+                return Ok(());
+            }
         }
         // Go's `NextPart` loop sets the strict error as soon as a part fails, but it
         // has already published the parts before it (`internal/bodyprocessors/multipart.go:52-70`,
@@ -255,6 +257,7 @@ impl Transaction {
             PathBuf::from(&self.config.upload_dir)
         };
         let mut total_size = 0_u64;
+        let mut file_count = self.uploaded_paths.len();
 
         for part in parts {
             if part.repeats_header {
@@ -304,14 +307,26 @@ impl Transaction {
             // part with no non-empty filename as a field, which is what an empty file
             // input sends (`internal/bodyprocessors/multipart.go:106-115`, v3.8.1).
             if let Some(filename) = filename.or(alt_filename) {
-                if self.uploaded_paths.len() >= self.config.upload_file_limit {
+                if file_count >= self.config.upload_file_limit {
                     self.multipart_strict_error.set("1");
+                    continue;
+                }
+                if reject_uploads {
+                    self.files.add("", filename);
+                    self.files_sizes.set_index(filename, 0, size.to_string());
+                    if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
+                        self.files.add("", alt_filename);
+                        self.files_sizes.set_index(alt_filename, 0, size.to_string());
+                    }
+                    self.files_names.add("", &part.name);
+                    file_count += 1;
                     continue;
                 }
                 let path =
                     save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
                 self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
                 self.uploaded_paths.push(path);
+                file_count += 1;
                 self.files.add("", filename);
                 self.files_sizes.set_index(filename, 0, size.to_string());
                 if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
@@ -1840,6 +1855,68 @@ mod multipart_tests {
         assert_eq!(interruption.rule_id, 0);
         assert!(tx.uploaded_paths.is_empty(), "no temporary upload was created");
         assert!(!tx.request_body_stats().spilled, "the body stayed in memory");
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+    }
+
+    #[test]
+    fn detection_only_host_rejection_publishes_parts_without_temporary_uploads() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"before\"\r\n\
+\r\n\
+pre-attack\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"upload\"; filename=\"x.txt\"\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+PAYLOAD\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"second-upload\"; filename=\"y.txt\"\r\n\
+\r\n\
+OTHER\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"after\"\r\n\
+\r\n\
+post-attack\r\n\
+--b--\r\n";
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRuleEngine DetectionOnly\n\
+                 SecRule ARGS_POST \"@contains attack\" \"id:2,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        parser.config_mut().reject_multipart_file_uploads = true;
+        parser.config_mut().upload_file_limit = 1;
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-detection-only-host-policy");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(body), None);
+
+        assert_eq!(tx.args_post.first(b"before"), Some(&b"pre-attack"[..]));
+        assert_eq!(tx.args_post.first(b"after"), Some(&b"post-attack"[..]));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule_id() == 2));
+        assert_eq!(tx.interruption(), None);
+        assert_eq!(
+            tx.would_be_interruption().map(|interruption| interruption.status),
+            Some(413)
+        );
+        assert_eq!(tx.files.first(""), Some(&b"x.txt"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b"upload"[..]));
+        assert_eq!(tx.files.value_count(), 1, "the configured file limit still applies");
+        assert_eq!(tx.files_combined_size.get(), "33");
+        assert_eq!(tx.files_tmp_names.value_count(), 0);
+        assert!(tx.uploaded_paths.is_empty());
+        assert_eq!(
+            tx.multipart_part_headers.first(b"upload"),
+            Some(&b"Content-Disposition: form-data; name=\"upload\"; filename=\"x.txt\""[..])
+        );
+        assert_eq!(tx.multipart_name.first(b"before"), Some(&b"before"[..]));
+        assert_eq!(tx.multipart_name.first(b"upload"), Some(&b"upload"[..]));
+        assert_eq!(tx.multipart_name.first(b"second-upload"), Some(&b"second-upload"[..]));
+        assert_eq!(tx.multipart_name.first(b"after"), Some(&b"after"[..]));
         assert_eq!(tx.multipart_strict_error.get(), "1");
     }
 
