@@ -1,0 +1,15 @@
+# IstioOperator overlay applied on top of the minimal profile by test-istio.sh:
+#   istioctl install -y -f istio-operator.yaml
+#
+# * hub docker.io/istio: pin the proxy image registry so the running
+#   istio-proxy digest can be compared against the pinned digests recorded in
+#   test-istio.sh (Istio defaults to registry.istio.io/release).
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: coraza-istio-mvp
+spec:
+  profile: minimal
+  values:
+    global:
+      hub: docker.io/istio

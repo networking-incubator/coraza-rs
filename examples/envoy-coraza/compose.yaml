@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - "3000"
+
+  envoy:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    command:
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - warning
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:10001:10001"
+      - "127.0.0.1:9901:9901"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ${ENVOY_CORAZA_WASM:-../../target/wasm32-wasip1/release/envoy_coraza.wasm}:/etc/envoy/envoy_coraza.wasm:ro
