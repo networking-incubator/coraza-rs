@@ -61,19 +61,21 @@ uses post-MVP wasm features that wasm-merge's conservative default
 validation rejects):
 
 ```sh
+mkdir -p /tmp/coraza-demo
 wasm-as /tmp/wasi-stub.wat -o /tmp/wasi-stub.wasm
 wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
     target/wasm32-wasip1/release/envoy_coraza.wasm envoy-coraza \
-    -o /tmp/envoy_coraza_istio.wasm \
+    -o /tmp/coraza-demo/envoy_coraza_istio.wasm \
     --rename-export-conflicts --all-features
-WASM_SHA256=$(sha256sum /tmp/envoy_coraza_istio.wasm | cut -d' ' -f1)
+WASM_SHA256=$(sha256sum /tmp/coraza-demo/envoy_coraza_istio.wasm | cut -d' ' -f1)
 echo "artifact sha256: $WASM_SHA256"
 ```
 
 ## 3. Serve the artifact over HTTP
 
 On Kind, bind a file server to the docker bridge gateway address, which the
-cluster nodes can reach:
+cluster nodes can reach. It serves the dedicated directory holding only the
+artifact:
 
 ```sh
 FETCH_ADDRESS=$(docker network inspect kind --format '{{json .IPAM.Config}}' | python3 -c '
@@ -84,14 +86,26 @@ for config in json.load(sys.stdin):
 else:
     raise SystemExit("no IPv4 gateway on the kind network")
 ')
-python3 -m http.server --bind "$FETCH_ADDRESS" 8123 --directory /tmp &
+FETCH_PORT=8123
+python3 -m http.server --bind "$FETCH_ADDRESS" "$FETCH_PORT" --directory /tmp/coraza-demo &
 ```
 
-On another cluster, serve `/tmp/envoy_coraza_istio.wasm` from any
-plain-HTTP endpoint reachable from the gateway pods and note its address
-and port.
+On another cluster, serve `/tmp/coraza-demo/envoy_coraza_istio.wasm` from
+any plain-HTTP endpoint reachable from the gateway pods, then set the same
+variables to that endpoint:
+
+```sh
+FETCH_ADDRESS=artifact.example.com  # your endpoint host
+FETCH_PORT=8080                      # your endpoint port
+```
 
 ## 4. Create the Gateway and route
+
+The Gateway, route and grant live in a dedicated namespace; create it first:
+
+```sh
+kubectl create namespace coraza-demo
+```
 
 Replace `your-service` and `your-namespace` with the service the WAF should
 protect, then apply:
@@ -111,7 +125,10 @@ spec:
       protocol: HTTP
       allowedRoutes:
         namespaces:
-          from: All
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: coraza-demo
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -129,16 +146,32 @@ spec:
       backendRefs:
         - name: your-service
           namespace: your-namespace
-          port: 80
+          port: 80 # replace with your Service's port (its port, not targetPort)
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-coraza-demo-routes
+  namespace: your-namespace
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: coraza-demo
+  to:
+    - group: ""
+      kind: Service
 EOF
 ```
 
-The Gateway must live in a namespace that exists; create `coraza-demo`
-first (`kubectl create namespace coraza-demo`) or edit the namespaces to
-taste. The Istio gateway-class controller creates a Deployment named
+The Istio gateway-class controller creates a Deployment named
 `coraza-gateway-istio` whose pods carry the label
 `gateway.networking.k8s.io/gateway-name=coraza-gateway` — that is what the
-EnvoyFilter selects on.
+EnvoyFilter selects on. The ReferenceGrant is required because the route
+references a Service in another namespace; if you instead put the HTTPRoute
+in the Service's own namespace, drop the grant, the `namespace:` field on
+the backendRef, and keep the Gateway's namespace selector in mind (only
+routes from `coraza-demo` may attach).
 
 ## 5. Deploy the EnvoyFilter
 
@@ -274,10 +307,10 @@ spec:
 Substitute your endpoint and the digest, then apply:
 
 ```sh
-sed -e "s/__WASM_URI__/http:\/\/$FETCH_ADDRESS:8123\/envoy_coraza_istio.wasm/" \
+sed -e "s|__WASM_URI__|http://$FETCH_ADDRESS:$FETCH_PORT/envoy_coraza_istio.wasm|" \
     -e "s/__WASM_SHA256__/$WASM_SHA256/" \
     -e "s/__WASM_FETCH_ADDRESS__/$FETCH_ADDRESS/" \
-    -e "s/__WASM_FETCH_PORT__/8123/" \
+    -e "s/__WASM_FETCH_PORT__/$FETCH_PORT/" \
     /tmp/envoyfilter.yaml | kubectl apply -f -
 ```
 
@@ -299,10 +332,13 @@ Port-forward to the gateway pod and try a benign request and a blocked one:
 ```sh
 GATEWAY_POD=$(kubectl -n coraza-demo get pods -l gateway.networking.k8s.io/gateway-name=coraza-gateway -o name | head -1)
 kubectl -n coraza-demo port-forward "$GATEWAY_POD" 18080:80 &
+# Wait until the forward accepts connections (kubectl prints
+# "Forwarding from 127.0.0.1:18080" when it is ready).
+until curl -s -o /dev/null http://127.0.0.1:18080/; do sleep 1; done
 ```
 
 ```sh
-curl -i http://127.0.0.1:18080/             # 200, your service's response
+curl -i http://127.0.0.1:18080/             # your service's response (status depends on the service)
 curl -i http://127.0.0.1:18080/phase1-deny  # 403 from rule 101 (phase 1)
 curl -i 'http://127.0.0.1:18080/?q=attack'  # 403 from rule 102 (phase 1)
 ```
