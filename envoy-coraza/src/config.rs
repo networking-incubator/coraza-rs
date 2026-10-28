@@ -53,8 +53,8 @@
 //!
 //! Runtime authority lookup lowercases the request authority and strips only its scheme's default port before
 //! selection, and uses Envoy's `request.host` property when `:authority` is absent. Upstream uses the raw authority
-//! string as an exact key and does not use that property fallback. Configure authority keys in lowercase; bracketed
-//! IPv6 literals retain their brackets, and non-default ports remain part of the lookup key.
+//! string as an exact key and does not use that property fallback. Invalid or non-lowercase authority keys are
+//! rejected; bracketed IPv6 literals retain their brackets, and non-default ports remain part of the lookup key.
 //!
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
@@ -232,6 +232,11 @@ pub(crate) enum ConfigError {
     TooManyAuthorities,
     /// An authority key is empty.
     EmptyAuthority,
+    /// An authority key is invalid or does not use its normalized lowercase form.
+    InvalidAuthority {
+        /// Offending authority key.
+        authority: String,
+    },
     /// An authority entry names an empty policy.
     EmptyPolicyName {
         /// Authority the entry is for.
@@ -297,6 +302,11 @@ impl Display for ConfigError {
                 )
             },
             Self::EmptyAuthority => f.write_str("per_authority_directives has an empty authority"),
+            Self::InvalidAuthority { authority } => write!(
+                f,
+                "per_authority_directives authority {} is invalid or not lowercase",
+                display_name(authority)
+            ),
             Self::EmptyPolicyName { authority } => {
                 write!(
                     f,
@@ -496,6 +506,11 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
         };
         if authority.is_empty() {
             return Err(ConfigError::EmptyAuthority);
+        }
+        if crate::stream::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority) {
+            return Err(ConfigError::InvalidAuthority {
+                authority: authority.clone(),
+            });
         }
         if policy.is_empty() {
             return Err(ConfigError::EmptyPolicyName {
@@ -893,6 +908,25 @@ mod tests {
                 .contains_key("a"),
             "an unresolved authority is kept so compilation can reject it"
         );
+    }
+
+    #[test]
+    fn per_authority_keys_must_be_valid_normalized_authorities() {
+        for authority in ["A.example", "a.example/path", "a.example:abc", "[invalid"] {
+            let error = parse_error(&format!(
+                r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#
+            ));
+            assert!(
+                error.contains("is invalid or not lowercase"),
+                "authority {authority:?} was accepted: {error}"
+            );
+        }
+
+        for authority in ["a.example:80", "a.example:443", "[2001:db8::1]:443"] {
+            let input =
+                format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
+            assert!(Config::parse(input.as_bytes()).is_ok(), "authority {authority:?}");
+        }
     }
 
     #[test]
