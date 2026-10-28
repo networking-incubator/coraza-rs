@@ -352,9 +352,9 @@ impl Parser {
         }
     }
 
-    /// Stop parsing once more than `limit` rules have been compiled.
+    /// Stop parsing once more than `limit` rule compilations have been attempted.
     ///
-    /// The count includes chain members. Exceeding the limit is an ordinary
+    /// The count includes failed compilations and chain members. Exceeding the limit is an ordinary
     /// [`ParseError`] naming it; the default is unlimited, so native parsing is
     /// unchanged.
     #[must_use]
@@ -479,7 +479,7 @@ impl Parser {
         self.rules.count()
     }
 
-    /// Number of rules compiled so far, chain members included.
+    /// Number of rule compilation attempts so far, including failures and chain members.
     pub fn total_rule_count(&self) -> usize {
         self.rules.total_count()
     }
@@ -1021,6 +1021,7 @@ fn add_rule(options: &mut DirectiveOptions<'_>, rule: Result<Rule, CompileError>
 
 /// `SecRule` VARIABLES "OPERATOR" "ACTIONS"
 fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
+    options.rules.record_compilation();
     let context = OperatorContext {
         base_dir: options.config_dir,
         datasets: options.datasets,
@@ -1043,6 +1044,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
 
 /// `SecAction` "ACTIONS"
 fn directive_sec_action(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
+    options.rules.record_compilation();
     let rule = compile_sec_action_in(&options.opts, options.default_actions, options.action_compile_context);
     add_rule(options, rule)
 }
@@ -1060,6 +1062,7 @@ fn directive_sec_default_action(options: &mut DirectiveOptions<'_>) -> Result<()
 
 /// `SecMarker` LABEL
 fn directive_sec_marker(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
+    options.rules.record_compilation();
     let rule = compile_sec_marker(&options.opts);
     add_rule(options, rule)
 }
@@ -3426,6 +3429,7 @@ SecWebAppId production
         let mut at_limit = Parser::new().with_rule_limit(3);
         at_limit.from_string(&rules).unwrap();
         assert_eq!(at_limit.rule_count(), 3, "exactly the limit is accepted");
+        assert_eq!(at_limit.total_rule_count(), 3, "successful rules are counted once");
 
         let mut over = Parser::new().with_rule_limit(3);
         let error = over
@@ -3505,6 +3509,67 @@ SecWebAppId production
             error.message.contains("rule limit of 2 rules"),
             "rejected compiles must still count: {error:?}"
         );
+    }
+
+    #[test]
+    fn rule_limit_counts_failed_compilation_attempts() {
+        for directive in [
+            "SecRule REQUEST_URI \"@unknown_operator value\" \"id:1,pass\"",
+            "SecAction \"id:not-a-number,pass\"",
+        ] {
+            let mut parser = Parser::new().with_rule_limit(2);
+            parser.skip_failed_directives();
+            let error = parser
+                .from_string(&format!("{directive}\n{directive}\n{directive}"))
+                .unwrap_err();
+            assert!(
+                error.message.contains("rule limit of 2 rules"),
+                "{directive}: {error:?}"
+            );
+            assert_eq!(parser.rule_count(), 0);
+            assert_eq!(parser.total_rule_count(), 3);
+            assert_eq!(parser.skipped().len(), 2);
+        }
+    }
+
+    #[test]
+    fn rule_limit_counts_failed_rules_in_includes() {
+        let rules = b"SecRule REQUEST_URI \"@unknown_operator value\" \"id:1,pass\"\n";
+        let data = Memory::new([("bad.conf".to_owned(), rules.repeat(3))]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data)).with_rule_limit(2);
+        parser.skip_failed_directives();
+        let error = parser.from_string("Include bad.conf").unwrap_err();
+        assert!(error.message.contains("rule limit of 2 rules"), "{error:?}");
+        assert_eq!(parser.total_rule_count(), 3);
+        assert_eq!(parser.skipped().len(), 2);
+    }
+
+    #[test]
+    fn rule_limit_counts_failed_rules_without_skipping() {
+        let mut parser = Parser::new().with_rule_limit(1);
+        assert!(
+            parser
+                .from_string("SecRule REQUEST_URI \"@unknown_operator value\" \"id:1,pass\"")
+                .is_err()
+        );
+        assert_eq!(parser.total_rule_count(), 1);
+        let error = parser.from_string("SecAction \"id:2,pass\"").unwrap_err();
+        assert!(error.message.contains("rule limit of 1 rules"), "{error:?}");
+    }
+
+    #[test]
+    fn rule_limit_counts_chain_members_and_markers_once() {
+        let mut parser = Parser::new().with_rule_limit(4);
+        parser
+            .from_string(
+                "SecRule REQUEST_URI \"@contains /\" \"id:1,pass,chain\"\n\
+                 SecRule REQUEST_URI \"@contains /\" \"t:none\"\n\
+                 SecMarker END\n\
+                 SecAction \"id:2,pass\"",
+            )
+            .unwrap();
+        assert_eq!(parser.total_rule_count(), 4);
+        assert_eq!(parser.rule_count(), 3);
     }
 
     #[test]

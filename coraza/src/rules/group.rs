@@ -32,7 +32,7 @@ pub(crate) struct RuleGroup {
     rules: Vec<Rule>,
     /// Every rule retained right now, chain members included.
     total: usize,
-    /// Every rule this group ever compiled, chain members included.
+    /// Rule compilation attempts, including failed attempts and chain members.
     ///
     /// Never decreases: removing or discarding a rule does not refund compilation
     /// work, so a configuration cannot compile an unbounded number of rules and then
@@ -114,9 +114,6 @@ impl RuleGroup {
         multiphase_evaluation: bool,
         observer: Option<&RuleObserver>,
     ) -> Result<(), String> {
-        // Count the attempt before any rejection: a rejected rule still cost a compile,
-        // and a rule budget must not be bypassed with repeated duplicate-ID directives.
-        self.compiled += 1;
         if multiphase_evaluation {
             rule.split_args_variables();
         }
@@ -239,7 +236,12 @@ impl RuleGroup {
         self.rules.len()
     }
 
-    /// Returns every rule compiled, chain members included.
+    /// Count an attempt before compiling, including attempts that fail.
+    pub(crate) fn record_compilation(&mut self) {
+        self.compiled = self.compiled.saturating_add(1);
+    }
+
+    /// Returns the number of compilation attempts, chain members included.
     pub(crate) fn total_count(&self) -> usize {
         self.compiled
     }
@@ -301,8 +303,10 @@ mod tests {
     #[test]
     fn discarding_a_chain_does_not_refund_the_compiled_count() {
         let mut group = RuleGroup::new();
+        group.record_compilation();
         group.add(rule("1", "chain"), false, None).unwrap();
         let compiled = group.total_count();
+        assert_eq!(compiled, 1);
         assert!(group.discard_open_chain());
         assert_eq!(group.count(), 0, "the chain is no longer retained");
         assert_eq!(group.total_count(), compiled, "compilation work is not refunded");
@@ -311,9 +315,12 @@ mod tests {
     #[test]
     fn removing_rules_does_not_refund_the_compiled_count() {
         let mut group = RuleGroup::new();
+        group.record_compilation();
         group.add(rule("1", ""), false, None).unwrap();
+        group.record_compilation();
         group.add(rule("2", ""), false, None).unwrap();
         let compiled = group.total_count();
+        assert_eq!(compiled, 2);
         group.delete_by_range(1, 2);
         assert_eq!(group.count(), 0, "both rules are gone");
         assert_eq!(group.total_count(), compiled, "compilation work is not refunded");
