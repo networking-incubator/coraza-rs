@@ -25,7 +25,12 @@ use std::path::Path;
 use aho_corasick::AhoCorasick;
 
 use super::{Datasets, Macro, MacroError, Operator, Outputs, simple::contains_bytes};
-use crate::{transaction::Transaction, transformations::text_of, utils::strings::x2c};
+use crate::{
+    rule_data::{FileSystem, RuleData, read_to_string},
+    transaction::Transaction,
+    transformations::text_of,
+    utils::strings::x2c,
+};
 
 /// Regular expression operator with Coraza's multiline and dotall defaults.
 #[derive(Debug, Clone)]
@@ -338,8 +343,17 @@ impl PmFromFile {
     ///
     /// Returns an error if the file cannot be read or no phrases are found.
     pub fn new(file_path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::with_rule_data(file_path, &FileSystem)
+    }
+
+    /// Read phrases from `file_path` through `rule_data`, ignoring blank lines and comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or no phrases are found.
+    pub(crate) fn with_rule_data(file_path: impl AsRef<Path>, rule_data: &dyn RuleData) -> Result<Self, String> {
         let file_path = file_path.as_ref();
-        let content = std::fs::read_to_string(file_path)
+        let content = read_to_string(rule_data, file_path)
             .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
         let patterns: Vec<_> = content
             .lines()

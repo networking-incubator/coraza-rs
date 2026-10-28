@@ -73,6 +73,7 @@ use serde_json::Value;
 
 use crate::{
     operators::{Operator, Outputs},
+    rule_data::RuleData,
     transaction::Transaction,
     types::{RulePhase, RuleVariable},
 };
@@ -96,27 +97,7 @@ impl ValidateSchema {
     /// file whose extension is not `.json`, is larger than [`SCHEMA_CAP`],
     /// cannot be read, or does not contain a valid JSON Schema.
     pub fn new(base_dir: &Path, argument: &str) -> Result<Self, String> {
-        if argument.is_empty() {
-            return Err("missing schema file path".to_owned());
-        }
-
-        let relative = Path::new(argument);
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
-            return Err("schema path must stay inside the configured root".to_owned());
-        }
-
-        let extension = relative
-            .extension()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if extension != "json" {
-            return Err(format!("unsupported schema type: {extension}, only JSON is supported"));
-        }
-
+        let relative = schema_path(argument)?;
         let base = canonical_base(base_dir)?;
         let path = resolve_under(&base, relative)?;
         let file = File::open(&path).map_err(|error| format!("reading schema from root FS: {error}"))?;
@@ -134,8 +115,40 @@ impl ValidateSchema {
         }
 
         let bytes = read_schema(file)?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Load and compile the JSON Schema `argument` through `rule_data`.
+    ///
+    /// A filesystem source keeps the descriptor and canonical-path confinement of
+    /// [`ValidateSchema::new`]; any other source reads `base_dir/argument`
+    /// directly through [`RuleData::read`], so the embedder's storage defines
+    /// the root and a source that performs real filesystem access must apply
+    /// its own containment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `argument` is empty, escapes `base_dir`, names a
+    /// file whose extension is not `.json`, is larger than [`SCHEMA_CAP`],
+    /// cannot be read, or does not contain a valid JSON Schema.
+    pub(crate) fn with_rule_data(base_dir: &Path, argument: &str, rule_data: &dyn RuleData) -> Result<Self, String> {
+        if rule_data.as_file_system().is_some() {
+            return Self::new(base_dir, argument);
+        }
+        let relative = schema_path(argument)?;
+        let bytes = rule_data
+            .read(&base_dir.join(relative))
+            .map_err(|error| format!("reading schema: {error}"))?;
+        if bytes.len() as u64 > SCHEMA_CAP {
+            return Err(format!("schema file is larger than {SCHEMA_CAP} bytes"));
+        }
+        Self::from_bytes(&bytes)
+    }
+
+    /// Compile a schema from its raw bytes.
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let schema: Value =
-            serde_json::from_slice(&bytes).map_err(|error| format!("validating schema as JSON: {error}"))?;
+            serde_json::from_slice(bytes).map_err(|error| format!("validating schema as JSON: {error}"))?;
         // Go's compiler never reads `$schema`: every schema is 2020-12, so pin the
         // draft instead of letting this engine auto-detect one.
         // The compiler's own message quotes the offending schema fragment.
@@ -162,6 +175,31 @@ impl Operator for ValidateSchema {
 /// Returns an error for an invalid schema path or schema; see [`ValidateSchema::new`].
 pub fn validate_schema(base_dir: &Path, argument: &str) -> Result<ValidateSchema, String> {
     ValidateSchema::new(base_dir, argument)
+}
+
+/// Validate a schema argument and return it as a path relative to the root.
+fn schema_path(argument: &str) -> Result<&Path, String> {
+    if argument.is_empty() {
+        return Err("missing schema file path".to_owned());
+    }
+
+    let relative = Path::new(argument);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err("schema path must stay inside the configured root".to_owned());
+    }
+
+    let extension = relative
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension != "json" {
+        return Err(format!("unsupported schema type: {extension}, only JSON is supported"));
+    }
+    Ok(relative)
 }
 
 /// Read at most [`SCHEMA_CAP`] bytes from the opened `file`.
@@ -546,6 +584,7 @@ mod tests {
             base_dir: dir.path(),
             datasets: &datasets,
             custom: None,
+            ..OperatorContext::default()
         };
         assert!(matches!(
             OperatorEnum::with_context("validateSchema", "schema.json", &context),
@@ -619,5 +658,26 @@ mod tests {
         std::fs::write(dir.path().join("schemas").join("api.json"), SCHEMA).unwrap();
         let operator = validate_schema(dir.path(), "schemas/api.json").unwrap();
         assert!(!evaluate(&operator, VALID), "nested schema must load");
+    }
+
+    #[test]
+    fn a_memory_source_loads_a_schema() {
+        use std::path::Path;
+
+        use crate::rule_data::Memory;
+
+        let data = Memory::new([("schema.json".to_owned(), SCHEMA.as_bytes().to_vec())]);
+        let operator = ValidateSchema::with_rule_data(Path::new(""), "schema.json", &data).unwrap();
+        assert!(!evaluate(&operator, VALID), "in-memory schema must load");
+        assert!(evaluate(&operator, MISSING_AGE), "in-memory schema must validate");
+
+        assert_eq!(
+            ValidateSchema::with_rule_data(Path::new(""), "missing.json", &data).unwrap_err(),
+            "reading schema: rule data has no file 'missing.json'"
+        );
+        assert_eq!(
+            ValidateSchema::with_rule_data(Path::new(""), "../schema.json", &data).unwrap_err(),
+            "schema path must stay inside the configured root"
+        );
     }
 }

@@ -51,9 +51,18 @@ pub(crate) fn parse_variables(input: &str) -> ParseResult<Vec<VariableSpec>> {
 /// The configured argument key mode does not affect compilation: a selector is lowered
 /// from its variable alone, as Go's `caseSensitiveVariable` decides it, and only the
 /// transaction's argument maps decide whether the keys it is matched against fold case.
+#[cfg(test)]
 pub(crate) fn parse_variables_in(input: &str) -> ParseResult<Vec<VariableSpec>> {
+    parse_variables_in_mode(input, false)
+}
+
+/// Parse variable expressions under the selected multiphase compilation mode.
+///
+/// In multiphase, a negated selector excludes across the argument families the rule's
+/// variables are split into, as Go does when it compiles the rule for early phases.
+pub(crate) fn parse_variables_in_mode(input: &str, multiphase: bool) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
-    VariableList::parse(input)?.apply_to(&mut variables, false);
+    VariableList::parse(input)?.apply_to(&mut variables, multiphase);
     Ok(variables)
 }
 

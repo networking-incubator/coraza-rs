@@ -30,6 +30,14 @@ pub(crate) type RuleObserver = dyn Fn(&RuleMetadata) + Send + Sync;
 pub(crate) struct RuleGroup {
     /// Top-level rules in directive order.
     rules: Vec<Rule>,
+    /// Every rule retained right now, chain members included.
+    total: usize,
+    /// Every rule this group ever compiled, chain members included.
+    ///
+    /// Never decreases: removing or discarding a rule does not refund compilation
+    /// work, so a configuration cannot compile an unbounded number of rules and then
+    /// delete them to stay under a rule budget.
+    compiled: usize,
     /// The argument-map mode recorded when these rules were compiled.
     ///
     /// Key selectors do not depend on it: the variable parser lowers a selector from its
@@ -106,6 +114,9 @@ impl RuleGroup {
         multiphase_evaluation: bool,
         observer: Option<&RuleObserver>,
     ) -> Result<(), String> {
+        // Count the attempt before any rejection: a rejected rule still cost a compile,
+        // and a rule budget must not be bypassed with repeated duplicate-ID directives.
+        self.compiled += 1;
         if multiphase_evaluation {
             rule.split_args_variables();
         }
@@ -142,13 +153,16 @@ impl RuleGroup {
         if let (Some(observer), Some(inserted)) = (observer, inserted) {
             observer(inserted.metadata());
         }
+        self.total += 1;
         Ok(())
     }
 
     /// Drop an unfinished chain after a skipped compilation error.
     pub(crate) fn discard_open_chain(&mut self) -> bool {
         if self.open_chain().is_some() {
-            self.rules.pop();
+            if let Some(rule) = self.rules.pop() {
+                self.total = self.total.saturating_sub(1 + rule.chain.len());
+            }
             true
         } else {
             false
@@ -171,17 +185,25 @@ impl RuleGroup {
     /// Removes rules with ids in the inclusive range.
     pub(crate) fn delete_by_range(&mut self, start: i32, end: i32) {
         self.rules.retain(|rule| !(start..=end).contains(&rule.metadata().id()));
+        self.recount();
     }
 
     /// Removes rules whose message equals `message`.
     pub(crate) fn delete_by_msg(&mut self, message: &str) {
         self.rules.retain(|rule| rule.metadata().msg() != Some(message));
+        self.recount();
     }
 
     /// Removes rules tagged with `tag`.
     pub(crate) fn delete_by_tag(&mut self, tag: &str) {
         self.rules
             .retain(|rule| !rule.metadata().tags().iter().any(|item| item == tag));
+        self.recount();
+    }
+
+    /// Recompute the total after a bulk removal.
+    fn recount(&mut self) {
+        self.total = self.rules.iter().map(|rule| 1 + rule.chain.len()).sum();
     }
 
     /// Updates rules tagged with `tag` and returns their count.
@@ -215,6 +237,11 @@ impl RuleGroup {
     /// Returns the number of top-level rules.
     pub(crate) fn count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Returns every rule compiled, chain members included.
+    pub(crate) fn total_count(&self) -> usize {
+        self.compiled
     }
 }
 
@@ -269,6 +296,27 @@ mod tests {
         );
         assert_eq!(group.count(), 1);
         assert!(group.discard_open_chain());
+    }
+
+    #[test]
+    fn discarding_a_chain_does_not_refund_the_compiled_count() {
+        let mut group = RuleGroup::new();
+        group.add(rule("1", "chain"), false, None).unwrap();
+        let compiled = group.total_count();
+        assert!(group.discard_open_chain());
+        assert_eq!(group.count(), 0, "the chain is no longer retained");
+        assert_eq!(group.total_count(), compiled, "compilation work is not refunded");
+    }
+
+    #[test]
+    fn removing_rules_does_not_refund_the_compiled_count() {
+        let mut group = RuleGroup::new();
+        group.add(rule("1", ""), false, None).unwrap();
+        group.add(rule("2", ""), false, None).unwrap();
+        let compiled = group.total_count();
+        group.delete_by_range(1, 2);
+        assert_eq!(group.count(), 0, "both rules are gone");
+        assert_eq!(group.total_count(), compiled, "compilation work is not refunded");
     }
 
     #[test]

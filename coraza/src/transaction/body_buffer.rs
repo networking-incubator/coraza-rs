@@ -286,6 +286,11 @@ impl BodyBuffer {
         }
     }
 
+    /// Bytes held by the in-memory body allocation.
+    pub(super) fn allocated_bytes(&self) -> usize {
+        self.memory.capacity()
+    }
+
     /// Return the spill file path, if the body spilled, for cleanup tests.
     #[cfg(test)]
     pub(super) fn spill_path(&self) -> Option<&Path> {

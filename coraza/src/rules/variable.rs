@@ -176,6 +176,15 @@ impl VariableSpec {
 
     /// Return the matches from the collection associated with this variable.
     pub(crate) fn get_matches(&self, collection: Option<CollectionView<'_>>) -> Vec<MatchData> {
+        self.get_matches_filter(collection, |_, _| false)
+    }
+
+    /// Return matches after excluding transaction-local targets before count aggregation.
+    pub(crate) fn get_matches_filter(
+        &self,
+        collection: Option<CollectionView<'_>>,
+        mut excluded: impl FnMut(RuleVariable, &str) -> bool,
+    ) -> Vec<MatchData> {
         let Some(collection) = collection.filter(|view| {
             view.variable() == self.variable
                 || (self.variable == RuleVariable::XML && view.variable() == RuleVariable::RequestXML)
@@ -195,7 +204,7 @@ impl VariableSpec {
                     matches.push(MatchData::new(variable, String::from_utf8_lossy(key), value));
                 }
             };
-            let keep = |key: &[u8]| {
+            let mut keep = |variable: RuleVariable, key: &[u8]| {
                 let key_text = String::from_utf8_lossy(key);
                 let key_lower = has_exceptions.then(|| lowercase_like_go(&key_text));
                 let key_lower = key_lower.as_deref().unwrap_or(&key_text);
@@ -203,22 +212,23 @@ impl VariableSpec {
                     .exceptions
                     .iter()
                     .any(|exception| exception.matches_lowered(key_lower))
+                    && !excluded(variable, &key_text)
             };
 
             match (collection, &self.key) {
                 (CollectionView::Map(map), _) => self.select(map, false, |key, value| {
-                    if keep(key) {
+                    if keep(self.variable, key) {
                         record(self.variable, key, value);
                     }
                 }),
                 (CollectionView::Names(variable, map), _) => self.select(map, true, |key, _| {
-                    if keep(key) {
+                    if keep(variable, key) {
                         // Go exposes the raw name bytes as the value, so keep them exact.
                         record(variable, key, key);
                     }
                 }),
                 (CollectionView::Single(single), None) => {
-                    if keep(b"") {
+                    if keep(single.variable(), b"") {
                         record(single.variable(), b"", single.get_bytes());
                     }
                 },

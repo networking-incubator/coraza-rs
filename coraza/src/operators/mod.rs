@@ -61,7 +61,10 @@ pub use validation::{
     unconditional_match, validate_byte_range, validate_nid, validate_url_encoding, validate_utf8_encoding,
 };
 
-use crate::transaction::Transaction;
+use crate::{
+    rule_data::{FileSystem, RuleData},
+    transaction::Transaction,
+};
 
 /// The result of evaluating an operator against one input value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +153,7 @@ impl CustomOperators {
 
 /// Inputs needed when an operator reads a configured file or dataset.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct OperatorContext<'a> {
     /// Base directory for relative operator file paths.
     pub base_dir: &'a Path,
@@ -157,6 +161,8 @@ pub struct OperatorContext<'a> {
     pub datasets: &'a Datasets,
     /// Operator factories registered by the embedder, consulted before the built-in names.
     pub custom: Option<&'a CustomOperators>,
+    /// Source of the files that file-based operators read.
+    pub rule_data: &'a dyn RuleData,
 }
 
 impl std::fmt::Debug for OperatorContext<'_> {
@@ -172,10 +178,12 @@ impl std::fmt::Debug for OperatorContext<'_> {
 impl Default for OperatorContext<'_> {
     fn default() -> Self {
         static EMPTY_DATASETS: Datasets = BTreeMap::new();
+        static FILE_SYSTEM: FileSystem = FileSystem;
         Self {
             base_dir: Path::new(""),
             datasets: &EMPTY_DATASETS,
             custom: None,
+            rule_data: &FILE_SYSTEM,
         }
     }
 }
@@ -346,7 +354,9 @@ impl OperatorEnum {
             "rx" => rx(argument).map(Self::Rx).map_err(|error| error.to_string()),
             "restpath" => rest_path(argument).map(Self::RestPath),
             "pm" => pm(argument).map(Self::Pm).map_err(|error| error.to_string()),
-            "pmfromfile" | "pmf" => pm_from_file(context.base_dir.join(argument)).map(Self::PmFromFile),
+            "pmfromfile" | "pmf" => {
+                PmFromFile::with_rule_data(context.base_dir.join(argument), context.rule_data).map(Self::PmFromFile)
+            },
             "pmfromdataset" => pm_from_dataset(argument, context.datasets).map(Self::PmFromDataset),
             "strmatch" => strmatch(argument)
                 .map(Self::StrMatch)
@@ -371,7 +381,8 @@ impl OperatorEnum {
             "detectxss" => Ok(Self::DetectXSS(detect_xss())),
             "ipmatch" => Ok(Self::IpMatch(ip_match(argument))),
             "ipmatchfromfile" | "ipmatchf" => {
-                ip_match_from_file(context.base_dir.join(argument)).map(Self::IpMatchFromFile)
+                IpMatchFromFile::with_rule_data(context.base_dir.join(argument), context.rule_data)
+                    .map(Self::IpMatchFromFile)
             },
             "ipmatchfromdataset" => ip_match_from_dataset(argument, context.datasets).map(Self::IpMatchFromDataset),
             "validatebyterange" => validate_byte_range(argument).map(Self::ValidateByteRange),
@@ -385,7 +396,9 @@ impl OperatorEnum {
             #[cfg(feature = "rbl")]
             "rbl" => rbl(argument).map(Self::Rbl),
             #[cfg(feature = "validate-schema")]
-            "validateschema" => validate_schema(context.base_dir, argument).map(Self::ValidateSchema),
+            "validateschema" => {
+                ValidateSchema::with_rule_data(context.base_dir, argument, context.rule_data).map(Self::ValidateSchema)
+            },
             _ => Err(format!("unknown operator: {name}")),
         }
     }
@@ -534,6 +547,7 @@ mod tests {
             base_dir: std::path::Path::new(""),
             datasets,
             custom: Some(custom),
+            ..OperatorContext::default()
         }
     }
 
@@ -590,6 +604,7 @@ mod tests {
                 base_dir: dir.path(),
                 datasets: &datasets,
                 custom: None,
+                ..OperatorContext::default()
             };
             let operator = OperatorEnum::with_context("validateSchema", "schema.json", &context).unwrap();
             assert!(!operator.is_detector());
@@ -613,6 +628,7 @@ mod tests {
             base_dir: std::path::Path::new(""),
             datasets: &datasets,
             custom: None,
+            ..OperatorContext::default()
         };
         let tx = Transaction::new("operator-test");
 
@@ -637,6 +653,7 @@ mod tests {
             base_dir: &temp_dir,
             datasets: &datasets,
             custom: None,
+            ..OperatorContext::default()
         };
         let tx = Transaction::new("operator-test");
         let phrase_name = phrase_path.file_name().unwrap().to_str().unwrap();

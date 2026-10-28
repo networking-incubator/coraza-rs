@@ -37,7 +37,7 @@ use crate::{
     rules::Rule,
     seclang::{
         CompileError, action_parser::ParsedAction, operator_parser::parse_operator_in, parse_actions,
-        parse_variables_in,
+        variable_parser::parse_variables_in_mode,
     },
     types::RulePhase,
 };
@@ -55,6 +55,7 @@ pub(crate) fn compile_sec_rule(input: &str) -> CompileResult<Rule> {
         &OperatorContext::default(),
         &DefaultActions::default(),
         ActionCompileContext::default(),
+        false,
     )
 }
 
@@ -66,6 +67,7 @@ pub(crate) fn compile_sec_rule_in(
     context: &OperatorContext<'_>,
     defaults: &DefaultActions,
     action_context: ActionCompileContext<'_>,
+    multiphase: bool,
 ) -> CompileResult<Rule> {
     let RuleArguments {
         variables: vars,
@@ -74,7 +76,7 @@ pub(crate) fn compile_sec_rule_in(
     } = RuleArguments::parse(input)?;
 
     // Parse variables
-    let variable_specs = parse_variables_in(vars)
+    let variable_specs = parse_variables_in_mode(vars, multiphase)
         .map_err(|error| CompileError::new(format!("failed to parse variables '{vars}': {error}")))?;
 
     // Parse operator
@@ -519,6 +521,7 @@ mod tests {
             &context,
             &defaults,
             ActionCompileContext::default(),
+            false,
         )
         .unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();
@@ -532,6 +535,7 @@ mod tests {
             &context,
             &defaults,
             ActionCompileContext::default(),
+            false,
         )
         .unwrap();
         let names: Vec<&str> = rule.actions().iter().map(|action| action.name.as_str()).collect();

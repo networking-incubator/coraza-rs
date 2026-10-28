@@ -27,6 +27,7 @@ pub mod collection;
 pub mod config;
 pub mod debug_log;
 pub mod operators;
+pub mod rule_data;
 mod rules;
 pub mod seclang;
 pub mod transaction;

@@ -41,6 +41,7 @@
 use std::{
     borrow::Cow,
     collections::BTreeMap,
+    io,
     ops::RangeInclusive,
     path::Path,
     str::FromStr as _,
@@ -59,11 +60,14 @@ use winnow::{
 
 use crate::{
     actions::{ActionCompileContext, CustomActionFactory, RuleMetadata},
-    audit_log::{AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule},
+    audit_log::{
+        AuditLog, AuditLogCallback, AuditLogFormatter, AuditLogRegistry, AuditLogWriterFactory, ErrorLog, MatchedRule,
+    },
     body_processors::BodyProcessorFactory,
     config::{UploadKeepFiles, WafConfig},
     debug_log::DebugLogger,
     operators::{CustomOperatorFactory, CustomOperators, Datasets, OperatorContext},
+    rule_data::{FileSystem, RuleData, read_to_string},
     rules::{Rule, RuleGroup, RuleObserver},
     seclang::{
         CompileError, parse_actions,
@@ -104,6 +108,8 @@ const RESERVED_CUSTOM_ACTION_NAMES: [&str; 19] = [
 
 /// Maximum include recursion depth to prevent `DoS` attacks.
 const MAX_INCLUDE_RECURSION: usize = 100;
+/// Maximum files one top-level configuration parse may read, counting the entry file.
+const MAX_INCLUDED_FILES: usize = 1024;
 /// Unique suffix for temporary upload directory probes.
 static UPLOAD_PROBE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -192,6 +198,9 @@ struct DirectiveOptions<'a> {
     /// Rule observer registered on the parser.
     rule_observer: Option<&'a RuleObserver>,
 
+    /// Files that file-based operators read
+    rule_data: &'a dyn RuleData,
+
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
@@ -214,6 +223,17 @@ struct ParserState {
 ///
 /// Parses ModSecurity `SecLang` directives into a WAF configuration and compiled rules.
 ///
+/// # Filesystem access
+///
+/// `SecUploadDir` normally proves its directory writable by creating a probe
+/// file there. That probe is skipped when the rule data comes from a source
+/// other than the process filesystem, such as
+/// [`Memory`](crate::rule_data::Memory), because a non-filesystem source has no
+/// directory to probe; the embedder is then responsible for rejecting a
+/// directory its runtime cannot write. The default
+/// [`FileSystem`](crate::rule_data::FileSystem) source keeps probing exactly as
+/// before.
+///
 /// # Example
 ///
 /// ```
@@ -230,12 +250,19 @@ struct ParserState {
 /// assert_eq!(parser.rule_count(), 1);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+// The three state flags are independent one-shot signals (skip a failed directive,
+// drop the rest of a broken chain, stop on an exhausted budget); folding them into an
+// enum would not make any call site simpler.
+#[expect(clippy::struct_excessive_bools, reason = "independent one-shot parser state flags")]
 pub struct Parser {
     /// Current parser state
     state: ParserState,
 
     /// Include recursion counter (prevents `DoS`)
     include_count: usize,
+
+    /// Files read by the current top-level parse, for the total include budget
+    included_files: usize,
 
     /// WAF configuration (populated by directives)
     waf_config: WafConfig,
@@ -280,6 +307,20 @@ pub struct Parser {
 
     /// Optional host-provided debug sink.
     debug_logger: Option<Arc<dyn DebugLogger>>,
+
+    /// Optional callback for audit entries selected by `SecAuditEngine`.
+    audit_log: Option<AuditLogCallback>,
+
+    /// Files that includes and file-based operators read.
+    rule_data: Arc<dyn RuleData>,
+
+    /// Most rules this parser may compile; `None` is unlimited.
+    rule_limit: Option<usize>,
+
+    /// Set when a budget (include file count, include nesting, rule count) is
+    /// exhausted. Such an error ends the top-level parse even when failed
+    /// directives are skipped: a partial include set must not look successful.
+    budget_exhausted: bool,
 }
 
 impl Parser {
@@ -288,6 +329,7 @@ impl Parser {
         Self {
             state: ParserState::default(),
             include_count: 0,
+            included_files: 0,
             waf_config: WafConfig::new(),
             rules: RuleGroup::new(),
             default_actions: DefaultActions::default(),
@@ -299,11 +341,26 @@ impl Parser {
             custom_actions: BTreeMap::new(),
             custom_body_processors: BTreeMap::new(),
             skip_failed: false,
+            budget_exhausted: false,
             dropping_chain: false,
             skipped: Vec::new(),
             error_log: None,
             debug_logger: None,
+            audit_log: None,
+            rule_data: Arc::new(FileSystem),
+            rule_limit: None,
         }
+    }
+
+    /// Stop parsing once more than `limit` rules have been compiled.
+    ///
+    /// The count includes chain members. Exceeding the limit is an ordinary
+    /// [`ParseError`] naming it; the default is unlimited, so native parsing is
+    /// unchanged.
+    #[must_use]
+    pub fn with_rule_limit(mut self, limit: usize) -> Self {
+        self.rule_limit = Some(limit);
+        self
     }
 
     /// Get reference to the parsed WAF configuration.
@@ -406,9 +463,25 @@ impl Parser {
         self.audit_log_registry.register_formatter(name, formatter);
     }
 
+    /// Read rule files and operator data from `data` instead of the filesystem.
+    ///
+    /// [`Parser::new`] reads from the process filesystem; use this with
+    /// [`Memory`](crate::rule_data::Memory) or another
+    /// [`RuleData`] when no filesystem is available.
+    #[must_use]
+    pub fn with_rule_data(mut self, data: Arc<dyn RuleData>) -> Self {
+        self.rule_data = data;
+        self
+    }
+
     /// Number of rules compiled so far.
     pub fn rule_count(&self) -> usize {
         self.rules.count()
+    }
+
+    /// Number of rules compiled so far, chain members included.
+    pub fn total_rule_count(&self) -> usize {
+        self.rules.total_count()
     }
 
     /// Consume the parser and build a WAF without activating its audit resources.
@@ -429,6 +502,7 @@ impl Parser {
             self.rules,
             self.error_log,
             self.debug_logger,
+            self.audit_log,
             &self.audit_log_registry,
         )
     }
@@ -469,6 +543,14 @@ impl Parser {
         self.rule_observer = Some(Arc::new(observer));
     }
 
+    /// Set a connector-owned sink for audit entries selected by `SecAuditEngine`.
+    ///
+    /// The callback receives the same parts, relevance decision, and phase-5 effects as
+    /// the configured native audit writer. Native sinks remain active when configured.
+    pub fn on_audit_log(&mut self, log: impl Fn(&AuditLog) + Send + Sync + 'static) {
+        self.audit_log = Some(AuditLogCallback::new(log));
+    }
+
     /// Makes later parsing skip directives that fail, instead of stopping at the first one.
     ///
     /// Use this to load a rule set the engine only partly supports. Each skipped
@@ -498,6 +580,12 @@ impl Parser {
     ///
     /// Returns an error with the directive location if parsing or compilation fails.
     ///
+    /// A top-level parse through a non-filesystem
+    /// [`RuleData`](crate::rule_data::RuleData) source reads at most 1024
+    /// included files, including the entry file; files read by
+    /// `@pmFromFile`, `@ipMatchFromFile` and `@validateSchema` come on top of
+    /// that. The default filesystem source has no such limit.
+    ///
     /// # Example
     ///
     /// ```
@@ -509,6 +597,8 @@ impl Parser {
     /// ```
     #[expect(clippy::wrong_self_convention, reason = "Preserves the upstream Parser API name.")]
     pub fn from_string(&mut self, data: &str) -> ParseResult<()> {
+        self.included_files = 0;
+        self.budget_exhausted = false;
         let old_file = std::mem::replace(&mut self.state.current_file, "_inline_".to_owned());
         let old_line = std::mem::take(&mut self.state.current_line);
         let result = self.parse_string(data);
@@ -532,6 +622,12 @@ impl Parser {
     /// Returns an error with the file and directive location if reading, parsing, or
     /// compilation fails.
     ///
+    /// A top-level parse through a non-filesystem
+    /// [`RuleData`](crate::rule_data::RuleData) source reads at most 1024
+    /// included files, including the entry file; files read by
+    /// `@pmFromFile`, `@ipMatchFromFile` and `@validateSchema` come on top of
+    /// that. The default filesystem source has no such limit.
+    ///
     /// # Features
     ///
     /// - Supports glob patterns like `/path/to/rules/*.conf`
@@ -552,6 +648,11 @@ impl Parser {
     #[expect(clippy::wrong_self_convention, reason = "Preserves the upstream Parser API name.")]
     pub fn from_file<P: AsRef<Path>>(&mut self, path: P) -> ParseResult<()> {
         let state = self.state.clone();
+        // A top-level call starts a new budget; nested includes share it.
+        if self.include_count == 0 {
+            self.included_files = 0;
+            self.budget_exhausted = false;
+        }
         let result = self.parse_file(path.as_ref());
         self.state = state;
         result
@@ -566,14 +667,14 @@ impl Parser {
         };
         let pattern = pattern_path.to_string_lossy();
         let files = if pattern.contains('*') {
-            let paths = glob::glob(&pattern)
-                .map_err(|error| self.error(format!("failed to glob pattern '{pattern}': {error}")))?;
-            let mut files = Vec::new();
-            for path in paths {
-                files.push(
-                    path.map_err(|error| self.error(format!("failed to expand glob pattern '{pattern}': {error}")))?,
-                );
-            }
+            let files = self.rule_data.glob(&pattern).map_err(|error| {
+                let failure = if error.kind() == io::ErrorKind::InvalidInput {
+                    "failed to glob pattern"
+                } else {
+                    "failed to expand glob pattern"
+                };
+                self.error(format!("{failure} '{pattern}': {error}"))
+            })?;
             if files.is_empty() {
                 return Err(self.error(format!("glob pattern '{pattern}' matched no files")));
             }
@@ -582,7 +683,17 @@ impl Parser {
             vec![pattern_path]
         };
 
+        // The budget bounds a memory-backed source; native disk parsing keeps
+        // reading as many files as it always has.
+        let budgeted = self.rule_data.as_file_system().is_none();
         for file in files {
+            if budgeted && self.included_files >= MAX_INCLUDED_FILES {
+                return Err(self.budget_error(format!(
+                    "cannot read more than {MAX_INCLUDED_FILES} files in one top-level parse through a \
+                     non-filesystem rule-data source"
+                )));
+            }
+            self.included_files += 1;
             let resolved_path = file.to_string_lossy().into_owned();
             let resolved = file;
             self.state.current_file.clone_from(&resolved_path);
@@ -590,7 +701,7 @@ impl Parser {
                 .parent()
                 .map_or_else(|| ".".to_owned(), |parent| parent.to_string_lossy().into_owned());
 
-            let content = std::fs::read_to_string(&resolved)
+            let content = read_to_string(self.rule_data.as_ref(), &resolved)
                 .map_err(|error| self.error(format!("failed to read file '{resolved_path}': {error}")))?;
             let line = std::mem::take(&mut self.state.current_line);
             let result = self.parse_string(&content);
@@ -613,8 +724,10 @@ impl Parser {
         loop {
             let start = input;
             let directive = written_directive.parse_next(&mut input);
-            // Count the consumed source, including lines inside a backtick block.
-            let read = start.strip_suffix(input).unwrap_or_default();
+            // Count the consumed source, including lines inside a backtick block. `input`
+            // is always a suffix of `start`, so its length gives the consumed prefix:
+            // comparing the whole strings here is quadratic over a large configuration.
+            let read = start.get(..start.len().saturating_sub(input.len())).unwrap_or_default();
             self.state.current_line += read.lines().count();
             let directive = match directive {
                 Ok(directive) => directive,
@@ -634,7 +747,10 @@ impl Parser {
             }
 
             match self.evaluate_line(&directive) {
-                Err(e) if self.skip_failed => {
+                // A budget failure is not a directive the embedder may skip: continuing
+                // would compile every remaining rule before rejecting it, or accept a
+                // truncated include set.
+                Err(e) if self.skip_failed && !self.budget_exhausted => {
                     let chain_status = super::rule_compiler::directive_chain_status(&directive);
                     let discarded_chain = self.rules.discard_open_chain();
                     if let Some(has_chain) = chain_status {
@@ -676,7 +792,7 @@ impl Parser {
         // Special case: Include directive (handled separately due to recursion)
         if directive_lower == "include" {
             if self.include_count >= MAX_INCLUDE_RECURSION {
-                return Err(self.error(format!("cannot include more than {MAX_INCLUDE_RECURSION} files")));
+                return Err(self.budget_error(format!("include nesting exceeds {MAX_INCLUDE_RECURSION} levels")));
             }
             self.include_count += 1;
             let result = self.from_file(&opts);
@@ -688,6 +804,7 @@ impl Parser {
             return Err(self.error(format!("unknown directive \"{directive_name}\"")));
         };
 
+        let adds_rule = matches!(directive_lower.as_str(), "secrule" | "secaction" | "secmarker");
         let result = match directive {
             Directive::WithArgument(_) if opts.is_empty() => Err("requires an argument".to_owned()),
             Directive::WithoutArgument(_) if !opts.is_empty() => Err("takes no argument".to_owned()),
@@ -708,15 +825,33 @@ impl Parser {
                     .with_actions(&self.custom_actions)
                     .with_body_processors(&self.custom_body_processors),
                 rule_observer: self.rule_observer.as_deref(),
+                rule_data: self.rule_data.as_ref(),
                 skip_failed: &mut self.skip_failed,
             }),
         };
-        result.map_err(|message| self.error(format!("failed to compile directive \"{directive_name}\": {message}")))
+        let result = result
+            .map_err(|message| self.error(format!("failed to compile directive \"{directive_name}\": {message}")));
+        if adds_rule
+            && let Some(limit) = self.rule_limit
+            && self.rules.total_count() > limit
+        {
+            return Err(self.budget_error(format!("rule limit of {limit} rules exceeded in one parse")));
+        }
+        result
     }
 
     /// An error at the current position.
     fn error(&self, message: String) -> ParseError {
         ParseError::new(message, self.state.current_line, self.state.current_file.clone())
+    }
+
+    /// A budget error at the current position.
+    ///
+    /// Budgets bound work and must never be skipped: continuing would make a
+    /// truncated include set or rule set look like a successful parse.
+    fn budget_error(&mut self, message: String) -> ParseError {
+        self.budget_exhausted = true;
+        self.error(message)
     }
 }
 
@@ -890,6 +1025,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
         base_dir: options.config_dir,
         datasets: options.datasets,
         custom: (!options.custom_operators.is_empty()).then_some(options.custom_operators),
+        rule_data: options.rule_data,
     };
     let case_sensitive_args_keys = options.waf_config.case_sensitive_args_keys;
     options
@@ -900,6 +1036,7 @@ fn directive_sec_rule(options: &mut DirectiveOptions<'_>) -> Result<(), String> 
         &context,
         options.default_actions,
         options.action_compile_context,
+        options.waf_config.multiphase_evaluation,
     );
     add_rule(options, rule)
 }
@@ -1275,18 +1412,23 @@ fn directive_sec_arguments_limit(options: &mut DirectiveOptions<'_>) -> Result<(
 /// Sets the directory where uploaded files will be stored, which must be writable: as Go
 /// Coraza does, it checks by writing a file in it.
 fn directive_sec_upload_dir(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
-    let probe = Path::new(&options.opts).join(format!(
-        "checkfsfile-{}-{}",
-        std::process::id(),
-        UPLOAD_PROBE_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .map_err(|e| format!("upload directory {} is not writable: {e}", options.opts))?;
-    // A probe that can't be removed is only left behind
-    drop(std::fs::remove_file(&probe));
+    // Without a process filesystem the embedder owns the storage: probing would
+    // create a file in a directory that does not exist here, and on
+    // wasm32-wasip1 `std::fs` and `std::process::id` trap the VM.
+    if options.rule_data.as_file_system().is_some() {
+        let probe = Path::new(&options.opts).join(format!(
+            "checkfsfile-{}-{}",
+            std::process::id(),
+            UPLOAD_PROBE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| format!("upload directory {} is not writable: {e}", options.opts))?;
+        // A probe that can't be removed is only left behind
+        drop(std::fs::remove_file(&probe));
+    }
 
     options.waf_config.upload_dir.clone_from(&options.opts);
     Ok(())
@@ -1523,6 +1665,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::rule_data::Memory;
 
     #[test]
     fn test_split_last_argument() {
@@ -1547,6 +1690,7 @@ mod tests {
         let parser = Parser::new();
         assert_eq!(parser.state.current_line, 0);
         assert_eq!(parser.include_count, 0);
+        assert_eq!(parser.included_files, 0);
     }
 
     #[test]
@@ -1909,7 +2053,7 @@ mod tests {
             ..parser.config().clone()
         };
 
-        let error = Waf::with_rules(config, parser.rules, None, None, &parser.audit_log_registry).unwrap_err();
+        let error = Waf::with_rules(config, parser.rules, None, None, None, &parser.audit_log_registry).unwrap_err();
 
         assert!(error.to_string().contains("case_sensitive_args_keys"));
     }
@@ -1923,6 +2067,25 @@ mod tests {
                 .from_string("SecRule REQUEST_URI \"@contains /\" \"id:1,phase:2,pass\"")
                 .unwrap();
             assert!(parser.into_waf().is_ok(), "{multiphase_evaluation}");
+        }
+    }
+
+    #[test]
+    fn compiled_multiphase_negation_excludes_cross_family_args_names() {
+        for (multiphase, expected_match) in [(false, true), (true, false)] {
+            let mut parser = Parser::new();
+            parser.config_mut().multiphase_evaluation = multiphase;
+            parser
+                .from_string("SecRule ARGS_NAMES|!ARGS:foo \"@streq foo\" \"id:1,phase:1,deny,status:403\"")
+                .unwrap();
+            let waf = parser.compile().unwrap();
+            let mut tx = waf.new_transaction_with_id("compiled-args-negation");
+            tx.add_get_argument("foo", "1");
+
+            let interruption = tx.process_request_headers();
+            let matched = tx.matched_rules().iter().any(|rule| rule.rule.id == 1);
+            assert_eq!(matched, expected_match, "multiphase={multiphase}");
+            assert_eq!(interruption.is_some(), expected_match, "multiphase={multiphase}");
         }
     }
 
@@ -2063,6 +2226,17 @@ On
         assert_eq!(err.line, 3);
         let err = parser.from_string("SecMarker A\nSecDataset d `\na\n\n").unwrap_err();
         assert_eq!((err.line, err.message.as_str()), (4, "backticks left open"));
+    }
+
+    #[test]
+    fn line_accounting_stays_linear_in_the_directive_text() {
+        // The consumed prefix is found by length, so line accounting is linear in the
+        // directive text. Comparing the whole remaining text per directive made this
+        // quadratic: 200k cheap directives took seconds natively and minutes per VM.
+        let text = "SecRuleEngine On\n".repeat(200_000);
+        let mut parser = Parser::new();
+        parser.from_string(&text).unwrap();
+        assert_eq!(parser.total_rule_count(), 0, "no directive compiles a rule");
     }
 
     #[test]
@@ -2409,6 +2583,15 @@ SecWebAppId production
     }
 
     #[test]
+    fn test_sec_upload_dir_memory_source_skips_the_probe() {
+        // The parent does not exist, so the filesystem source would reject this.
+        let upload_dir = "/coraza-memory-source-has-no-directories/upload";
+        let mut parser = Parser::new().with_rule_data(Arc::new(Memory::default()));
+        parser.from_string(&format!("SecUploadDir {upload_dir}")).unwrap();
+        assert_eq!(parser.config().upload_dir, upload_dir);
+    }
+
+    #[test]
     fn test_sec_upload_file_limit() {
         let mut parser = Parser::new();
         assert!(parser.from_string("SecUploadFileLimit 50").is_ok());
@@ -2606,7 +2789,7 @@ SecWebAppId production
         assert!(result.is_err());
         assert_eq!(parser.include_count, 0);
         if let Err(e) = result {
-            assert!(e.message.contains("cannot include more than"));
+            assert!(e.message.contains("include nesting exceeds"), "{e:?}");
         }
 
         // Cleanup
@@ -2653,6 +2836,234 @@ SecWebAppId production
         if let Err(e) = result {
             assert!(e.message.contains("failed to read file"));
         }
+    }
+
+    #[test]
+    fn include_reads_a_rule_from_memory_and_matches() {
+        let data = Memory::new([(
+            "rules/main.conf".to_owned(),
+            b"SecRule ARGS:q \"@contains attack\" \"id:1,phase:1,deny\"\n".to_vec(),
+        )]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser.from_file("rules/main.conf").unwrap();
+        assert_eq!(parser.rule_count(), 1);
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("memory-include");
+        tx.add_get_argument("q", "attack here");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
+    }
+
+    #[test]
+    fn include_glob_from_memory_keeps_sorted_order() {
+        let data = Memory::new([
+            ("rules/20-b.conf".to_owned(), b"SecComponentSignature \"B\"\n".to_vec()),
+            ("rules/10-a.conf".to_owned(), b"SecComponentSignature \"A\"\n".to_vec()),
+            ("rules/30-c.conf".to_owned(), b"SecComponentSignature \"C\"\n".to_vec()),
+        ]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser.from_file("rules/*.conf").unwrap();
+
+        assert_eq!(parser.config().component_names, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn pm_from_file_resolves_from_memory() {
+        let data = Memory::new([("phrases.txt".to_owned(), b"# comment\nattack\nscanner\n".to_vec())]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser
+            .from_string("SecRule ARGS:q \"@pmFromFile phrases.txt\" \"id:1,phase:1,deny\"")
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("memory-pm");
+        tx.add_get_argument("q", "ATTACK");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
+    }
+
+    #[test]
+    fn ip_match_from_file_resolves_from_memory() {
+        let data = Memory::new([("networks.txt".to_owned(), b"# comment\n203.0.113.0/24\n".to_vec())]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser
+            .from_string("SecRule REMOTE_ADDR \"@ipMatchFromFile networks.txt\" \"id:2,phase:1,deny\"")
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("memory-ip");
+        tx.set_remote_addr("203.0.113.7");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 2));
+    }
+
+    #[test]
+    fn nested_include_resolves_through_memory() {
+        let data = Memory::new([
+            ("rules/main.conf".to_owned(), b"Include sub/*.conf\n".to_vec()),
+            ("rules/sub/child.conf".to_owned(), b"Include deep/grand.conf\n".to_vec()),
+            (
+                "rules/sub/deep/grand.conf".to_owned(),
+                b"SecWebAppId from_nested_memory\n".to_vec(),
+            ),
+        ]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+
+        parser.from_file("./rules/main.conf").unwrap();
+        assert_eq!(parser.config().web_app_id, "from_nested_memory");
+    }
+
+    #[test]
+    fn include_nesting_is_not_skipped_when_failed_directives_are_enabled() {
+        let data = Memory::new([("self.conf".to_owned(), b"Include self.conf\n".to_vec())]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser.skip_failed_directives();
+
+        let error = parser.from_file("self.conf").unwrap_err();
+        assert!(error.message.contains("include nesting exceeds"), "{error:?}");
+    }
+
+    #[test]
+    fn include_recursion_limit_applies_through_memory() {
+        let data = Memory::new([("self.conf".to_owned(), b"Include self.conf\n".to_vec())]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+
+        let error = parser.from_file("self.conf").unwrap_err();
+        assert!(error.message.contains("include nesting exceeds"), "{error:?}");
+        assert_eq!(parser.include_count, 0);
+    }
+
+    #[test]
+    fn include_budget_stops_a_fan_out_dag() {
+        // Each level includes the next twice, so an unbounded parse reads
+        // 2^11 - 1 files; the budget must stop it long before that.
+        let depth = 10;
+        let mut files = Vec::new();
+        for level in 0..depth {
+            files.push((
+                format!("rules/{level}.conf"),
+                format!("Include {}.conf\nInclude {}.conf\n", level + 1, level + 1).into_bytes(),
+            ));
+        }
+        files.push((format!("rules/{depth}.conf"), b"SecWebAppId end\n".to_vec()));
+        let mut parser = Parser::new().with_rule_data(Arc::new(Memory::new(files)));
+
+        let error = parser.from_file("rules/0.conf").unwrap_err();
+        assert!(error.message.contains("cannot read more than 1024 files"), "{error:?}");
+        assert!(error.message.contains("one top-level parse"), "{error:?}");
+    }
+
+    #[test]
+    fn include_budget_is_not_skipped_when_failed_directives_are_enabled() {
+        let depth = 10;
+        let mut files = Vec::new();
+        for level in 0..depth {
+            files.push((
+                format!("rules/{level}.conf"),
+                format!("Include {}.conf\nInclude {}.conf\n", level + 1, level + 1).into_bytes(),
+            ));
+        }
+        files.push((format!("rules/{depth}.conf"), b"SecWebAppId end\n".to_vec()));
+        let mut parser = Parser::new().with_rule_data(Arc::new(Memory::new(files)));
+        parser.skip_failed_directives();
+
+        let error = parser.from_file("rules/0.conf").unwrap_err();
+        assert!(error.message.contains("cannot read more than 1024 files"), "{error:?}");
+    }
+
+    #[test]
+    fn include_budget_resets_after_a_failure() {
+        let mut files = Vec::new();
+        for level in 0..10 {
+            files.push((
+                format!("rules/{level}.conf"),
+                format!("Include {}.conf\nInclude {}.conf\n", level + 1, level + 1).into_bytes(),
+            ));
+        }
+        files.push(("rules/10.conf".to_owned(), b"SecWebAppId after_failure\n".to_vec()));
+        let mut parser = Parser::new().with_rule_data(Arc::new(Memory::new(files)));
+
+        assert!(parser.from_file("rules/0.conf").is_err());
+        // A new top-level parse starts a new budget.
+        parser.from_file("rules/10.conf").unwrap();
+        assert_eq!(parser.config().web_app_id, "after_failure");
+    }
+
+    #[test]
+    fn the_filesystem_source_has_no_include_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2000 files: well past the 1024-file budget a memory source gets.
+        for index in 0..2000 {
+            std::fs::write(dir.path().join(format!("{index:05}.conf")), "SecRuleEngine On\n").unwrap();
+        }
+        let pattern = dir.path().join("*.conf").to_string_lossy().into_owned();
+
+        let mut parser = Parser::new();
+        parser.from_file(&pattern).unwrap();
+    }
+
+    #[test]
+    fn pm_and_ip_match_aliases_resolve_from_memory() {
+        let data = Memory::new([
+            ("phrases.txt".to_owned(), b"attack\n".to_vec()),
+            ("networks.txt".to_owned(), b"203.0.113.0/24\n".to_vec()),
+        ]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data));
+        parser
+            .from_string(
+                r#"
+                SecRule ARGS:q "@pmf phrases.txt" "id:3,phase:1,pass"
+                SecRule REMOTE_ADDR "@ipMatchF networks.txt" "id:4,phase:1,deny"
+                "#,
+            )
+            .unwrap();
+
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("memory-aliases");
+        tx.add_get_argument("q", "ATTACK");
+        tx.set_remote_addr("203.0.113.7");
+        tx.process_request_headers();
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 3));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 4));
+    }
+
+    #[test]
+    fn a_memory_source_never_falls_back_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("present.conf"), "SecWebAppId from_disk\n").unwrap();
+        std::fs::write(dir.path().join("phrases.txt"), "attack\n").unwrap();
+        let mut parser = Parser::new().with_rule_data(Arc::new(Memory::default()));
+        // The files exist on disk, but the resolved path is absolute, which the
+        // memory source rejects instead of reading the filesystem.
+        parser.state.current_dir = dir.path().to_string_lossy().into_owned();
+
+        let error = parser.from_string("Include present.conf").unwrap_err();
+        assert!(error.message.contains("rule data path is absolute"), "{error:?}");
+        assert!(error.message.contains("present.conf"), "{error:?}");
+
+        let error = parser
+            .from_string(r#"SecRule ARGS:q "@pmf phrases.txt" "id:1,phase:1,deny""#)
+            .unwrap_err();
+        assert!(error.message.contains("rule data path is absolute"), "{error:?}");
+        assert!(error.message.contains("phrases.txt"), "{error:?}");
+    }
+
+    #[test]
+    fn a_missing_memory_include_has_the_disk_diagnostic_shape() {
+        let name = format!("coraza-missing-include-{}.conf", std::process::id());
+        let mut memory = Parser::new().with_rule_data(Arc::new(Memory::default()));
+        let memory_error = memory.from_string(&format!("Include {name}")).unwrap_err();
+        let mut disk = Parser::new();
+        let disk_error = disk.from_string(&format!("Include {name}")).unwrap_err();
+
+        let shape = format!("failed to read file '{name}': ");
+        assert!(memory_error.message.starts_with(&shape), "{memory_error:?}");
+        assert!(disk_error.message.starts_with(&shape), "{disk_error:?}");
+        assert_eq!(memory_error.file, name);
+        assert_eq!(disk_error.file, name);
+        assert_eq!(memory_error.line, 1);
+        assert_eq!(disk_error.line, 1);
     }
 
     // ===== Rule directives =====
@@ -3003,5 +3414,107 @@ SecWebAppId production
         assert!(parser.rules.find_by_id(3).is_some());
         assert_eq!(parser.rule_count(), 1);
         assert_eq!(parser.skipped().len(), 2);
+    }
+
+    #[test]
+    fn rule_limit_accepts_the_boundary_and_rejects_one_more() {
+        let rules = (1..=3)
+            .map(|id| format!("SecAction \"id:{id},pass\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut at_limit = Parser::new().with_rule_limit(3);
+        at_limit.from_string(&rules).unwrap();
+        assert_eq!(at_limit.rule_count(), 3, "exactly the limit is accepted");
+
+        let mut over = Parser::new().with_rule_limit(3);
+        let error = over
+            .from_string(&format!("{rules}\nSecAction \"id:4,pass\""))
+            .unwrap_err();
+        assert!(error.message.contains("rule limit of 3 rules"), "{error:?}");
+        assert_eq!(over.rule_count(), 4, "parsing stops at limit + 1, not at the end");
+    }
+
+    #[test]
+    fn rule_limit_bounds_a_newline_packed_directive_string() {
+        let packed = (1..=100)
+            .map(|id| format!("SecAction \"id:{id},pass\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut parser = Parser::new().with_rule_limit(2);
+        let error = parser.from_string(&packed).unwrap_err();
+        assert!(error.message.contains("rule limit of 2 rules"), "{error:?}");
+        assert_eq!(parser.rule_count(), 3, "the packed string stops at limit + 1");
+    }
+
+    #[test]
+    fn rule_limit_bounds_an_include_expansion() {
+        let rules = (1..=100)
+            .map(|id| format!("SecAction \"id:{id},pass\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = Memory::new([("many.conf".to_owned(), rules.into_bytes())]);
+        let mut parser = Parser::new().with_rule_data(Arc::new(data)).with_rule_limit(2);
+        let error = parser.from_string("Include many.conf").unwrap_err();
+        assert!(error.message.contains("rule limit of 2 rules"), "{error:?}");
+        assert_eq!(parser.rule_count(), 3, "the included file stops at limit + 1");
+    }
+
+    #[test]
+    fn rule_limit_aborts_even_when_failed_directives_are_skipped() {
+        let packed = (1..=100)
+            .map(|id| format!("SecAction \"id:{id},pass\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut parser = Parser::new().with_rule_limit(2);
+        parser.skip_failed_directives();
+        let error = parser.from_string(&packed).unwrap_err();
+        assert!(error.message.contains("rule limit of 2 rules"), "{error:?}");
+        assert_eq!(parser.rule_count(), 3, "a skipped-directive parser still aborts");
+    }
+
+    #[test]
+    fn rule_limit_counts_rules_removed_by_directives() {
+        let mut parser = Parser::new().with_rule_limit(2);
+        let error = parser
+            .from_string(
+                "SecAction \"id:1,pass\"\n\
+                 SecAction \"id:2,pass\"\n\
+                 SecRuleRemoveById 1 2\n\
+                 SecAction \"id:3,pass\"",
+            )
+            .unwrap_err();
+        assert!(
+            error.message.contains("rule limit of 2 rules"),
+            "removing rules must not refund the budget: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rule_limit_stops_duplicate_ids_when_failed_directives_are_skipped() {
+        let mut parser = Parser::new().with_rule_limit(2);
+        parser.skip_failed_directives();
+        let error = parser
+            .from_string(
+                "SecAction \"id:1,pass\"\n\
+                 SecAction \"id:1,pass\"\n\
+                 SecAction \"id:1,pass\"",
+            )
+            .unwrap_err();
+        assert!(
+            error.message.contains("rule limit of 2 rules"),
+            "rejected compiles must still count: {error:?}"
+        );
+    }
+
+    #[test]
+    fn no_rule_limit_leaves_parsing_unlimited() {
+        let rules = (1..=100)
+            .map(|id| format!("SecAction \"id:{id},pass\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut parser = Parser::new();
+        parser.from_string(&rules).unwrap();
+        assert_eq!(parser.rule_count(), 100);
     }
 }

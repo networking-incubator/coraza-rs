@@ -104,6 +104,15 @@ pub struct WafConfig {
     /// Maximum request body size, in bytes (`SecRequestBodyLimit`).
     pub request_body_limit: i64,
 
+    /// Host policy ceiling, in bytes, on the request body limit a transaction may set
+    /// with `ctl:requestBodyLimit` or make effective with `ctl:requestBodyAccess=On`.
+    ///
+    /// `0`, the default, means no ceiling, so `ctl` behaves exactly as before. A positive
+    /// value also clamps the effective limit to a positive
+    /// [`Self::request_body_in_memory_limit`], so a `ctl` cannot reintroduce spill. This
+    /// is a host setting, not a `SecLang` directive.
+    pub max_request_body_limit: i64,
+
     /// Request body bytes kept in memory before spilling to a private temporary file
     /// (`SecRequestBodyInMemoryLimit`).
     ///
@@ -130,6 +139,13 @@ pub struct WafConfig {
     /// Maximum response body size, in bytes (`SecResponseBodyLimit`).
     pub response_body_limit: i64,
 
+    /// Host policy ceiling, in bytes, on the response body limit a transaction may set
+    /// with `ctl:responseBodyLimit` or make effective with `ctl:responseBodyAccess=On`.
+    ///
+    /// `0`, the default, means no ceiling, so `ctl` behaves exactly as before. This is a
+    /// host setting, not a `SecLang` directive.
+    pub max_response_body_limit: i64,
+
     /// What happens when the response body exceeds its limit (`SecResponseBodyLimitAction`).
     pub response_body_limit_action: BodyLimitAction,
 
@@ -147,6 +163,13 @@ pub struct WafConfig {
 
     /// Audit logging mode (`SecAuditEngine`).
     pub audit_engine: AuditEngineStatus,
+
+    /// Host policy: whether `ctl:auditEngine` may change [`Self::audit_engine`].
+    ///
+    /// `false`, the default, applies the action, as before. `true` ignores it, so an
+    /// embedder with no audit sink cannot be made to retain an audit copy of the request
+    /// body at request time. This is a host setting, not a `SecLang` directive.
+    pub audit_engine_locked: bool,
 
     /// Target of the audit log, empty when unset (`SecAuditLog`): a file path for
     /// `Serial` and `Concurrent`, a syslog target for `Syslog`, and an endpoint URL
@@ -268,6 +291,10 @@ pub struct WafConfig {
     /// Permission bits for stored uploaded files, e.g. `0o600` (`SecUploadFileMode`).
     pub upload_file_mode: u32,
 
+    /// Host policy: reject multipart requests that contain file parts before any upload
+    /// is written to a temporary file. `false`, the default, preserves native behavior.
+    pub reject_multipart_file_uploads: bool,
+
     /// Whether uploaded files are kept after the transaction ends
     /// (`SecUploadKeepFiles`).
     pub upload_keep_files: UploadKeepFiles,
@@ -280,6 +307,7 @@ impl Default for WafConfig {
             rule_engine: RuleEngineStatus::On,
             request_body_access: false,
             request_body_limit: 128 * 1024 * 1024,
+            max_request_body_limit: 0,
             // Unset; the effective limit follows request_body_limit, as in Go
             // (internal/corazawaf/waf.go:242-247), so the default path never spills.
             request_body_in_memory_limit: 0,
@@ -287,11 +315,13 @@ impl Default for WafConfig {
             request_body_limit_action: BodyLimitAction::Reject,
             response_body_access: false,
             response_body_limit: 512 * 1024,
+            max_response_body_limit: 0,
             response_body_limit_action: BodyLimitAction::ProcessPartial,
             response_body_mime_types: Vec::new(),
             request_body_json_depth_limit: DEFAULT_JSON_DEPTH_LIMIT,
             response_body_json_depth_limit: DEFAULT_JSON_DEPTH_LIMIT,
             audit_engine: AuditEngineStatus::Off,
+            audit_engine_locked: false,
             audit_log: String::new(),
             audit_log_format: AuditLogFormat::Native,
             audit_log_parts: vec![
@@ -326,6 +356,7 @@ impl Default for WafConfig {
             upload_dir: String::new(),
             upload_file_limit: 100,
             upload_file_mode: 0o600,
+            reject_multipart_file_uploads: false,
             upload_keep_files: UploadKeepFiles::Off,
         }
     }
@@ -347,9 +378,12 @@ mod tests {
         let config = WafConfig::default();
         assert_eq!(config.rule_engine, RuleEngineStatus::On);
         assert_eq!(config.request_body_limit, 134_217_728);
+        assert_eq!(config.max_request_body_limit, 0);
         assert_eq!(config.request_body_in_memory_limit, 0);
         assert_eq!(config.response_body_limit, 524_288);
+        assert_eq!(config.max_response_body_limit, 0);
         assert_eq!(config.audit_engine, AuditEngineStatus::Off);
+        assert!(!config.audit_engine_locked, "a host must opt in to locking the engine");
         assert_eq!(config.argument_limit, 1000);
         assert!(!config.case_sensitive_args_keys);
         assert!(!config.multiphase_evaluation);

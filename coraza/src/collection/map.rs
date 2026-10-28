@@ -29,7 +29,12 @@
 //! Text interfaces use the lossy view described on [`Map::iter`]; they never decide which
 //! entries exist.
 
-use std::{borrow::Cow, collections::HashMap, hash::Hash};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    hash::Hash,
+    mem::{align_of, size_of},
+};
 
 use regex::Regex;
 
@@ -99,6 +104,14 @@ impl Key {
         match self {
             Self::Text(text) => text,
             Self::Bytes { lossy, .. } => lossy,
+        }
+    }
+
+    /// Bytes held by this key's string or byte backing allocations.
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Text(text) => text.capacity(),
+            Self::Bytes { bytes, lossy } => bytes.len().saturating_add(lossy.capacity()),
         }
     }
 }
@@ -434,6 +447,48 @@ impl Map {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Estimated bytes held by this map's backing allocations.
+    ///
+    /// The estimate is deliberately conservative. `HashMap` never shrinks its table
+    /// when entries are removed, and its capacity is an element count, not the number
+    /// of allocated buckets, so the table is sized from the bucket count with one
+    /// control byte per bucket plus an allocator alignment allowance.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let mut total = hash_table_bytes::<(Key, Vec<KeyValue>)>(self.data.capacity());
+        for (key, values) in &self.data {
+            total = total.saturating_add(key.allocated_bytes());
+            total = total.saturating_add(values.capacity().saturating_mul(size_of::<KeyValue>()));
+            for value in values {
+                total = total
+                    .saturating_add(value.key.allocated_bytes())
+                    .saturating_add(value.value.capacity());
+            }
+        }
+        total
+    }
+}
+
+/// Estimated bytes of a `HashMap` table that can hold `capacity` elements.
+///
+/// Mirrors the standard library's capacity-to-bucket mapping (at least four buckets,
+/// otherwise `(capacity + 1) * 8 / 7` rounded up to a power of two) so the estimate
+/// over-counts rather than under-counts, including an allowance for allocator
+/// alignment. The table never shrinks on removal, so a cleared map keeps its cost.
+fn hash_table_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = capacity
+        .saturating_add(1)
+        .saturating_mul(8)
+        .div_ceil(7)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .max(4);
+    buckets
+        .saturating_mul(size_of::<T>().saturating_add(1))
+        .saturating_add(align_of::<T>().saturating_mul(2))
 }
 
 impl std::fmt::Display for Map {
@@ -457,6 +512,24 @@ impl std::fmt::Display for Map {
 
 #[cfg(test)]
 mod tests {
+    use super::hash_table_bytes;
+
+    #[test]
+    fn table_estimate_covers_capacity_and_never_undercounts() {
+        for capacity in [0_usize, 1, 2, 3, 4, 7, 8, 9, 15, 16, 100, 1024] {
+            let bytes = hash_table_bytes::<(u64, u64)>(capacity);
+            assert!(
+                bytes >= capacity.saturating_mul(size_of::<(u64, u64)>() + 1),
+                "capacity {capacity} underestimated: {bytes}"
+            );
+        }
+        assert_eq!(hash_table_bytes::<(u64, u64)>(0), 0, "an empty map has no table");
+        assert!(
+            hash_table_bytes::<(u64, u64)>(9) >= hash_table_bytes::<(u64, u64)>(8),
+            "the estimate must not shrink as capacity grows"
+        );
+    }
+
     use super::*;
 
     #[test]
