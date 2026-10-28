@@ -1,0 +1,824 @@
+[
+  {
+    "id": "config-empty",
+    "plugin_configuration": "",
+    "assert": "record configure.accepted for empty plugin configuration",
+    "topics": [
+      "config.default-policy"
+    ]
+  },
+  {
+    "id": "config-whitespace",
+    "plugin_configuration": " \n\t ",
+    "assert": "record configure.accepted for ASCII whitespace-only plugin configuration",
+    "topics": [
+      "config.default-policy"
+    ]
+  },
+  {
+    "id": "config-empty-object",
+    "plugin_configuration": "{}",
+    "assert": "record configure.accepted for {} plugin configuration",
+    "topics": [
+      "config.default-policy"
+    ]
+  },
+  {
+    "id": "config-root-scalar",
+    "plugin_configuration": "null",
+    "assert": "record configure result and request/response behavior for a valid scalar root config",
+    "request": {
+      "method": "GET",
+      "path": "/root-scalar",
+      "headers": [],
+      "body_base64": ""
+    },
+    "topics": [
+      "config.root-scalar"
+    ]
+  },
+  {
+    "id": "config-deprecated-rules",
+    "plugin_configuration": "{\"rules\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1001,phase:1,deny,status:403\\\"\"]}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe deprecated rules configuration with a deny rule for the request; record response status and backend receipt.",
+    "topics": [
+      "config.deprecated-rules"
+    ]
+  },
+  {
+    "id": "config-directives-map-invalid-type",
+    "plugin_configuration": "{\"directives_map\":\"SecRuleEngine On\\nSecRule REQUEST_URI \\\"@streq /scalar-map\\\" \\\"id:1060,phase:1,deny,status:403\\\"\"}",
+    "assert": "records upstream configure behavior when directives_map itself has the wrong scalar shape",
+    "topics": [
+      "config.directives-map-invalid-type"
+    ]
+  },
+  {
+    "id": "config-scalar-policy-directives-map",
+    "plugin_configuration": "{\"directives_map\":{\"default\":\"SecRuleEngine On\\nSecRule REQUEST_URI \\\"@streq /scalar-map\\\" \\\"id:1060,phase:1,deny,status:403\\\"\"},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/scalar-map"
+    },
+    "assert": "Probe scalar directives_map.default with the request targeted by its configured rule; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.directives-map-policy-scalar"
+    ]
+  },
+  {
+    "id": "config-directives-map-policy-object",
+    "plugin_configuration": "{\"directives_map\":{\"default\":{\"first\":\"SecRuleEngine On\"}},\"default_directives\":\"default\"}",
+    "assert": "Probe an object-valued directives_map policy; record configure.accepted and configure.error.",
+    "topics": [
+      "config.directives-map-policy-object"
+    ]
+  },
+  {
+    "id": "config-directives-map-array-containers",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",{\"directive\":\"SecRule REQUEST_URI \\\"@streq /shape\\\" \\\"id:1070,phase:1,deny\\\"\"},[\"SecRule REQUEST_URI \\\"@streq /shape\\\" \\\"id:1071,phase:1,deny\\\"\"]]},\"default_directives\":\"default\"}",
+    "assert": "Probe object and array entries in a directive array; record configure.accepted and configure.error.",
+    "topics": [
+      "config.directives-map-array-containers"
+    ]
+  },
+  {
+    "id": "config-scalar-deprecated-rules",
+    "plugin_configuration": "{\"rules\":\"SecRuleEngine On\\nSecRule REQUEST_URI \\\"@streq /scalar-rules\\\" \\\"id:1061,phase:1,deny,status:403\\\"\"}",
+    "request": {
+      "method": "GET",
+      "path": "/scalar-rules"
+    },
+    "assert": "Probe scalar deprecated rules configuration with a deny rule for the request; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.deprecated-rules-scalar"
+    ]
+  },
+  {
+    "id": "config-numeric-default-directives",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":7}",
+    "assert": "records upstream configure behavior when default_directives is numeric",
+    "topics": [
+      "config.default-directives-invalid-type"
+    ]
+  },
+  {
+    "id": "config-rules-null",
+    "plugin_configuration": "{\"rules\":null}",
+    "assert": "Probe rules:null configuration handling; record configure.accepted and configure.error.",
+    "topics": [
+      "config.rules-null"
+    ]
+  },
+  {
+    "id": "config-authority-map-invalid-type",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\",\"per_authority_directives\":[]}",
+    "assert": "Probe a non-object per_authority_directives value; record configure.accepted and configure.error.",
+    "topics": [
+      "config.authority-map-invalid-type"
+    ]
+  },
+  {
+    "id": "config-authority-value-invalid-type",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"],\"other\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":[\"other\"]}}",
+    "assert": "Probe a non-scalar authority mapping value; record configure.accepted and configure.error.",
+    "topics": [
+      "config.authority-value-invalid-type"
+    ]
+  },
+  {
+    "id": "config-directive-order",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /ordered\\\" \\\"id:1002,phase:1,pass,log,msg:'first'\\\"\",\"SecRule REQUEST_URI \\\"@streq /ordered\\\" \\\"id:1003,phase:1,pass,log,msg:'second'\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/ordered"
+    },
+    "assert": "Probe a request configured for two rule conditions with distinct IDs and actions; record their ordered rule matches.",
+    "topics": [
+      "config.directive-order"
+    ]
+  },
+  {
+    "id": "config-authority-selection",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1035,phase:1,deny,status:403\\\"\"],\"other\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1036,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":\"other\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/authority-deny",
+      "authority": "waf.example"
+    },
+    "assert": "Probe exact-authority policy mapping with a deny rule configured for the request; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.authority"
+    ]
+  },
+  {
+    "id": "config-missing-policy-reference",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"missing\"}",
+    "assert": "Probe a missing policy reference; record configure.accepted and configure.error.",
+    "topics": [
+      "config.policy-selection"
+    ]
+  },
+  {
+    "id": "config-missing-authority-policy-reference",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":\"missing\"}}",
+    "assert": "Probe an authority mapping that names an absent policy; record configure.accepted and configure.error.",
+    "topics": [
+      "config.authority-missing-policy-reference"
+    ]
+  },
+  {
+    "id": "config-unknown-key-and-duplicate-key",
+    "plugin_configuration": "{\"unknown\":true,\"default_directives\":\"first\",\"default_directives\":\"last\",\"directives_map\":{\"first\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /duplicate-policy\\\" \\\"id:1021,phase:1,deny,status:403\\\"\"] ,\"last\":[\"SecRuleEngine Off\",\"SecRule REQUEST_URI \\\"@streq /duplicate-policy\\\" \\\"id:1022,phase:1,deny,status:403\\\"\"]}}",
+    "assert": "records the observed response status, backend receipt, and rule matches for unknown and duplicate keys; no selected-policy outcome is prescribed before capture",
+    "topics": [
+      "config.unknown-duplicate-keys"
+    ],
+    "request": {
+      "method": "GET",
+      "path": "/duplicate-policy"
+    }
+  },
+  {
+    "id": "bundle-aliases",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"Include @recommended-conf\",\"Include @crs-setup-conf\",\"Include @owasp_crs/*.conf\"]},\"default_directives\":\"default\"}",
+    "assert": "Probe the three embedded include aliases; record configure.accepted and defer expanded rule ordering.",
+    "topics": [
+      "bundle.recommended",
+      "bundle.crs-setup",
+      "bundle.owasp"
+    ]
+  },
+  {
+    "id": "rule-phase-one-deny",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1003,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe a phase-one deny rule; record response status, backend receipt, and transaction/interruption metric deltas and labels.",
+    "topics": [
+      "lifecycle.request-interruption",
+      "metrics.tx-total",
+      "metrics.interruption"
+    ]
+  },
+  {
+    "id": "rule-phase-two-body-deny",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule ARGS \\\"@streq attack\\\" \\\"id:1004,phase:request,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "Y21kPWF0dGFjaw=="
+    },
+    "assert": "Probe phase-two form-body inspection with a deny rule; record response status, backend receipt, rule matches, and transaction/interruption metric observations.",
+    "topics": [
+      "lifecycle.request-interruption",
+      "metrics.phase-two-interruption"
+    ]
+  },
+  {
+    "id": "rule-phase-three-response-header-deny",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule RESPONSE_HEADERS:x-phase \\\"@streq block\\\" \\\"id:1080,phase:3,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/phase-three"
+    },
+    "backend_response": {
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/plain"
+        ],
+        [
+          "x-phase",
+          "block"
+        ]
+      ],
+      "body_base64": "cGhhc2UtdGhyZWUtYm9keQ=="
+    },
+    "assert": "Probe phase-3 response-header rule timing; record response status, headers, body, backend receipt, rule matches, and whether headers arrived before body completion.",
+    "topics": [
+      "engine.phase-three"
+    ],
+    "host_scenarios": [
+      "pause-after-response-headers-before-body"
+    ]
+  },
+  {
+    "id": "rule-chain-and-ctl",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /chain\\\" \\\"id:1005,phase:1,pass,chain\\\"\",\"SecRule REQUEST_METHOD \\\"@streq GET\\\" \\\"ctl:ruleEngine=Off\\\"\",\"SecRule REQUEST_URI \\\"@streq /chain\\\" \\\"id:1006,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/chain"
+    },
+    "assert": "Probe GET /chain against the URI parent and GET child with ctl:ruleEngine=Off; record response status, backend receipt, ordered rule matches, and match-list completeness/later-deny observations.",
+    "topics": [
+      "engine.chains-controls"
+    ]
+  },
+  {
+    "id": "rule-multiphase-early-block",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecAction \\\"id:1006,phase:1,pass,setvar:tx.blocking_paranoia_level=1\\\"\",\"SecRule TX:blocking_paranoia_level \\\"@eq 1\\\" \\\"id:1007,phase:2,deny,status:403,chain\\\"\",\"SecRule REQUEST_URI \\\"@streq /early-block\\\" \\\"t:none\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/early-block",
+      "headers": [
+        [
+          "content-type",
+          "text/plain"
+        ]
+      ]
+    },
+    "assert": "Probe a phase-1 TX variable read by a phase-2 chain with REQUEST_URI; record response status, backend receipt, and whether rule 1007 interrupts before request-body completion.",
+    "topics": [
+      "engine.multiphase"
+    ],
+    "host_scenarios": [
+      "await-early-response-before-request-body-complete"
+    ]
+  },
+  {
+    "id": "rule-detection-only-and-off",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1008,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe the same deny-rule request under DetectionOnly and Off; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "lifecycle.detection-only"
+    ]
+  },
+  {
+    "id": "http-benign-byte-exact",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/echo",
+      "headers": [
+        [
+          "x-repeat",
+          "one"
+        ],
+        [
+          "x-repeat",
+          "two"
+        ]
+      ],
+      "body_base64": "AAECAwQ="
+    },
+    "assert": "Probe benign byte-exact HTTP forwarding; record response status/body and backend receipt with forwarded method, path, headers, and body.",
+    "topics": [
+      "http.byte-exact",
+      "lifecycle.allow"
+    ]
+  },
+  {
+    "id": "http-duplicate-headers-cookies",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/",
+      "body_base64": "AAECAwQ=",
+      "headers": [
+        [
+          "cookie",
+          "a=1"
+        ],
+        [
+          "cookie",
+          "b=2"
+        ],
+        [
+          "x-repeat",
+          "one"
+        ],
+        [
+          "x-repeat",
+          "two"
+        ]
+      ]
+    },
+    "assert": "Probe ordered duplicate request headers and cookies; record backend receipt and the forwarded method, path, headers, and body.",
+    "topics": [
+      "http.duplicate-headers",
+      "lifecycle.allow"
+    ]
+  },
+  {
+    "id": "http-response-interruption",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule RESPONSE_BODY \\\"@contains secret\\\" \\\"id:1009,phase:response,deny,status:451\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/response-secret"
+    },
+    "assert": "Probe phase-4 response-rule rewriting; record status, headers, body, trailers, whether sensitive upstream pairs are withheld, and backend receipt.",
+    "topics": [
+      "lifecycle.response-interruption",
+      "http.response-header-trailer-rewrite"
+    ],
+    "backend_response": {
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/plain"
+        ],
+        [
+          "x-upstream-secret",
+          "header-secret"
+        ]
+      ],
+      "body_base64": "c2VjcmV0",
+      "trailers": [
+        [
+          "x-upstream-secret-trailer",
+          "trailer-secret"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "http-empty-body-and-trailers",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/trailers",
+      "body_base64": "",
+      "trailers": [
+        [
+          "x-end",
+          "done"
+        ]
+      ]
+    },
+    "assert": "Probe an empty request body completed by a trailer callback; record response status, backend receipt, and forwarded request trailers/body/method/path.",
+    "topics": [
+      "lifecycle.empty-body",
+      "lifecycle.trailers"
+    ]
+  },
+  {
+    "id": "http-request-body-limit-below",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRequestBodyLimit 10\",\"SecRule ARGS \\\"@streq attack\\\" \\\"id:1081,phase:2,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/body-limit",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "Y21kPWF0dGFj"
+    },
+    "assert": "Probe a 9-byte form body with a 10-byte limit (N-1); record response status, backend receipt/body, and rule matches.",
+    "topics": [
+      "http.request-body-limit.below"
+    ],
+    "host_scenarios": [
+      "body-size-9"
+    ]
+  },
+  {
+    "id": "http-request-body-limit-at",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRequestBodyLimit 10\",\"SecRule ARGS \\\"@streq attack\\\" \\\"id:1081,phase:2,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/body-limit",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "Y21kPWF0dGFjaw=="
+    },
+    "assert": "Probe a 10-byte form body with a 10-byte limit (N); record response status, backend receipt/body, and rule matches.",
+    "topics": [
+      "http.request-body-limit.at"
+    ],
+    "host_scenarios": [
+      "body-size-10"
+    ]
+  },
+  {
+    "id": "http-request-body-limit-above",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRequestBodyLimit 10\",\"SecRule ARGS \\\"@streq attack\\\" \\\"id:1081,phase:2,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/body-limit",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "Y21kPWF0dGFja3g="
+    },
+    "assert": "Probe an 11-byte form body with a 10-byte limit (N+1); record response status, backend receipt/body, and rule matches.",
+    "topics": [
+      "http.request-body-limit.above"
+    ],
+    "host_scenarios": [
+      "body-size-11"
+    ]
+  },
+  {
+    "id": "ops-reload-and-inflight-stream",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /reload-deny\\\" \\\"id:1040,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "assert": "Probe an in-flight request across a reload from an enforcing generation to DetectionOnly; record reload acceptance and both response statuses.",
+    "topics": [
+      "lifecycle.reload"
+    ],
+    "reload_plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /reload-deny\\\" \\\"id:1041,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "host_scenarios": [
+      "hold-request-before-reload",
+      "reload-with-inflight-stream",
+      "repeat-request-after-reload"
+    ],
+    "request": {
+      "method": "GET",
+      "path": "/reload-deny"
+    }
+  },
+  {
+    "id": "ops-reset-abort-finalize-once",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "assert": "Probe reset, abort, local-reply, and normal-finish terminal paths; record each finalization-call count.",
+    "topics": [
+      "lifecycle.reset-abort"
+    ],
+    "host_scenarios": [
+      "reset",
+      "abort",
+      "local-reply",
+      "normal-finish"
+    ]
+  },
+  {
+    "id": "ops-reset-while-headers-held",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule ARGS \\\"@streq attack\\\" \\\"id:1082,phase:2,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "POST",
+      "path": "/reset-held",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "Y21kPWF0dGFjaw=="
+    },
+    "assert": "Probe reset while request headers are held for phase-2 body inspection; record whether headers were held, backend receipt, and reset finalization count.",
+    "topics": [
+      "lifecycle.reset-while-held"
+    ],
+    "host_scenarios": [
+      "pause-after-request-headers",
+      "reset-while-request-headers-held"
+    ]
+  },
+  {
+    "id": "pr20-filter-state-disabled",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1042,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"enable_filter_state_logs\":false}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe an interruption rule with filter-state publication disabled; record response status, backend receipt, and filter-state presence.",
+    "topics": [
+      "pr20.state-disabled"
+    ]
+  },
+  {
+    "id": "pr20-filter-state-interruption-fields",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1010,phase:1,deny,status:403,severity:2,tag:'attack-SQLi'\\\"\"]},\"default_directives\":\"default\",\"enable_filter_state_logs\":true}",
+    "request": {
+      "method": "GET",
+      "path": "/deny",
+      "client_ip": "192.0.2.5"
+    },
+    "assert": "Probe PR #20 interruption state; record its fields and the publication/local-reply sequence numbers.",
+    "topics": [
+      "pr20.state-published"
+    ]
+  },
+  {
+    "id": "pr20-category-tag-validation",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1010,phase:1,deny,status:403,severity:2,tag:'attack-SQLi'\\\"\"]},\"default_directives\":\"default\",\"enable_filter_state_logs\":true}",
+    "assert": "Probe an attack-SQLi tag; record the PR #20 category field and full filter state.",
+    "request": {
+      "method": "GET",
+      "path": "/deny",
+      "client_ip": "192.0.2.5"
+    },
+    "topics": [
+      "pr20.category-tag"
+    ]
+  },
+  {
+    "id": "config-authority-case-variant",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1035,phase:1,deny,status:403\\\"\"],\"other\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1036,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":\"other\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/authority-deny",
+      "authority": "WAF.EXAMPLE"
+    },
+    "assert": "Probe policy selection for uppercase authority with a deny rule configured for the request; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.authority-case"
+    ]
+  },
+  {
+    "id": "config-authority-port-variant",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1035,phase:1,deny,status:403\\\"\"],\"other\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1036,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":\"other\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/authority-deny",
+      "authority": "waf.example:8443"
+    },
+    "assert": "Probe policy selection for authority with a port and a deny rule configured for the request; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.authority-port"
+    ]
+  },
+  {
+    "id": "config-metric-labels-and-metrics",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1030,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"metric_labels\":{\"suite\":\"contract\",\"env\":\"qa\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe the untagged legacy transaction counter and configured static labels on the interruption metric; record counter deltas and observed labels.",
+    "topics": [
+      "metrics.custom-labels",
+      "metrics.tx-total",
+      "metrics.interruption"
+    ]
+  },
+  {
+    "id": "bundle-demo-alias",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"Include @demo-conf\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/"
+    },
+    "assert": "Probe the @demo-conf bundle alias; record configure.accepted.",
+    "topics": [
+      "bundle.demo"
+    ]
+  },
+  {
+    "id": "bundle-ftw-alias",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"Include @ftw-conf\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/"
+    },
+    "assert": "Probe the @ftw-conf bundle alias; record configure.accepted.",
+    "topics": [
+      "bundle.ftw"
+    ]
+  },
+  {
+    "id": "bundle-crs-setup-demo-alias",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"Include @crs-setup-demo-conf\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/"
+    },
+    "assert": "Probe the deprecated @crs-setup-demo-conf bundle alias; record configure.accepted.",
+    "topics": [
+      "bundle.crs-setup-demo"
+    ]
+  },
+  {
+    "id": "rule-engine-off",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine Off\",\"SecRule REQUEST_URI \\\"@streq /deny\\\" \\\"id:1031,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/deny"
+    },
+    "assert": "Probe a configured deny rule with engine Off; record response status and backend receipt.",
+    "topics": [
+      "lifecycle.engine-off"
+    ]
+  },
+  {
+    "id": "rule-phase-five-effect",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecAction \\\"id:1032,phase:5,pass,log,msg:'phase-five-ran'\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/"
+    },
+    "assert": "Probe the host-normalized phase-five rule log during finalization; record observed logs.",
+    "topics": [
+      "engine.phase-5"
+    ]
+  },
+  {
+    "id": "rule-relative-rule-data-files",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"Include rules/relative.conf\"]},\"default_directives\":\"default\",\"rule_data\":{\"rules/relative.conf\":\"SecRule ARGS \\\"@pmFromFile data/needles.txt\\\" \\\"id:1033,phase:2,deny,status:403\\\"\\n\",\"data/needles.txt\":\"attack\\n\"}}",
+    "request": {
+      "method": "POST",
+      "path": "/",
+      "headers": [
+        [
+          "content-type",
+          "application/x-www-form-urlencoded"
+        ]
+      ],
+      "body_base64": "dGVybT1hdHRhY2s="
+    },
+    "assert": "Diagnostic-only probe of relative Include and @pmFromFile fixture inputs; record response status, backend receipt, and rule matches without asserting runtime file resolution.",
+    "topics": [
+      "bundle.relative-data"
+    ]
+  },
+  {
+    "id": "rule-data-ip-match-from-file",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REMOTE_ADDR \\\"@ipMatchFromFile data/networks.txt\\\" \\\"id:1090,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"rule_data\":{\"data/networks.txt\":\"203.0.113.0/24\\n\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/ip-match",
+      "client_ip": "203.0.113.7"
+    },
+    "assert": "Diagnostic-only probe of client_ip and a rule_data CIDR for @ipMatchFromFile; record response status, backend receipt, and rule matches without asserting runtime matching.",
+    "topics": [
+      "rule-data.ip-match-from-file"
+    ]
+  },
+  {
+    "id": "rule-regex-capture",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@rx ^/item-([0-9]+)$\\\" \\\"id:1034,phase:1,pass,capture,setvar:tx.item=%{TX.1},logdata:%{TX.item}\\\"\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/item-42"
+    },
+    "assert": "Probe a regex with a numbered capture; record rule matches and capture values.",
+    "topics": [
+      "engine.regex-capture"
+    ]
+  },
+  {
+    "id": "ops-finalization-failure",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/"
+    },
+    "host_faults": [
+      {
+        "operation": "finalization",
+        "result": "failure"
+      }
+    ],
+    "assert": "Probe a finalization failure; record the finalization result and call count.",
+    "topics": [
+      "lifecycle.finalization-failure"
+    ]
+  },
+  {
+    "id": "ops-filter-state-hostcall-failure",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /hostcall-failure\\\" \\\"id:1083,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"enable_filter_state_logs\":true}",
+    "request": {
+      "method": "GET",
+      "path": "/hostcall-failure"
+    },
+    "host_faults": [
+      {
+        "operation": "set_property",
+        "result": "failure"
+      }
+    ],
+    "assert": "Probe a filter-state set_property hostcall failure with a deny rule configured for the request; record the hostcall result, response status, and backend receipt.",
+    "topics": [
+      "ops.hostcall-failure"
+    ],
+    "host_scenarios": [
+      "fail-filter-state-set-property"
+    ]
+  },
+  {
+    "id": "config-configured-default-policy",
+    "plugin_configuration": "{\"directives_map\":{\"first\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /configured-default\\\" \\\"id:1051,phase:1,deny,status:403\\\"\"],\"selected\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /configured-default\\\" \\\"id:1050,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"selected\"}",
+    "request": {
+      "method": "GET",
+      "path": "/configured-default"
+    },
+    "assert": "Probe the configured default against a different first map entry with DetectionOnly; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.configured-default"
+    ]
+  },
+  {
+    "id": "config-absent-default-no-first-policy",
+    "plugin_configuration": "{\"directives_map\":{\"first\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /absent-default\\\" \\\"id:1052,phase:1,deny,status:403\\\"\"]}}",
+    "request": {
+      "method": "GET",
+      "path": "/absent-default"
+    },
+    "assert": "Probe policy selection when no default is configured; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.absent-default"
+    ]
+  },
+  {
+    "id": "config-authority-host-fallback",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine DetectionOnly\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1038,phase:1,deny,status:403\\\"\"],\"other\":[\"SecRuleEngine On\",\"SecRule REQUEST_URI \\\"@streq /authority-deny\\\" \\\"id:1037,phase:1,deny,status:403\\\"\"]},\"default_directives\":\"default\",\"per_authority_directives\":{\"waf.example\":\"other\"}}",
+    "request": {
+      "method": "GET",
+      "path": "/authority-deny",
+      "host": "waf.example"
+    },
+    "assert": "Probe a request without :authority when the host property maps to an enforcing policy; record response status, backend receipt, and rule matches.",
+    "topics": [
+      "config.authority-host-fallback"
+    ]
+  },
+  {
+    "id": "http-response-headers-trailers",
+    "plugin_configuration": "{\"directives_map\":{\"default\":[\"SecRuleEngine On\"]},\"default_directives\":\"default\"}",
+    "request": {
+      "method": "GET",
+      "path": "/response-trailers"
+    },
+    "backend_response": {
+      "status": 201,
+      "headers": [
+        [
+          "content-type",
+          "text/plain"
+        ],
+        [
+          "x-response",
+          "one"
+        ]
+      ],
+      "body_base64": "cmVzcG9uc2U=",
+      "trailers": [
+        [
+          "x-response-end",
+          "done"
+        ]
+      ]
+    },
+    "assert": "Probe response forwarding; record response status, headers, body, trailers, and backend receipt.",
+    "topics": [
+      "lifecycle.response-headers",
+      "lifecycle.response-trailers"
+    ]
+  }
+]
