@@ -1,0 +1,21 @@
+[package]
+name = "envoy-coraza"
+version.workspace = true
+# Edition 2021: the SDK's #[no_mangle] entry point would need unsafe syntax under edition 2024.
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Envoy Proxy-Wasm HTTP filter backed by the coraza crate"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+coraza = { path = "../coraza" }
+proxy-wasm = { git = "https://github.com/Kuadrant/proxy-wasm-rust-sdk", rev = "6ceedbbdd07a048a65d197c9bbb1f950884561fb" }
+serde_json = "1"
+
+[lints]
+workspace = true

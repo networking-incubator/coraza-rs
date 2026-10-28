@@ -39,7 +39,7 @@ check:
 
 build-envoy-wasm:
 	rustup target add wasm32-wasip1
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion -p envoy-coraza
 
 build-envoy-wasm-image:
 	docker build --file envoy-libperfusion/Dockerfile --tag "$(ENVOY_WASM_IMAGE)" .
