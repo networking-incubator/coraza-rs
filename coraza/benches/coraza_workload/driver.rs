@@ -1690,6 +1690,13 @@ pub(crate) fn run_timing(workload: &Workload, iterations: usize) -> Result<Vec<T
 }
 
 /// Drives and closes one fresh transaction; the caller times the call.
+// The harness frame holds one transaction plus the lifecycle locals built for it.
+// It runs in the benchmark/test binary, never on a proxy worker, and the engine
+// types it materializes are sized by the public configuration contract.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "benchmark harness frame, not a proxy execution path"
+)]
 fn run_timed_transaction(prepared: &PreparedCase, uri: &str) -> Result<(), DriverError> {
     let transaction = drive_lifecycle(prepared, uri, |_, _| {})?;
     drop(transaction);

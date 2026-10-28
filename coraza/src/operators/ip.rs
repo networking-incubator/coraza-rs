@@ -26,6 +26,7 @@ use ipnet::{IpNet, Ipv4Net};
 
 use crate::{
     operators::{Datasets, Operator, Outputs},
+    rule_data::{FileSystem, RuleData, read_to_string},
     transaction::Transaction,
 };
 
@@ -223,8 +224,17 @@ impl IpMatchFromFile {
     ///
     /// Returns an error when the file cannot be read.
     pub fn new(file_path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::with_rule_data(file_path, &FileSystem)
+    }
+
+    /// Creates a new `IpMatchFromFile` operator from `file_path` through `rule_data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read.
+    pub(crate) fn with_rule_data(file_path: impl AsRef<Path>, rule_data: &dyn RuleData) -> Result<Self, String> {
         let file_path = file_path.as_ref();
-        let content = std::fs::read_to_string(file_path)
+        let content = read_to_string(rule_data, file_path)
             .map_err(|error| format!("failed to read file {}: {error}", file_path.display()))?;
 
         let mut subnets = Vec::new();

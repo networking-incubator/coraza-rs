@@ -137,15 +137,13 @@ mod variable_parser;
 
 fuzz_target!(|data: &[u8]| {
     let input = String::from_utf8_lossy(data);
-    let outcome = variable_parser::parse_variables_in(&input).map(|specs| {
+    let outcome = variable_parser::parse_variables_in_mode(&input, false).map(|specs| {
         specs
             .iter()
             .map(rules::VariableSpec::fingerprint)
             .fold(0_usize, usize::saturating_add)
     });
-    let multiphase_outcome = variable_parser::VariableList::parse(&input).map(|list| {
-        let mut specs = Vec::new();
-        list.apply_to(&mut specs, true);
+    let multiphase_outcome = variable_parser::parse_variables_in_mode(&input, true).map(|specs| {
         specs
             .iter()
             .map(rules::VariableSpec::fingerprint)

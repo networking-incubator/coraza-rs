@@ -232,6 +232,17 @@ impl Transaction {
     fn process_multipart_body(&mut self, body: &[u8], truncated: bool) -> Result<(), String> {
         let content_type = self.request_headers.first("content-type").unwrap_or_default().to_vec();
         let (parts, failure) = multipart::parse(&content_type, body, truncated);
+        if self.config.reject_multipart_file_uploads
+            && parts.iter().any(|part| {
+                part.filename.as_deref().is_some_and(|name| !name.is_empty())
+                    || part.alt_filename.as_deref().is_some_and(|name| !name.is_empty())
+            })
+        {
+            self.multipart_strict_error.set("1");
+            self.inbound_data_error.set("1");
+            self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
+            return Ok(());
+        }
         // Go's `NextPart` loop sets the strict error as soon as a part fails, but it
         // has already published the parts before it (`internal/bodyprocessors/multipart.go:52-70`,
         // v3.8.1), so publishing continues here and the error is reported afterwards.
@@ -1807,6 +1818,29 @@ mod multipart_tests {
         assert_eq!(tx.multipart_filename.first(b"u"), Some(&b"shell.php"[..]));
         assert_eq!(tx.args_post.first(b"u"), None);
         assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(403));
+    }
+
+    #[test]
+    fn host_policy_rejects_multipart_files_before_creating_a_temporary_upload() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        parser.config_mut().reject_multipart_file_uploads = true;
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-file-rejected");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+
+        let interruption = tx
+            .process_request_body(
+                b"--b\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"x.txt\"\r\n\r\nPAYLOAD\r\n--b--\r\n",
+            )
+            .unwrap();
+
+        assert_eq!(interruption.status, 413);
+        assert_eq!(interruption.rule_id, 0);
+        assert!(tx.uploaded_paths.is_empty(), "no temporary upload was created");
+        assert!(!tx.request_body_stats().spilled, "the body stayed in memory");
+        assert_eq!(tx.multipart_strict_error.get(), "1");
     }
 
     #[test]

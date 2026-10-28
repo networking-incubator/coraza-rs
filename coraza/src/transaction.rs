@@ -33,6 +33,7 @@ mod variables;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    mem::size_of,
     ops::RangeInclusive,
     path::PathBuf,
     sync::Arc,
@@ -48,8 +49,8 @@ pub use variables::VariableCollection;
 pub use crate::{actions::RuleMetadata, audit_log::MatchedRule};
 use crate::{
     audit_log::{
-        AuditFile, AuditLog, AuditLogger, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse,
-        AuditTransaction, ErrorLog, Failure, mime_type_of,
+        AuditFile, AuditLog, AuditLogCallback, AuditLogger, AuditMessage, AuditMessageData, AuditProducer,
+        AuditRequest, AuditResponse, AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
     body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory},
     collection::{Map, MatchData, Single},
@@ -202,6 +203,8 @@ pub struct Transaction {
     debug_logger: Arc<dyn DebugLogger>,
     /// Transaction-local override set by `ctl:debugLogLevel`.
     debug_log_level: Option<u8>,
+    /// Optional connector-owned audit callback inherited from the WAF.
+    audit_log_callback: Option<AuditLogCallback>,
     /// Optional connector callback for rules with the `log` action.
     error_log: Option<ErrorLog>,
     /// Rules matched by this transaction.
@@ -447,6 +450,7 @@ impl Transaction {
             audit_logger: None,
             debug_logger: noop_logger(),
             debug_log_level: None,
+            audit_log_callback: None,
             error_log: None,
             matched_rules: Vec::new(),
             started,
@@ -652,6 +656,11 @@ impl Transaction {
         });
     }
 
+    /// Attach the WAF's connector-owned audit callback.
+    pub(crate) fn set_audit_log_callback(&mut self, callback: AuditLogCallback) {
+        self.audit_log_callback = Some(callback);
+    }
+
     /// Attach the connector's matched-rule callback.
     pub(crate) fn set_error_log(&mut self, log: ErrorLog) {
         self.error_log = Some(log);
@@ -708,9 +717,19 @@ impl Transaction {
         self.response_body_access
     }
 
+    /// Whether this transaction currently inspects request bodies.
+    pub fn request_body_access(&self) -> bool {
+        self.request_body_access
+    }
+
     /// Return the request body limit currently applied to this transaction.
     pub fn request_body_limit(&self) -> i64 {
         self.request_body_limit
+    }
+
+    /// Return the response body limit currently applied to this transaction.
+    pub fn response_body_limit(&self) -> i64 {
+        self.response_body_limit
     }
 
     /// Return counters for the request body bytes this transaction received.
@@ -729,6 +748,72 @@ impl Transaction {
     /// and `truncated` keep the values recorded during the response body phase.
     pub fn response_body_stats(&self) -> BodyIngestionStats {
         self.response_body_buffer.stats()
+    }
+
+    /// Estimate dynamic memory retained for request and response body data.
+    ///
+    /// This includes body buffers, raw body variables, parsed body collections,
+    /// audit copies, and match data. Collection backing capacities are counted,
+    /// so this is a conservative estimate for connector retained-body budgets.
+    pub fn body_memory_bytes(&self) -> usize {
+        let maps = [
+            &self.args,
+            &self.args_post,
+            &self.request_xml,
+            &self.response_args,
+            &self.response_xml,
+            &self.files,
+            &self.files_names,
+            &self.files_sizes,
+            &self.files_tmp_names,
+            &self.multipart_name,
+            &self.multipart_filename,
+            &self.multipart_filename_charset,
+            &self.multipart_filename_language,
+            &self.multipart_part_headers,
+            &self.tx,
+            &self.matched_vars,
+        ];
+        let singles = [&self.request_body, &self.response_body];
+        maps.into_iter()
+            .map(Map::allocated_bytes)
+            .chain(singles.into_iter().map(Single::allocated_bytes))
+            .chain([
+                self.request_body_buffer.allocated_bytes(),
+                self.response_body_buffer.allocated_bytes(),
+                self.audit_request_body.capacity(),
+                self.audit_response_body.capacity(),
+                self.matched_rules_memory_bytes(),
+            ])
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    /// Estimate backing storage copied into matched-rule results.
+    fn matched_rules_memory_bytes(&self) -> usize {
+        self.matched_rules.iter().fold(
+            self.matched_rules.capacity().saturating_mul(size_of::<MatchedRule>()),
+            |total, rule| {
+                let strings = [
+                    rule.rule.raw.capacity(),
+                    rule.rule.tags.iter().map(String::capacity).sum(),
+                    rule.client_ip.capacity(),
+                    rule.server_ip.capacity(),
+                    rule.uri.capacity(),
+                    rule.transaction_id.capacity(),
+                    rule.matches.iter().fold(0_usize, |size, matched| {
+                        size.saturating_add(matched.key.capacity())
+                            .saturating_add(matched.value.capacity())
+                            .saturating_add(matched.message.capacity())
+                            .saturating_add(matched.data.capacity())
+                    }),
+                ]
+                .into_iter()
+                .fold(0_usize, usize::saturating_add);
+                total
+                    .saturating_add(strings)
+                    .saturating_add(rule.matches.capacity().saturating_mul(size_of::<MatchData>()))
+            },
+        )
     }
 
     /// Return the request body spill file path, if the body spilled, for cleanup tests.
@@ -942,7 +1027,11 @@ impl Transaction {
         };
         if should_log {
             self.debug_log(DebugLevel::Debug, "Transaction marked for audit logging", || []);
-            if let Err(error) = logger.write(&self.audit_log()) {
+            let entry = self.audit_log();
+            if let Some(callback) = &self.audit_log_callback {
+                callback.write(&entry);
+            }
+            if let Err(error) = logger.write(&entry) {
                 self.debug_log(DebugLevel::Error, "Failed to write audit log", || []);
                 self.debug_log_with(DebugLevel::Trace, |logger| {
                     let details = error.to_string();
@@ -2044,7 +2133,10 @@ impl Drop for Transaction {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "transaction tests use fixed valid inputs")]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::{
         BodyIngestionStats, Transaction, VariableCollection,
@@ -4747,7 +4839,7 @@ v\r\n\
     fn audit_logging_records_matches_and_request_response_data_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.json");
-        let callback_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_lines = Arc::new(Mutex::new(Vec::new()));
         let callback_output = Arc::clone(&callback_lines);
         let mut parser = crate::seclang::Parser::new();
         *parser.config_mut() = WafConfig {
@@ -4871,6 +4963,86 @@ v\r\n\
             tx.get_variable(RuleVariable::TX, Some("logged")).as_deref(),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn connector_audit_callback_observes_phase_five_once_without_a_native_sink() {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let callback_entries = Arc::clone(&entries);
+        let phase_five_matches = Arc::new(AtomicUsize::new(0));
+        let callback_matches = Arc::clone(&phase_five_matches);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_format: crate::types::AuditLogFormat::Json,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABFHKZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_error_log(move |matched| {
+            if matched.rule_id() == 702 {
+                callback_matches.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        parser.on_audit_log(move |entry| {
+            callback_entries.lock().unwrap().push(entry.clone());
+        });
+        parser
+            .from_string(
+                "SecRule ARGS:q \"@streq deny\" \"id:701,phase:1,deny,status:403\"\n\
+                 SecRule ARGS:q \"@streq deny\" \"id:702,phase:5,log,msg:'phase five'\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("connector-audit-once");
+        tx.process_uri("/?q=deny", "GET", "HTTP/1.1");
+        assert_eq!(tx.process_request_headers().map(|value| value.rule_id), Some(701));
+
+        tx.finish().unwrap();
+        tx.finish().unwrap();
+
+        assert_eq!(
+            phase_five_matches.load(Ordering::Relaxed),
+            1,
+            "phase 5 ran before logging"
+        );
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "selected audit entry is emitted exactly once");
+        let entry_is_valid = entries.first().is_some_and(|entry| {
+            entry.transaction.id == "connector-audit-once"
+                && !entry.format(crate::types::AuditLogFormat::Json).is_empty()
+        });
+        drop(entries);
+        assert!(entry_is_valid, "selected audit entry is complete");
+    }
+
+    #[test]
+    fn connector_audit_callback_keeps_relevant_only_selection() {
+        let audited = Arc::new(AtomicUsize::new(0));
+        let callback_audited = Arc::clone(&audited);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::RelevantOnly,
+            ..WafConfig::default()
+        };
+        parser.on_audit_log(move |_| {
+            callback_audited.fetch_add(1, Ordering::Relaxed);
+        });
+        parser
+            .from_string("SecRule ARGS:q \"@streq audit\" \"id:703,phase:1,pass,auditlog\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let mut benign = waf.new_transaction_with_id("audit-callback-benign");
+        benign.process_uri("/?q=allow", "GET", "HTTP/1.1");
+        benign.process_request_headers();
+        benign.finish().unwrap();
+        assert_eq!(audited.load(Ordering::Relaxed), 0, "unmatched traffic is not relevant");
+
+        let mut match_tx = waf.new_transaction_with_id("audit-callback-match");
+        match_tx.process_uri("/?q=audit", "GET", "HTTP/1.1");
+        match_tx.process_request_headers();
+        match_tx.finish().unwrap();
+        assert_eq!(audited.load(Ordering::Relaxed), 1, "auditlog match is relevant");
     }
 
     #[test]

@@ -40,7 +40,11 @@ impl Transaction {
         };
         match name {
             "auditEngine" => {
-                if let Ok(audit_engine) = value.parse::<AuditEngineStatus>() {
+                // Host policy: an embedder with no audit sink locks the engine so a
+                // request cannot make it retain an audit body copy with none to write.
+                if !self.config.audit_engine_locked
+                    && let Ok(audit_engine) = value.parse::<AuditEngineStatus>()
+                {
                     self.audit_engine = audit_engine;
                 }
             },
@@ -55,18 +59,8 @@ impl Transaction {
                     self.rule_engine = rule_engine;
                 }
             },
-            "requestBodyAccess" => {
-                if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody) {
-                    self.request_body_access = value.eq_ignore_ascii_case("on");
-                }
-            },
-            "requestBodyLimit" => {
-                if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody)
-                    && let Ok(limit) = value.parse::<i64>()
-                    && limit >= 0
-                {
-                    self.request_body_limit = limit;
-                }
+            "requestBodyAccess" | "requestBodyLimit" | "responseBodyAccess" | "responseBodyLimit" => {
+                self.apply_body_ctl(name, value);
             },
             "forceRequestBodyVariable" => {
                 self.force_request_body_variable = value.eq_ignore_ascii_case("on");
@@ -74,19 +68,6 @@ impl Transaction {
             "requestBodyProcessor" => {
                 if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody) {
                     self.set_request_body_processor(value);
-                }
-            },
-            "responseBodyAccess" => {
-                if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody) {
-                    self.response_body_access = value.eq_ignore_ascii_case("on");
-                }
-            },
-            "responseBodyLimit" => {
-                if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody)
-                    && let Ok(limit) = value.parse::<i64>()
-                    && limit >= 0
-                {
-                    self.response_body_limit = limit;
                 }
             },
             "forceResponseBodyVariable" => {
@@ -158,6 +139,54 @@ impl Transaction {
             _ => self.debug_log(DebugLevel::Warn, "Invalid ctl debug log level", || {
                 [DebugField::Text(value)]
             }),
+        }
+    }
+
+    /// Apply a `ctl` body setting, clamped to the host ceilings.
+    fn apply_body_ctl(&mut self, name: &str, value: &str) {
+        match name {
+            "requestBodyAccess" => {
+                if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody) {
+                    self.request_body_access = value.eq_ignore_ascii_case("on");
+                    if self.request_body_access {
+                        self.request_body_limit = clamp_limit(
+                            self.request_body_limit,
+                            self.config.max_request_body_limit,
+                            self.config.request_body_in_memory_limit,
+                        );
+                    }
+                }
+            },
+            "requestBodyLimit" => {
+                if self.last_phase.is_none_or(|last| last < RulePhase::RequestBody)
+                    && let Ok(limit) = value.parse::<i64>()
+                    && limit >= 0
+                {
+                    self.request_body_limit = clamp_limit(
+                        limit,
+                        self.config.max_request_body_limit,
+                        self.config.request_body_in_memory_limit,
+                    );
+                }
+            },
+            "responseBodyAccess" => {
+                if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody) {
+                    self.response_body_access = value.eq_ignore_ascii_case("on");
+                    if self.response_body_access {
+                        self.response_body_limit =
+                            clamp_limit(self.response_body_limit, self.config.max_response_body_limit, 0);
+                    }
+                }
+            },
+            "responseBodyLimit" => {
+                if self.last_phase.is_none_or(|last| last < RulePhase::ResponseBody)
+                    && let Ok(limit) = value.parse::<i64>()
+                    && limit >= 0
+                {
+                    self.response_body_limit = clamp_limit(limit, self.config.max_response_body_limit, 0);
+                }
+            },
+            _ => {},
         }
     }
 
@@ -247,6 +276,25 @@ impl Transaction {
     }
 }
 
+/// Clamp a `ctl` body limit to a positive host ceiling and, when positive, an
+/// in-memory limit; `0` means unset for either.
+///
+/// A positive ceiling also clamps the limit to a positive in-memory limit, so a
+/// `ctl` cannot reintroduce body spill; the response path passes `0` there.
+/// Without a positive ceiling the host has no policy, so the limit is left as
+/// configured and native behavior is unchanged.
+fn clamp_limit(limit: i64, ceiling: i64, in_memory_limit: i64) -> i64 {
+    if ceiling <= 0 {
+        return limit;
+    }
+    let limit = limit.min(ceiling);
+    if in_memory_limit > 0 {
+        limit.min(in_memory_limit)
+    } else {
+        limit
+    }
+}
+
 /// Parse a single rule ID or an inclusive rule ID range.
 fn parse_id_range(value: &str) -> Option<RangeInclusive<i32>> {
     let (start, end) = value.split_once('-').unwrap_or((value, value));
@@ -313,6 +361,31 @@ mod tests {
         assert!(transaction.matched_rules().iter().any(|matched| matched.rule.id == 80));
         assert!(!transaction.matched_rules().iter().any(|matched| matched.rule.id == 81));
         assert!(!transaction.matched_rules().iter().any(|matched| matched.rule.id == 82));
+    }
+
+    #[test]
+    fn multiphase_count_applies_target_removal_before_aggregation() {
+        let rules = "SecRequestBodyAccess On\n\
+                     SecAction \"id:80,phase:1,pass,ctl:ruleRemoveTargetById=81;ARGS:skip\"\n\
+                     SecRule &ARGS \"@eq 1\" \"id:81,phase:2,deny,status:403\"";
+
+        for (multiphase, expected_match) in [(false, false), (true, true)] {
+            let mut parser = crate::seclang::Parser::new();
+            parser.config_mut().multiphase_evaluation = multiphase;
+            parser.from_string(rules).unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut transaction = waf.new_transaction_with_id("ctl-count-target");
+            transaction.add_get_argument("skip", "1");
+            transaction.add_get_argument("keep", "2");
+
+            let mut interruption = transaction.process_request_headers();
+            if interruption.is_none() {
+                interruption = transaction.process_request_body(b"");
+            }
+            let matched = transaction.matched_rules().iter().any(|rule| rule.rule.id == 81);
+            assert_eq!(matched, expected_match, "multiphase={multiphase}");
+            assert_eq!(interruption.is_some(), expected_match, "multiphase={multiphase}");
+        }
     }
 
     #[test]
@@ -425,5 +498,121 @@ mod tests {
             None,
             "single-character lowercase mappings still apply"
         );
+    }
+
+    /// Build a transaction after applying `configure` to the parser's WAF config.
+    fn transaction_with_config(rules: &str, configure: impl FnOnce(&mut crate::config::WafConfig)) -> Transaction {
+        let mut parser = crate::seclang::Parser::new();
+        configure(parser.config_mut());
+        parser.from_string(rules).unwrap();
+        parser.into_waf().unwrap().new_transaction_with_id("ctl-limits")
+    }
+
+    #[test]
+    fn ctl_request_body_limit_is_clamped_to_the_host_ceiling() {
+        let rules = "SecAction \"id:80,phase:1,ctl:requestBodyLimit=1073741824\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.max_request_body_limit = 16 * 1024 * 1024;
+        });
+        transaction.process_request_headers();
+        assert_eq!(transaction.request_body_limit, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_zero_ceiling_leaves_the_ctl_limit_unchanged() {
+        let rules = "SecAction \"id:80,phase:1,ctl:requestBodyLimit=1073741824\"";
+        let mut transaction = transaction_with_config(rules, |_config| {});
+        transaction.process_request_headers();
+        assert_eq!(transaction.request_body_limit, 1_073_741_824);
+    }
+
+    #[test]
+    fn ctl_enabling_body_access_uses_the_ceiling() {
+        let rules = "SecAction \"id:80,phase:1,ctl:requestBodyAccess=On\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.request_body_access = false;
+            config.request_body_limit = 128 * 1024 * 1024;
+            config.max_request_body_limit = 16 * 1024 * 1024;
+        });
+        transaction.process_request_headers();
+        assert!(transaction.request_body_access);
+        assert_eq!(transaction.request_body_limit, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ctl_never_raises_the_request_limit_above_a_positive_in_memory_limit() {
+        let rules = "SecAction \"id:80,phase:1,ctl:requestBodyLimit=1073741824\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.request_body_access = true;
+            config.request_body_limit = 4;
+            config.request_body_in_memory_limit = 4;
+            config.max_request_body_limit = 16 * 1024 * 1024;
+            config.request_body_limit_action = crate::types::BodyLimitAction::ProcessPartial;
+        });
+        transaction.process_request_headers();
+        assert_eq!(transaction.request_body_limit, 4, "the in-memory limit wins");
+        transaction.process_request_body(b"0123456789");
+        assert!(
+            transaction.request_body_buffer.spill_path().is_none(),
+            "a clamped limit cannot spill the body to a file"
+        );
+    }
+
+    #[test]
+    fn ctl_response_body_limit_is_clamped_to_the_host_ceiling() {
+        let rules = "SecAction \"id:80,phase:1,ctl:responseBodyLimit=1073741824\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.max_response_body_limit = 1024 * 1024;
+        });
+        transaction.process_request_headers();
+        assert_eq!(transaction.response_body_limit, 1024 * 1024);
+    }
+
+    #[test]
+    fn ctl_enabling_response_body_access_uses_the_ceiling() {
+        let rules = "SecAction \"id:80,phase:1,ctl:responseBodyAccess=On\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.response_body_access = false;
+            config.response_body_limit = 512 * 1024;
+            config.max_response_body_limit = 1024 * 1024;
+        });
+        transaction.process_request_headers();
+        assert!(transaction.response_body_access);
+        assert_eq!(transaction.response_body_limit, 512 * 1024, "already below the ceiling");
+    }
+
+    #[test]
+    fn a_locked_audit_engine_ignores_ctl_and_retains_no_audit_body() {
+        let rules = "SecAction \"id:80,phase:1,ctl:auditEngine=On\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.audit_engine_locked = true;
+            config.request_body_access = true;
+            config.request_body_limit = 1024;
+        });
+        transaction.process_request_headers();
+        transaction.process_request_body(b"attack");
+        assert_eq!(
+            transaction.audit_engine,
+            crate::types::AuditEngineStatus::Off,
+            "the host lock keeps the engine off"
+        );
+        assert!(
+            transaction.audit_request_body.is_empty(),
+            "a locked engine must not copy the body into an audit entry"
+        );
+    }
+
+    #[test]
+    fn an_unlocked_audit_engine_still_applies_ctl() {
+        let rules = "SecAction \"id:80,phase:1,ctl:auditEngine=On\"";
+        let mut transaction = transaction_with_config(rules, |config| {
+            config.audit_engine_locked = false;
+            config.request_body_access = true;
+            config.request_body_limit = 1024;
+        });
+        transaction.process_request_headers();
+        transaction.process_request_body(b"attack");
+        assert_eq!(transaction.audit_engine, crate::types::AuditEngineStatus::On);
+        assert_eq!(transaction.audit_request_body, b"attack");
     }
 }

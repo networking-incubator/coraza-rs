@@ -308,9 +308,19 @@ impl Transaction {
         if !self.removed_rule_targets.contains_key(&id) {
             return self.find_matches(spec);
         }
-        let mut matches = self.find_matches(spec);
-        matches.retain(|matched| !self.is_rule_target_removed(id, matched.variable, &matched.key));
-        matches
+        if !self.multiphase_evaluation() {
+            let mut matches = self.find_matches(spec);
+            matches.retain(|matched| !self.is_rule_target_removed(id, matched.variable, &matched.key));
+            return matches;
+        }
+        let collection = self.collection(spec.variable()).map(|collection| match collection {
+            VariableCollection::Single(single) => CollectionView::Single(single),
+            VariableCollection::Map(map) => CollectionView::Map(map),
+            VariableCollection::Names(variable, map) => CollectionView::Names(variable, map),
+        });
+        spec.get_matches_filter(collection, |variable, key| {
+            self.is_rule_target_removed(id, variable, key)
+        })
     }
 
     /// Set one stored single-value variable.

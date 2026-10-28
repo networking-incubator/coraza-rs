@@ -117,10 +117,8 @@ fn go_corpus_matches_go_operator_expectations() {
 
     let waf = Waf::default();
     let operator_dir = dir.join("op");
-    let context = OperatorContext {
-        base_dir: &operator_dir,
-        ..OperatorContext::default()
-    };
+    let mut context = OperatorContext::default();
+    context.base_dir = &operator_dir;
     let mut rows = Vec::with_capacity(files.len());
     let mut skips: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut failures = Vec::new();

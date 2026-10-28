@@ -71,6 +71,11 @@ impl Single {
     pub fn variable(&self) -> RuleVariable {
         self.variable
     }
+
+    /// Bytes held by the stored value's backing allocation.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.data.capacity()
+    }
 }
 
 impl std::fmt::Display for Single {

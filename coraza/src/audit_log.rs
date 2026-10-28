@@ -330,6 +330,16 @@ impl MatchedRule {
         self.rule.id
     }
 
+    /// The severity configured on the matched rule, if any.
+    pub fn severity(&self) -> Option<crate::types::RuleSeverity> {
+        self.rule.severity
+    }
+
+    /// The rule's tags in source order.
+    pub fn tags(&self) -> &[String] {
+        &self.rule.tags
+    }
+
     /// First match with an expanded message.
     fn first_with_message(&self) -> Option<&MatchData> {
         self.matches.iter().find(|matched| !matched.message.is_empty())
@@ -453,6 +463,31 @@ impl fmt::Debug for ErrorLog {
     }
 }
 
+/// Callback used to emit selected audit entries through a connector-owned sink.
+#[derive(Clone)]
+pub(crate) struct AuditLogCallback(Arc<AuditLogCallbackFn>);
+
+/// Thread-safe callback invoked for each selected audit entry.
+type AuditLogCallbackFn = dyn Fn(&AuditLog) + Send + Sync;
+
+impl AuditLogCallback {
+    /// Wrap a callback for sharing across transactions.
+    pub(crate) fn new(log: impl Fn(&AuditLog) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(log))
+    }
+
+    /// Invoke the callback for one selected entry.
+    pub(crate) fn write(&self, entry: &AuditLog) {
+        (self.0)(entry);
+    }
+}
+
+impl fmt::Debug for AuditLogCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuditLogCallback")
+    }
+}
+
 impl AuditLog {
     /// The entry written out in `format`; empty when there is nothing to write.
     pub fn format(&self, format: AuditLogFormat) -> String {
@@ -461,6 +496,212 @@ impl AuditLog {
             AuditLogFormat::Json => self.json().to_string(),
             AuditLogFormat::JsonLegacy => self.json_legacy().to_string(),
             AuditLogFormat::Ocsf => self.ocsf().to_string(),
+        }
+    }
+
+    /// Formats an audit entry for a bounded sink, returning whether source data was cut.
+    ///
+    /// This hidden connector seam leaves [`AuditLog::format`] unchanged. Its temporary
+    /// view retains at most `max_bytes` of text and `ceil(max_bytes / 64)` collection
+    /// entries before using the configured formatter. OCSF's nested JSON escaping is the
+    /// largest pre-sink expansion, at most 36 times the retained text plus bounded
+    /// collection overhead.
+    #[doc(hidden)]
+    pub fn format_bounded(&self, format: AuditLogFormat, max_bytes: usize) -> (String, bool) {
+        let mut budget = AuditCopyBudget::new(max_bytes);
+        let view = self.bounded_copy(format, &mut budget);
+        let (output, formatter_truncated) = match format {
+            AuditLogFormat::Native => {
+                let mut output = view.native();
+                let truncated = output.len() > max_bytes;
+                if truncated {
+                    output.truncate(utf8_boundary(&output, max_bytes));
+                }
+                (output, truncated)
+            },
+            AuditLogFormat::Json => serialize_json_bounded(&view.json(), max_bytes),
+            AuditLogFormat::JsonLegacy => serialize_json_bounded(&view.json_legacy(), max_bytes),
+            AuditLogFormat::Ocsf => serialize_json_bounded(&view.ocsf(), max_bytes),
+        };
+        (output, budget.truncated || formatter_truncated)
+    }
+
+    /// Copies only the fields used by `format`, within `budget`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each audit format uses a distinct bounded field view"
+    )]
+    fn bounded_copy(&self, format: AuditLogFormat, budget: &mut AuditCopyBudget) -> Self {
+        let native = format == AuditLogFormat::Native;
+        let native_headers = native && self.parts.contains(&AuditLogPart::RequestHeaders);
+        let native_request_body = native && self.parts.contains(&AuditLogPart::RequestBody);
+        let native_response_headers = native && self.parts.contains(&AuditLogPart::ResponseHeaders);
+        let native_response_body = native
+            && (self.parts.contains(&AuditLogPart::IntermediaryResponseBody)
+                || self.parts.contains(&AuditLogPart::ResponseBody));
+        let native_files = native && self.parts.contains(&AuditLogPart::UploadedFiles);
+        let native_trailer = native && self.parts.contains(&AuditLogPart::Trailer);
+        let native_rules = native && self.parts.contains(&AuditLogPart::RulesMatched);
+        let native_header = native && self.parts.contains(&AuditLogPart::Header);
+        let parts = if native {
+            budget.sequence(&self.parts, |_, part| *part)
+        } else {
+            Vec::new()
+        };
+
+        let json = format == AuditLogFormat::Json;
+        let legacy = format == AuditLogFormat::JsonLegacy;
+        let ocsf = format == AuditLogFormat::Ocsf;
+        let transaction = &self.transaction;
+        let timestamp = if json || legacy || native_header {
+            budget.string(&transaction.timestamp)
+        } else {
+            String::new()
+        };
+        let unix_timestamp = if json || ocsf { transaction.unix_timestamp } else { 0 };
+        let id = if json || legacy || ocsf || native_header {
+            budget.string(&transaction.id)
+        } else {
+            String::new()
+        };
+        let client_ip = if json || legacy || ocsf || native_header {
+            budget.string(&transaction.client_ip)
+        } else {
+            String::new()
+        };
+        let client_port = transaction.client_port;
+        let host_ip = if json || legacy || ocsf || native_header {
+            budget.string(&transaction.host_ip)
+        } else {
+            String::new()
+        };
+        let host_port = transaction.host_port;
+        let server_id = if json || ocsf {
+            budget.string(&transaction.server_id)
+        } else {
+            String::new()
+        };
+        let highest_severity = if json || ocsf {
+            budget.string(&transaction.highest_severity)
+        } else {
+            String::new()
+        };
+        let is_interrupted = if json || ocsf {
+            transaction.is_interrupted
+        } else {
+            false
+        };
+        let request = &transaction.request;
+        let bounded_request = AuditRequest {
+            method: if !native || native_headers {
+                budget.string(&request.method)
+            } else {
+                String::new()
+            },
+            protocol: if json || ocsf || native_headers {
+                budget.string(&request.protocol)
+            } else {
+                String::new()
+            },
+            uri: if !native || native_headers {
+                budget.string(&request.uri)
+            } else {
+                String::new()
+            },
+            http_version: if json || legacy {
+                budget.string(&request.http_version)
+            } else {
+                String::new()
+            },
+            headers: if json || legacy || ocsf || native_headers {
+                budget.headers(&request.headers)
+            } else {
+                None
+            },
+            body: if json || native_request_body {
+                budget.string(&request.body)
+            } else {
+                String::new()
+            },
+            files: if json || ocsf || native_files {
+                budget.files(&request.files)
+            } else {
+                None
+            },
+            length: if json || ocsf { request.length } else { 0 },
+            args: if ocsf { budget.args(&request.args) } else { Vec::new() },
+        };
+
+        let response = transaction.response.as_ref().map(|response| AuditResponse {
+            protocol: if json || legacy || native_response_headers {
+                budget.string(&response.protocol)
+            } else {
+                String::new()
+            },
+            status: if json || legacy || ocsf || native_response_headers {
+                response.status
+            } else {
+                0
+            },
+            headers: if json || legacy || ocsf || native_response_headers {
+                budget.headers(&response.headers)
+            } else {
+                None
+            },
+            body: if json || native_response_body {
+                budget.string(&response.body)
+            } else {
+                String::new()
+            },
+        });
+
+        let producer = if json || legacy || ocsf {
+            transaction
+                .producer
+                .as_ref()
+                .map(|producer| budget.producer(producer, format))
+        } else {
+            None
+        };
+
+        let message_mode = if json {
+            AuditMessageCopy::Json
+        } else if legacy {
+            AuditMessageCopy::Legacy
+        } else if ocsf {
+            AuditMessageCopy::Ocsf
+        } else if native_trailer || native_rules {
+            AuditMessageCopy::Native {
+                error: native_trailer,
+                raw: native_rules,
+            }
+        } else {
+            AuditMessageCopy::None
+        };
+        let messages = if message_mode == AuditMessageCopy::None {
+            Vec::new()
+        } else {
+            budget.sequence(&self.messages, |budget, message| budget.message(message, message_mode))
+        };
+
+        Self {
+            parts,
+            transaction: AuditTransaction {
+                timestamp,
+                unix_timestamp,
+                id,
+                client_ip,
+                client_port,
+                host_ip,
+                host_port,
+                server_id,
+                request: bounded_request,
+                response,
+                producer,
+                highest_severity,
+                is_interrupted,
+            },
+            messages,
         }
     }
 
@@ -861,6 +1102,282 @@ fn message_data_json(data: &AuditMessageData) -> Value {
         "tags": data.tags,
         "raw": data.raw,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+/// Selects the fields to retain for each audit format.
+enum AuditMessageCopy {
+    /// The native format has no message section in this entry.
+    None,
+    /// Copy every message field used by JSON.
+    Json,
+    /// Copy only the expanded text used by `JSONLegacy`.
+    Legacy,
+    /// Copy the OCSF message and nested rule data.
+    Ocsf,
+    /// Copy the native trailer and/or rules section.
+    Native {
+        /// Copy the message's error log text for part H.
+        error: bool,
+        /// Copy the matched rule text for part K.
+        raw: bool,
+    },
+}
+
+/// Limits owned strings and collection entries while preparing an audit formatter view.
+struct AuditCopyBudget {
+    /// Remaining bytes available for copied string contents.
+    bytes_left: usize,
+    /// Remaining list and map entries.
+    items_left: usize,
+    /// Bytes copied so far, used by regression tests.
+    bytes_used: usize,
+    /// Entries copied so far, used by regression tests.
+    items_used: usize,
+    /// Whether any source content exceeded the copy budget.
+    truncated: bool,
+}
+
+impl AuditCopyBudget {
+    /// Sets text and collection budgets derived from the output limit.
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes_left: max_bytes,
+            items_left: max_bytes.saturating_add(63) / 64,
+            bytes_used: 0,
+            items_used: 0,
+            truncated: false,
+        }
+    }
+
+    /// Copies the longest UTF-8 prefix that fits the remaining text budget.
+    fn string(&mut self, value: &str) -> String {
+        let mut end = value.len().min(self.bytes_left);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < value.len() {
+            self.truncated = true;
+        }
+        self.bytes_left -= end;
+        self.bytes_used += end;
+        value.get(..end).unwrap_or_default().to_owned()
+    }
+
+    /// Reserves up to the remaining number of collection entries.
+    fn item_count(&mut self, len: usize) -> usize {
+        let count = len.min(self.items_left);
+        if count < len {
+            self.truncated = true;
+        }
+        self.items_left -= count;
+        self.items_used += count;
+        count
+    }
+
+    /// Copies a sequence while charging each retained element against the item budget.
+    fn sequence<T, U>(&mut self, values: &[T], mut copy: impl FnMut(&mut Self, &T) -> U) -> Vec<U> {
+        let count = self.item_count(values.len());
+        values.iter().take(count).map(|value| copy(self, value)).collect()
+    }
+
+    /// Copies string entries in a list.
+    fn strings(&mut self, values: &[String]) -> Vec<String> {
+        self.sequence(values, |budget, value| budget.string(value))
+    }
+
+    /// Copies header names and values without retaining unbounded maps or strings.
+    fn headers(&mut self, headers: &Option<BTreeMap<String, Vec<String>>>) -> Option<BTreeMap<String, Vec<String>>> {
+        headers.as_ref().map(|headers| {
+            let count = self.item_count(headers.len());
+            headers
+                .iter()
+                .take(count)
+                .map(|(name, values)| (self.string(name), self.strings(values)))
+                .collect()
+        })
+    }
+
+    /// Copies uploaded-file metadata within both budgets.
+    fn files(&mut self, files: &Option<Vec<AuditFile>>) -> Option<Vec<AuditFile>> {
+        files.as_ref().map(|files| {
+            self.sequence(files, |budget, file| AuditFile {
+                name: budget.string(&file.name),
+                size: file.size,
+                mime: budget.string(&file.mime),
+            })
+        })
+    }
+
+    /// Copies OCSF request arguments within both budgets.
+    fn args(&mut self, args: &[(String, String)]) -> Vec<(String, String)> {
+        self.sequence(args, |budget, (key, value)| (budget.string(key), budget.string(value)))
+    }
+
+    /// Copies only producer fields used by the selected JSON format.
+    fn producer(&mut self, producer: &AuditProducer, format: AuditLogFormat) -> AuditProducer {
+        let json = format == AuditLogFormat::Json;
+        let legacy = format == AuditLogFormat::JsonLegacy;
+        let ocsf = format == AuditLogFormat::Ocsf;
+        AuditProducer {
+            connector: self.string(&producer.connector),
+            version: if json || ocsf {
+                self.string(&producer.version)
+            } else {
+                String::new()
+            },
+            server: if json {
+                self.string(&producer.server)
+            } else {
+                String::new()
+            },
+            rule_engine: if json || legacy {
+                self.string(&producer.rule_engine)
+            } else {
+                String::new()
+            },
+            stopwatch: if json {
+                self.string(&producer.stopwatch)
+            } else {
+                String::new()
+            },
+            rulesets: if json || legacy {
+                self.strings(&producer.rulesets)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Copies only message fields used by the selected audit format.
+    fn message(&mut self, message: &AuditMessage, mode: AuditMessageCopy) -> AuditMessage {
+        let json = mode == AuditMessageCopy::Json;
+        let legacy = mode == AuditMessageCopy::Legacy;
+        let ocsf = mode == AuditMessageCopy::Ocsf;
+        let (native_error, native_raw) = match mode {
+            AuditMessageCopy::Native { error, raw } => (error, raw),
+            _ => (false, false),
+        };
+        let all_data = json || ocsf;
+        let data = &message.data;
+        AuditMessage {
+            actionset: if json {
+                self.string(&message.actionset)
+            } else {
+                String::new()
+            },
+            message: if json || legacy || ocsf {
+                self.string(&message.message)
+            } else {
+                String::new()
+            },
+            error_message: if json || native_error {
+                self.string(&message.error_message)
+            } else {
+                String::new()
+            },
+            data: AuditMessageData {
+                file: if all_data {
+                    self.string(&data.file)
+                } else {
+                    String::new()
+                },
+                line: if all_data { data.line } else { 0 },
+                id: if all_data { data.id } else { 0 },
+                rev: if all_data {
+                    self.string(&data.rev)
+                } else {
+                    String::new()
+                },
+                msg: if all_data {
+                    self.string(&data.msg)
+                } else {
+                    String::new()
+                },
+                data: if all_data {
+                    self.string(&data.data)
+                } else {
+                    String::new()
+                },
+                severity: if all_data { data.severity } else { 0 },
+                ver: if all_data {
+                    self.string(&data.ver)
+                } else {
+                    String::new()
+                },
+                maturity: if all_data { data.maturity } else { 0 },
+                accuracy: if all_data { data.accuracy } else { 0 },
+                tags: if all_data { self.strings(&data.tags) } else { Vec::new() },
+                raw: if all_data || native_raw {
+                    self.string(&data.raw)
+                } else {
+                    String::new()
+                },
+            },
+        }
+    }
+}
+
+/// Returns the longest UTF-8 boundary no later than `max_bytes`.
+fn utf8_boundary(value: &str, max_bytes: usize) -> usize {
+    (0..=max_bytes.min(value.len()))
+        .rev()
+        .find(|index| value.is_char_boundary(*index))
+        .unwrap_or(0)
+}
+
+/// Serializes JSON directly into a capped output buffer.
+fn serialize_json_bounded(value: &Value, max_bytes: usize) -> (String, bool) {
+    let mut output = AuditFormatBuffer::new(max_bytes);
+    let failed = serde_json::to_writer(&mut output, value).is_err();
+    let truncated = output.truncated || failed;
+    (output.into_string(), truncated)
+}
+
+/// Byte buffer that stops JSON serialization at its configured output limit.
+struct AuditFormatBuffer {
+    /// Serialized JSON bytes retained so far.
+    bytes: Vec<u8>,
+    /// Maximum serialized byte count.
+    max_bytes: usize,
+    /// Whether the serializer attempted to write beyond the limit.
+    truncated: bool,
+}
+
+impl AuditFormatBuffer {
+    /// Creates a sink with the exact output capacity.
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes),
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    /// Converts the retained UTF-8 prefix into a string.
+    fn into_string(mut self) -> String {
+        if let Err(error) = std::str::from_utf8(&self.bytes) {
+            self.bytes.truncate(error.valid_up_to());
+        }
+        String::from_utf8(self.bytes).unwrap_or_default()
+    }
+}
+
+impl Write for AuditFormatBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.bytes.len());
+        if buf.len() <= remaining {
+            self.bytes.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        self.bytes.extend_from_slice(buf.get(..remaining).unwrap_or_default());
+        self.truncated = true;
+        Err(io::Error::new(io::ErrorKind::WriteZero, "audit output limit reached"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// `value` without the object fields that are null, `""`, `0`, `false` or `[]`, at any
@@ -1713,6 +2230,10 @@ impl AuditLogger {
     ///
     /// If the writer cannot be activated or writing fails.
     pub(crate) fn write(&self, entry: &AuditLog) -> io::Result<()> {
+        // A discard plan with no custom writer has nothing to format or activate.
+        if self.custom_writer.is_none() && matches!(&self.plan, WriterPlan::Discard) {
+            return Ok(());
+        }
         let formatted = self.formatter.format(entry);
         if formatted.as_bytes().is_empty() {
             return Ok(());
@@ -2502,9 +3023,9 @@ fn index_field(value: &str) -> String {
 #[expect(clippy::unwrap_used, reason = "audit log tests use fixed temporary paths")]
 mod tests {
     use super::{
-        ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditLog, AuditLogger,
-        AuditTransaction, FormattedAudit, Syslog, SyslogSocket, Writer, connect_deadline, connect_tcp, index_field,
-        next_backoff, safe_file_component, write_new,
+        ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditCopyBudget, AuditLog,
+        AuditLogger, AuditMessage, AuditMessageData, AuditRequest, AuditTransaction, FormattedAudit, Syslog,
+        SyslogSocket, Writer, connect_deadline, connect_tcp, index_field, next_backoff, safe_file_component, write_new,
     };
     use crate::{
         actions::RuleMetadata,
@@ -2742,6 +3263,78 @@ mod tests {
         let native = entry.format(AuditLogFormat::Native);
         assert!(native.contains("-A--\n"));
         assert!(native.contains("-Z--\n"));
+    }
+
+    #[test]
+    fn bounded_format_caps_control_heavy_entries_in_every_configured_format() {
+        const OUTPUT_LIMIT: usize = 16 * 1024;
+        let control_heavy = "\u{0007}".repeat(1024 * 1024);
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ACHKZ").unwrap(),
+            transaction: AuditTransaction {
+                request: AuditRequest {
+                    body: control_heavy.clone(),
+                    args: vec![("body".to_owned(), control_heavy.clone())],
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                message: control_heavy.clone(),
+                data: AuditMessageData {
+                    data: control_heavy.clone(),
+                    raw: control_heavy,
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+
+        for format in [
+            AuditLogFormat::Native,
+            AuditLogFormat::Json,
+            AuditLogFormat::JsonLegacy,
+            AuditLogFormat::Ocsf,
+        ] {
+            let mut budget = AuditCopyBudget::new(OUTPUT_LIMIT);
+            let view = entry.bounded_copy(format, &mut budget);
+            assert!(budget.bytes_used <= OUTPUT_LIMIT);
+            assert!(budget.items_used <= OUTPUT_LIMIT.saturating_add(63) / 64);
+            assert!(view.format(format).len() <= OUTPUT_LIMIT * 48);
+
+            let (formatted, truncated) = entry.format_bounded(format, OUTPUT_LIMIT);
+            assert!(truncated, "format={format:?}");
+            assert!(formatted.len() <= OUTPUT_LIMIT, "format={format:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_copy_caps_collection_items() {
+        let entry = AuditLog {
+            transaction: AuditTransaction {
+                request: AuditRequest {
+                    args: vec![("k".to_owned(), "v".to_owned()), ("k".to_owned(), "v".to_owned())],
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            ..AuditLog::default()
+        };
+        let mut budget = AuditCopyBudget::new(64);
+
+        let view = entry.bounded_copy(AuditLogFormat::Ocsf, &mut budget);
+
+        assert_eq!(view.transaction.request.args.len(), 1);
+        assert_eq!(budget.items_used, 1);
+        assert!(budget.truncated);
+    }
+
+    #[test]
+    fn bounded_json_output_drops_a_partial_multibyte_character() {
+        let (formatted, truncated) = super::serialize_json_bounded(&serde_json::json!("é"), 2);
+
+        assert_eq!(formatted, "\"");
+        assert!(truncated);
     }
 
     #[test]

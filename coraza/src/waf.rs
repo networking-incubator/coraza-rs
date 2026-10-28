@@ -26,7 +26,7 @@ use std::sync::{
 };
 
 use crate::{
-    audit_log::{AuditLogRegistry, AuditLogger, ErrorLog},
+    audit_log::{AuditLogCallback, AuditLogRegistry, AuditLogger, ErrorLog},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugLevel, DebugLogger, Writer, noop_logger},
     rules::RuleGroup,
@@ -70,6 +70,8 @@ pub struct Waf {
     debug_writer: Option<Arc<Writer>>,
     /// Delay the construction event until after `Parser::compile` has returned.
     construction_logged: AtomicBool,
+    /// Optional connector-owned audit entry sink.
+    audit_log: Option<AuditLogCallback>,
 }
 
 impl std::fmt::Debug for Waf {
@@ -92,7 +94,7 @@ impl Waf {
     /// Returns an error for invalid limits, incompatible upload settings, or invalid
     /// audit logging configuration. Log sinks are not opened here.
     pub fn new(config: WafConfig) -> Result<Self, ConfigError> {
-        Self::with_rules(config, RuleGroup::new(), None, None, &AuditLogRegistry::default())
+        Self::with_rules(config, RuleGroup::new(), None, None, None, &AuditLogRegistry::default())
     }
 
     /// Create a WAF from configuration and compiled rules.
@@ -109,11 +111,15 @@ impl Waf {
     /// [`Transaction::finish`] that writes an entry opens them. The debug sink is also
     /// deferred until activation or its first enabled event, so a candidate policy can be
     /// compiled and discarded without creating log files or connecting.
+    // Callers are the parser and `Waf::new`; each optional sink stays a distinct
+    // parameter so none can be silently dropped or reordered.
+    #[expect(clippy::too_many_arguments, reason = "host sinks are distinct constructor inputs")]
     pub(crate) fn with_rules(
         config: WafConfig,
         rules: RuleGroup,
         error_log: Option<ErrorLog>,
         debug_logger: Option<Arc<dyn DebugLogger>>,
+        audit_log: Option<AuditLogCallback>,
         audit_log_registry: &AuditLogRegistry,
     ) -> Result<Self, ConfigError> {
         validate_config(&config)?;
@@ -157,6 +163,7 @@ impl Waf {
             debug_logger,
             debug_writer,
             construction_logged: AtomicBool::new(false),
+            audit_log,
         })
     }
 
@@ -247,6 +254,9 @@ impl Waf {
             transaction.set_error_log(error_log.clone());
         }
         transaction.debug_log(DebugLevel::Debug, "Transaction started", || []);
+        if let Some(audit_log) = &self.audit_log {
+            transaction.set_audit_log_callback(audit_log.clone());
+        }
         transaction
     }
 
@@ -291,6 +301,7 @@ impl Default for Waf {
             debug_logger: noop_logger(),
             debug_writer: None,
             construction_logged: AtomicBool::new(false),
+            audit_log: None,
         }
     }
 }
