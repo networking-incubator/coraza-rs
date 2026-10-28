@@ -275,7 +275,7 @@ pub struct Transaction {
     files_tmp_names: Map,
     /// Native paths for uploads, retained so cleanup also works with non-UTF-8 paths.
     uploaded_paths: Vec<PathBuf>,
-    /// Combined size of all parsed multipart parts.
+    /// Combined size of multipart file parts, including files skipped by the upload-file limit.
     files_combined_size: Single,
     /// Multipart metadata indexed by each part name.
     multipart_name: Map,
