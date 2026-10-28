@@ -343,18 +343,22 @@ mod tests {
     }
 
     #[test]
-    fn a_scalar_rules_value_is_enforced_end_to_end() {
+    fn legacy_rules_config_is_rejected_instead_of_failing_open() {
         let mut root = root();
-        root.apply(
-            br#"{
+        let error = root
+            .apply(
+                br#"{
                 "rules": "SecRule REQUEST_URI \"@contains attack\" \"id:8,phase:1,deny,status:403\""
             }"#,
-        )
-        .expect("a scalar rules value is one directive");
+            )
+            .unwrap_err();
         assert_eq!(
-            interrupting_rule(&root, "a.example"),
-            8,
-            "the scalar directives are enforced, not dropped"
+            error,
+            "rules is no longer supported; use directives_map and default_directives"
+        );
+        assert!(
+            root.current_generation().is_none(),
+            "no empty pass-through generation was installed"
         );
     }
 
