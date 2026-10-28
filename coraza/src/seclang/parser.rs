@@ -805,6 +805,15 @@ impl Parser {
         };
 
         let adds_rule = matches!(directive_lower.as_str(), "secrule" | "secaction" | "secmarker");
+        // Gate entry when an earlier parse already exhausted the budget: a reused parser
+        // with a lowered limit must not compile one more rule, or read its operator data,
+        // before the post-handler check rejects it.
+        if adds_rule
+            && let Some(limit) = self.rule_limit
+            && self.rules.total_count() > limit
+        {
+            return Err(self.rule_limit_error(limit));
+        }
         let result = match directive {
             Directive::WithArgument(_) if opts.is_empty() => Err("requires an argument".to_owned()),
             Directive::WithoutArgument(_) if !opts.is_empty() => Err("takes no argument".to_owned()),
@@ -835,7 +844,7 @@ impl Parser {
             && let Some(limit) = self.rule_limit
             && self.rules.total_count() > limit
         {
-            return Err(self.budget_error(format!("rule limit of {limit} rules exceeded in one parse")));
+            return Err(self.rule_limit_error(limit));
         }
         result
     }
@@ -852,6 +861,11 @@ impl Parser {
     fn budget_error(&mut self, message: String) -> ParseError {
         self.budget_exhausted = true;
         self.error(message)
+    }
+
+    /// The budget error for an exhausted rule limit.
+    fn rule_limit_error(&mut self, limit: usize) -> ParseError {
+        self.budget_error(format!("rule limit of {limit} rules exceeded in one parse"))
     }
 }
 
@@ -3555,6 +3569,23 @@ SecWebAppId production
         assert_eq!(parser.total_rule_count(), 1);
         let error = parser.from_string("SecAction \"id:2,pass\"").unwrap_err();
         assert!(error.message.contains("rule limit of 1 rules"), "{error:?}");
+    }
+
+    #[test]
+    fn a_lowered_rule_limit_rejects_before_compiling_the_next_rule() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecAction \"id:1,pass\"\nSecAction \"id:2,pass\"")
+            .unwrap();
+        let mut parser = parser.with_rule_limit(1);
+
+        // The file does not exist: reaching the operator would report a read error, so a
+        // limit error proves the budget rejected the directive before reading rule data.
+        let error = parser
+            .from_string("SecRule REQUEST_URI \"@pmFromFile missing.list\" \"id:3,pass\"")
+            .unwrap_err();
+        assert!(error.message.contains("rule limit of 1 rules"), "{error:?}");
+        assert_eq!(parser.total_rule_count(), 2, "the rejected directive was not counted");
     }
 
     #[test]
