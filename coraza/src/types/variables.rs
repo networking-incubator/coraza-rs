@@ -42,7 +42,7 @@ pub enum RuleVariable {
     UniqueID,
     /// `ARGS_COMBINED_SIZE` - Combined size of all arguments
     ArgsCombinedSize,
-    /// `FILES_COMBINED_SIZE` - Combined size of uploaded files
+    /// `FILES_COMBINED_SIZE` - Combined size of multipart file parts, including files skipped by the upload-file limit
     FilesCombinedSize,
     /// `FULL_REQUEST_LENGTH` - Length of the full request
     FullRequestLength,
