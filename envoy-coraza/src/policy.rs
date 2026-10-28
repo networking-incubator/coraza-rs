@@ -1,0 +1,1420 @@
+// Copyright Coraza Kubernetes Operator contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Compilation of one immutable policy generation.
+//!
+//! A generation is built once from a [`Config`] and then shared read-only by
+//! every stream. Strict compilation is deliberate: a policy that does not
+//! compile fails the whole generation, so a partially enforced rule set can
+//! never serve traffic.
+
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fmt::{self, Display, Formatter},
+    io,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+use coraza::{
+    config::{UploadKeepFiles, WafConfig},
+    rule_data::{FileSystem, Memory, RuleData},
+    seclang::Parser,
+    types::{AuditLogType, RuleEngineStatus},
+    Waf,
+};
+
+use crate::{
+    config::{display_name, Config},
+    observability::{self, Diagnostics, Metrics},
+};
+
+/// Most policies one generation may hold.
+const MAX_POLICIES: usize = 64;
+
+/// Most rules one policy may compile.
+///
+/// Rule insertion scans the rules already compiled for a duplicate id, so a policy is
+/// collected in quadratic time: 30,000 flat rules measured about 0.8 s (1.2 s with a
+/// realistic rule shape) on the reference native host and 3.3 s of configure-plus-start in
+/// an Envoy 1.40 V8 worker; the generation cap measured 5.4 s there. Re-measure before
+/// raising either cap. Stock CRS is about 6,000 rules.
+const MAX_RULES_PER_POLICY: usize = 30_000;
+
+/// Most rules one generation may compile across all policies.
+const MAX_RULES_PER_GENERATION: usize = 60_000;
+
+/// Most rule data bytes one generation may read through its shared source.
+const MAX_RULE_DATA_READ_BYTES: usize = 32 * 1024 * 1024;
+
+/// Largest request body, in bytes, a WASM filter may buffer.
+///
+/// This is the host ceiling, not the installed default: stock CRS sets
+/// `SecRequestBodyLimit 13107200` (12.5 `MiB`), so the ceiling has to admit it.
+/// New deployments are expected to install an 8 `MiB` limit.
+const MAX_REQUEST_BODY_LIMIT: i64 = 16 * 1024 * 1024;
+
+/// Largest response body, in bytes, a WASM filter may buffer.
+const MAX_RESPONSE_BODY_LIMIT: i64 = 1024 * 1024;
+
+/// Longest engine diagnostic copied into a log line.
+const MAX_DIRECTIVE_MESSAGE_BYTES: usize = 512;
+
+/// One set of generation-wide bounds.
+///
+/// A value rather than bare constants so the caps can be exercised with small
+/// limits instead of compiling thousands of policies in every test.
+#[derive(Debug, Clone, Copy)]
+struct CompileLimits {
+    /// Most policies.
+    policies: usize,
+    /// Most rule data bytes read through the shared source.
+    rule_data_read_bytes: usize,
+    /// Most rules one policy may compile.
+    rules_per_policy: usize,
+    /// Most rules across all policies.
+    rules_per_generation: usize,
+}
+
+/// The production [`CompileLimits`].
+const COMPILE_LIMITS: CompileLimits = CompileLimits {
+    policies: MAX_POLICIES,
+    rule_data_read_bytes: MAX_RULE_DATA_READ_BYTES,
+    rules_per_policy: MAX_RULES_PER_POLICY,
+    rules_per_generation: MAX_RULES_PER_GENERATION,
+};
+
+/// Rule data source shared by every policy of one generation.
+///
+/// It delegates storage to [`Memory`] and stops the generation once more than
+/// its budget has been read, so repeated `Include`s cannot multiply the work a
+/// small configuration asks for.
+#[derive(Debug)]
+struct CountingRuleData {
+    /// The storage every policy reads.
+    memory: Memory,
+    /// Bytes read so far in this generation.
+    read: AtomicUsize,
+    /// Most bytes one generation may read.
+    budget: usize,
+}
+
+impl CountingRuleData {
+    /// Wraps `memory` with a per-generation read budget.
+    fn new(memory: Memory, budget: usize) -> Self {
+        Self {
+            memory,
+            read: AtomicUsize::new(0),
+            budget,
+        }
+    }
+}
+
+impl RuleData for CountingRuleData {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let bytes = self.memory.read(path)?;
+        let total = self
+            .read
+            .fetch_add(bytes.len(), Ordering::Relaxed)
+            .saturating_add(bytes.len());
+        if total > self.budget {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "rule data read budget of {} bytes exceeded in one generation",
+                    self.budget
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn glob(&self, pattern: &str) -> io::Result<Vec<std::path::PathBuf>> {
+        self.memory.glob(pattern)
+    }
+
+    fn as_file_system(&self) -> Option<&FileSystem> {
+        self.memory.as_file_system()
+    }
+}
+
+/// One compiled policy, shared by every stream that selects it.
+#[derive(Debug)]
+pub(crate) struct Policy {
+    /// Compiled rules and effective configuration.
+    pub(crate) waf: Waf,
+}
+
+impl Policy {
+    /// Wraps a compiled WAF after checking that the host can run it.
+    fn new(waf: Waf) -> Result<Self, String> {
+        let policy = Self { waf };
+        check_wasm_safety(policy.waf.config())?;
+        Ok(policy)
+    }
+}
+
+/// An immutable set of compiled policies plus their selection tables.
+#[derive(Debug)]
+pub(crate) struct Generation {
+    /// Every compiled policy, by name.
+    policies: BTreeMap<String, Policy>,
+    /// Authority to policy name, for authorities with a policy of their own.
+    authority_policies: BTreeMap<String, String>,
+    /// Fallback policy name, absent when the configuration names none.
+    default_policy: Option<String>,
+    /// Whether the fork's filter-state log lines are enabled.
+    enable_filter_state_logs: bool,
+    /// Per-generation metric IDs and bounded interruption series.
+    metrics: Arc<Metrics>,
+    /// Shared rate-limited diagnostics for telemetry failures.
+    diagnostics: Arc<Diagnostics>,
+    /// Monotonic plugin configuration generation identifier.
+    generation_id: u64,
+    /// Configure-time warnings, one per policy that needs one.
+    warnings: Vec<String>,
+}
+
+/// A generation that cannot be built.
+#[derive(Debug)]
+pub(crate) enum CompileError {
+    /// A policy's directives do not parse or do not compile.
+    Directive {
+        /// Policy being compiled.
+        policy: String,
+        /// Engine diagnostic, including its file and line, truncated before logging.
+        message: String,
+    },
+    /// A compiled policy configures behaviour the host cannot provide.
+    Unsafe {
+        /// Policy being compiled.
+        policy: String,
+        /// What the host cannot do.
+        reason: String,
+    },
+    /// A policy compiled more rules than one policy may hold.
+    RulesPerPolicy {
+        /// Policy that pushed the count over the bound.
+        policy: String,
+        /// Rules compiled in that policy.
+        count: usize,
+        /// Bound that was exceeded, built from its constant.
+        limit: String,
+    },
+    /// A generation compiled more rules than it may hold.
+    RulesPerGeneration {
+        /// Rules compiled across every policy.
+        count: usize,
+        /// Bound that was exceeded, built from its constant.
+        limit: String,
+    },
+    /// An authority names a policy that does not exist.
+    UnknownAuthorityPolicy {
+        /// Authority the entry is for.
+        authority: String,
+        /// Missing policy name.
+        policy: String,
+    },
+    /// `default_directives` names a policy that does not exist.
+    UnknownDefaultPolicy {
+        /// Missing policy name.
+        policy: String,
+    },
+    /// The configuration is over a generation-wide bound.
+    Limit {
+        /// Bound that was exceeded, built from its constant.
+        limit: String,
+    },
+}
+
+impl Display for CompileError {
+    /// Formats the error for an operator-facing configure failure.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directive { policy, message } => {
+                write!(f, "policy {}: {}", display_name(policy), truncate_message(message))
+            },
+            Self::Unsafe { policy, reason } => {
+                write!(f, "policy {} cannot run on this host: {reason}", display_name(policy))
+            },
+            Self::RulesPerPolicy { policy, count, limit } => {
+                write!(
+                    f,
+                    "policy {} compiles {count} rules, over the {limit}",
+                    display_name(policy)
+                )
+            },
+            Self::RulesPerGeneration { count, limit } => {
+                write!(f, "generation compiles {count} rules, over the {limit}")
+            },
+            Self::UnknownAuthorityPolicy { authority, policy } => {
+                write!(
+                    f,
+                    "directive map not found for authority {}: {}",
+                    display_name(authority),
+                    display_name(policy)
+                )
+            },
+            Self::UnknownDefaultPolicy { policy } => {
+                write!(
+                    f,
+                    "directive map not found for default directive: {}",
+                    display_name(policy)
+                )
+            },
+            Self::Limit { limit } => write!(f, "generation exceeds its {limit}"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+/// Rule-count boundary and the configure error it must report.
+#[derive(Debug, Clone, Copy)]
+enum RuleBudget {
+    /// Per-policy rule cap.
+    Policy {
+        /// Maximum rules in one policy.
+        limit: usize,
+    },
+    /// Per-generation rule cap became tighter than the per-policy cap.
+    Generation {
+        /// Rules still available before this policy compiles.
+        remaining: usize,
+        /// Rules already compiled in earlier policies.
+        prior: usize,
+        /// Maximum rules across the generation.
+        limit: usize,
+    },
+}
+
+impl RuleBudget {
+    /// Returns the parser's maximum rule count for this policy.
+    fn parser_limit(self) -> usize {
+        match self {
+            Self::Policy { limit } => limit,
+            Self::Generation { remaining, .. } => remaining,
+        }
+    }
+
+    /// Builds the operator-facing error for a rule-budget overflow.
+    fn error(self, policy: &str, count: usize) -> CompileError {
+        match self {
+            Self::Policy { limit } => CompileError::RulesPerPolicy {
+                policy: policy.to_owned(),
+                count,
+                limit: format!("limit of {limit} rules per policy"),
+            },
+            Self::Generation { prior, limit, .. } => CompileError::RulesPerGeneration {
+                count: prior.saturating_add(count),
+                limit: format!("limit of {limit} rules per generation"),
+            },
+        }
+    }
+}
+
+/// Shared dependencies for compiling every policy in one generation.
+struct PolicyCompiler {
+    /// Rule data source shared by the generation.
+    rule_data: Arc<dyn RuleData>,
+    /// Metric callbacks installed on compiled rules.
+    metrics: Arc<Metrics>,
+    /// Diagnostics used by telemetry callbacks.
+    diagnostics: Arc<Diagnostics>,
+}
+
+impl PolicyCompiler {
+    /// Compiles one policy with the shared in-memory rule data and rule budget.
+    fn compile(
+        &self,
+        name: &str,
+        directives: &[String],
+        rule_budget: RuleBudget,
+    ) -> Result<(Policy, usize, Option<String>), CompileError> {
+        let mut parser = Parser::new()
+            .with_rule_data(Arc::clone(&self.rule_data))
+            .with_rule_limit(rule_budget.parser_limit());
+        parser.config_mut().multiphase_evaluation = true;
+        parser.config_mut().audit_engine_locked = false;
+        let error_metrics = Arc::clone(&self.metrics);
+        let error_diagnostics = Arc::clone(&self.diagnostics);
+        parser.on_error_log(move |matched| {
+            observability::error_log(matched, &error_metrics, &error_diagnostics);
+        });
+        let text = directives.join("\n");
+        let failure = |message: String| CompileError::Directive {
+            policy: name.to_owned(),
+            message,
+        };
+        if let Err(error) = parser.from_string(&text) {
+            let count = parser.total_rule_count();
+            if count > rule_budget.parser_limit() {
+                return Err(rule_budget.error(name, count));
+            }
+            return Err(failure(error.to_string()));
+        }
+        // `SecIgnoreRuleCompilationErrors On` can make a broken directive disappear.
+        // A policy that silently loses a rule line is a fail-open, so refuse it here.
+        if let Some(skipped) = parser.skipped().first() {
+            return Err(failure(format!("directive was skipped instead of failing: {skipped}")));
+        }
+        let count = parser.total_rule_count();
+        let audit_format = parser.config().audit_log_format;
+        let audit_metrics = Arc::clone(&self.metrics);
+        let audit_diagnostics = Arc::clone(&self.diagnostics);
+        parser.on_audit_log(move |entry| {
+            observability::audit_log(entry, audit_format, &audit_metrics, &audit_diagnostics);
+        });
+        // Host policy: `ctl` must not raise the effective body limits past what this host
+        // buffers; connector audit output uses the configured Proxy-Wasm log callback.
+        parser.config_mut().max_request_body_limit = MAX_REQUEST_BODY_LIMIT;
+        parser.config_mut().max_response_body_limit = MAX_RESPONSE_BODY_LIMIT;
+        parser.config_mut().audit_engine_locked = true;
+        parser.config_mut().reject_multipart_file_uploads = true;
+        let waf = parser.compile().map_err(|error| failure(error.to_string()))?;
+        let warning = match waf.config().rule_engine {
+            RuleEngineStatus::On => None,
+            RuleEngineStatus::DetectionOnly => Some(format!(
+                "envoy-coraza: policy {} uses SecRuleEngine DetectionOnly; would-be interruptions do not block traffic",
+                display_name(name)
+            )),
+            RuleEngineStatus::Off => Some(format!(
+                "envoy-coraza: policy {} uses SecRuleEngine Off; requests are not enforced",
+                display_name(name)
+            )),
+        };
+        let policy = Policy::new(waf).map_err(|reason| CompileError::Unsafe {
+            policy: name.to_owned(),
+            reason,
+        })?;
+        Ok((policy, count, warning))
+    }
+}
+
+/// Truncates an engine diagnostic so one log line stays bounded.
+fn truncate_message(message: &str) -> Cow<'_, str> {
+    if message.len() <= MAX_DIRECTIVE_MESSAGE_BYTES {
+        return Cow::Borrowed(message);
+    }
+    let mut end = MAX_DIRECTIVE_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let Some(prefix) = message.get(..end) else {
+        return Cow::Borrowed(message);
+    };
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(prefix);
+    truncated.push('…');
+    Cow::Owned(truncated)
+}
+
+impl Generation {
+    /// Compiles every configured policy into one generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileError`] when a generation bound is exceeded, a policy
+    /// fails to compile, a compiled policy needs a filesystem, audit target or
+    /// body size the host does not provide, or a policy reference does not
+    /// resolve.
+    pub(crate) fn compile(config: Config) -> Result<Self, CompileError> {
+        Self::compile_with_limits(config, COMPILE_LIMITS)
+    }
+
+    /// Compiles with injectable bounds, for tests.
+    fn compile_with_limits(config: Config, limits: CompileLimits) -> Result<Self, CompileError> {
+        check_limits(&config, limits)?;
+        // Resolve references first, so a name typo fails before any policy compiles.
+        for (authority, name) in &config.per_authority_directives {
+            if !config.directives_map.contains_key(name) {
+                return Err(CompileError::UnknownAuthorityPolicy {
+                    authority: authority.clone(),
+                    policy: name.clone(),
+                });
+            }
+        }
+        if let Some(name) = &config.default_directives {
+            if !config.directives_map.contains_key(name) {
+                return Err(CompileError::UnknownDefaultPolicy { policy: name.clone() });
+            }
+        }
+
+        let Config {
+            directives_map,
+            default_directives,
+            per_authority_directives,
+            metric_labels,
+            enable_filter_state_logs,
+            rule_data,
+        } = config;
+        let metrics = Arc::new(Metrics::new(&metric_labels));
+        let diagnostics = Arc::new(Diagnostics::default());
+        let mut warnings = Vec::new();
+        if directives_map.is_empty() {
+            warnings.push("envoy-coraza: no policies configured; every request passes uninspected".to_owned());
+        } else if default_directives.is_none() && per_authority_directives.is_empty() {
+            warnings.push(
+                "envoy-coraza: policies are configured but no default_directives or per_authority_directives \
+                 selects one; every request passes uninspected"
+                    .to_owned(),
+            );
+        }
+        let source: Arc<dyn RuleData> = Arc::new(CountingRuleData::new(
+            Memory::new(rule_data),
+            limits.rule_data_read_bytes,
+        ));
+        let compiler = PolicyCompiler {
+            rule_data: source,
+            metrics: Arc::clone(&metrics),
+            diagnostics: Arc::clone(&diagnostics),
+        };
+        let mut policies = BTreeMap::new();
+        let mut generation_rules = 0_usize;
+        for (name, directives) in directives_map {
+            let remaining = limits.rules_per_generation.saturating_sub(generation_rules);
+            let prior = generation_rules;
+            let rule_budget = if remaining < limits.rules_per_policy {
+                RuleBudget::Generation {
+                    remaining,
+                    prior,
+                    limit: limits.rules_per_generation,
+                }
+            } else {
+                RuleBudget::Policy {
+                    limit: limits.rules_per_policy,
+                }
+            };
+            let (policy, count, warning) = compiler.compile(&name, &directives, rule_budget)?;
+            generation_rules = generation_rules.saturating_add(count);
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            policies.insert(name, policy);
+        }
+
+        Ok(Self {
+            policies,
+            authority_policies: per_authority_directives,
+            default_policy: default_directives,
+            enable_filter_state_logs,
+            metrics,
+            diagnostics,
+            generation_id: 0,
+            warnings,
+        })
+    }
+
+    /// Selects the policy for a normalized `authority`: an exact match, else the default.
+    ///
+    /// `None` means the request is passed uninspected. That matches upstream,
+    /// which logs a warning and continues for an authority that has no policy
+    /// and no default; the lifecycle step will log and continue the same way.
+    pub(crate) fn select_named(&self, authority: &str) -> Option<(&str, &Policy)> {
+        let name = self
+            .authority_policies
+            .get(authority)
+            .or(self.default_policy.as_ref())?;
+        Some((name, self.policies.get(name)?))
+    }
+
+    /// Selects the policy for a normalized `authority`: an exact match, else the default.
+    #[cfg_attr(not(test), expect(dead_code, reason = "policy tests exercise the selection API"))]
+    pub(crate) fn select(&self, authority: &str) -> Option<&Policy> {
+        self.select_named(authority).map(|(_, policy)| policy)
+    }
+
+    /// Configure-time warnings, one per policy that needs one.
+    pub(crate) fn warnings(&self) -> impl Iterator<Item = &str> {
+        self.warnings.iter().map(String::as_str)
+    }
+
+    /// Whether the legacy interruption filter-state fields are enabled.
+    pub(crate) fn enable_filter_state_logs(&self) -> bool {
+        self.enable_filter_state_logs
+    }
+
+    /// Returns metrics scoped to this generation.
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// Returns diagnostics scoped to this generation.
+    pub(crate) fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+
+    /// Returns the monotonic ID assigned to this generation.
+    pub(crate) fn generation_id(&self) -> u64 {
+        self.generation_id
+    }
+
+    /// Assigns the ID after the generation compiles successfully.
+    pub(crate) fn set_id(&mut self, generation_id: u64) {
+        self.generation_id = generation_id;
+    }
+
+    /// Defines this generation's metrics in the Proxy-Wasm host.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn initialize_metrics(&self) {
+        self.metrics.initialize(&self.diagnostics);
+    }
+}
+
+/// Rejects an effective WAF configuration that cannot run on a WASM host.
+///
+/// The WASI host has no usable filesystem, and native audit targets cannot be
+/// opened there. Selected audit entries use the bounded Proxy-Wasm log callback.
+/// Body buffers also have to stay within the memory a filtered stream can afford.
+fn check_wasm_safety(config: &WafConfig) -> Result<(), String> {
+    if config.upload_keep_files != UploadKeepFiles::Off {
+        return Err("SecUploadKeepFiles stores uploaded files, which needs a filesystem".to_owned());
+    }
+    if !config.upload_dir.is_empty() {
+        return Err("SecUploadDir names a directory, which needs a filesystem".to_owned());
+    }
+    // Audit output is sent through the connector callback; native transports remain unavailable.
+    if !config.audit_log.is_empty() {
+        return Err("SecAuditLog names a sink, which this build does not provide".to_owned());
+    }
+    if !config.audit_log_storage_dir.is_empty() {
+        return Err("SecAuditLogStorageDir names a directory, which this build does not provide".to_owned());
+    }
+    if config.audit_log_type != AuditLogType::Serial {
+        return Err("SecAuditLogType needs a sink, which this build does not provide".to_owned());
+    }
+    if config.request_body_in_memory_limit != 0 && config.request_body_in_memory_limit < config.request_body_limit {
+        return Err(
+            "SecRequestBodyInMemoryLimit is below SecRequestBodyLimit, so the body would spill to a file".to_owned(),
+        );
+    }
+    if config.request_body_access {
+        if config.request_body_limit <= 0 {
+            return Err("SecRequestBodyLimit must be greater than 0 when SecRequestBodyAccess is on".to_owned());
+        }
+        if config.request_body_limit > MAX_REQUEST_BODY_LIMIT {
+            return Err(format!(
+                "SecRequestBodyLimit is {} bytes, over the {MAX_REQUEST_BODY_LIMIT}-byte WASM ceiling",
+                config.request_body_limit
+            ));
+        }
+    }
+    if config.response_body_access {
+        if config.response_body_limit <= 0 {
+            return Err("SecResponseBodyLimit must be greater than 0 when SecResponseBodyAccess is on".to_owned());
+        }
+        if config.response_body_limit > MAX_RESPONSE_BODY_LIMIT {
+            return Err(format!(
+                "SecResponseBodyLimit is {} bytes, over the {MAX_RESPONSE_BODY_LIMIT}-byte WASM ceiling",
+                config.response_body_limit
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a configuration over any generation-wide bound.
+///
+/// Only the policy count is checked here: the rule budget passed to the parser
+/// bounds the compiled rules, so neither a directive-line nor a directive-text
+/// count is needed, and the plugin configuration size is checked before parsing.
+fn check_limits(config: &Config, limits: CompileLimits) -> Result<(), CompileError> {
+    if config.directives_map.len() > limits.policies {
+        return Err(CompileError::Limit {
+            limit: format!("limit of {} policies", limits.policies),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Generation tests use fixed valid fixtures."
+)]
+/// Generation compilation and selection tests.
+mod tests {
+    use super::{
+        check_limits, truncate_message, CompileError, CompileLimits, Generation, COMPILE_LIMITS, MAX_POLICIES,
+        MAX_REQUEST_BODY_LIMIT, MAX_RESPONSE_BODY_LIMIT, MAX_RULES_PER_GENERATION, MAX_RULES_PER_POLICY,
+    };
+    use crate::config::Config;
+
+    /// Parses a document that must be accepted.
+    fn parse_config(json: &str) -> Config {
+        Config::parse(json.as_bytes()).unwrap()
+    }
+
+    /// Compiles a document that must be accepted.
+    fn parse_generation(json: &str) -> Generation {
+        Generation::compile(parse_config(json)).unwrap()
+    }
+
+    /// Renders a compile error from a document.
+    fn compile_error(json: &str) -> String {
+        Generation::compile(parse_config(json)).unwrap_err().to_string()
+    }
+
+    /// Compiles a document with test bounds.
+    fn compile_with(json: &str, limits: CompileLimits) -> Result<Generation, CompileError> {
+        Generation::compile_with_limits(parse_config(json), limits)
+    }
+
+    /// Small bounds for the rule-count tests.
+    const SMALL_LIMITS: CompileLimits = CompileLimits {
+        policies: 4,
+        rule_data_read_bytes: 1000,
+        rules_per_policy: 2,
+        rules_per_generation: 3,
+    };
+
+    #[test]
+    fn an_empty_configuration_compiles_without_policies() {
+        let generation = parse_generation("{}");
+        assert!(generation.policies.is_empty(), "no policy is configured");
+        assert!(generation.select("a.example").is_none(), "nothing is selected");
+        assert_eq!(
+            generation.warnings().collect::<Vec<_>>(),
+            ["envoy-coraza: no policies configured; every request passes uninspected"],
+            "an empty generation warns that nothing is inspected"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_generation_does_not_warn_about_missing_policies() {
+        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        assert!(
+            !generation.warnings().any(|warning| warning.contains("no policies")),
+            "warnings were {:?}",
+            generation.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_policy_locks_the_audit_engine_and_body_ceilings() {
+        let generation = parse_generation(r#"{"directives_map": {"p": ["SecRuleEngine On"], "q": []}}"#);
+        assert_eq!(generation.policies.len(), 2, "both policies compile");
+        for (name, policy) in &generation.policies {
+            let config = policy.waf.config();
+            assert!(config.audit_engine_locked, "policy {name} must lock ctl:auditEngine");
+            assert_eq!(
+                config.max_request_body_limit, MAX_REQUEST_BODY_LIMIT,
+                "policy {name} must install the request body ceiling"
+            );
+            assert_eq!(
+                config.max_response_body_limit, MAX_RESPONSE_BODY_LIMIT,
+                "policy {name} must install the response body ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_prefers_an_exact_authority_then_the_default() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {"per_authority": ["SecRuleEngine On"], "fallback": []},
+                "per_authority_directives": {"a.example": "per_authority"},
+                "default_directives": "fallback"
+            }"#,
+        );
+        let matched = generation.select("a.example").unwrap();
+        assert!(
+            std::ptr::eq(matched, generation.policies.get("per_authority").unwrap()),
+            "the authority's own policy is selected"
+        );
+        let fallback = generation.select("b.example").unwrap();
+        assert!(
+            std::ptr::eq(fallback, generation.policies.get("fallback").unwrap()),
+            "an unknown authority falls back to the default policy"
+        );
+        assert!(
+            generation.select("").is_some(),
+            "an empty authority is matched verbatim, then falls back"
+        );
+    }
+
+    #[test]
+    fn an_absent_default_does_not_select_the_first_policy() {
+        let generation = parse_generation(r#"{"directives_map": {"only": ["SecRuleEngine On"]}}"#);
+        assert!(
+            generation.select("nope").is_none(),
+            "a single policy is not an implicit default"
+        );
+    }
+
+    #[test]
+    fn an_unknown_authority_without_a_default_is_uninspected() {
+        let generation = parse_generation(r#"{"directives_map": {"only": []}, "default_directives": "only"}"#);
+        assert!(generation.select("nope").is_some(), "the configured default is used");
+        let no_default = parse_generation(r#"{"directives_map": {"only": []}}"#);
+        assert!(no_default.select("nope").is_none(), "no default means no policy");
+    }
+
+    #[test]
+    fn unresolved_authority_and_default_are_rejected_end_to_end() {
+        let error =
+            compile_error(r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "missing"}}"#);
+        assert_eq!(
+            error,
+            "directive map not found for authority \"a.example\": \"missing\""
+        );
+
+        let error = compile_error(r#"{"directives_map": {"p": []}, "default_directives": "missing"}"#);
+        assert_eq!(error, "directive map not found for default directive: \"missing\"");
+    }
+
+    #[test]
+    fn a_name_typo_fails_before_a_broken_policy_compiles() {
+        let error = compile_error(
+            r#"{
+                "directives_map": {"broken": ["SecNotADirective x"]},
+                "default_directives": "missing"
+            }"#,
+        );
+        assert_eq!(error, "directive map not found for default directive: \"missing\"");
+
+        let error = compile_error(
+            r#"{
+                "directives_map": {"broken": ["SecNotADirective x"]},
+                "per_authority_directives": {"a.example": "missing"}
+            }"#,
+        );
+        assert_eq!(
+            error,
+            "directive map not found for authority \"a.example\": \"missing\""
+        );
+    }
+
+    #[test]
+    fn an_include_expansion_stops_at_the_rule_budget() {
+        let limits = CompileLimits {
+            rule_data_read_bytes: 1_000_000,
+            ..SMALL_LIMITS
+        };
+        let rules = (1..=100)
+            .map(|id| format!("SecAction \"id:{id}\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = compile_with(
+            &format!(
+                r#"{{
+                    "directives_map": {{"p": ["Include many.conf", "Include many.conf"]}},
+                    "rule_data": {{"many.conf": {}}}
+                }}"#,
+                serde_json::Value::String(rules)
+            ),
+            limits,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("policy \"p\""), "the error names the policy: {error:?}");
+        assert!(
+            error.contains("limit of 2 rules per policy"),
+            "the first include stops at the budget: {error:?}"
+        );
+        assert!(
+            error.contains("compiles 3 rules"),
+            "only the third rule of the first include was parsed: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_newline_packed_directive_cannot_exceed_the_rule_budget() {
+        let packed = (1..=100)
+            .map(|id| format!("SecAction \"id:{id}\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = compile_with(
+            &format!(
+                r#"{{"directives_map": {{"p": [{}]}}}}"#,
+                serde_json::Value::String(packed)
+            ),
+            SMALL_LIMITS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("limit of 2 rules per policy"),
+            "a newline-packed string cannot bypass the budget: {error:?}"
+        );
+        assert!(
+            error.contains("compiles 3 rules"),
+            "the packed string stops at the third rule: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rule_data_resolves_file_operators_at_compile_time() {
+        let generation = parse_generation(
+            r##"{
+                "directives_map": {
+                    "p": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:1,phase:1,deny,status:403\""]
+                },
+                "rule_data": {"data.txt": "# comment\nattack\n"}
+            }"##,
+        );
+        let policy = generation.policies.get("p").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri("/attack", "GET", "HTTP/1.1");
+        let interruption = transaction.process_request_headers();
+        let interruption = interruption.expect("the configured phrase must interrupt the request");
+        assert_eq!(interruption.rule_id, 1, "the file's phrase fired the rule");
+        assert_eq!(interruption.status, 403, "the rule's status is reported");
+    }
+
+    #[test]
+    fn ip_match_resolves_through_rule_data() {
+        let generation = parse_generation(
+            r##"{
+                "directives_map": {
+                    "p": ["SecRule REMOTE_ADDR \"@ipMatchFromFile networks.txt\" \"id:2,phase:1,deny,status:403\""]
+                },
+                "rule_data": {"networks.txt": "# comment\n203.0.113.0/24\n"}
+            }"##,
+        );
+        let policy = generation.policies.get("p").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.set_remote_addr("203.0.113.7");
+        let interruption = transaction.process_request_headers();
+        let interruption = interruption.expect("the configured network must interrupt the request");
+        assert_eq!(interruption.rule_id, 2, "the file's network fired the rule");
+    }
+
+    #[test]
+    fn include_resolves_through_rule_data() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {"p": ["Include rules/*.conf"]},
+                "rule_data": {
+                    "rules/a.conf": "SecRule REQUEST_URI \"@contains attack\" \"id:3,phase:1,deny,status:403\""
+                }
+            }"#,
+        );
+        let policy = generation.policies.get("p").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri("/attack", "GET", "HTTP/1.1");
+        let interruption = transaction.process_request_headers();
+        let interruption = interruption.expect("the included rule must interrupt the request");
+        assert_eq!(interruption.rule_id, 3, "the included rule fired");
+    }
+
+    #[test]
+    fn two_policies_share_one_rule_data_source() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {
+                    "p": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:4,phase:1,deny,status:403\""],
+                    "q": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:5,phase:1,deny,status:403\""]
+                },
+                "rule_data": {"data.txt": "attack\n"}
+            }"#,
+        );
+        for (policy, rule_id) in [("p", 4), ("q", 5)] {
+            let policy = generation.policies.get(policy).unwrap();
+            let mut transaction = policy.waf.new_transaction();
+            transaction.process_uri("/attack", "GET", "HTTP/1.1");
+            let interruption = transaction
+                .process_request_headers()
+                .expect("both policies read the same phrase file");
+            assert_eq!(interruption.rule_id, rule_id, "the shared phrase fired");
+        }
+    }
+
+    #[test]
+    fn rule_data_read_budget_fails_the_generation() {
+        let limits = CompileLimits {
+            rule_data_read_bytes: 20,
+            ..SMALL_LIMITS
+        };
+        let error = compile_with(
+            r#"{
+                "directives_map": {"p": ["Include a.conf", "Include a.conf"]},
+                "rule_data": {"a.conf": "SecRuleEngine On\n"}
+            }"#,
+            limits,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("policy \"p\": "),
+            "the error names the policy: {error:?}"
+        );
+        assert!(error.contains("read budget of 20 bytes"), "message was {error:?}");
+    }
+
+    #[test]
+    fn a_rule_data_file_that_is_missing_fails_the_policy() {
+        let error = compile_error(
+            r#"{"directives_map": {"p": ["SecRule REQUEST_URI \"@pmFromFile absent.txt\" \"id:1,deny\""]}}"#,
+        );
+        assert!(
+            error.starts_with("policy \"p\": "),
+            "the error names the policy: {error:?}"
+        );
+        assert!(error.contains("absent.txt"), "the error names the file: {error:?}");
+    }
+
+    #[test]
+    fn an_invalid_directive_fails_the_whole_generation() {
+        let error = compile_error(
+            r#"{"directives_map": {"good": ["SecRuleEngine On"], "broken": ["SecRuleEngine On", "SecNotADirective x"]}}"#,
+        );
+        assert!(
+            error.starts_with("policy \"broken\": "),
+            "the error names the policy: {error:?}"
+        );
+        assert!(
+            error.contains("_inline_:2"),
+            "the error carries the file and line: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_upload_directory_is_rejected() {
+        let error = compile_error(r#"{"directives_map": {"p": ["SecUploadDir /tmp"]}}"#);
+        assert!(error.contains("SecUploadDir"), "message was {error:?}");
+        assert!(
+            error.starts_with("policy \"p\" cannot run on this host: "),
+            "message was {error:?}"
+        );
+    }
+
+    #[test]
+    fn keeping_uploaded_files_is_rejected() {
+        let error = compile_error(r#"{"directives_map": {"p": ["SecUploadDir /tmp", "SecUploadKeepFiles On"]}}"#);
+        assert!(error.contains("SecUploadKeepFiles"), "message was {error:?}");
+    }
+
+    #[test]
+    fn an_audit_target_is_rejected() {
+        let error = compile_error(
+            r#"{"directives_map": {"p": ["SecAuditEngine On", "SecAuditLog /tmp/audit.log", "SecAuditLogType Serial"]}}"#,
+        );
+        assert!(error.contains("SecAuditLog"), "message was {error:?}");
+        assert!(error.contains("sink"), "message was {error:?}");
+    }
+
+    #[test]
+    fn audit_engine_on_uses_the_connector_sink_without_a_native_target() {
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": ["SecAuditEngine On"]}, "default_directives": "p"}"#);
+        let policy = generation.select("example.test").unwrap();
+        assert_eq!(policy.waf.config().audit_engine, coraza::types::AuditEngineStatus::On);
+        assert!(
+            policy.waf.config().audit_log.is_empty(),
+            "no native target is configured"
+        );
+    }
+
+    #[test]
+    fn an_audit_sink_is_rejected_even_when_the_static_engine_is_off() {
+        for (rule, expected) in [
+            ("SecAuditLog /tmp/audit.log", "SecAuditLog"),
+            ("SecAuditLogStorageDir /tmp/audit", "SecAuditLogStorageDir"),
+            ("SecAuditLogType Syslog", "SecAuditLogType"),
+            ("SecAuditLogType Https", "HTTPS"),
+            ("SecAuditLogType Concurrent", "SecAuditLogType"),
+        ] {
+            let error = compile_error(&format!(r#"{{"directives_map": {{"p": ["{rule}"]}}}}"#));
+            assert!(error.contains(expected), "message was {error:?}");
+        }
+        let generation = parse_generation(r#"{"directives_map": {"p": ["SecAuditEngine Off"]}}"#);
+        assert!(
+            generation.policies.contains_key("p"),
+            "the all-Off default audit configuration is accepted"
+        );
+    }
+
+    #[test]
+    fn a_body_spill_threshold_is_rejected() {
+        let error = compile_error(
+            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 100"]}}"#,
+        );
+        assert!(error.contains("SecRequestBodyInMemoryLimit"), "message was {error:?}");
+        assert!(error.contains("spill"), "message was {error:?}");
+    }
+
+    #[test]
+    fn a_matching_in_memory_limit_is_accepted() {
+        let generation = parse_generation(
+            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 1000"]}}"#,
+        );
+        assert!(
+            generation.policies.contains_key("p"),
+            "a matching in-memory limit is compiled"
+        );
+    }
+
+    #[test]
+    fn request_body_limits_are_bounded_and_positive() {
+        for limit in ["16777216", "13107200"] {
+            let accepted = parse_generation(&format!(
+                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}}}"#
+            ));
+            assert!(
+                accepted.policies.contains_key("p"),
+                "the ceiling and stock CRS's 12.5 MiB limit are accepted: {limit}"
+            );
+        }
+
+        for limit in ["16777217", "0"] {
+            let error = compile_error(&format!(
+                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}}}"#
+            ));
+            assert!(error.contains("SecRequestBodyLimit"), "message was {error:?}");
+            assert!(
+                error.contains("16777216") || error.contains("greater than 0"),
+                "the error names the limit: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_body_limits_are_bounded_and_positive() {
+        let accepted = parse_generation(
+            r#"{"directives_map": {"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit 1048576"]}}"#,
+        );
+        assert!(accepted.policies.contains_key("p"), "the response ceiling is accepted");
+
+        for limit in ["1048577", "0"] {
+            let error = compile_error(&format!(
+                r#"{{"directives_map": {{"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit {limit}"]}}}}"#
+            ));
+            assert!(error.contains("SecResponseBodyLimit"), "message was {error:?}");
+            assert!(
+                error.contains("1048576") || error.contains("greater than 0"),
+                "the error names the limit: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detection_only_warns_once_per_policy() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {
+                    "a": ["SecRuleEngine DetectionOnly"],
+                    "b": ["SecRuleEngine DetectionOnly"],
+                    "c": ["SecRuleEngine On"]
+                },
+                "default_directives": "c"
+            }"#,
+        );
+        let warnings = generation.warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "one warning per DetectionOnly policy");
+        assert!(
+            warnings.iter().any(|warning| warning.contains("policy \"a\"")),
+            "warning was {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("policy \"b\"")),
+            "warning was {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("would-be interruptions do not block traffic")),
+            "every warning explains DetectionOnly enforcement: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn off_warns_that_requests_are_not_enforced() {
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": ["SecRuleEngine Off"]}, "default_directives": "p"}"#);
+        let warnings = generation.warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "one warning per Off policy: {warnings:?}");
+        assert!(
+            warnings.first().unwrap().contains("SecRuleEngine Off"),
+            "the warning names the mode: {warnings:?}"
+        );
+        assert!(
+            warnings.first().unwrap().contains("not enforced"),
+            "the warning says requests are not enforced: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn policies_without_a_selector_warn_that_nothing_can_be_selected() {
+        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        let warnings = generation.warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "one warning for the generation: {warnings:?}");
+        assert!(
+            warnings
+                .first()
+                .unwrap()
+                .contains("no default_directives or per_authority_directives"),
+            "the warning names both missing selectors: {warnings:?}"
+        );
+
+        for config in [
+            r#"{"directives_map": {"p": []}, "default_directives": "p"}"#,
+            r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}}"#,
+        ] {
+            let generation = parse_generation(config);
+            assert!(
+                !generation
+                    .warnings()
+                    .any(|warning| warning.contains("no default_directives")),
+                "a configured selector suppresses the warning: {:?}",
+                generation.warnings().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn sec_ignore_rule_compilation_errors_cannot_drop_a_rule() {
+        let error = compile_error(
+            r#"{
+                "directives_map": {
+                    "strict": [
+                        "SecIgnoreRuleCompilationErrors On",
+                        "SecRule REQUEST_URI \"@notAnOperator\" \"id:1,phase:1,deny\""
+                    ]
+                }
+            }"#,
+        );
+        assert!(
+            error.starts_with("policy \"strict\": "),
+            "the error names the policy: {error:?}"
+        );
+        assert!(
+            error.contains("skipped instead of failing"),
+            "the error says the directive was skipped: {error:?}"
+        );
+        assert!(
+            error.contains("_inline_:2"),
+            "the error carries the file and line: {error:?}"
+        );
+        assert!(
+            error.contains("@notAnOperator"),
+            "the error names the skipped directive: {error:?}"
+        );
+    }
+
+    #[test]
+    fn sec_ignore_rule_compilation_errors_with_only_valid_rules_still_compiles() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {
+                    "p": [
+                        "SecIgnoreRuleCompilationErrors On",
+                        "SecRule REQUEST_URI \"@contains attack\" \"id:1,phase:1,deny,status:403\""
+                    ]
+                }
+            }"#,
+        );
+        assert!(
+            generation.policies.contains_key("p"),
+            "no directive was skipped, so the policy compiles"
+        );
+    }
+
+    #[test]
+    fn a_skipped_include_budget_diagnostic_is_rejected() {
+        let mut config = parse_config("{}");
+        let mut directives = vec!["SecIgnoreRuleCompilationErrors On".to_owned()];
+        let mut rule_data = std::collections::BTreeMap::new();
+        // The parser's per-top-level-parse budget is 1024 files; the 1025th Include fails.
+        for index in 0..=1024 {
+            let name = format!("f{index}.conf");
+            directives.push(format!("Include {name}"));
+            rule_data.insert(name, b"SecRuleEngine On\n".to_vec());
+        }
+        config.directives_map.insert("p".to_owned(), directives);
+        config.rule_data = rule_data;
+
+        let error = Generation::compile(config).unwrap_err().to_string();
+        assert!(
+            error.starts_with("policy \"p\": "),
+            "the error names the policy: {error:?}"
+        );
+        assert!(
+            error.contains("cannot read more than 1024 files"),
+            "the first skipped diagnostic is the include budget: {error:?}"
+        );
+    }
+
+    /// A six-rule chain: one top-level parent plus five members.
+    const CHAIN: &str = r#"SecRule REQUEST_URI "@contains a" "id:1,phase:1,pass,chain"
+SecRule REQUEST_URI "@contains b" "id:2,phase:1,chain"
+SecRule REQUEST_URI "@contains c" "id:3,phase:1,chain"
+SecRule REQUEST_URI "@contains d" "id:4,phase:1,chain"
+SecRule REQUEST_URI "@contains e" "id:5,phase:1,chain"
+SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
+
+    /// A two-policy generation whose only rules are one included six-rule chain each.
+    fn chain_generation(limits: CompileLimits) -> Result<Generation, CompileError> {
+        let config = serde_json::json!({
+            "directives_map": {
+                "p": ["Include chain.conf"],
+                "q": ["Include chain.conf"]
+            },
+            "rule_data": {"chain.conf": CHAIN}
+        });
+        Generation::compile_with_limits(parse_config(&config.to_string()), limits)
+    }
+
+    #[test]
+    fn chain_members_count_toward_the_generation_budget() {
+        let limits = CompileLimits {
+            rules_per_policy: 6,
+            rules_per_generation: 11,
+            ..SMALL_LIMITS
+        };
+        let error = chain_generation(limits).unwrap_err().to_string();
+        assert!(
+            error.starts_with("generation compiles 12 rules"),
+            "both six-rule chains count, not one top-level rule each: {error:?}"
+        );
+        assert!(
+            error.contains("limit of 11 rules per generation"),
+            "the error names the generation limit: {error:?}"
+        );
+        assert!(
+            !error.contains("policy \"q\""),
+            "a generation count is not reported as a per-policy count: {error:?}"
+        );
+    }
+
+    #[test]
+    fn chain_members_accept_the_generation_boundary() {
+        let limits = CompileLimits {
+            rules_per_policy: 6,
+            rules_per_generation: 12,
+            ..SMALL_LIMITS
+        };
+        let generation = chain_generation(limits).expect("exactly the generation limit is accepted");
+        for name in ["p", "q"] {
+            let policy = generation.policies.get(name).expect("both policies compile");
+            assert_eq!(policy.waf.rule_count(), 1, "the policy has one top-level rule");
+        }
+    }
+
+    #[test]
+    fn the_policy_count_accepts_the_boundary_and_rejects_one_more() {
+        let mut config = parse_config("{}");
+        for index in 0..MAX_POLICIES {
+            config.directives_map.insert(format!("p{index}"), Vec::new());
+        }
+        assert!(
+            check_limits(&config, COMPILE_LIMITS).is_ok(),
+            "exactly {MAX_POLICIES} policies are accepted"
+        );
+        config.directives_map.insert("one-more".to_owned(), Vec::new());
+        let error = check_limits(&config, COMPILE_LIMITS).unwrap_err();
+        assert!(
+            matches!(&error, CompileError::Limit { limit } if limit.contains("64 policies")),
+            "message was {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_production_rule_caps_are_the_measured_ones() {
+        // Rule collection is quadratic in the rules already compiled, so raising either
+        // cap needs a fresh configure measurement on the WASM host, not just native.
+        assert_eq!(MAX_RULES_PER_POLICY, 30_000);
+        assert_eq!(MAX_RULES_PER_GENERATION, 60_000);
+        assert_eq!(COMPILE_LIMITS.rules_per_policy, MAX_RULES_PER_POLICY);
+        assert_eq!(COMPILE_LIMITS.rules_per_generation, MAX_RULES_PER_GENERATION);
+    }
+
+    #[test]
+    fn rule_caps_accept_the_boundary_and_reject_one_more() {
+        let at_policy_limit = compile_with(
+            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\""]}}"#,
+            SMALL_LIMITS,
+        );
+        assert!(at_policy_limit.is_ok(), "exactly the per-policy limit is accepted");
+
+        let error = compile_with(
+            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\"", "SecAction \"id:3\""]}}"#,
+            SMALL_LIMITS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("policy \"p\""), "the error names the policy: {error:?}");
+        assert!(
+            error.contains("limit of 2 rules per policy"),
+            "the error names the limit: {error:?}"
+        );
+        assert!(
+            !error.contains("per generation"),
+            "a per-policy count is not reported as a generation count: {error:?}"
+        );
+
+        let at_generation_limit = compile_with(
+            r#"{
+                "directives_map": {
+                    "p": ["SecAction \"id:1\"", "SecAction \"id:2\""],
+                    "q": ["SecAction \"id:3\""]
+                }
+            }"#,
+            SMALL_LIMITS,
+        );
+        assert!(at_generation_limit.is_ok(), "exactly the generation limit is accepted");
+
+        let error = compile_with(
+            r#"{
+                "directives_map": {
+                    "p": ["SecAction \"id:1\"", "SecAction \"id:2\""],
+                    "q": ["SecAction \"id:3\"", "SecAction \"id:4\""]
+                }
+            }"#,
+            SMALL_LIMITS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("generation compiles "),
+            "the count is the generation total, not one policy's: {error:?}"
+        );
+        assert!(
+            error.contains("limit of 3 rules per generation"),
+            "the error names the limit: {error:?}"
+        );
+        assert!(
+            !error.contains("policy \"q\""),
+            "a generation count is not reported as a per-policy count: {error:?}"
+        );
+    }
+
+    #[test]
+    fn directive_messages_are_truncated_for_logs() {
+        let short = CompileError::Directive {
+            policy: "p".to_owned(),
+            message: "x".repeat(512),
+        }
+        .to_string();
+        assert!(!short.contains('…'), "a 512-byte message is not truncated");
+
+        let long = CompileError::Directive {
+            policy: "p".to_owned(),
+            message: "x".repeat(4000),
+        }
+        .to_string();
+        assert!(long.ends_with('…'), "a long message ends with an ellipsis");
+        assert_eq!(
+            long.len(),
+            "policy \"p\": ".len() + 512 + '…'.len_utf8(),
+            "the message is cut at the byte limit"
+        );
+        assert_eq!(truncate_message("ok"), "ok", "short messages pass through");
+    }
+}

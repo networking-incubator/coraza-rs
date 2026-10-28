@@ -313,6 +313,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-coraza"
+version = "0.1.0"
+dependencies = [
+ "coraza",
+ "proxy-wasm 0.2.5 (git+https://github.com/Kuadrant/proxy-wasm-rust-sdk?rev=6ceedbbdd07a048a65d197c9bbb1f950884561fb)",
+ "serde_json",
+]
+
+[[package]]
 name = "envoy-libperfusion"
 version = "0.1.0"
 dependencies = [
@@ -322,7 +331,7 @@ dependencies = [
  "libperfusion",
  "log",
  "multer",
- "proxy-wasm",
+ "proxy-wasm 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
 ]
@@ -980,6 +989,15 @@ name = "proxy-wasm"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de8f6564bd52c2f4ff79fa5d1bd3bc10d8f822162af8d527e121e46703496aa0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "log",
+]
+
+[[package]]
+name = "proxy-wasm"
+version = "0.2.5"
+source = "git+https://github.com/Kuadrant/proxy-wasm-rust-sdk?rev=6ceedbbdd07a048a65d197c9bbb1f950884561fb#6ceedbbdd07a048a65d197c9bbb1f950884561fb"
 dependencies = [
  "hashbrown 0.16.1",
  "log",
