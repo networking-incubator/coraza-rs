@@ -184,6 +184,5 @@ spec:
                       },
                       "default_directives": "main",
                       "enable_filter_state_logs": true,
-                      "metric_labels": {"suite": "envoy-harness"},
                       "per_authority_directives": {"reject.local": "reject", "off.local": "response-off"}
                     }

@@ -68,17 +68,15 @@ the per-version results directory.
   Deployment `coraza-gateway-istio`; its pods carry the workload label
   `gateway.networking.k8s.io/gateway-name=coraza-gateway` (what the EnvoyFilter
   selects on) and an Envoy listener `0.0.0.0_80` that binds port 80 directly.
-- `istio-operator.yaml` overlays the minimal profile: `hub: docker.io/istio`
-  so the running proxy digest can be checked against the pinned digests, and
-  `proxyStatsMatcher.inclusionPrefixes` so the `waf_filter` stats are recorded
-  (Envoy on Istio drops stats outside the inclusion list).
+- `istio-operator.yaml` overlays the minimal profile with `hub: docker.io/istio`
+  so the running proxy digest can be checked against the pinned digests.
 - `envoyfilter.yaml` inserts the wasm HTTP filter immediately BEFORE
   `envoy.filters.http.router` (last filter before routing, after Istio's own
   filters), with the plugin configuration semantically identical to
   `examples/envoy-coraza/envoy.yaml` (`directives_map` {main,reject,response-off},
   `default_directives: main`, 32-byte body limits, `failure_policy:
   FAIL_CLOSED`, `allow_on_headers_stop_iteration: true`, filter-state logs,
-  `metric_labels {suite: envoy-harness}`, `per_authority_directives`). It also:
+  `per_authority_directives`). It also:
   - raises the listener `per_connection_buffer_limit_bytes` to 16 MiB, matching
     the standalone `envoy.yaml`. This matters only while the filter holds
     response headers stopped (phase-4 header rules): Envoy buffers the body
@@ -198,10 +196,10 @@ Per version (recorded run notes stay with the release evidence, not this change)
   is asserted present in the running Envoy binary and recorded from
   `/runtime` (not overridden there, i.e. the compiled default applies).
 - Lifecycle: phase-1/phase-2 request denials (403, backend not hit — with a
-  positive control that the `/__stats` counter endpoint is reachable), benign
+  positive control that the `/__stats` backend endpoint is reachable), benign
   byte-exact pass-through (16 KiB), an aborted held request (client reset
   mid-body must not reach the backend; the follow-up request is received
-  exactly once; the stream finalizes and releases the gauges), request/response
+  exactly once), request/response
   body limit boundaries at N=31/32/33 for ProcessPartial (200) and Reject
   (413/500) policies, phase-4 response body and response header denials (502,
   upstream body and sensitive headers withheld), large MIME-excluded response
@@ -219,35 +217,19 @@ Per version (recorded run notes stay with the release evidence, not this change)
   directory).
 - Observability: the access log line carries the coraza filter-state fields
   for a denial (plus `%RESPONSE_CODE_DETAILS%`); the RelevantOnly audit record
-  reaches the proxy log; admin stats expose `waf_filter.tx.total`, the
-  interruption counter with `rule_id`/`phase`/`suite` in the raw stat name,
-  and the same counter expectations as the standalone harness —
-  `errors_total` > 0 (the aborted-held-request error terminal),
-  `incomplete_inspections_total` > 0, and both gauges released to zero.
+  and bounded error logs reach the proxy log. This filter build intentionally
+  does not define Envoy counters or gauges for Prometheus.
 - The oracle smoke (reference-only, does not gate): the upstream Go artifact
   (`/tmp/coraza-proxy-wasm-upstream-pinned/build/main.wasm`) through the same
-  EnvoyFilter path. The switch **restarts the gateway** and selects the
-  post-restart pod by identity (new UID, no deletionTimestamp, Ready — the
-  old pod stays Running during a rollout and can sort first by name), so the
-  fresh proxy loads the oracle artifact from scratch (Envoy otherwise keeps
-  serving the previously loaded Rust VM). It then verifies, before any
-  request is asserted: the config dump's `node.id` names the selected pod and
-  its **active** chain holds exactly one `envoy.filters.http.wasm` filter
-  whose `code.remote.sha256` equals the oracle artifact's digest; the
-  Rust-only counters (`waf_filter_errors_total`,
-  `waf_filter_incomplete_inspections_total`) and the Rust filter-state denial
-  log lines do not move across the oracle requests; and the Go plugin left
-  positive evidence — both plugins emit `waf_filter.tx.total`, so
-  attribution rests on the interruption stat's phase string
-  (`_phase=http_request_headers` for the Go artifact vs
-  `_phase=http_request_headers_identifier` for the Rust filter), whose
-  appearance also proves configure succeeded (a plugin whose `on_configure`
-  fails never serves). Only if every check passes are oracle PASS lines
-  printed (all-or-nothing); failures — including a failed gateway restart —
-  are recorded as `ORACLE-FAIL` lines and counted in the summary without
-  aborting the run. Skippable with `ORACLE_WASM=none`; a corrupt artifact
-  yields zero oracle PASS lines and non-zero failures (verified with a
-  text-file artifact).
+  EnvoyFilter path. The switch restarts the gateway and selects a fresh pod by
+  UID, so it loads the oracle artifact from scratch. The active filter chain
+  must contain exactly one wasm filter with the oracle artifact digest; phase-1
+  denial (403), benign pass-through (200), and absence of the Rust interruption
+  filter-state signature are checked. This driver does not publish counters,
+  so oracle attribution relies on the digest-verified active chain, fresh proxy,
+  and those request outcomes. Oracle failures are recorded but do not gate the
+  lifecycle assertions. `ORACLE_WASM=none` skips the smoke; a corrupt artifact
+  produces failed oracle checks and no oracle PASS lines.
 - The gating assertion count is pinned (`EXPECTED_GATING_ASSERTIONS`); the
   run fails if an assertion was added or lost.
 
@@ -262,12 +244,8 @@ Per version (recorded run notes stay with the release evidence, not this change)
 - `Expect: 100-continue` pass-through: covered by the standalone harness, not
   ported (Istio's HCM has no `proxy_100_continue` setting to mirror, and the
   case adds no gateway-specific coverage).
-- Prometheus tag extraction for `rule_id`/`phase`/`suite`: the istio-agent
-  bootstrap generates the regex `(tag=\.=(.*?);\.;)` for `extraStatTags`,
-  which only matches the mixer/telemetry wasm naming convention and cannot
-  extract this filter's `waf_filter.tx.interruptions_ruleid=N_phase=X_suite=Y`
-  naming. The values are asserted in the raw admin stats instead; fixing the
-  prometheus labels would need a custom proxy bootstrap template.
+- Envoy/Prometheus counters and gauges: intentionally not emitted by this
+  implementation; observability is limited to filter state and bounded logs.
 - Gateway `Programmed` condition: stays False on Kind because no
   LoadBalancer controller assigns the generated Service an address. Both
   observed messages ("address pending for hostname …" and "Failed to assign
@@ -277,9 +255,6 @@ Per version (recorded run notes stay with the release evidence, not this change)
   generated deployment and pod instead; the condition is recorded, not gated.
 - HTTP/2 multiplexing, multi-worker behavior, full CRS coverage and the full
   56-case contract capture: out of MVP scope.
-- Per-case attribution of the `waf_filter_incomplete_inspections_total`
-  counter (the harness asserts the aggregate; which of the cases make up the
-  eight is not individually labeled).
 
 ## Known limitations
 

@@ -70,13 +70,13 @@ BINARYEN_DIR=/tmp/binaryen-version_123
 # validated against. A mismatch means the filter changed: re-validate on both
 # Istio versions, update these constants, and re-record the results
 # (see README.md, "Updating the artifact pins").
-EXPECTED_UNPATCHED_SHA256=79d354a7837c5460ac5eec38322c70cfa6f5fdf7b7cc96fe9b6d59fcc49ad3e0
-EXPECTED_ISTIO_SHA256=75b36722b98390e73526527e252e1c79aabf1fb961667da6f02201bc466c817b
+EXPECTED_UNPATCHED_SHA256=dbe01dd7d581fcc70c9226079f5a3d49394091bb8d43eede37f0e267108a9d36
+EXPECTED_ISTIO_SHA256=TO_BE_RECORDED
 
 # Total gating PASS lines the harness must emit (the oracle smoke records up
 # to five more PASS lines through `oracle_pass`, and never gates). A mismatch means an assertion
 # was added or lost; update the constant together with the documented results.
-EXPECTED_GATING_ASSERTIONS=59
+EXPECTED_GATING_ASSERTIONS=52
 
 # Pinned proxy images: the amd64 manifest digest is the deployment pin; the
 # manifest-list digest is what containerd reports in pod status.imageID when
@@ -616,14 +616,6 @@ assert sha256 == expected_sha256, f"active chain serves sha256 {sha256}, expecte
 PY
 }
 
-# One admin-stat value, 0 when the stat does not exist.
-admin_stat() {
-    local name=$1
-    kubectl -n "$NAMESPACE" exec -c istio-proxy "$GATEWAY_POD" -- \
-        curl -s localhost:15000/stats 2>/dev/null \
-        | grep -E "(^|\\.)${name//./\\.}: " | grep -oE '[0-9]+$' || echo 0
-}
-
 # Count of Rust denial-signature access-log lines (the Rust plugin's
 # filter-state values; the Go oracle leaves these fields empty).
 rust_deny_log_count() {
@@ -832,8 +824,7 @@ pass 'benign request body was byte-exact'
 
 # Aborted held request: the filter holds the request body until EOS, so a
 # client reset mid-body must not reach the backend, and the stream ends as an
-# error terminal (this is the case that makes waf_filter_errors_total tick,
-# exactly as in the standalone harness).
+# error terminal, exactly as in the standalone harness.
 abort_held_http1_request() {
     local url=$1
     python3 - "$url" <<'PY'
@@ -876,21 +867,6 @@ check_status 200 "$status" 'normal request after aborted held request'
 [[ $(backend_count /abort-held) == "$((before + 1))" ]] \
     || fail 'normal request after abort was not received exactly once'
 pass 'normal request after abort was received exactly once'
-
-# The aborted stream finalizes asynchronously: the port-forward tunnel
-# teardown reaches Envoy seconds after the client reset. Wait for the active
-# stream gauge to release so the stats snapshot below observes the error
-# terminal (the gauges themselves are asserted in the stats block).
-ACTIVE_STREAMS=""
-for _attempt in {1..60}; do
-    ACTIVE_STREAMS=$(kubectl -n "$NAMESPACE" exec -c istio-proxy "$GATEWAY_POD" -- \
-        curl -s localhost:15000/stats 2>/dev/null \
-        | grep -E '(^|\.)waf_filter_active_streams: ' | grep -o '[0-9]*$' || true)
-    [[ $ACTIVE_STREAMS == 0 ]] && break
-    sleep 1
-done
-[[ $ACTIVE_STREAMS == 0 ]] \
-    || fail "aborted stream did not finalize (waf_filter_active_streams=$ACTIVE_STREAMS after 60s)"
 
 # Body limit boundaries at N-1/N/N+1 of the configured 32-byte limits.
 for size in 31 32 33; do
@@ -1042,70 +1018,13 @@ require_gateway_log 'test blocked' \
     || fail 'RelevantOnly audit output did not reach the proxy log'
 pass 'RelevantOnly audit output reached the proxy log'
 
-kubectl -n "$NAMESPACE" exec -c istio-proxy "$GATEWAY_POD" -- curl -s 'localhost:15000/stats' \
-    >"$RESULTS_DIR/stats.txt"
-kubectl -n "$NAMESPACE" exec -c istio-proxy "$GATEWAY_POD" -- curl -s 'localhost:15000/stats?format=prometheus' \
-    >"$RESULTS_DIR/stats.prom"
-
-# On Istio the plugin's stats are namespaced (wasmcustom. prefix in the text
-# endpoint); prometheus output strips it. Tag extraction (rule_id/phase/suite
-# labels) is not available on Istio, so the raw stat names are asserted. The
-# counter expectations mirror the standalone harness: errors_total > 0 comes
-# from the aborted-held-request case (an error terminal on Envoy 1.38 exactly
-# as on 1.40, verified), incomplete_inspections_total > 0 from the
-# ProcessPartial truncation and mid-stream interruption cases.
-python3 - "$RESULTS_DIR/stats.txt" "$RESULTS_DIR/stats.prom" <<'PY' | tee -a "$RESULTS_DIR/assertions.txt"
-import re
-import sys
-
-text = open(sys.argv[1]).read()
-prometheus = open(sys.argv[2]).read()
-
-def counter(pattern):
-    match = re.search(pattern, text, re.MULTILINE)
-    assert match, f"stat not found: {pattern}"
-    return int(match.group(1))
-
-def gauge(pattern):
-    return counter(pattern)
-
-total = counter(r"(?:^|\.)waf_filter\.tx\.total: (\d+)")
-interruption = counter(
-    r"(?:^|\.)waf_filter\.tx\.interruptions_ruleid=101"
-    r"_phase=http_request_headers_identifier_suite=envoy-harness: (\d+)"
-)
-errors = counter(r"(?:^|\.)waf_filter_errors_total: (\d+)")
-incomplete = counter(r"(?:^|\.)waf_filter_incomplete_inspections_total: (\d+)")
-active_streams = gauge(r"(?:^|\.)waf_filter_active_streams: (\d+)")
-retained = gauge(r"(?:^|\.)waf_filter_retained_body_bytes: (\d+)")
-
-assert total > 0, f"transaction counter did not increment: {total}"
-print(f"PASS: waf_filter.tx.total incremented ({total} transactions)")
-assert interruption > 0, f"interruption counter did not increment: {interruption}"
-print(
-    "PASS: interruption counter exposed with phase/rule_id/suite in the raw name "
-    f"(rule_id=101 phase=http_request_headers_identifier suite=envoy-harness: {interruption})"
-)
-assert errors > 0, f"error counter did not include the aborted-request error terminal: {errors}"
-print(f"PASS: waf_filter_errors_total incremented by the aborted-held-request case ({errors})")
-assert incomplete > 0, f"incomplete counter did not increment: {incomplete}"
-print(f"PASS: waf_filter_incomplete_inspections_total incremented ({incomplete})")
-assert active_streams == 0, f"active stream gauge was not released: {active_streams}"
-print("PASS: waf_filter_active_streams released to zero")
-assert retained == 0, f"retained body gauge was not released: {retained}"
-print("PASS: waf_filter_retained_body_bytes released to zero")
-match = re.search(r"^waf_filter_tx_total(?:\{\})? (\d+)$", prometheus, re.MULTILINE)
-assert match and int(match.group(1)) > 0, "waf_filter_tx_total missing from prometheus output"
-print(f"PASS: waf_filter_tx_total exposed in prometheus format ({match.group(1)})")
-PY
-
 # ---------------------------------------------------------------------------
 # QTE: the 16 MiB listener buffer limit exists so the phase-4 header-deny case
 # can hold the 1 MiB+1 body while response headers are stopped. Record the
 # failure mode it prevents (and its restoration) instead of just claiming it;
 # written to buffer-limit-experiment.txt in the results directory. Streams
-# aborted by this experiment can add error terminals after the stats snapshot
-# above was taken.
+# aborted by this experiment may produce additional state/log records; those
+# do not affect the earlier lifecycle assertions.
 # ---------------------------------------------------------------------------
 
 render_envoyfilter envoy-coraza-test "http://coraza-wasm-fetch/envoy_coraza.wasm" \
@@ -1213,13 +1132,8 @@ if [[ $ORACLE_WASM != none ]]; then
                     oracle_fail 'active filter chain does not serve the oracle artifact (identity check failed)'
                     ORACLE_CHECKS_OK=false
                 fi
-                # The Rust plugin must not answer. Its exclusive counters and
-                # its filter-state denial signature are snapshotted before and
-                # after the oracle requests and must not move (the fresh proxy
-                # never loaded the Rust plugin, so any movement would mean the
-                # old VM is somehow still serving).
-                RUST_ERRORS_BEFORE=$(admin_stat waf_filter_errors_total)
-                RUST_INCOMPLETE_BEFORE=$(admin_stat waf_filter_incomplete_inspections_total)
+                # The Rust plugin's interruption state signature must not appear
+                # in the fresh proxy's access log while the oracle handles traffic.
                 RUST_DENYLOG_BEFORE=$(rust_deny_log_count)
                 # Bounded retries: the freshly loaded plugin can still be
                 # warming when the chain is already active (fail-closed 503s).
@@ -1245,26 +1159,9 @@ if [[ $ORACLE_WASM != none ]]; then
                 }
                 # Let Envoy flush the access log before re-reading evidence.
                 sleep 3
-                RUST_ERRORS_AFTER=$(admin_stat waf_filter_errors_total)
-                RUST_INCOMPLETE_AFTER=$(admin_stat waf_filter_incomplete_inspections_total)
                 RUST_DENYLOG_AFTER=$(rust_deny_log_count)
-                if [[ $RUST_ERRORS_BEFORE != "$RUST_ERRORS_AFTER" \
-                    || $RUST_INCOMPLETE_BEFORE != "$RUST_INCOMPLETE_AFTER" \
-                    || $RUST_DENYLOG_BEFORE != "$RUST_DENYLOG_AFTER" ]]; then
-                    oracle_fail "Rust plugin answered the oracle requests (errors $RUST_ERRORS_BEFORE->$RUST_ERRORS_AFTER, incomplete $RUST_INCOMPLETE_BEFORE->$RUST_INCOMPLETE_AFTER, deny-log $RUST_DENYLOG_BEFORE->$RUST_DENYLOG_AFTER)"
-                    ORACLE_CHECKS_OK=false
-                fi
-                # Positive proof the oracle itself served. Both plugins emit
-                # waf_filter.tx.total, so attribution rests on the
-                # interruption stat's phase string: the Go plugin writes
-                # _phase=http_request_headers, the Rust plugin
-                # _phase=http_request_headers_identifier.
-                ORACLE_TX=$(admin_stat waf_filter.tx.total)
-                ORACLE_INTERRUPTS=$(kubectl -n "$NAMESPACE" exec -c istio-proxy "$GATEWAY_POD" -- \
-                    curl -s localhost:15000/stats 2>/dev/null \
-                    | grep -c 'waf_filter\.tx\.interruptions_ruleid=101_phase=http_request_headers_suite=envoy-harness' || true)
-                if (( ORACLE_TX == 0 )) || (( ORACLE_INTERRUPTS == 0 )); then
-                    oracle_fail "oracle counters did not move (tx.total=$ORACLE_TX, Go-phase rule-101 interruption lines=$ORACLE_INTERRUPTS); the Go plugin did not process the requests"
+                if [[ $RUST_DENYLOG_BEFORE != "$RUST_DENYLOG_AFTER" ]]; then
+                    oracle_fail "Rust filter-state denial signature appeared during oracle requests ($RUST_DENYLOG_BEFORE->$RUST_DENYLOG_AFTER)"
                     ORACLE_CHECKS_OK=false
                 fi
             else
@@ -1275,8 +1172,7 @@ if [[ $ORACLE_WASM != none ]]; then
                 oracle_pass 'artifact identity verified: exactly one wasm filter in the active chain of the restarted pod, sha256 matches'
                 oracle_pass 'phase-1 request denial returned 403'
                 oracle_pass 'benign request returned 200'
-                oracle_pass 'Rust plugin did not answer (Rust-only counters and denial log lines unchanged)'
-                oracle_pass "served the requests (Go-phase rule-101 interruption recorded, tx.total=$ORACLE_TX)"
+                oracle_pass 'Rust interruption filter-state was absent from the fresh proxy logs'
             fi
         else
             oracle_fail 'oracle EnvoyFilter apply failed'
@@ -1318,8 +1214,8 @@ GATING_ASSERTIONS=$((GATING_ASSERTIONS - ORACLE_ASSERTIONS))
 if (( GATING_ASSERTIONS != EXPECTED_GATING_ASSERTIONS )); then
     fail "expected $EXPECTED_GATING_ASSERTIONS gating assertions, recorded $GATING_ASSERTIONS; an assertion was added or lost, update EXPECTED_GATING_ASSERTIONS and the documented results"
 fi
-if (( ORACLE_ASSERTIONS > 5 )); then
-    fail "oracle smoke emitted $ORACLE_ASSERTIONS PASS lines, expected at most 5"
+if (( ORACLE_ASSERTIONS > 4 )); then
+    fail "oracle smoke emitted $ORACLE_ASSERTIONS PASS lines, expected at most 4"
 fi
 
 printf '\n== summary (istio %s, envoy %s, wasm sha256 %s)\n' \
