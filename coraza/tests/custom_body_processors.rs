@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #![expect(
+    clippy::panic,
     clippy::unwrap_used,
     clippy::tests_outside_test_module,
     reason = "custom body processor tests use fixed rules and bounded fixtures"
@@ -31,7 +32,9 @@ use std::{
 
 use coraza::{
     BodyDirection, BodyLimitAction, BodyProcessor, BodyProcessorOptions, BodyProcessorOutput, RuleVariable,
-    config::UploadKeepFiles, seclang::Parser, transaction::Transaction,
+    config::UploadKeepFiles,
+    seclang::Parser,
+    transaction::{Transaction, VariableCollection},
 };
 
 struct JsonLines;
@@ -693,18 +696,65 @@ fn custom_files_obey_the_transaction_upload_file_limit() {
         .unwrap();
     let mut tx = request_transaction(&parser.compile().unwrap(), b"body", b"application/x-custom");
 
+    let VariableCollection::Map(files) = tx.collection(RuleVariable::Files).unwrap() else {
+        panic!("FILES is a map");
+    };
+    assert_eq!(files.get(""), ["first.txt", "second.txt"]);
+    let VariableCollection::Map(names) = tx.collection(RuleVariable::FilesNames).unwrap() else {
+        panic!("FILES_NAMES is a map");
+    };
+    assert_eq!(names.get(""), ["first", "second"]);
     assert_eq!(
-        tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
-        Some("first.txt")
+        tx.get_variable(RuleVariable::FilesSizes, Some("first.txt")).as_deref(),
+        Some("5")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("second.txt")).as_deref(),
+        Some("6")
     );
     let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
     assert_eq!(fs::read(&*path).unwrap(), b"first");
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     assert_eq!(
         tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
         Some("1")
     );
     tx.finish().unwrap();
     assert!(!std::path::Path::new(&*path).exists());
+}
+
+#[test]
+fn custom_file_past_the_limit_stays_visible_to_rules() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().multiphase_evaluation = true;
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.config_mut().upload_file_limit = 1;
+    parser.register_body_processor("twofiles", Arc::new(|| Box::new(TwoFiles)));
+    parser
+        .from_string(
+            "SecAction \"id:1,phase:1,ctl:requestBodyProcessor=twofiles,pass\"\n\
+             SecRule FILES \"@contains second.txt\" \"id:2,phase:2,setvar:tx.real_upload=matched,pass\"",
+        )
+        .unwrap();
+    let mut tx = request_transaction(&parser.compile().unwrap(), b"body", b"application/x-custom");
+
+    assert_eq!(
+        tx.get_variable(RuleVariable::TX, Some("real_upload")).as_deref(),
+        Some("matched")
+    );
+    let VariableCollection::Map(files) = tx.collection(RuleVariable::Files).unwrap() else {
+        panic!("FILES is a map");
+    };
+    assert!(files.get("").iter().any(|name| name == "second.txt"));
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("second.txt")).as_deref(),
+        Some("6")
+    );
+    let path = tx.get_variable(RuleVariable::FilesTmpNames, Some("")).unwrap();
+    assert_eq!(fs::read(&*path).unwrap(), b"first");
+    tx.finish().unwrap();
 }
 
 #[test]
@@ -903,7 +953,12 @@ fn custom_response_processor_populates_outputs_and_matches_request_error_semanti
         tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
         Some("request.txt")
     );
-    assert_eq!(tx.get_variable(RuleVariable::FilesSizes, Some("response.txt")), None);
+    // Past the limit the response file is still recorded; only its temp-file write stops.
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("response.txt"))
+            .as_deref(),
+        Some("13")
+    );
     assert_eq!(
         tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
         Some("1")
