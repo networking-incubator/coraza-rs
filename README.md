@@ -14,7 +14,9 @@ detecting.
 | `ftw-runner/` | Optional Go FTW integration harness for the Coraza crate. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
+| [`envoy-coraza/`](envoy-coraza/README.md) | Envoy Proxy-Wasm HTTP filter backed by the `coraza` crate, with an optional build that embeds a pinned OWASP CRS release. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
+| `examples/envoy-coraza/` | Standalone Envoy lifecycle harness for the Coraza filter, including an embedded-CRS run. |
 | `xtask/` | Internal commands for checking and refreshing pinned corpora and generated tables. |
 | `docs/` | CI, performance, and design documentation. |
 | `.github/workflows/` | Build, test, parity, fuzz, coverage, and supply-chain workflows. |

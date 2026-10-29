@@ -12,6 +12,10 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Embeds a fetched CRS tree (see `make crs-fetch`) as the policy rule data.
+embed-crs = []
+
 [dependencies]
 coraza = { path = "../coraza" }
 proxy-wasm = { git = "https://github.com/Kuadrant/proxy-wasm-rust-sdk", rev = "6ceedbbdd07a048a65d197c9bbb1f950884561fb" }
