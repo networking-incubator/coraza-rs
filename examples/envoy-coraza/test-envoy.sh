@@ -388,6 +388,15 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     [[ $(backend_count /crs-sqli) == "$before" ]] \
         || fail 'embedded CRS sent a denied request to the backend'
     require_log '[id "949110"]'
+
+    printf '{"name":"1%s OR %s1%s=%s1"}' "'" "'" "'" "'" >"$temp_dir/crs-json-sqli"
+    before=$(backend_count /crs-json-sqli)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --header 'Content-Type: application/json' \
+        --data-binary "@$temp_dir/crs-json-sqli" http://127.0.0.1:10001/crs-json-sqli)
+    check_status 403 "$status" 'embedded CRS JSON SQLi denial'
+    [[ $(backend_count /crs-json-sqli) == "$before" ]] \
+        || fail 'embedded CRS sent a denied JSON request to the backend'
 fi
 
 # A field-only multipart body must not need a temporary upload directory. This used
