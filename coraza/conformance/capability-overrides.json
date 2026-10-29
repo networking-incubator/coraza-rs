@@ -31,18 +31,14 @@
         "evaluator": "coraza/src/operators/detection.rs:DetectSQLi::evaluate",
         "go_reference": "internal/operators/detect_sqli.go",
         "fixtures": [],
-        "differences": [
-          "The libperfusion public wrapper does not scan inputs over 65536 bytes. The operator reports OperatorOutcome::NotInspected, the transaction sets TX.inspection_incomplete=1 and Transaction::inspection_incomplete() returns true, and WafConfig::detector_inspection_action defaults to RecordOnly (a miss with the signal); FailClosed interrupts the transaction instead (F02)."
-        ]
+        "differences": []
       },
       "detectXSS": {
         "state": "implemented",
         "evaluator": "coraza/src/operators/detection.rs:DetectXSS::evaluate",
         "go_reference": "internal/operators/detect_xss.go",
         "fixtures": [],
-        "differences": [
-          "The libperfusion public wrapper does not scan inputs over 65536 bytes. The operator reports OperatorOutcome::NotInspected, the transaction sets TX.inspection_incomplete=1 and Transaction::inspection_incomplete() returns true, and WafConfig::detector_inspection_action defaults to RecordOnly (a miss with the signal); FailClosed interrupts the transaction instead (F02)."
-        ]
+        "differences": []
       },
       "endsWith": {
         "state": "implemented",

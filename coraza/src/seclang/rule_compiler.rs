@@ -139,6 +139,19 @@ fn add_actions(
 ) -> CompileResult<Rule> {
     let Some(defaults) = defaults.for_phase(phase_of(parsed_actions)?) else {
         apply_actions(&mut rule, parsed_actions, true, false, action_context)?;
+        // `block` only resolves against a phase default; without one it is a disruptive
+        // action the runtime ignores, so surface the no-op at load time.
+        if rule
+            .actions()
+            .iter()
+            .any(|action| action.name == "block" && action.action_type() == ActionType::Disruptive)
+        {
+            rule.metadata_mut().warnings.push(
+                "block has no SecDefaultAction for this phase and does nothing; use deny, drop or a \
+                 phase default"
+                    .to_owned(),
+            );
+        }
         return Ok(rule);
     };
 

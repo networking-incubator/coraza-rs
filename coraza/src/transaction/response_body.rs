@@ -31,7 +31,7 @@ use super::{
 use crate::{
     audit_log::Failure,
     body_processors::{BodyDirection, truncate_custom_body_text},
-    types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
+    types::{BodyLimitAction, RulePhase},
 };
 
 #[expect(
@@ -71,7 +71,9 @@ impl Transaction {
         if processable {
             self.response_content_length.set(body.len().to_string());
             if !body.is_empty() {
-                let limit = usize::try_from(self.response_body_limit).unwrap_or(0);
+                // A conversion failure must not disable inspection: fail closed with the
+                // largest usable bound instead of retaining nothing.
+                let limit = usize::try_from(self.response_body_limit).unwrap_or(usize::MAX);
                 self.response_body_buffer = BodyBuffer::new(limit, limit);
                 if body.len() >= limit.saturating_sub(self.response_body_buffer.len()) {
                     self.outbound_data_error.set("1");
@@ -90,20 +92,6 @@ impl Transaction {
             }
         }
 
-        if self.audit_engine != AuditEngineStatus::Off
-            && (self.audit_log_parts.contains(&AuditLogPart::IntermediaryResponseBody)
-                || self.audit_log_parts.contains(&AuditLogPart::ResponseBody))
-        {
-            self.audit_response_body.clear();
-            match self.response_body_buffer.contiguous() {
-                Ok(retained) => self.audit_response_body.extend_from_slice(&retained),
-                Err(error) => {
-                    self.finalization_errors.push(Failure::new(&error));
-                    ingest_error = true;
-                },
-            }
-        }
-
         if ingest_error {
             self.outbound_data_error.set("1");
             self.interrupt(0, "deny", 500, "");
@@ -116,7 +104,7 @@ impl Transaction {
             // Go runs the selected processor even for an empty response body
             // (`internal/corazawaf/transaction.go:1389-1423`).
             let truncated = self.response_body_buffer.stats().truncated;
-            let mut buffer = std::mem::take(&mut self.response_body_buffer);
+            let buffer = std::mem::take(&mut self.response_body_buffer);
             let inspected = buffer.contiguous().map(|body| {
                 let length = body.len();
                 self.inspect_response_body(&body, truncated);

@@ -106,7 +106,7 @@ pub(super) struct BodyBuffer {
     truncated: bool,
     /// Number of replay reads performed, for tests.
     #[cfg(test)]
-    replays: usize,
+    replays: Cell<usize>,
 }
 
 impl Default for BodyBuffer {
@@ -130,7 +130,7 @@ impl BodyBuffer {
             inspected: 0,
             truncated: false,
             #[cfg(test)]
-            replays: 0,
+            replays: Cell::new(0),
         }
     }
 
@@ -252,19 +252,31 @@ impl BodyBuffer {
     /// # Errors
     ///
     /// Returns an error when the spill file cannot be read.
-    pub(super) fn contiguous(&mut self) -> io::Result<Cow<'_, [u8]>> {
+    pub(super) fn contiguous(&self) -> io::Result<Cow<'_, [u8]>> {
         #[cfg(test)]
         {
             if take_injected_failure(BufferFailure::Replay) {
                 return Err(io::Error::other("injected body buffer failure"));
             }
-            self.replays = self.replays.saturating_add(1);
+            self.replays.set(self.replays.get().saturating_add(1));
         }
-        let Some(file) = self.spill.as_mut() else {
+        self.retained()
+    }
+
+    /// Return all retained bytes, for a caller that only has `&self`.
+    ///
+    /// Audit logging reads the body this way after the body phase, so a later
+    /// `ctl:auditLogParts` still sees it. Same bytes as [`Self::contiguous`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spill file cannot be read.
+    pub(super) fn retained(&self) -> io::Result<Cow<'_, [u8]>> {
+        let Some(file) = self.spill.as_ref() else {
             return Ok(Cow::Borrowed(&self.memory));
         };
         let mut bytes = vec![0_u8; self.length];
-        let handle = file.as_file_mut();
+        let mut handle = file.as_file();
         handle.seek(SeekFrom::Start(0))?;
         handle.read_exact(&mut bytes)?;
         Ok(Cow::Owned(bytes))
@@ -300,7 +312,7 @@ impl BodyBuffer {
     /// Return how many replay reads the buffer served, for tests.
     #[cfg(test)]
     pub(super) fn replay_count(&self) -> usize {
-        self.replays
+        self.replays.get()
     }
 }
 

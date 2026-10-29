@@ -75,11 +75,12 @@ pub enum OperatorOutcome {
     NotMatched,
     /// The operator could not inspect the input, so it has no verdict.
     ///
-    /// Rules treat this as not matched. Only the detector operators (`detectSQLi` and
-    /// `detectXSS`) produce it from a skipped input and turn it into the transaction's
-    /// inspection-incomplete signal and the configured fail-closed action. A host operator
-    /// (`inspectFile`, `rbl`, `validateSchema`) reports [`OperatorOutcome::NotMatched`]
-    /// when it cannot run, because Go returns `false` for every operational error.
+    /// Rules treat this as not matched. A built-in operator never reports it: the
+    /// detector operators scan every input, and a host operator (`inspectFile`, `rbl`,
+    /// `validateSchema`) reports [`OperatorOutcome::NotMatched`] when it cannot run,
+    /// because Go returns `false` for every operational error. The value is kept for
+    /// embedder-supplied operators that need three-valued logic; an embedder's report
+    /// does not raise the transaction's inspection-incomplete signal.
     NotInspected,
 }
 
@@ -96,7 +97,7 @@ pub trait Operator: Send + Sync {
     ///
     /// The default implementation maps [`Operator::evaluate`] onto
     /// [`OperatorOutcome::Matched`] and [`OperatorOutcome::NotMatched`]. An
-    /// operator that can skip an input overrides this method and reports
+    /// operator with no verdict for an input overrides this method and reports
     /// [`OperatorOutcome::NotInspected`] instead.
     fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
         if self.evaluate(tx, input, out) {
@@ -448,14 +449,12 @@ impl OperatorEnum {
         }
     }
 
-    /// Whether this operator's [`OperatorOutcome::NotInspected`] means the
-    /// detector skipped an input it is not allowed to scan.
+    /// Whether this operator's [`OperatorOutcome::NotInspected`] is the
+    /// transaction's inspection-incomplete signal.
     ///
-    /// Only the detectors are bounded by [`libperfusion::MAX_INPUT_LEN`]; their
-    /// skipped input is the signal the transaction records and the fail-closed
-    /// policy acts on. Every other operator reports a plain
-    /// [`OperatorOutcome::NotMatched`] when it cannot run, so it never raises
-    /// that signal.
+    /// The built-in detectors scan every input, so they no longer report a skip.
+    /// Other operators report a plain [`OperatorOutcome::NotMatched`] when they
+    /// cannot run, so they never raise that signal.
     pub(crate) fn is_detector(&self) -> bool {
         matches!(self, Self::DetectSQLi(_) | Self::DetectXSS(_))
     }

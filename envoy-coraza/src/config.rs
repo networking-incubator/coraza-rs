@@ -74,10 +74,10 @@
 //! * An array or object inside a `directives_map` directive array is rejected, naming the policy and element index,
 //!   where upstream stringifies its raw JSON text into one directive. A policy that silently loses a rule line is a
 //!   fail-open, so the document is rejected. `null` becomes the empty string in both.
-//! * `SecIgnoreRuleCompilationErrors On` is accepted but ineffective: a configuration that skips any directive,
-//!   including one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic.
-//!   Upstream would compile the rest of the policy and serve it; a policy that silently loses a rule line is a
-//!   fail-open, so this build keeps strict compilation.
+//! * `SecIgnoreRuleCompilationErrors On` is accepted but ineffective: a policy that skips a rule directive, including
+//!   one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic. Upstream
+//!   would compile the rest of the policy and serve it; a policy that silently loses a rule line is a fail-open, so
+//!   this build keeps strict compilation.
 //! * A present `directives_map` or `per_authority_directives` that is not an object is rejected. Upstream's `ForEach`
 //!   on `null` iterates once and on an array iterates its elements, so such a document does something rather than
 //!   nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is read as empty instead:

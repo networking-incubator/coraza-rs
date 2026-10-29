@@ -288,7 +288,7 @@ fn replacing_disruptive_action_preserves_its_position_before_flow_actions() {
 }
 
 #[test]
-fn failed_action_update_is_atomic_with_and_without_skip_failed_directives() {
+fn failed_action_update_is_atomic_and_never_skipped() {
     for skip_failed in [false, true] {
         let mut parser = Parser::new();
         register_interrupt(&mut parser);
@@ -303,18 +303,10 @@ fn failed_action_update_is_atomic_with_and_without_skip_failed_directives() {
             "SecRule ARGS \"@streq hit\" \"id:82,phase:1,setvar:TX.original=kept,deny\"\n\
              SecRuleUpdateActionById 82 \"hostdeny,failsecond\"",
         );
-        if skip_failed {
-            assert!(result.is_ok());
-            assert_eq!(parser.skipped().len(), 1);
-            assert!(
-                parser
-                    .skipped()
-                    .first()
-                    .is_some_and(|error| error.message.contains("second factory failed"))
-            );
-        } else {
-            assert!(result.unwrap_err().message.contains("second factory failed"));
-        }
+        // Only rule directives are skippable, so this configuration failure is returned
+        // even with failed directives enabled, and the update stays atomic.
+        assert!(result.unwrap_err().message.contains("second factory failed"));
+        assert!(parser.skipped().is_empty());
 
         let tx = matched_transaction(&parser.compile().unwrap());
         assert_eq!(

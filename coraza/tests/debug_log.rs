@@ -201,7 +201,7 @@ fn transformation_errors_are_aggregated_once_per_argument() {
 }
 
 #[test]
-fn not_inspected_inputs_do_not_log_a_no_match_verdict() {
+fn scanned_detector_inputs_log_a_no_match_verdict() {
     let logger = Arc::new(CaptureLogger::default());
     let mut parser = Parser::new().with_debug_logger(share_logger(&logger));
     parser.config_mut().debug_log_level = 4;
@@ -218,10 +218,10 @@ fn not_inspected_inputs_do_not_log_a_no_match_verdict() {
     transaction.process_request_headers();
 
     let events = logger.events();
-    assert!(events.iter().any(|event| {
+    assert!(!events.iter().any(|event| {
         event.message == "Evaluating operator: NOT INSPECTED" && event.fields.contains(&"rule_id=970".to_owned())
     }));
-    assert!(!events.iter().any(|event| {
+    assert!(events.iter().any(|event| {
         event.message == "Evaluating operator: NO MATCH" && event.fields.contains(&"rule_id=970".to_owned())
     }));
     assert!(events.iter().any(|event| {

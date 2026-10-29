@@ -211,10 +211,6 @@ pub struct Transaction {
     matched_rules: Vec<MatchedRule>,
     /// Transaction start time, used in audit records.
     started: SystemTime,
-    /// Raw bodies retained only when an enabled audit entry requests them.
-    audit_request_body: Vec<u8>,
-    /// Retained response bytes for selected audit parts.
-    audit_response_body: Vec<u8>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
     /// Whether the audit write was attempted; an attempt is never repeated.
@@ -454,8 +450,6 @@ impl Transaction {
             error_log: None,
             matched_rules: Vec::new(),
             started,
-            audit_request_body: Vec::new(),
-            audit_response_body: Vec::new(),
             config,
             rules,
             last_phase: None,
@@ -753,8 +747,8 @@ impl Transaction {
     /// Estimate dynamic memory retained for request and response body data.
     ///
     /// This includes body buffers, raw body variables, parsed body collections,
-    /// audit copies, and match data. Collection backing capacities are counted,
-    /// so this is a conservative estimate for connector retained-body budgets.
+    /// and match data. Collection backing capacities are counted, so this is a
+    /// conservative estimate for connector retained-body budgets.
     pub fn body_memory_bytes(&self) -> usize {
         let maps = [
             &self.args,
@@ -781,8 +775,6 @@ impl Transaction {
             .chain([
                 self.request_body_buffer.allocated_bytes(),
                 self.response_body_buffer.allocated_bytes(),
-                self.audit_request_body.capacity(),
-                self.audit_response_body.capacity(),
                 self.matched_rules_memory_bytes(),
             ])
             .fold(0_usize, usize::saturating_add)
@@ -1027,7 +1019,7 @@ impl Transaction {
         };
         if should_log {
             self.debug_log(DebugLevel::Debug, "Transaction marked for audit logging", || []);
-            let entry = self.audit_log();
+            let entry = self.audit_log_checked();
             if let Some(callback) = &self.audit_log_callback {
                 callback.write(&entry);
             }
@@ -1091,13 +1083,63 @@ impl Transaction {
     }
 
     /// Build this transaction's audit entry using the current audit parts.
+    ///
+    /// The body parts are read from the retained buffers, so call this before
+    /// [`Transaction::finish`] resets them; `finish` itself reads them before resetting.
+    pub fn audit_log(&self) -> AuditLog {
+        let has = |part| self.audit_log_parts.contains(&part);
+        // Go reads the retained body here, at log time, rather than when it was
+        // ingested, so a phase 2/4/5 `ctl:auditLogParts=+C` still captures it
+        // (`internal/corazawaf/transaction.go:1584-1592`, v3.8.1). This accessor is
+        // best-effort; the write path uses `audit_log_checked` to report a spill failure.
+        let request_body =
+            has(AuditLogPart::RequestBody).then(|| self.request_body_buffer.retained().unwrap_or(Cow::Borrowed(&[])));
+        let response_body = has(AuditLogPart::IntermediaryResponseBody)
+            .then(|| self.response_body_buffer.retained().unwrap_or(Cow::Borrowed(&[])));
+        self.audit_log_with(request_body.as_deref(), response_body.as_deref())
+    }
+
+    /// Build the audit entry for the write path, recording a spill read failure.
+    ///
+    /// `audit_log` is best-effort because it cannot mutate the transaction; `finish`
+    /// uses this so a disappeared spill file is reported by `finish` instead of silently
+    /// producing an entry with an empty body.
+    fn audit_log_checked(&mut self) -> AuditLog {
+        let has = |part| self.audit_log_parts.contains(&part);
+        let request_body = if has(AuditLogPart::RequestBody) {
+            match self.request_body_buffer.retained() {
+                Ok(body) => Some(body.into_owned()),
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        let response_body = if has(AuditLogPart::IntermediaryResponseBody) {
+            match self.response_body_buffer.retained() {
+                Ok(body) => Some(body.into_owned()),
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        self.audit_log_with(request_body.as_deref(), response_body.as_deref())
+    }
+
+    /// Build the audit entry from bodies already read, or `None` when the part is off.
     #[expect(
         clippy::too_many_lines,
         reason = "builds the typed record from all selected transaction fields"
     )]
-    pub fn audit_log(&self) -> AuditLog {
+    fn audit_log_with(&self, request_body: Option<&[u8]>, response_body: Option<&[u8]>) -> AuditLog {
         let elapsed = self.started.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let at = LocalTime::from_unix(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+        let has = |part| self.audit_log_parts.contains(&part);
         let mut transaction = AuditTransaction {
             timestamp: format!(
                 "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -1114,7 +1156,7 @@ impl Transaction {
                 method: self.request_method.get().into_owned(),
                 protocol: self.request_protocol.get().into_owned(),
                 uri: self.request_uri.get().into_owned(),
-                length: i32::try_from(self.audit_request_body.len()).unwrap_or(i32::MAX),
+                length: i32::try_from(request_body.map_or(0, <[u8]>::len)).unwrap_or(i32::MAX),
                 args: self
                     .args
                     .iter()
@@ -1127,12 +1169,11 @@ impl Transaction {
             ..AuditTransaction::default()
         };
 
-        let has = |part| self.audit_log_parts.contains(&part);
         if has(AuditLogPart::RequestHeaders) {
             transaction.request.headers = Some(self.request_headers.entries());
         }
-        if has(AuditLogPart::RequestBody) {
-            transaction.request.body = text_of(&self.audit_request_body).into_owned();
+        if let Some(body) = request_body {
+            transaction.request.body = text_of(body).into_owned();
         }
         if has(AuditLogPart::UploadedFiles) {
             transaction.request.files = Some(
@@ -1154,16 +1195,15 @@ impl Transaction {
                     .collect(),
             );
         }
-        if has(AuditLogPart::IntermediaryResponseBody)
-            || has(AuditLogPart::ResponseBody)
-            || has(AuditLogPart::ResponseHeaders)
-        {
+        if has(AuditLogPart::IntermediaryResponseBody) || has(AuditLogPart::ResponseHeaders) {
             let mut response = AuditResponse {
                 protocol: self.response_protocol.get().into_owned(),
                 ..AuditResponse::default()
             };
-            if has(AuditLogPart::IntermediaryResponseBody) || has(AuditLogPart::ResponseBody) {
-                response.body = text_of(&self.audit_response_body).into_owned();
+            // Part E is the only response-body part: Go leaves part G empty
+            // (`internal/auditlog/formats.go:160-171`, v3.8.1).
+            if let Some(body) = response_body {
+                response.body = text_of(body).into_owned();
             }
             if has(AuditLogPart::ResponseHeaders) {
                 response.status = self.response_status.get().parse().unwrap_or(0);
@@ -1268,6 +1308,10 @@ impl Transaction {
             rule.evaluate(self, phase);
         }
         self.skip = 0;
+        // `skipAfter` is phase-scoped (Go's own action documentation says so). Clearing
+        // it here keeps a missing target marker from disabling every later phase,
+        // including logging, which Go's implementation accidentally does.
+        self.skip_after = None;
         if self.allow == AllowType::Phase {
             self.allow = AllowType::Unset;
         }
@@ -1614,15 +1658,12 @@ impl Transaction {
         self.arguments_limit_reached.get_bytes() == b"1"
     }
 
-    /// Whether a detector operator skipped an input because it was too large to inspect.
+    /// Whether an operator reported that it could not inspect an input.
     ///
-    /// The `detectSQLi` and `detectXSS` operators scan values up to
-    /// [`libperfusion::MAX_INPUT_LEN`] bytes, the bound of libperfusion's public
-    /// detection wrappers. A longer value has no verdict, so the operator reports
-    /// [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected)
-    /// instead of matching. This method returns `true` once at least one detector
-    /// operator skipped an input, and the transaction variable
-    /// `TX.inspection_incomplete` is set to `"1"`; both stay clear otherwise.
+    /// The built-in `detectSQLi` and `detectXSS` operators scan every input, as Go does,
+    /// so they never set this. The signal is retained for a future operator with no
+    /// verdict: this method returns `true` and `TX.inspection_incomplete` is set to
+    /// `"1"` once such an operator reports it.
     ///
     /// By default the affected rule continues as a miss. Set
     /// [`WafConfig::detector_inspection_action`] to
@@ -1631,7 +1672,7 @@ impl Transaction {
         self.inspection_incomplete
     }
 
-    /// Record that a detector operator skipped an input and apply the configured policy.
+    /// Record that an operator could not inspect an input and apply the configured policy.
     ///
     /// The signal is recorded once, but `FailClosed` applies on every skipped input,
     /// including after a `ctl` switches the rule engine from `DetectionOnly` to `On`.
@@ -2901,10 +2942,16 @@ field value\r\n\
         assert_eq!(tx.process_request_body(body), None);
 
         let files = tx.find_matches(&VariableSpec::new_string(RuleVariable::Files, String::new()));
-        assert_eq!(files.len(), 1);
         assert_eq!(
-            files.first().map(|matched| matched.value.as_slice()),
-            Some(&b"first.txt"[..])
+            files.iter().map(|matched| matched.value.as_slice()).collect::<Vec<_>>(),
+            [&b"first.txt"[..], &b"second.txt"[..]],
+            "past the limit every upload is still recorded in FILES"
+        );
+        assert_eq!(
+            tx.find_matches(&VariableSpec::new_string(RuleVariable::FilesTmpNames, String::new()))
+                .len(),
+            1,
+            "only the first upload is written to disk"
         );
         assert_eq!(
             tx.get_variable(RuleVariable::ArgsPost, Some("after")).as_deref(),
@@ -3400,7 +3447,7 @@ payload\r\n\
             audit_engine: AuditEngineStatus::On,
             audit_log_parts: vec![
                 AuditLogPart::Header,
-                AuditLogPart::ResponseBody,
+                AuditLogPart::IntermediaryResponseBody,
                 AuditLogPart::EndMarker,
             ],
             ..WafConfig::default()
@@ -3418,6 +3465,30 @@ payload\r\n\
         );
         assert_eq!(tx.response_body_stats(), BodyIngestionStats::default());
         assert_eq!(tx.audit_log().transaction.response.unwrap().body, "");
+    }
+
+    #[test]
+    fn audit_part_g_is_empty_and_only_e_carries_the_response_body() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 16,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABCDEFGHZ").unwrap(),
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("audit-part-g", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.process_response_body(b"secret");
+
+        let log = tx.audit_log();
+        assert_eq!(log.transaction.response.as_ref().unwrap().body, "secret");
+        let native = log.format(crate::types::AuditLogFormat::Native);
+        assert!(native.contains("-E--\nsecret\n"), "part E holds the body: {native}");
+        assert!(native.contains("-G--\n\n"), "part G stays empty: {native}");
     }
 
     #[test]
@@ -4836,6 +4907,23 @@ v\r\n\
     }
 
     #[test]
+    fn a_missing_skip_after_marker_does_not_leak_into_the_next_phase() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:20,phase:1,skipAfter:NO_MARKER,pass\"\n\
+                 SecAction \"id:21,phase:1,deny\"\n\
+                 SecAction \"id:22,phase:2,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("skip-after-missing");
+
+        assert!(tx.process_request_headers().is_none());
+        assert_eq!(tx.process_request_body(b"").unwrap().rule_id, 22);
+    }
+
+    #[test]
     fn audit_logging_records_matches_and_request_response_data_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.json");
@@ -4846,7 +4934,7 @@ v\r\n\
             audit_engine: AuditEngineStatus::On,
             audit_log: path.to_string_lossy().into_owned(),
             audit_log_format: crate::types::AuditLogFormat::Json,
-            audit_log_parts: crate::types::parse_audit_log_parts("ABCFGHKZ").unwrap(),
+            audit_log_parts: crate::types::parse_audit_log_parts("ABCEFHKZ").unwrap(),
             request_body_access: true,
             response_body_access: true,
             response_body_mime_types: vec!["text/plain".to_owned()],
@@ -6374,7 +6462,7 @@ content\r\n\
     }
 
     #[test]
-    fn detector_reports_an_over_bound_input_as_not_inspected() {
+    fn detector_scans_an_input_past_the_wrapper_bound() {
         for (operator, payload, rule_id) in [
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 612),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 613),
@@ -6387,13 +6475,9 @@ content\r\n\
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
 
             assert!(tx.process_request_headers().is_none());
-            assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
-            assert!(tx.inspection_incomplete());
-            assert_eq!(
-                tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                    .as_deref(),
-                Some("1")
-            );
+            assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
+            assert!(!tx.inspection_incomplete());
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
         }
     }
 
@@ -6415,7 +6499,7 @@ content\r\n\
     }
 
     #[test]
-    fn fail_closed_interrupts_when_a_detector_cannot_inspect() {
+    fn fail_closed_does_not_interrupt_a_scanned_detector() {
         for (operator, payload, rule_id) in [
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 616),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 617),
@@ -6427,11 +6511,9 @@ content\r\n\
             let mut tx = waf.new_transaction_with_id(format!("detector-fail-closed-{operator}"));
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
 
-            let interruption = tx.process_request_headers().unwrap();
-            assert_eq!(interruption.rule_id, rule_id);
-            assert_eq!(interruption.action, "deny");
-            assert!(interruption.data.contains("inspection bound"));
-            assert!(tx.inspection_incomplete());
+            assert!(tx.process_request_headers().is_none());
+            assert!(!tx.inspection_incomplete());
+            assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
         }
     }
 
@@ -6450,7 +6532,7 @@ content\r\n\
     }
 
     #[test]
-    fn fail_closed_interrupts_after_ctl_switches_from_detection_only() {
+    fn a_ctl_switching_to_on_still_scans_over_bound_detector_input() {
         let waf = detector_waf(
             "SecRuleEngine DetectionOnly\n\
              SecRule ARGS:q \"@detectSQLi\" \"id:630,phase:1,pass\"\n\
@@ -6462,15 +6544,11 @@ content\r\n\
         let mut tx = waf.new_transaction_with_id("detector-fail-closed-ctl-on");
         tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1));
 
-        let interruption = tx.process_request_headers().unwrap();
-        assert_eq!(interruption.rule_id, 633);
-        assert_eq!(interruption.action, "deny");
-        assert_eq!(interruption.status, 500);
-        assert!(interruption.data.contains("inspection bound"));
-        // Detection-only mode keeps the first would-be interruption from rule 630.
-        let would_be = tx.would_be_interruption().unwrap();
-        assert_eq!(would_be.rule_id, 630);
-        assert!(tx.inspection_incomplete());
+        assert!(tx.process_request_headers().is_none());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 630));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 633));
+        assert!(tx.would_be_interruption().is_none());
+        assert!(!tx.inspection_incomplete());
     }
 
     #[test]
@@ -6496,7 +6574,7 @@ content\r\n\
     }
 
     #[test]
-    fn record_only_keeps_repeated_skipped_inputs_non_blocking() {
+    fn record_only_detects_every_over_bound_input() {
         let waf = detector_waf(
             "SecRule ARGS:q \"@detectSQLi\" \"id:634,phase:1,pass\"\n\
              SecRule ARGS:r \"@detectXSS\" \"id:635,phase:1,pass\"",
@@ -6510,17 +6588,13 @@ content\r\n\
         );
 
         assert!(tx.process_request_headers().is_none());
-        assert!(tx.inspection_incomplete());
-        assert_eq!(
-            tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                .as_deref(),
-            Some("1")
-        );
-        assert!(tx.matched_rules().is_empty());
+        assert!(!tx.inspection_incomplete());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 634));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 635));
     }
 
     #[test]
-    fn inspection_signal_survives_a_rule_chain() {
+    fn a_detector_chain_matches_over_bound_input_without_a_signal() {
         let waf = detector_waf(
             "SecRule ARGS:q \"@contains needle\" \"id:619,phase:1,pass,chain\"\n\
              SecRule ARGS:q \"@detectSQLi\" \"\"\n\
@@ -6534,9 +6608,9 @@ content\r\n\
         );
 
         assert!(tx.process_request_headers().is_none());
-        assert!(tx.inspection_incomplete());
-        assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
-        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
+        assert!(!tx.inspection_incomplete());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
+        assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
     }
 
     #[test]

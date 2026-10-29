@@ -238,6 +238,12 @@ semicolon_inside_block = "deny"
 # Restriction: enforce clippy.toml method blocklist
 disallowed_methods = "deny"
 
+# Wrapping arithmetic on attacker-controlled sizes and offsets would be silent; a
+# release build must trap instead. This is a security trade for speed, so the
+# performance gate must re-measure it.
+[profile.release]
+overflow-checks = true
+
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
