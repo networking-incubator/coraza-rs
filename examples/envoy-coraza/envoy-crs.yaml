@@ -101,8 +101,12 @@ static_resources:
                                     "SecAuditLogFormat JSON",
                                     "SecRequestBodyAccess On",
                                     "SecRequestBodyLimit 13107200",
+                                    "SecResponseBodyAccess On",
+                                    "SecResponseBodyLimit 1048576",
+                                    "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
-                                    "Include crs/rules/*.conf"
+                                    "Include crs/rules/*.conf",
+                                    "SecRule REQUEST_HEADERS:Content-Type \"@rx ^application/json(?:\\s*;.*)?$\" \"id:999100,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\""
                                   ]
                                 },
                                 "default_directives": "main",
