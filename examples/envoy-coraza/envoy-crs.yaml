@@ -106,7 +106,7 @@ static_resources:
                                     "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
                                     "Include crs/rules/*.conf",
-                                    "SecRule REQUEST_HEADERS:Content-Type \"@rx ^application/json(?:\\s*;.*)?$\" \"id:999100,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\""
+                                    "SecRule REQUEST_HEADERS:Content-Type \"@rx ^application/json(?:\\s*;.*)?$\" \"id:999100,phase:1,pass,nolog,t:none,t:lowercase,ctl:requestBodyProcessor=JSON\""
                                   ]
                                 },
                                 "default_directives": "main",
