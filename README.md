@@ -26,6 +26,12 @@ Pablo Tosso and the OWASP Coraza contributors. It is not the upstream Go
 project. See the
 [Coraza import history](docs/coraza-import-history.md) for provenance.
 
+## Replacement readiness
+
+`coraza` is not yet a drop-in replacement for a Go Coraza installation. The
+remaining requirements, gaps, decisions and work packages are tracked in
+[docs/coraza-go-replacement-plan.md](docs/coraza-go-replacement-plan.md).
+
 ## Use the library
 
 Add `libperfusion` from this repository to an application. For example, a
