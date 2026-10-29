@@ -395,9 +395,8 @@ impl Transaction {
     ///
     /// # Panics
     ///
-    /// Panics if the configuration is invalid: a request or response body limit that is
-    /// zero, negative, or above `1 GiB`, or another limit [`crate::Waf::new`] rejects. Use
-    /// [`Transaction::try_with_config`] or [`crate::Waf::new`] to validate a configuration
+    /// Panics if the configuration fails the checks [`Transaction::try_with_config`]
+    /// documents. Use that method, or [`crate::Waf::new`], to validate a configuration
     /// instead.
     #[expect(
         clippy::expect_used,
@@ -409,8 +408,11 @@ impl Transaction {
 
     /// Create a transaction with the supplied WAF configuration, validating it first.
     ///
-    /// This is the fallible form of [`Transaction::with_config`] and performs the same
-    /// validation as [`crate::Waf::new`].
+    /// This is the fallible form of [`Transaction::with_config`]. It applies the same
+    /// configuration checks [`crate::Waf::new`] applies to a rule-less WAF: body and
+    /// collection limits, the debug log level, and the upload-directory requirement. It
+    /// does not validate audit-log sinks, which only a WAF that writes audit entries
+    /// prepares, and it pairs no compiled rules with the configuration.
     ///
     /// # Errors
     ///
