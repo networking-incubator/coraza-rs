@@ -540,10 +540,6 @@ fn upload_directory(configured: &str) -> Option<PathBuf> {
 
 /// Store a custom file using the same private temporary-file path as multipart uploads.
 fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyProcessorFile) -> Result<(), String> {
-    if tx.uploaded_paths.len() >= tx.config.upload_file_limit {
-        tx.multipart_strict_error.set("1");
-        return Ok(());
-    }
     let size = u64::try_from(file.bytes.len()).map_err(|error| format!("upload size overflow: {error}"))?;
     let current_size = std::str::from_utf8(tx.files_combined_size.get_bytes())
         .ok()
@@ -552,20 +548,27 @@ fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyP
     let total_size = current_size
         .checked_add(size)
         .ok_or_else(|| "upload size overflow".to_owned())?;
-    let path = save_to_temp(upload_dir, &file.bytes)?;
 
     let mut content_type = Vec::with_capacity(file.content_type.len().saturating_add(14));
     content_type.extend_from_slice(b"Content-Type: ");
     content_type.extend_from_slice(&file.content_type);
     tx.multipart_part_headers.add_bytes(&file.name, content_type);
-    tx.files_tmp_names.add_bytes(b"", path.to_string_lossy().as_bytes());
-    tx.uploaded_paths.push(path);
+    // Past the limit `FILES`, `FILES_SIZES` and `FILES_NAMES` still record the upload,
+    // as the built-in multipart processor does: only the temporary file write stops.
     tx.files.add_bytes(b"", &file.filename);
     tx.multipart_name.add_bytes(&file.name, &file.name);
     tx.multipart_filename.add_bytes(&file.name, &file.filename);
     tx.files_sizes.set_index(&file.filename, 0, size.to_string());
     tx.files_names.add_bytes(b"", &file.name);
     tx.files_combined_size.set(total_size.to_string());
+
+    if tx.uploaded_paths.len() >= tx.config.upload_file_limit {
+        tx.multipart_strict_error.set("1");
+        return Ok(());
+    }
+    let path = save_to_temp(upload_dir, &file.bytes)?;
+    tx.files_tmp_names.add_bytes(b"", path.to_string_lossy().as_bytes());
+    tx.uploaded_paths.push(path);
     Ok(())
 }
 
