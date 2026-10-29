@@ -98,6 +98,10 @@ const fn html_byte_set(bytes: &[u8]) -> [bool; 256] {
 static ATTRIBUTE_NAME_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r/=>");
 /// What ends an unquoted attribute value: whitespace or '>'.
 static UNQUOTED_VALUE_END: [bool; 256] = html_byte_set(b" \t\n\x0b\x0c\r>");
+/// Attribute-name delimiters for the NUL-as-space XSS pass.
+static ATTRIBUTE_NAME_END_NUL: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r/=>");
+/// Unquoted-value delimiters for the NUL-as-space XSS pass.
+static UNQUOTED_VALUE_END_NUL: [bool; 256] = byte_set(b" \t\n\x0b\x0c\r>");
 
 /// Short spans are cheaper to check directly before searching multiple delimiter groups.
 const HTML_SCALAR_PREFIX: usize = 128;
@@ -133,6 +137,11 @@ fn attribute_name_cspan(s: &[u8]) -> usize {
     HTML_SCALAR_PREFIX + attribute_name_rest_cspan(&s[HTML_SCALAR_PREFIX..])
 }
 
+/// Attribute-name span with NUL treated as a delimiter for the XSS NUL pass.
+fn attribute_name_cspan_nul(s: &[u8]) -> usize {
+    cspan(s, &ATTRIBUTE_NAME_END_NUL)
+}
+
 /// Searches the long attribute-name tail after the scalar prefix has no match.
 #[inline(never)]
 fn attribute_name_rest_cspan(s: &[u8]) -> usize {
@@ -153,6 +162,8 @@ pub struct Tokenizer<'a> {
     pos: usize,
     /// Set by `</`, so the tag name that follows is a closing one.
     is_close: bool,
+    /// Treat NUL as whitespace in attribute names and unquoted values.
+    nul_as_space: bool,
     state: State,
 }
 
@@ -170,8 +181,16 @@ impl<'a> Tokenizer<'a> {
             s,
             pos: 0,
             is_close: false,
+            nul_as_space: false,
             state,
         }
+    }
+
+    /// Starts tokenization with NUL treated as whitespace, without copying the input.
+    pub(crate) fn new_nul_as_space(s: &'a [u8], context: Context) -> Self {
+        let mut tokenizer = Self::new(s, context);
+        tokenizer.nul_as_space = true;
+        tokenizer
     }
 
     pub(crate) fn new_data_at(s: &'a [u8], pos: usize) -> Self {
@@ -179,8 +198,16 @@ impl<'a> Tokenizer<'a> {
             s,
             pos,
             is_close: false,
+            nul_as_space: false,
             state: State::Data,
         }
+    }
+
+    /// Starts data tokenization at `pos` with NUL treated as whitespace.
+    pub(crate) fn new_data_at_nul_as_space(s: &'a [u8], pos: usize) -> Self {
+        let mut tokenizer = Self::new_data_at(s, pos);
+        tokenizer.nul_as_space = true;
+        tokenizer
     }
 
     fn token(&self, kind: TokenKind, start: usize, len: usize) -> Token<'a> {
@@ -369,7 +396,13 @@ impl<'a> Tokenizer<'a> {
         let s = self.s;
         let start = self.pos;
         // The first byte is part of the name, whatever it is.
-        let end = start + 1 + attribute_name_cspan(&s[start + 1..]);
+        let end = start
+            + 1
+            + if self.nul_as_space {
+                attribute_name_cspan_nul(&s[start + 1..])
+            } else {
+                attribute_name_cspan(&s[start + 1..])
+            };
         (self.state, self.pos) = match s.get(end) {
             None => (State::Eof, end),
             Some(b'/') => (State::SelfClosingStartTag, end + 1),
@@ -434,7 +467,15 @@ impl<'a> Tokenizer<'a> {
     fn state_attribute_value_no_quote(&mut self) -> Option<Token<'a>> {
         let s = self.s;
         let start = self.pos;
-        let end = start + cspan(&s[start..], &UNQUOTED_VALUE_END);
+        let end = start
+            + cspan(
+                &s[start..],
+                if self.nul_as_space {
+                    &UNQUOTED_VALUE_END_NUL
+                } else {
+                    &UNQUOTED_VALUE_END
+                },
+            );
         (self.state, self.pos) = match s.get(end) {
             // Unlike elsewhere, upstream leaves the position where it was.
             None => (State::Eof, start),
