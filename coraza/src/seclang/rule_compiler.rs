@@ -139,19 +139,7 @@ fn add_actions(
 ) -> CompileResult<Rule> {
     let Some(defaults) = defaults.for_phase(phase_of(parsed_actions)?) else {
         apply_actions(&mut rule, parsed_actions, true, false, action_context)?;
-        // `block` only resolves against a phase default; without one it is a disruptive
-        // action the runtime ignores, so surface the no-op at load time.
-        if rule
-            .actions()
-            .iter()
-            .any(|action| action.name == "block" && action.action_type() == ActionType::Disruptive)
-        {
-            rule.metadata_mut().warnings.push(
-                "block has no SecDefaultAction for this phase and does nothing; use deny, drop or a \
-                 phase default"
-                    .to_owned(),
-            );
-        }
+        warn_block_without_default(&mut rule, defaults);
         return Ok(rule);
     };
 
@@ -165,6 +153,28 @@ fn add_actions(
         apply_actions(&mut rule, [&defaults.disruptive], false, false, action_context)?;
     }
     Ok(rule)
+}
+
+/// Surface a `block` action that a phase has no `SecDefaultAction` to resolve.
+///
+/// Without a phase default `block` stays a disruptive action the runtime ignores, so
+/// the rule is detect-only by accident. Both initial compilation and
+/// `SecRuleUpdateActionById` use this warning.
+pub(crate) fn warn_block_without_default(rule: &mut Rule, defaults: &DefaultActions) {
+    if defaults.for_phase(rule.metadata().phase).is_some() {
+        return;
+    }
+    if rule
+        .actions()
+        .iter()
+        .any(|action| action.name == "block" && action.action_type() == ActionType::Disruptive)
+    {
+        rule.metadata_mut().warnings.push(
+            "block has no SecDefaultAction for this phase and does nothing; use deny, drop or a \
+             phase default"
+                .to_owned(),
+        );
+    }
 }
 
 /// Applies parsed actions to `rule` in order: metadata actions update its metadata,
