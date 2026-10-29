@@ -237,12 +237,20 @@ struct PhaseDefaults {
 impl DefaultActions {
     /// Adds the defaults of one `SecDefaultAction`.
     ///
+    /// Warnings raised by its actions are appended to `warnings` only when the directive
+    /// succeeds; a rejected directive publishes nothing.
+    ///
     /// # Errors
     ///
     /// If `actions` is not valid, names no phase or no disruptive action, holds metadata
     /// actions (`id`, `msg`, `tag`, ...) or transformations, or its phase already has
     /// defaults.
-    pub(crate) fn add(&mut self, actions: &str, action_context: ActionCompileContext<'_>) -> CompileResult<()> {
+    pub(crate) fn add(
+        &mut self,
+        actions: &str,
+        action_context: ActionCompileContext<'_>,
+        warnings: &mut Vec<String>,
+    ) -> CompileResult<()> {
         const METADATA: [&str; 8] = ["accuracy", "id", "maturity", "msg", "rev", "severity", "tag", "ver"];
 
         let mut metadata = RuleMetadata::new();
@@ -283,6 +291,7 @@ impl DefaultActions {
             )));
         }
         self.phases.insert(metadata.phase, PhaseDefaults { others, disruptive });
+        warnings.append(&mut metadata.warnings);
         Ok(())
     }
 
@@ -535,7 +544,11 @@ mod tests {
     fn test_default_actions_apply_to_explicit_and_builtin_phases() {
         let mut defaults = DefaultActions::default();
         defaults
-            .add("phase:1,log,auditlog,deny,status:403", ActionCompileContext::default())
+            .add(
+                "phase:1,log,auditlog,deny,status:403",
+                ActionCompileContext::default(),
+                &mut Vec::new(),
+            )
             .unwrap();
         let context = OperatorContext::default();
 
