@@ -19,7 +19,7 @@ httparse = { version = "1.10", optional = true }
 hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 ipnet = "2.9"
-jsonschema = { version = "0.59", default-features = false, optional = true }
+jsonschema = { version = "0.60", default-features = false, optional = true }
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = { version = "0.11", optional = true }
 mime = "0.3"
