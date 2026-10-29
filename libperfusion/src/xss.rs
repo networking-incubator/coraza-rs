@@ -458,22 +458,13 @@ fn is_black_url(url: &[u8]) -> bool {
 /// `<a href=x\0onerror=...>`, where C treats the NUL as whitespace and sees a new
 /// attribute. Trying both readings is a superset of either engine's detection.
 pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
-    if is_xss_raw(input, context, data_start) {
+    if is_xss_raw(input, context, data_start, false) {
         return true;
     }
-    if !input.contains(&0) {
-        return false;
-    }
-    let mut spaced = input.to_vec();
-    for byte in &mut spaced {
-        if *byte == 0 {
-            *byte = b' ';
-        }
-    }
-    is_xss_raw(&spaced, context, data_start)
+    input.contains(&0) && is_xss_raw(input, context, data_start, true)
 }
 
-fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
+fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>, nul_as_space: bool) -> bool {
     let mut attr = None;
     let mut tokenizer = match context {
         Context::Data => {
@@ -487,8 +478,13 @@ fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>) -> bool
             }) else {
                 return false;
             };
-            Tokenizer::new_data_at(input, start)
+            if nul_as_space {
+                Tokenizer::new_data_at_nul_as_space(input, start)
+            } else {
+                Tokenizer::new_data_at(input, start)
+            }
         },
+        _ if nul_as_space => Tokenizer::new_nul_as_space(input, context),
         _ => Tokenizer::new(input, context),
     };
     for token in &mut tokenizer {
