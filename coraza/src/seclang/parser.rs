@@ -1111,7 +1111,7 @@ fn directive_sec_action(options: &mut DirectiveOptions<'_>) -> Result<(), String
 fn directive_sec_default_action(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     options
         .default_actions
-        .add(&options.opts, options.action_compile_context)
+        .add(&options.opts, options.action_compile_context, options.warnings)
         .map_err(|e| e.message)
 }
 
@@ -3475,6 +3475,32 @@ SecWebAppId production
         assert_eq!(parser.warnings().len(), 2);
         assert!(parser.warnings().iter().any(|warning| warning.contains("initcol")));
         assert!(parser.warnings().iter().any(|warning| warning.contains("expirevar")));
+    }
+
+    #[test]
+    fn default_action_publishes_persistent_collection_warnings() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecDefaultAction \"phase:1,pass,initcol:IP=%{REMOTE_ADDR}\"\n\
+                 SecDefaultAction \"phase:2,pass,expirevar:IP=60\"",
+            )
+            .unwrap();
+
+        assert!(parser.warnings().iter().any(|warning| warning.contains("initcol")));
+        assert!(parser.warnings().iter().any(|warning| warning.contains("expirevar")));
+    }
+
+    #[test]
+    fn rejected_default_action_does_not_publish_warnings() {
+        for directive in [
+            "SecDefaultAction \"phase:1,pass,initcol:IP=x,msg:hello\"",
+            "SecDefaultAction \"phase:1,pass\"\nSecDefaultAction \"phase:1,pass,initcol:IP=x\"",
+        ] {
+            let mut parser = Parser::new();
+            assert!(parser.from_string(directive).is_err(), "{directive}");
+            assert!(parser.warnings().is_empty(), "{directive}: {:?}", parser.warnings());
+        }
     }
 
     #[test]
