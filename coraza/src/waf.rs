@@ -311,7 +311,7 @@ impl Default for Waf {
 const MAX_BODY_LIMIT: i64 = 1_073_741_824;
 
 /// Validate settings enforced by WAF and transaction construction.
-fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
+pub(crate) fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
     if config.request_body_limit <= 0 {
         return Err(ConfigError("request body limit must be greater than 0".to_owned()));
     }

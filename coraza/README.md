@@ -367,6 +367,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 
 ## Migrating from the previous release
 
+- `Transaction::with_config` now validates the configuration like `Waf::new`
+  does and panics on an invalid body limit instead of building a transaction
+  that inspects nothing. `Transaction::try_with_config` is the fallible form.
 - `WafConfig::multiphase_evaluation` is a new runtime setting, defaulting to
   `false`. Set it before compiling rules; a compiled rule set cannot be paired
   with a WAF whose setting differs. It replaces the equivalent Go build-tag

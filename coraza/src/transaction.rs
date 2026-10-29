@@ -61,6 +61,7 @@ use crate::{
     transformations::text_of,
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
     utils::time::LocalTime,
+    waf::ConfigError,
 };
 
 /// Custom processor selections and lazily created instances for one transaction.
@@ -391,8 +392,34 @@ impl Transaction {
     }
 
     /// Create a transaction with the supplied WAF configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration is invalid: a request or response body limit that is
+    /// zero, negative, or above `1 GiB`, or another limit [`crate::Waf::new`] rejects. Use
+    /// [`Transaction::try_with_config`] or [`crate::Waf::new`] to validate a configuration
+    /// instead.
+    #[expect(
+        clippy::expect_used,
+        reason = "this constructor deliberately panics on an invalid configuration; try_with_config is the fallible form"
+    )]
     pub fn with_config(id: impl Into<String>, config: Arc<WafConfig>) -> Self {
-        Self::with_rules(config, Arc::new(RuleGroup::new()), id)
+        Self::try_with_config(id, config).expect("invalid WAF configuration")
+    }
+
+    /// Create a transaction with the supplied WAF configuration, validating it first.
+    ///
+    /// This is the fallible form of [`Transaction::with_config`] and performs the same
+    /// validation as [`crate::Waf::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration has invalid limits, such as a zero or
+    /// negative body limit, a body limit above `1 GiB`, or an in-memory limit above the
+    /// body limit.
+    pub fn try_with_config(id: impl Into<String>, config: Arc<WafConfig>) -> Result<Self, ConfigError> {
+        crate::waf::validate_config(&config)?;
+        Ok(Self::with_rules(config, Arc::new(RuleGroup::new()), id))
     }
 
     /// Create a transaction with shared WAF configuration and compiled rules.
@@ -2172,7 +2199,11 @@ impl Drop for Transaction {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "transaction tests use fixed valid inputs")]
+#[expect(
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "transaction tests use fixed valid inputs"
+)]
 mod tests {
     use std::sync::{
         Arc, Mutex,
@@ -2180,7 +2211,7 @@ mod tests {
     };
 
     use super::{
-        BodyIngestionStats, Transaction, VariableCollection,
+        BodyIngestionStats, RuleGroup, Transaction, VariableCollection,
         body_buffer::{BufferFailure, inject_failure},
     };
     use crate::{
@@ -2205,6 +2236,61 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    #[test]
+    fn try_with_config_rejects_invalid_body_limits() {
+        for config in [
+            WafConfig {
+                request_body_limit: 0,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                request_body_limit: -1,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                response_body_limit: 0,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                request_body_limit: 1_073_741_825,
+                ..WafConfig::default()
+            },
+        ] {
+            let Err(error) = Transaction::try_with_config("invalid-limit", Arc::new(config)) else {
+                panic!("invalid limit is accepted");
+            };
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn try_with_config_accepts_a_valid_limit_and_processes_the_body() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 1024,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::try_with_config("valid-limit", Arc::new(config)).unwrap();
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"name=value"), None);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("name")).as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid WAF configuration")]
+    fn with_config_panics_on_a_zero_body_limit() {
+        let config = WafConfig {
+            request_body_limit: 0,
+            ..WafConfig::default()
+        };
+        let _unused = Transaction::with_config("zero-limit", Arc::new(config));
     }
 
     #[test]
@@ -3157,6 +3243,11 @@ payload\r\n\
         );
     }
 
+    /// Build a transaction without config validation so zero limits stay testable.
+    fn transaction_with_unvalidated_config(id: &str, config: WafConfig) -> Transaction {
+        Transaction::with_rules(Arc::new(config), Arc::new(RuleGroup::new()), id)
+    }
+
     /// Build a transaction that inspects a RAW request body with the supplied limits.
     fn request_body_transaction(id: &str, limit: i64, action: BodyLimitAction) -> Transaction {
         let config = WafConfig {
@@ -3165,7 +3256,7 @@ payload\r\n\
             request_body_limit_action: action,
             ..WafConfig::default()
         };
-        let mut tx = Transaction::with_config(id, Arc::new(config));
+        let mut tx = transaction_with_unvalidated_config(id, config);
         tx.process_request_headers();
         tx.set_request_body_processor("RAW");
         tx
@@ -4400,7 +4491,7 @@ v\r\n\
                 response_body_mime_types: vec!["text/plain".to_owned()],
                 ..WafConfig::default()
             };
-            let mut tx = Transaction::with_config("response-limit-zero", Arc::new(config));
+            let mut tx = transaction_with_unvalidated_config("response-limit-zero", config);
             tx.process_request_headers();
             tx.process_request_body(b"");
             tx.add_response_header("Content-Type", "text/plain");
@@ -4420,7 +4511,7 @@ v\r\n\
                 response_body_mime_types: vec!["text/plain".to_owned()],
                 ..WafConfig::default()
             };
-            let mut tx = Transaction::with_config("response-limit-zero-body", Arc::new(config));
+            let mut tx = transaction_with_unvalidated_config("response-limit-zero-body", config);
             tx.process_request_headers();
             tx.process_request_body(b"");
             tx.add_response_header("Content-Type", "text/plain");
@@ -4450,7 +4541,7 @@ v\r\n\
             response_body_mime_types: vec!["text/plain".to_owned()],
             ..WafConfig::default()
         };
-        let mut tx = Transaction::with_config("empty-response-limit", Arc::new(config));
+        let mut tx = transaction_with_unvalidated_config("empty-response-limit", config);
         tx.process_request_headers();
         tx.process_request_body(b"");
         tx.add_response_header("Content-Type", "text/plain");
