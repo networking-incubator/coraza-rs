@@ -73,6 +73,7 @@ use crate::{
         CompileError, parse_actions,
         rule_compiler::{
             DefaultActions, apply_actions, compile_sec_action_in, compile_sec_marker, compile_sec_rule_in,
+            warn_block_without_default,
         },
         variable_parser::VariableList,
     },
@@ -934,8 +935,10 @@ fn written_directive<'i>(input: &mut &'i str) -> ModalResult<Cow<'i, str>, Empty
 /// (`internal/seclang/directives.go:186-206`, v3.8.1). `SecAction` and `SecMarker`
 /// return their errors unconditionally, as do configuration and `Include` failures.
 fn skippable_directive(line: &str) -> bool {
-    let line = line.trim_start();
-    let (name, _) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    // Match `evaluate_line` exactly: the directive name ends at the first ASCII space,
+    // not at a tab or other whitespace. A tab-separated `SecRule` is an unknown
+    // directive to the dispatcher and must not be skipped.
+    let (name, _) = line.split_once(' ').unwrap_or((line, ""));
     name.eq_ignore_ascii_case("secrule")
 }
 
@@ -1198,6 +1201,7 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
         {
             let first_warning = rule.metadata().warnings.len();
             apply_actions(rule, &actions, true, false, options.action_compile_context).map_err(|e| e.message)?;
+            warn_block_without_default(rule, options.default_actions);
             added_warnings.extend(rule.metadata_mut().warnings.split_off(first_warning));
             found = true;
         }
@@ -3431,6 +3435,17 @@ SecWebAppId production
     }
 
     #[test]
+    fn tab_separated_secrule_is_not_skipped() {
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        let error = parser
+            .from_string("SecRule\tARGS \"@contains x\" \"id:1,phase:1,pass\"")
+            .unwrap_err();
+        assert!(error.message.contains("unknown directive"), "{error:?}");
+        assert!(parser.skipped().is_empty(), "{:?}", parser.skipped());
+    }
+
+    #[test]
     fn block_without_a_phase_default_warns() {
         let mut parser = Parser::new();
         parser
@@ -3473,6 +3488,25 @@ SecWebAppId production
             .unwrap();
         assert!(
             parser.warnings().iter().any(|warning| warning.contains("initcol")),
+            "{:?}",
+            parser.warnings()
+        );
+    }
+
+    #[test]
+    fn update_action_warns_for_block_without_a_phase_default() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains x\" \"id:1,phase:1,pass\"\n\
+                 SecRuleUpdateActionById 1 \"block\"",
+            )
+            .unwrap();
+        assert!(
+            parser
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("block has no SecDefaultAction")),
             "{:?}",
             parser.warnings()
         );

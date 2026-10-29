@@ -171,6 +171,21 @@ fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The byte offset just past a `[:name:]` POSIX class, or `None` if it is not one.
+fn posix_class_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'[') || bytes.get(start + 1) != Some(&b':') {
+        return None;
+    }
+    let mut offset = start + 2;
+    while offset + 1 < bytes.len() {
+        if bytes.get(offset) == Some(&b':') && bytes.get(offset + 1) == Some(&b']') {
+            return Some(offset + 2);
+        }
+        offset += 1;
+    }
+    None
+}
+
 /// The byte offset just past the character class starting at `start`.
 fn class_end(pattern: &str, start: usize) -> Option<usize> {
     let bytes = pattern.as_bytes();
@@ -185,14 +200,13 @@ fn class_end(pattern: &str, start: usize) -> Option<usize> {
                 offset = offset.saturating_add(2);
                 first = false;
             },
-            b'[' if matches!(bytes.get(offset + 1), Some(b':' | b'.' | b'=')) => {
-                let kind = *bytes.get(offset + 1)?;
-                offset += 2;
-                while let Some(&inner) = bytes.get(offset) {
-                    if inner == kind && bytes.get(offset + 1) == Some(&b']') {
-                        offset += 2;
-                        break;
-                    }
+            b'[' if bytes.get(offset + 1) == Some(&b':') => {
+                // Only `[:name:]` is a POSIX class; `[.` and `[=` are literal
+                // brackets in Go. An unterminated `[:` stays a literal `[` so a
+                // later `]` still closes the class.
+                if let Some(end) = posix_class_end(bytes, offset) {
+                    offset = end;
+                } else {
                     offset += 1;
                 }
                 first = false;
@@ -270,18 +284,11 @@ fn rewrite_class(class: &str) -> Option<String> {
         // those bytes literally. A raw `[` starts a nested class in Rust, and
         // `]`/`^` are only literal in specific class positions. Escape them so
         // the nested-class wrapper does not change the original set.
-        if byte == b'[' && matches!(inner.as_bytes().get(offset + 1), Some(b':' | b'.' | b'=')) {
-            let kind = *inner.as_bytes().get(offset + 1)?;
-            let start = offset;
-            offset += 2;
-            while let Some(&inner_byte) = inner.as_bytes().get(offset) {
-                if inner_byte == kind && inner.as_bytes().get(offset + 1) == Some(&b']') {
-                    offset += 2;
-                    break;
-                }
-                offset += 1;
-            }
-            rewritten.push_str(inner.get(start..offset).unwrap_or_default());
+        if byte == b'['
+            && let Some(end) = posix_class_end(inner.as_bytes(), offset)
+        {
+            rewritten.push_str(inner.get(offset..end).unwrap_or_default());
+            offset = end;
             continue;
         }
         match byte {
@@ -810,6 +817,22 @@ mod tests {
         assert!(matches("[a&&b]", b"&"));
         assert!(matches("[~~]", b"~"));
         assert!(matches("[[]", b"["));
+    }
+
+    #[test]
+    fn posix_class_scanning_treats_dot_and_equals_as_literal_brackets() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        assert!(matches("[[.]", b"["));
+        assert!(matches("[[.]", b"."));
+        assert!(!matches("[[.]", b"]"));
+        assert!(matches("[[=]", b"["));
+        assert!(matches("[[=]", b"="));
+        assert!(!matches("[[=]", b"]"));
+        assert!(matches(r"[\w[.]", b"["));
+        assert!(matches(r"[\w[.]", b"."));
+        assert!(matches(r"[\w[.]", b"a"));
     }
 
     #[test]
