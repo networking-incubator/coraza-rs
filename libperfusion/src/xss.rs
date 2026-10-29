@@ -709,6 +709,13 @@ mod tests {
     }
 
     #[test]
+    fn nul_as_space_splits_a_tag_name_at_nul() {
+        let input = b"<script\x00foo>";
+        assert!(!is_xss_raw(input, Context::Data, None, false));
+        assert!(is_xss(input, Context::Data, None));
+    }
+
+    #[test]
     fn embedded_nuls_are_removed_before_name_classification() {
         assert!(is_xss(b"<a on\0error=1>", Context::Data, None));
         assert!(is_xss(b"<sv\0gload>", Context::Data, None));

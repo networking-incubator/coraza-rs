@@ -397,6 +397,14 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     check_status 403 "$status" 'embedded CRS JSON SQLi denial'
     [[ $(backend_count /crs-json-sqli) == "$before" ]] \
         || fail 'embedded CRS sent a denied JSON request to the backend'
+
+    before=$(backend_count /crs-json-sqli-case)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --header 'Content-Type: Application/JSON' \
+        --data-binary "@$temp_dir/crs-json-sqli" http://127.0.0.1:10001/crs-json-sqli-case)
+    check_status 403 "$status" 'embedded CRS mixed-case JSON SQLi denial'
+    [[ $(backend_count /crs-json-sqli-case) == "$before" ]] \
+        || fail 'embedded CRS sent a denied mixed-case JSON request to the backend'
 fi
 
 # A field-only multipart body must not need a temporary upload directory. This used

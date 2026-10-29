@@ -334,9 +334,10 @@ impl<'a> Tokenizer<'a> {
         let mut pos = start;
         while pos < s.len() {
             let ch = s[pos];
-            if ch == 0 {
+            if ch == 0 && !self.nul_as_space {
                 // Non-standard: some old browsers allow and ignore NULs
-                // in tag names.
+                // in tag names. The NUL-as-space retry treats it as the
+                // delimiter `is_white(0)` already recognizes.
                 pos += 1;
             } else if is_white(ch) {
                 self.pos = pos + 1;
