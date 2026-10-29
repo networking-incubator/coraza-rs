@@ -290,6 +290,8 @@ pub struct RuleMetadata {
     pub(crate) line: usize,
     /// Original SecLang directive text.
     pub(crate) raw: String,
+    /// Load-time warnings raised by this rule's actions.
+    pub(crate) warnings: Vec<String>,
 }
 
 impl RuleMetadata {
@@ -317,6 +319,7 @@ impl RuleMetadata {
             file: String::new(),
             line: 0,
             raw: String::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -355,6 +358,14 @@ impl RuleMetadata {
         self.msg.as_ref().map(Macro::as_str)
     }
 }
+
+/// Load-time warning for `expirevar`: the action loads but has no effect.
+const EXPIREVAR_WARNING: &str =
+    "expirevar is not implemented: persistent collections are unavailable and the expiration is ignored";
+
+/// Load-time warning for `initcol`: the action loads but has no effect.
+const INITCOL_WARNING: &str =
+    "initcol is not implemented: persistent collections are unavailable and the collection is not created";
 
 /// Compile a parsed action, resolving custom implementations before built-ins.
 #[expect(
@@ -499,7 +510,9 @@ pub(crate) fn compile_action(
             None
         },
         "exec" => {
-            require_argument(argument)?;
+            // Go accepts a bare `exec` as a no-op and rejects any argument at load time
+            // (`internal/actions/exec.go:Init`, v3.8.1).
+            require_no_argument(argument)?;
             None
         },
         "expirevar" => {
@@ -509,6 +522,7 @@ pub(crate) fn compile_action(
             seconds
                 .parse::<i64>()
                 .map_err(|_error| ActionError::InvalidArguments(format!("invalid expiration time: {seconds}")))?;
+            metadata.warnings.push(EXPIREVAR_WARNING.to_owned());
             None
         },
         "initcol" => {
@@ -516,6 +530,7 @@ pub(crate) fn compile_action(
             argument
                 .split_once('=')
                 .ok_or_else(|| ActionError::InvalidArguments("initcol requires format: collection=key".to_owned()))?;
+            metadata.warnings.push(INITCOL_WARNING.to_owned());
             None
         },
         "deny" | "drop" | "block" | "pass" => {
@@ -856,6 +871,46 @@ mod tests {
                 "{argument}"
             );
         }
+    }
+
+    #[test]
+    fn exec_is_a_no_op_only_without_an_argument() {
+        let mut metadata = RuleMetadata::new();
+        let context = ActionCompileContext::default();
+        assert!(compile_action("exec", "", &mut metadata, context).unwrap().is_none());
+        assert_eq!(
+            compile_action("exec", "/opt/handler.sh", &mut metadata, context).unwrap_err(),
+            super::ActionError::UnexpectedArguments
+        );
+    }
+
+    #[test]
+    fn persistent_collection_actions_compile_with_a_warning() {
+        let mut metadata = RuleMetadata::new();
+        let context = ActionCompileContext::default();
+        for (name, argument) in [
+            ("initcol", "RESOURCE=%{REQUEST_FILENAME}"),
+            ("expirevar", "TX.count=60"),
+        ] {
+            assert!(
+                compile_action(name, argument, &mut metadata, context)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(metadata.warnings.len(), 2);
+        assert!(
+            metadata
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("initcol is not implemented"))
+        );
+        assert!(
+            metadata
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("expirevar is not implemented"))
+        );
     }
 
     #[test]

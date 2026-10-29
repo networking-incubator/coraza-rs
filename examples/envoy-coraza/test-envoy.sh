@@ -390,6 +390,18 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     require_log '[id "949110"]'
 fi
 
+# A field-only multipart body must not need a temporary upload directory. This used
+# to abort the WASI plugin in std::env::temp_dir() before the part was published.
+printf '%b' '--X\r\nContent-Disposition: form-data; name="name"\r\n\r\nAlice\r\n--X--\r\n' \
+    >"$temp_dir/multipart-field"
+status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+    --header 'content-type: multipart/form-data; boundary=X' \
+    --data-binary "@$temp_dir/multipart-field" 'http://127.0.0.1:10001/greet?name=test')
+check_status 200 "$status" 'field-only multipart'
+if envoy_logs | grep --quiet --fixed-strings 'not supported by WASI yet'; then
+    fail 'field-only multipart aborted in the WASI temporary-directory path'
+fi
+
 envoy_logs >"$temp_dir/envoy.log"
 grep --quiet --fixed-strings 'test blocked' "$temp_dir/envoy.log" \
     || fail 'RelevantOnly audit output did not reach the bounded Proxy-Wasm log sink'

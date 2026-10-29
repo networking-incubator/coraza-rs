@@ -83,7 +83,7 @@ pub fn trim_right(input: &[u8]) -> TransformationResult {
     (transformed, end != input.len(), None)
 }
 
-/// Removes Unicode whitespace from valid UTF-8 and preserves malformed bytes.
+/// Removes Unicode whitespace from valid UTF-8 and replaces malformed bytes with U+FFFD.
 pub fn remove_whitespace(input: &[u8]) -> TransformationResult {
     let mut transformed = Vec::with_capacity(input.len());
     for_each_utf8(input, |item| match item {
@@ -92,7 +92,8 @@ pub fn remove_whitespace(input: &[u8]) -> TransformationResult {
             transformed.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
         },
         Ok(_) => {},
-        Err(byte) => transformed.push(byte),
+        // Go's strings.Map yields one U+FFFD per malformed byte.
+        Err(_) => transformed.extend_from_slice("\u{FFFD}".as_bytes()),
     });
     let changed = transformed.as_slice() != input;
     (transformed, changed, None)
@@ -486,9 +487,13 @@ mod tests {
     #[test]
     fn whitespace_transforms_handle_unicode_and_malformed_bytes() {
         let (removed, removed_changed, removed_error) = remove_whitespace(b"a \t\xc2\xa0\xffb");
-        assert_eq!(removed, b"a\xffb");
+        assert_eq!(removed, b"a\xef\xbf\xbdb");
         assert!(removed_changed);
         assert_eq!(removed_error, None);
+
+        // One U+FFFD per invalid byte, as Go's strings.Map does.
+        assert_eq!(remove_whitespace(b"a \xffb").0, b"a\xef\xbf\xbdb");
+        assert_eq!(remove_whitespace(b"a \xff\xfeb").0, b"a\xef\xbf\xbd\xef\xbf\xbdb");
     }
 
     // Ported from: coraza/internal/transformations/compress_whitespace.go::isLatinSpace

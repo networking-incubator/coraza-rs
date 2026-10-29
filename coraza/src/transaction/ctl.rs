@@ -364,12 +364,12 @@ mod tests {
     }
 
     #[test]
-    fn multiphase_count_applies_target_removal_before_aggregation() {
+    fn count_applies_target_removal_before_aggregation() {
         let rules = "SecRequestBodyAccess On\n\
                      SecAction \"id:80,phase:1,pass,ctl:ruleRemoveTargetById=81;ARGS:skip\"\n\
                      SecRule &ARGS \"@eq 1\" \"id:81,phase:2,deny,status:403\"";
 
-        for (multiphase, expected_match) in [(false, false), (true, true)] {
+        for multiphase in [false, true] {
             let mut parser = crate::seclang::Parser::new();
             parser.config_mut().multiphase_evaluation = multiphase;
             parser.from_string(rules).unwrap();
@@ -382,9 +382,33 @@ mod tests {
             if interruption.is_none() {
                 interruption = transaction.process_request_body(b"");
             }
-            let matched = transaction.matched_rules().iter().any(|rule| rule.rule.id == 81);
-            assert_eq!(matched, expected_match, "multiphase={multiphase}");
-            assert_eq!(interruption.is_some(), expected_match, "multiphase={multiphase}");
+            assert!(
+                transaction.matched_rules().iter().any(|rule| rule.rule.id == 81),
+                "the removed key is not counted, multiphase={multiphase}"
+            );
+            assert!(interruption.is_some(), "multiphase={multiphase}");
+        }
+    }
+
+    #[test]
+    fn a_removed_selector_leaves_the_count_match_in_place() {
+        // The count match must survive its own selector's removal, so `@eq 0` still sees
+        // the zero count instead of no value at all.
+        let rules = "SecAction \"id:80,phase:1,pass,ctl:ruleRemoveTargetById=81;ARGS:skip\"\n\
+                     SecRule &ARGS:skip \"@eq 0\" \"id:81,phase:1,deny,status:403\"";
+
+        for multiphase in [false, true] {
+            let mut parser = crate::seclang::Parser::new();
+            parser.config_mut().multiphase_evaluation = multiphase;
+            parser.from_string(rules).unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut transaction = waf.new_transaction_with_id("ctl-count-selector");
+            transaction.add_get_argument("skip", "1");
+            transaction.process_request_headers();
+            assert!(
+                transaction.matched_rules().iter().any(|rule| rule.rule.id == 81),
+                "multiphase={multiphase}"
+            );
         }
     }
 
@@ -582,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_audit_engine_ignores_ctl_and_retains_no_audit_body() {
+    fn a_locked_audit_engine_ignores_ctl() {
         let rules = "SecAction \"id:80,phase:1,ctl:auditEngine=On\"";
         let mut transaction = transaction_with_config(rules, |config| {
             config.audit_engine_locked = true;
@@ -595,10 +619,6 @@ mod tests {
             transaction.audit_engine,
             crate::types::AuditEngineStatus::Off,
             "the host lock keeps the engine off"
-        );
-        assert!(
-            transaction.audit_request_body.is_empty(),
-            "a locked engine must not copy the body into an audit entry"
         );
     }
 
@@ -613,6 +633,22 @@ mod tests {
         transaction.process_request_headers();
         transaction.process_request_body(b"attack");
         assert_eq!(transaction.audit_engine, crate::types::AuditEngineStatus::On);
-        assert_eq!(transaction.audit_request_body, b"attack");
+    }
+
+    #[test]
+    fn a_phase_two_ctl_can_add_the_request_body_part() {
+        // The audit entry reads the retained buffer at log time, so a ctl in a later
+        // phase still captures the body.
+        let rules = "SecRequestBodyAccess On\n\
+                     SecAction \"id:80,phase:2,pass,ctl:auditLogParts=+C\"";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut transaction = waf.new_transaction_with_id("ctl-late-audit-parts");
+        transaction.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        transaction.process_request_headers();
+        transaction.process_request_body(b"attack=1");
+
+        assert_eq!(transaction.audit_log().transaction.request.body, "attack=1");
     }
 }

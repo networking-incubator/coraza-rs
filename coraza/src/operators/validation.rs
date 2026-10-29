@@ -23,7 +23,7 @@
 use crate::{
     operators::{Operator, Outputs},
     transaction::Transaction,
-    transformations::text_of,
+    transformations::{RegexText, text_of},
 };
 
 /// Unconditional match operator.
@@ -301,17 +301,19 @@ enum NidKind {
 
 impl Operator for ValidateNid {
     fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
-        let input = text_of(input);
+        let text = RegexText::new(input);
         let mut valid = false;
-        for (index, found) in self.regex.find_iter(&input).take(10).enumerate() {
-            let nid = found.as_str();
+        for (index, found) in self.regex.find_iter(text.as_str()).take(10).enumerate() {
+            let range = text.original_range(found.start(), found.end());
+            let original = input.get(range).unwrap_or_default();
+            let nid = text_of(original);
             let checks = match self.kind {
-                NidKind::Cl => is_rut(nid),
-                NidKind::Us => is_ssn(nid),
+                NidKind::Cl => is_rut(&nid),
+                NidKind::Us => is_ssn(&nid),
             };
             if checks {
                 valid = true;
-                out.capture(index, nid.as_bytes());
+                out.capture(index, original);
             }
         }
         valid

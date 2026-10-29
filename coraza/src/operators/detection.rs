@@ -39,10 +39,6 @@ use crate::{
 /// # Returns
 ///
 /// `true` if SQL injection detected, `false` otherwise.
-///
-/// Inputs longer than [`libperfusion::MAX_INPUT_LEN`] bytes are not scanned:
-/// [`Operator::evaluate_outcome`] reports [`OperatorOutcome::NotInspected`] and
-/// [`Operator::evaluate`] returns `false`.
 #[derive(Debug, Clone, Copy)]
 pub struct DetectSQLi;
 
@@ -52,10 +48,7 @@ impl Operator for DetectSQLi {
     }
 
     fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
-        if input.len() > libperfusion::MAX_INPUT_LEN {
-            return OperatorOutcome::NotInspected;
-        }
-        let Some(fingerprint) = libperfusion::sqli(input) else {
+        let Some(fingerprint) = libperfusion::sqli_with_limit(input, input.len()) else {
             return OperatorOutcome::NotMatched;
         };
         out.capture(0, fingerprint.as_bytes());
@@ -80,10 +73,6 @@ pub fn detect_sqli() -> DetectSQLi {
 /// # Returns
 ///
 /// `true` if XSS detected, `false` otherwise.
-///
-/// Inputs longer than [`libperfusion::MAX_INPUT_LEN`] bytes are not scanned:
-/// [`Operator::evaluate_outcome`] reports [`OperatorOutcome::NotInspected`] and
-/// [`Operator::evaluate`] returns `false`.
 #[derive(Debug, Clone, Copy)]
 pub struct DetectXSS;
 
@@ -93,10 +82,7 @@ impl Operator for DetectXSS {
     }
 
     fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> OperatorOutcome {
-        if input.len() > libperfusion::MAX_INPUT_LEN {
-            return OperatorOutcome::NotInspected;
-        }
-        if libperfusion::xss(input) {
+        if libperfusion::xss_with_limit(input, input.len()) {
             OperatorOutcome::Matched
         } else {
             OperatorOutcome::NotMatched
@@ -139,36 +125,24 @@ mod tests {
     }
 
     #[test]
-    fn sqli_outcome_scans_up_to_the_wrapper_bound() {
+    fn sqli_scans_an_input_past_the_wrapper_bound() {
         let tx = Transaction::new("operator-test");
-        let input = padded(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN);
+        let input = padded(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1);
 
         assert_eq!(
             detect_sqli().evaluate_outcome(&tx, &input, &mut Outputs::default()),
             OperatorOutcome::Matched
         );
-        let mut over_bound = input;
-        over_bound.push(b' ');
-        assert_eq!(
-            detect_sqli().evaluate_outcome(&tx, &over_bound, &mut Outputs::default()),
-            OperatorOutcome::NotInspected
-        );
     }
 
     #[test]
-    fn xss_outcome_scans_up_to_the_wrapper_bound() {
+    fn xss_scans_an_input_past_the_wrapper_bound() {
         let tx = Transaction::new("operator-test");
-        let input = padded(b"<script>alert(1)</script>", libperfusion::MAX_INPUT_LEN);
+        let input = padded(b"<script>alert(1)</script>", libperfusion::MAX_INPUT_LEN + 1);
 
         assert_eq!(
             detect_xss().evaluate_outcome(&tx, &input, &mut Outputs::default()),
             OperatorOutcome::Matched
-        );
-        let mut over_bound = input;
-        over_bound.push(b' ');
-        assert_eq!(
-            detect_xss().evaluate_outcome(&tx, &over_bound, &mut Outputs::default()),
-            OperatorOutcome::NotInspected
         );
     }
 }

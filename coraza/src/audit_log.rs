@@ -536,9 +536,7 @@ impl AuditLog {
         let native_headers = native && self.parts.contains(&AuditLogPart::RequestHeaders);
         let native_request_body = native && self.parts.contains(&AuditLogPart::RequestBody);
         let native_response_headers = native && self.parts.contains(&AuditLogPart::ResponseHeaders);
-        let native_response_body = native
-            && (self.parts.contains(&AuditLogPart::IntermediaryResponseBody)
-                || self.parts.contains(&AuditLogPart::ResponseBody));
+        let native_response_body = native && self.parts.contains(&AuditLogPart::IntermediaryResponseBody);
         let native_files = native && self.parts.contains(&AuditLogPart::UploadedFiles);
         let native_trailer = native && self.parts.contains(&AuditLogPart::Trailer);
         let native_rules = native && self.parts.contains(&AuditLogPart::RulesMatched);
@@ -754,7 +752,7 @@ impl AuditLog {
                     out.push_str(&escape(&tx.request.body));
                     out.push('\n');
                 },
-                AuditLogPart::IntermediaryResponseBody | AuditLogPart::ResponseBody => {
+                AuditLogPart::IntermediaryResponseBody => {
                     if let Some(response) = tx.response.as_ref().filter(|r| !r.body.is_empty()) {
                         out.push_str(&escape(&response.body));
                         out.push('\n');
@@ -1960,7 +1958,7 @@ fn prepare_builtin_writer_plan(config: &WafConfig) -> Result<WriterPlan, String>
             WriterPlan::Syslog {
                 target: target.to_owned(),
                 connect_timeout: config.audit_log_connect_timeout,
-                write_timeout: config.audit_log_write_timeout,
+                write_timeout: syslog_write_timeout(target, config.audit_log_write_timeout),
             }
         },
         (_, "") => WriterPlan::Discard,
@@ -2283,6 +2281,31 @@ fn validate_syslog_target(target: &str) -> Result<(), String> {
         },
     }
     Ok(())
+}
+
+/// Default deadline for a write to a stream syslog socket.
+///
+/// A `write_all` on a full TCP or Unix-stream send buffer parks the writer's mutex, and
+/// every transaction waiting on it, until the peer reads. A few seconds bounds that; a
+/// configured `SecAuditLogWriteTimeout` stays authoritative.
+const DEFAULT_SYSLOG_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The write deadline for `target`: the configured one, or a default for a stream socket,
+/// whose writes can block until the peer reads.
+///
+/// Only TCP and Unix-stream targets default: a datagram write does not block on the peer,
+/// and the empty target resolves to whichever local socket answers, so its type is not
+/// known before the dial.
+fn syslog_write_timeout(target: &str, configured: Option<Duration>) -> Option<Duration> {
+    if configured.is_some() || target.is_empty() {
+        return configured;
+    }
+    let stream = match target.split_once("://") {
+        // A bare address is a TCP address, as `Syslog::connect` reads it.
+        None | Some(("tcp" | "tcp4" | "tcp6" | "unix", _)) => true,
+        Some(_) => false,
+    };
+    stream.then_some(DEFAULT_SYSLOG_WRITE_TIMEOUT)
 }
 
 /// A connection to syslog, as Go's `log/syslog` dials it with facility `local0` and tag
@@ -3024,8 +3047,9 @@ fn index_field(value: &str) -> String {
 mod tests {
     use super::{
         ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditCopyBudget, AuditLog,
-        AuditLogger, AuditMessage, AuditMessageData, AuditRequest, AuditTransaction, FormattedAudit, Syslog,
-        SyslogSocket, Writer, connect_deadline, connect_tcp, index_field, next_backoff, safe_file_component, write_new,
+        AuditLogger, AuditMessage, AuditMessageData, AuditRequest, AuditTransaction, DEFAULT_SYSLOG_WRITE_TIMEOUT,
+        FormattedAudit, Syslog, SyslogSocket, Writer, WriterPlan, connect_deadline, connect_tcp, index_field,
+        next_backoff, prepare_builtin_writer_plan, safe_file_component, syslog_write_timeout, write_new,
     };
     use crate::{
         actions::RuleMetadata,
@@ -3033,6 +3057,47 @@ mod tests {
         config::WafConfig,
         types::{AuditEngineStatus, AuditLogFormat, AuditLogType, RulePhase, parse_audit_log_parts},
     };
+
+    #[test]
+    fn stream_syslog_targets_get_a_default_write_timeout() {
+        let default = Some(DEFAULT_SYSLOG_WRITE_TIMEOUT);
+        for target in [
+            "tcp://127.0.0.1:514",
+            "tcp4://127.0.0.1:514",
+            "tcp6://[::1]:514",
+            // A bare address is a TCP address.
+            "127.0.0.1:514",
+        ] {
+            assert_eq!(syslog_write_timeout(target, None), default, "{target}");
+        }
+        for target in ["udp://127.0.0.1:514", "udp6://[::1]:514", "unixgram:///dev/log"] {
+            assert_eq!(syslog_write_timeout(target, None), None, "{target}");
+        }
+        assert_eq!(syslog_write_timeout("", None), None, "the local syslog type is unknown");
+
+        #[cfg(unix)]
+        assert_eq!(syslog_write_timeout("unix:///dev/log", None), default);
+
+        let configured = Some(std::time::Duration::from_secs(1));
+        for target in ["tcp://127.0.0.1:514", "udp://127.0.0.1:514"] {
+            assert_eq!(
+                syslog_write_timeout(target, configured),
+                configured,
+                "{target}: an explicit value stays authoritative"
+            );
+        }
+
+        let plan = prepare_builtin_writer_plan(&WafConfig {
+            audit_log_type: AuditLogType::Syslog,
+            audit_log: "tcp://127.0.0.1:514".to_owned(),
+            ..WafConfig::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(plan, WriterPlan::Syslog { write_timeout, .. } if write_timeout == default),
+            "the prepared plan carries the default"
+        );
+    }
 
     #[test]
     fn default_internal_connect_timeout_is_finite() {

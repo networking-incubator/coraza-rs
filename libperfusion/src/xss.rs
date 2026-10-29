@@ -451,7 +451,29 @@ fn is_black_url(url: &[u8]) -> bool {
         .any(|scheme| htmlencode_startswith(scheme, url))
 }
 
+/// Check one context, also trying a NUL-as-space reading when the input has NULs.
+///
+/// The tokenizer keeps NUL inside attribute names and unquoted values so
+/// `black_attr` can fold `on\0error` to `onerror`. That same reading hides
+/// `<a href=x\0onerror=...>`, where C treats the NUL as whitespace and sees a new
+/// attribute. Trying both readings is a superset of either engine's detection.
 pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
+    if is_xss_raw(input, context, data_start) {
+        return true;
+    }
+    if !input.contains(&0) {
+        return false;
+    }
+    let mut spaced = input.to_vec();
+    for byte in &mut spaced {
+        if *byte == 0 {
+            *byte = b' ';
+        }
+    }
+    is_xss_raw(&spaced, context, data_start)
+}
+
+fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
     let mut attr = None;
     let mut tokenizer = match context {
         Context::Data => {
@@ -646,6 +668,8 @@ mod tests {
         assert_eq!(detect_with_context(b"hello world"), None);
         assert!(!is_xss(b"plain text", Context::Data, None));
         assert!(is_xss(b"plain text <script>alert(1)</script>", Context::Data, None));
+        // C treats NUL as whitespace here, so the event attribute starts a new token.
+        assert!(is_xss(b"<a href=x\0onerror=alert(1)>", Context::Data, None));
         assert_eq!(detect_with_context(b"prefix <script>"), Some(Context::Data));
 
         for len in 0..=4 {

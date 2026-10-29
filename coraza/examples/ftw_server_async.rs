@@ -1767,16 +1767,37 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mode_skips_an_unsupported_directive() {
+    fn legacy_mode_skips_an_unsupported_rule() {
         let dir = tempdir().unwrap();
-        let path = write_rules(&dir, "SecRuleEngine On\nSecBogusDirective value\n");
+        let path = write_rules(
+            &dir,
+            "SecRuleEngine On\nSecRule ARGS \"@bogusOperator x\" \"id:1,phase:1,pass\"\n",
+        );
         let options = Options::parse(&test_args(&["--rules", &path])).unwrap();
 
         let (_waf, inventory) = load_policy(&options, &test_logfile(&dir)).unwrap();
 
         assert_eq!(inventory.mode, "legacy");
         assert_eq!(inventory.skipped_directives.len(), 1);
-        assert!(inventory.skipped_directives[0].contains("SecBogusDirective"));
+        assert!(inventory.skipped_directives[0].contains("unknown operator"));
+    }
+
+    #[test]
+    fn legacy_mode_rejects_an_unsupported_directive() {
+        let dir = tempdir().unwrap();
+        let path = write_rules(&dir, "SecRuleEngine On\nSecBogusDirective value\n");
+        let options = Options::parse(&test_args(&["--rules", &path])).unwrap();
+
+        let error = load_policy(&options, &test_logfile(&dir)).err().unwrap();
+
+        assert!(
+            error.to_string().contains("unknown directive"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("SecBogusDirective"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -369,10 +369,8 @@ impl Rule {
                             }
                             matched_values.push(matched);
                         },
-                        // A detector skip records the transaction's inspection signal. A
-                        // host operator reports `NotMatched` for the same failure, so this
-                        // arm stays as defence for an embedder operator whose skip is not
-                        // over-long detector input and must not raise that signal.
+                        // An embedder operator can report no verdict for a value; the
+                        // rule treats it as a miss. Built-in detectors scan every input.
                         OperatorOutcome::NotInspected if operator.is_detector() => tx.record_inspection_incomplete(id),
                         OperatorOutcome::NotMatched | OperatorOutcome::NotInspected => {},
                     }
@@ -465,11 +463,7 @@ impl Rule {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "rule tests use fixed valid rules"
-)]
+#[expect(clippy::unwrap_used, reason = "rule tests use fixed valid rules")]
 mod tests {
     use super::Rule;
     use crate::{
@@ -584,24 +578,20 @@ mod tests {
     }
 
     #[test]
-    fn a_detector_over_the_input_bound_still_fails_closed() {
+    fn a_detector_input_over_the_old_bound_is_still_inspected() {
         let waf = build_waf(
             "SecRule ARGS:q \"@detectSQLi\" \"id:962,phase:1,pass\"",
             DetectorInspectionAction::FailClosed,
         );
         let mut tx = waf.new_transaction_with_id("detector-input-bound");
-        tx.add_get_argument("q", vec![b' '; libperfusion::MAX_INPUT_LEN + 1]);
+        let mut input = b"1' OR '1'='1".to_vec();
+        input.resize(libperfusion::MAX_INPUT_LEN + 1, b' ');
+        tx.add_get_argument("q", input);
 
-        let interruption = tx
-            .process_request_headers()
-            .expect("a skipped detector input interrupts");
-        assert_eq!(interruption.status, 500);
-        assert!(tx.inspection_incomplete());
-        assert_eq!(
-            tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                .as_deref(),
-            Some("1")
-        );
+        assert!(tx.process_request_headers().is_none());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 962));
+        assert!(!tx.inspection_incomplete());
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
     }
 
     #[test]

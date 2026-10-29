@@ -41,7 +41,7 @@ const AUDIT_LOG_SOURCE: &str = include_str!("../src/audit_log.rs");
 const STATES: [&str; 4] = ["implemented", "rejected", "accepted_without_effect", "unavailable"];
 const GO_COMMIT: &str = "d9cc9befc2721fd217ce1660a0e91aca1157221d";
 const EXAMPLE_FIXTURE_SHA: &str = "7dfaa62fe41c266f931e9d05fb8cefd7ecba57c929b11f02af0ef8737fc93c04";
-const REVIEWED_LEDGER: [(&str, &str); 16] = [
+const REVIEWED_LEDGER: [(&str, &str); 17] = [
     (
         "sql-nul-after-hex-prefix",
         "ada05d3c4ccbcb21de99ab1609081812dbe7a37e76a516595d44af97cb6ed02e",
@@ -65,6 +65,10 @@ const REVIEWED_LEDGER: [(&str, &str); 16] = [
     (
         "xss-xenotix.txt:694",
         "55841cd4d4f4ad2d2a678fcc29a7a78534eb3ae4a0a9916a8fa22a30673b5194",
+    ),
+    (
+        "xss-nul-unquoted-value-boundary",
+        "705b7a0091fb18e44c6683300e022e8b9c5da00e7617875046b4d7d7da04a771",
     ),
     (
         "raw-0265",

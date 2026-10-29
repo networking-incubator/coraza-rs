@@ -376,7 +376,7 @@ impl PolicyCompiler {
         name: &str,
         directives: &[String],
         rule_budget: RuleBudget,
-    ) -> Result<(Policy, usize, Option<String>), CompileError> {
+    ) -> Result<(Policy, usize, Vec<String>), CompileError> {
         let mut parser = Parser::new()
             .with_rule_data(Arc::clone(&self.rule_data))
             .with_rule_limit(rule_budget.parser_limit());
@@ -403,6 +403,7 @@ impl PolicyCompiler {
         if let Some(skipped) = parser.skipped().first() {
             return Err(failure(format!("directive was skipped instead of failing: {skipped}")));
         }
+        let parser_warnings = parser.warnings().to_vec();
         let count = parser.total_rule_count();
         let audit_format = parser.config().audit_log_format;
         let audit_diagnostics = Arc::clone(&self.diagnostics);
@@ -416,22 +417,26 @@ impl PolicyCompiler {
         parser.config_mut().audit_engine_locked = true;
         parser.config_mut().reject_multipart_file_uploads = true;
         let waf = parser.compile().map_err(|error| failure(error.to_string()))?;
-        let warning = match waf.config().rule_engine {
-            RuleEngineStatus::On => None,
-            RuleEngineStatus::DetectionOnly => Some(format!(
+        let mut warnings = Vec::new();
+        match waf.config().rule_engine {
+            RuleEngineStatus::On => {},
+            RuleEngineStatus::DetectionOnly => warnings.push(format!(
                 "envoy-coraza: policy {} uses SecRuleEngine DetectionOnly; would-be interruptions do not block traffic",
                 display_name(name)
             )),
-            RuleEngineStatus::Off => Some(format!(
+            RuleEngineStatus::Off => warnings.push(format!(
                 "envoy-coraza: policy {} uses SecRuleEngine Off; requests are not enforced",
                 display_name(name)
             )),
-        };
+        }
+        for warning in parser_warnings {
+            warnings.push(format!("envoy-coraza: policy {}: {warning}", display_name(name)));
+        }
         let policy = Policy::new(waf).map_err(|reason| CompileError::Unsafe {
             policy: name.to_owned(),
             reason,
         })?;
-        Ok((policy, count, warning))
+        Ok((policy, count, warnings))
     }
 }
 
@@ -528,11 +533,9 @@ impl Generation {
                     limit: limits.rules_per_policy,
                 }
             };
-            let (policy, count, warning) = compiler.compile(&name, &directives, rule_budget)?;
+            let (policy, count, policy_warnings) = compiler.compile(&name, &directives, rule_budget)?;
             generation_rules = generation_rules.saturating_add(count);
-            if let Some(warning) = warning {
-                warnings.push(warning);
-            }
+            warnings.extend(policy_warnings);
             policies.insert(name, policy);
         }
 
@@ -1214,7 +1217,12 @@ mod tests {
             let error = compile_error(&format!(
                 r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}}}"#
             ));
-            assert!(error.contains("SecRequestBodyLimit"), "message was {error:?}");
+            // A zero limit is rejected by core WAF validation before this host check, so
+            // the message may not name the directive.
+            assert!(
+                error.contains("SecRequestBodyLimit") || error.contains("request body limit must be greater than 0"),
+                "message was {error:?}"
+            );
             assert!(
                 error.contains("16777216") || error.contains("greater than 0"),
                 "the error names the limit: {error:?}"
@@ -1233,7 +1241,12 @@ mod tests {
             let error = compile_error(&format!(
                 r#"{{"directives_map": {{"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit {limit}"]}}}}"#
             ));
-            assert!(error.contains("SecResponseBodyLimit"), "message was {error:?}");
+            // A zero limit is rejected by core WAF validation before this host check, so
+            // the message may not name the directive.
+            assert!(
+                error.contains("SecResponseBodyLimit") || error.contains("response body limit must be greater than 0"),
+                "message was {error:?}"
+            );
             assert!(
                 error.contains("1048576") || error.contains("greater than 0"),
                 "the error names the limit: {error:?}"
@@ -1268,6 +1281,39 @@ mod tests {
                 .iter()
                 .all(|warning| warning.contains("would-be interruptions do not block traffic")),
             "every warning explains DetectionOnly enforcement: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn parser_warnings_are_forwarded_with_the_policy_name() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {
+                    "p": [
+                        "SecRuleEngine DetectionOnly",
+                        "SecRule ARGS \"@contains x\" \"id:1,phase:1,pass,initcol:IP=x\""
+                    ]
+                },
+                "default_directives": "p"
+            }"#,
+        );
+        let warnings = generation.warnings().collect::<Vec<_>>();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "mode and parser warnings are both kept: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("policy \"p\"") && warning.contains("DetectionOnly")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("policy \"p\"") && warning.contains("initcol")),
+            "{warnings:?}"
         );
     }
 

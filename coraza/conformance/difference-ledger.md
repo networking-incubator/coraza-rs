@@ -31,6 +31,7 @@ must state which side was observed.
 | `xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102` | `9624e59812bd58fedf68d5e0639fc2a966224641bd3b54bed91700ecaeb7dce5` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:693` | `779a6aca1d223eb0a63f0362a44841e48b43bbf505679119dcd3cb07b5c2c8f3` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:694` | `55841cd4d4f4ad2d2a678fcc29a7a78534eb3ae4a0a9916a8fa22a30673b5194` | XSS miss | XSS hit | As above. |
+| `xss-nul-unquoted-value-boundary` | `705b7a0091fb18e44c6683300e022e8b9c5da00e7617875046b4d7d7da04a771` | XSS miss | XSS hit | Rust adds a NUL-as-space second pass, so `<a href=x\0onerror=alert(1)>` exposes the event attribute. The pinned C reference also flags it; Go misses it. |
 | `raw-0265` | `8ceda65b55dbd3d4557ea3eef1d140660fb28d983b86b9ce8aa3111aecb3205a` | SQLi miss | SQLi hit, fingerprint `son1o` | Narrowed `#` comment whitelist; `#` is followed by additional bytes and the input ends with `a*`, not a trailing comment. |
 | `raw-0043` | `1cdd835eb77c2bd1acb9003388a4c91e9b294fd01a2fed1b7701b1381f84701a` | SQLi miss | SQLi hit, fingerprint `sc` | Narrowed `#` comment whitelist; minimizes to a `#` shape. |
 | `raw-0060` | `f39efb68b9bee584cd30dcf85698b40f92cd709d48dec013d0ab919ca7f412c6` | SQLi miss | SQLi hit, fingerprint `sc` | As above. |
@@ -105,15 +106,6 @@ adding them requires a shared-corpus fixture first.
   literal keys, so they select nothing. This is a pre-existing selector-parser
   deviation (`coraza/src/seclang/variable_parser.rs::parse_key`) with no engine
   case ID or fixture hash yet.
-- Detector input bound. The `detectSQLi` and `detectXSS` operators use
-  libperfusion's public wrappers, which do not scan inputs longer than 65536 bytes;
-  Go Coraza passes any length to libinjection-go. The operators report
-  `OperatorOutcome::NotInspected` for these inputs, the transaction sets
-  `TX.inspection_incomplete` to `"1"` and `Transaction::inspection_incomplete()`
-  returns true, and `WafConfig::detector_inspection_action` defaults to
-  `RecordOnly`, which keeps the miss verdict and the signal. `FailClosed`
-  interrupts the transaction instead. No partial scan, splitting or chunking is
-  performed.
 
 ## Rust-only multipart parser hardening budgets
 

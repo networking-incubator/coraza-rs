@@ -85,6 +85,10 @@ enum State {
 }
 
 /// What ends an attribute name: whitespace (see [`is_white`]), '/', '=' or '>'.
+///
+/// NUL stays inside the name: `black_attr` folds it away, so `<a on\0error=1>` is
+/// still an event handler. The second NUL-as-space detection pass in `xss` covers
+/// the separate `<a href=x\0onerror=...>` boundary.
 const fn html_byte_set(bytes: &[u8]) -> [bool; 256] {
     let mut set = byte_set(bytes);
     set[0] = false;
@@ -103,7 +107,7 @@ fn first_match(s: &[u8], matches: [Option<usize>; 3]) -> usize {
     matches.into_iter().flatten().min().unwrap_or(s.len())
 }
 
-/// Finds HTML whitespace without treating NUL as whitespace in tokenizer spans.
+/// Finds HTML whitespace for an attribute-name span; NUL stays inside the name.
 fn html_space_cspan(s: &[u8]) -> usize {
     first_match(
         s,
