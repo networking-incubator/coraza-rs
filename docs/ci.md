@@ -13,11 +13,19 @@ This repository uses GitHub Actions to block risky changes early.
   feature set, so the feature-gated operators keep their tests.
 - `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
   integration checks against the pinned Envoy 1.40.0 image.
+- `envoy-wasm-crs`: fetches the CRS release pinned in `envoy-coraza/crs.pin`
+  (verifying its SHA-256), builds the filter with the non-default `embed-crs`
+  feature, and runs `make test-envoy-wasm-crs`. It also runs the Envoy lifecycle
+  harness against the feature-on artifact via
+  `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs`; that run adds a `crs.local`
+  policy that includes the embedded tree and asserts a SQL injection request is
+  denied by CRS rule 949110.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
-- Feature matrix: test and lint each feature combo with `cargo-hack`; also test
-  the digest-free FIPS profile with
+- Feature matrix: test and lint each feature combo with `cargo-hack`; the job
+  fetches the pinned CRS release first so `envoy-coraza`'s `embed-crs` feature
+  can build. Also test the digest-free FIPS profile with
   `cargo test -p coraza --no-default-features --features fips`, then assert its
   graph omits both digest crates with
   `tree=$(cargo tree -p coraza --no-default-features --features fips) && ! printf '%s\n' "$tree" | grep -Eq '(^|[[:space:]])(md-5|sha1) v'`.
@@ -126,6 +134,8 @@ by the fixture regeneration command.
 - `cargo deny check`
 - `cargo deny --all-features check`, which also resolves the feature-gated
   dependencies (`MIT-0` among them)
+- Any `envoy-coraza/crs.pin` bump must be reconciled by a reviewer against the
+  upstream release notes and the published asset digest before merging.
 
 ### `coverage`
 
@@ -151,6 +161,8 @@ by the fixture regeneration command.
 make lint
 make lint-extra
 make test
+make crs-fetch
+make test-envoy-wasm-crs
 make go-harness-check
 make ftw-runner-check
 make coraza-example-test

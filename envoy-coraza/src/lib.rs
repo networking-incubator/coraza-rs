@@ -133,6 +133,11 @@ impl RootContext for CorazaRoot {
         }
         match self.apply(&configuration) {
             Ok(()) => {
+                #[cfg(feature = "embed-crs")]
+                log_info(&format!(
+                    "envoy-coraza: embedded CRS {} files available to Include",
+                    policy::embedded_crs::EMBEDDED_CRS_VERSION
+                ));
                 if let Some(generation) = &self.generation {
                     for warning in generation.warnings() {
                         log_warn(warning);
@@ -171,6 +176,12 @@ fn log_error(message: &str) {
 /// Writes one configure-time warning to the Envoy log.
 fn log_warn(message: &str) {
     hostcalls::log(LogLevel::Warn, message).unwrap_or_default();
+}
+
+/// Writes one informational line to the Envoy log.
+#[cfg(feature = "embed-crs")]
+fn log_info(message: &str) {
+    hostcalls::log(LogLevel::Info, message).unwrap_or_default();
 }
 
 #[cfg(test)]

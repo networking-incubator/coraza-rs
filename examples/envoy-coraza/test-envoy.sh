@@ -19,6 +19,9 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 script_dir="$repo_root/examples/envoy-coraza"
 compose=(docker compose -f "$script_dir/compose.yaml" -p envoy-coraza-test)
 temp_dir=$(mktemp -d)
+# Interactive mode (ENVOY_CORAZA_INTERACTIVE=1) skips the assertions and leaves
+# the stack running for manual requests.
+interactive=${ENVOY_CORAZA_INTERACTIVE:-0}
 
 cleanup() {
     local exit_code=$?
@@ -170,15 +173,36 @@ make_body_with_byte() {
     head -c "$size" /dev/zero | tr '\000' "$byte" >"$destination"
 }
 
+require_log() {
+    local expected=$1
+    for _attempt in {1..20}; do
+        if envoy_logs | grep --fixed-strings --quiet "$expected"; then
+            return
+        fi
+        sleep 0.1
+    done
+    envoy_logs >"$temp_dir/envoy.log"
+    fail "Envoy logs did not contain: $expected"
+}
+
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 if [[ $target_dir != /* ]]; then
     target_dir="$repo_root/$target_dir"
 fi
 export ENVOY_CORAZA_WASM="$target_dir/wasm32-wasip1/release/envoy_coraza.wasm"
-make -C "$repo_root" build-envoy-wasm
+envoy_target=${ENVOY_CORAZA_MAKE_TARGET:-build-envoy-wasm}
+make -C "$repo_root" "$envoy_target"
 [[ -f $ENVOY_CORAZA_WASM ]] || fail "Wasm artifact is missing: $ENVOY_CORAZA_WASM"
 
-grep --quiet --fixed-strings 'proxy_100_continue: false' "$script_dir/envoy.yaml" \
+# envoy-crs.yaml is the CRS variant of the fixture configuration: the same
+# policies plus a "crs" policy for the crs.local authority. It only loads on a
+# build with the embedded CRS, so the default run keeps envoy.yaml.
+export ENVOY_CORAZA_CONFIG="$script_dir/envoy.yaml"
+if [[ $envoy_target == build-envoy-wasm-crs ]]; then
+    export ENVOY_CORAZA_CONFIG="$script_dir/envoy-crs.yaml"
+fi
+
+grep --quiet --fixed-strings 'proxy_100_continue: false' "$ENVOY_CORAZA_CONFIG" \
     || fail 'the HCM deployment invariant proxy_100_continue: false is missing'
 
 "${compose[@]}" build backend
@@ -191,6 +215,22 @@ for _attempt in {1..60}; do
     sleep 1
 done
 [[ ${status:-} == 200 ]] || fail 'Envoy did not become ready'
+
+if [[ $interactive == 1 ]]; then
+    trap - EXIT
+    rm -rf "$temp_dir"
+    escaped_script_dir=$(printf '%q' "$script_dir")
+    cat <<EOF
+Envoy is up with the embedded CRS (crs.local authority).
+
+    try:    curl -i -H 'Host: crs.local' 'http://127.0.0.1:10001/crs-sqli?q=1%27%20OR%201%3D1'
+    expect: HTTP/1.1 403 Forbidden and [id "949110"] in the Envoy log
+
+    logs:   docker compose -f $escaped_script_dir/compose.yaml -p envoy-coraza-test logs envoy
+    stop:   docker compose -f $escaped_script_dir/compose.yaml -p envoy-coraza-test down --rmi local --volumes
+EOF
+    exit 0
+fi
 
 make_body_with_byte "$temp_dir/expected-pass" 16384 x
 status=$(request "$temp_dir/pass" --request POST --header 'content-type: application/octet-stream' \
@@ -338,6 +378,16 @@ if grep --ignore-case --quiet -E '^(x-deny-response|x-large-probe):' "$temp_dir/
 fi
 if grep --quiet --fixed-strings 'LEAK-MARKER' "$temp_dir/response"; then
     fail 'phase-4 denial with body access off leaked upstream response body bytes'
+fi
+
+if [[ $envoy_target == build-envoy-wasm-crs ]]; then
+    before=$(backend_count /crs-sqli)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        'http://127.0.0.1:10001/crs-sqli?q=1%27%20OR%20%271%27%3D%271')
+    check_status 403 "$status" 'embedded CRS SQLi denial'
+    [[ $(backend_count /crs-sqli) == "$before" ]] \
+        || fail 'embedded CRS sent a denied request to the backend'
+    require_log '[id "949110"]'
 fi
 
 envoy_logs >"$temp_dir/envoy.log"

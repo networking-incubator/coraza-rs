@@ -60,7 +60,7 @@ const MAX_HEADER_VALUE_BYTES: usize = 64 * 1024;
 /// Maximum bytes accepted across one direction's headers.
 const MAX_HEADERS_BYTES: usize = 1024 * 1024;
 
-const REQUEST_BLOCK_BODY: &[u8] = b"Request blocked by security policy\n";
+const REQUEST_BLOCK_BODY: &[u8] = b"";
 const RESPONSE_BLOCK_BODY: &[u8] = b"Upstream response blocked\n";
 const REQUEST_INCOMPLETE_BODY: &[u8] = b"Request inspection unavailable\n";
 const RESPONSE_INCOMPLETE_BODY: &[u8] = b"Response inspection unavailable\n";

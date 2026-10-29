@@ -8,6 +8,9 @@ benchmarks/coraza/go/local.sum
 # Test artifacts
 **/*.db
 
+# Fetched OWASP CRS tree for the envoy-coraza `embed-crs` feature
+envoy-coraza/crs/
+
 # Rustfmt backup files
 **/*.rs.bk
 

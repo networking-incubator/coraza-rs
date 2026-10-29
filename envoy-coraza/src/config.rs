@@ -42,7 +42,8 @@
 //! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`.
 //! * `rule_data` is this connector's additive map of file name to file bytes for the file-based operators and
 //!   `Include`. Names are bounded like the engine's in-memory rule data source: see [`RULE_DATA_LIMITS`]. A non-string
-//!   value is ignored, but its name is still validated.
+//!   value is ignored, but its name is still validated. A build with the `embed-crs` feature seeds the fetched CRS tree
+//!   under `crs/`, through the same checks; a configured entry with an embedded file's normalized name wins.
 //! * Unknown keys are ignored.
 //!
 //! # Known divergences from upstream
@@ -95,12 +96,13 @@
 //!   or a newline-packed directive string stops at the limit; `MAX_RULE_DATA_FILES`, `MAX_RULE_DATA_FILE_BYTES`,
 //!   `MAX_RULE_DATA_TOTAL_BYTES`, `MAX_RULE_DATA_READ_BYTES` and `MAX_NAME_BYTES` (4096, with the engine's 64-component
 //!   rule) for rule-data names; `MAX_AUTHORITIES`; and `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's
-//!   `MAX_INCLUDED_FILES` is per top-level parse, so here it applies per policy. Stock CRS's `SecRequestBodyLimit
-//!   13107200` is under the `MAX_REQUEST_BODY_LIMIT` WASM ceiling, so it is accepted as written. The rule caps are low
-//!   because rule insertion scans for duplicate ids, so collecting one policy is quadratic: 30,000 flat rules measured
-//!   about 0.8 s natively (1.2 s with a realistic shape) and 3.3 s of configure-plus-start in an Envoy 1.40 V8 worker,
-//!   with 5.4 s at the generation cap. Re-measure before raising them. Stock CRS is about 6,000 rules, so the cap is
-//!   ample.
+//!   `MAX_INCLUDED_FILES` is per top-level parse, so here it applies per policy. CRS 4.30 sets no request-body limit,
+//!   so its engine default (128 `MiB`) is over the `MAX_REQUEST_BODY_LIMIT` WASM ceiling; a CRS policy must set
+//!   `SecRequestBodyLimit` explicitly, as the embedded-CRS example in `envoy-coraza/README.md` does. The rule caps are
+//!   low because rule insertion scans for duplicate ids, so collecting one policy is quadratic: 30,000 flat rules
+//!   measured about 0.8 s natively (1.2 s with a realistic shape) and 3.3 s of configure-plus-start in an Envoy 1.40 V8
+//!   worker, with 5.4 s at the generation cap. Re-measure before raising them. Stock CRS is about 6,000 rules, so the
+//!   cap is ample.
 //! * The body ceilings are host policy, not policy syntax: they are installed as
 //!   `WafConfig::max_request_body_limit`/`max_response_body_limit` so a request-time `ctl:requestBodyLimit`,
 //!   `ctl:responseBodyLimit`, `ctl:requestBodyAccess=On` or `ctl:responseBodyAccess=On` cannot raise the effective
@@ -153,7 +155,7 @@ const MAX_AUTHORITIES: usize = 4096;
 /// A value rather than bare constants so the checks can be exercised with small
 /// limits instead of allocating the production ceilings in every test.
 #[derive(Debug, Clone, Copy)]
-struct RuleDataLimits {
+pub(crate) struct RuleDataLimits {
     /// Most files.
     files: usize,
     /// Largest single value, in bytes.
@@ -163,7 +165,7 @@ struct RuleDataLimits {
 }
 
 /// The production [`RuleDataLimits`].
-const RULE_DATA_LIMITS: RuleDataLimits = RuleDataLimits {
+pub(crate) const RULE_DATA_LIMITS: RuleDataLimits = RuleDataLimits {
     files: MAX_RULE_DATA_FILES,
     file_bytes: MAX_RULE_DATA_FILE_BYTES,
     total_bytes: MAX_RULE_DATA_TOTAL_BYTES,
@@ -555,8 +557,11 @@ fn parse_rule_data(object: &Map<String, Value>) -> Result<BTreeMap<String, Vec<u
     Ok(files)
 }
 
-/// Adds one `rule_data` file after checking every bound.
-fn add_rule_data(
+/// Adds one `rule_data` file after validating its name and checking every bound.
+///
+/// Returns [`ConfigError::RuleData`] for a name the engine would reject, a
+/// name already present under its normalized spelling, or a bound violation.
+pub(crate) fn add_rule_data(
     files: &mut BTreeMap<String, Vec<u8>>,
     total: &mut usize,
     name: &str,
@@ -567,6 +572,10 @@ fn add_rule_data(
         name: name.to_owned(),
         reason,
     };
+    let normalized = check_rule_data_name(name)?;
+    if files.contains_key(&normalized) {
+        return Err(reject("name is already present".to_owned()));
+    }
     if files.len() >= limits.files {
         return Err(reject(format!("the file list already holds {} files", limits.files)));
     }
@@ -585,7 +594,7 @@ fn add_rule_data(
         )));
     }
     *total = new_total;
-    files.insert(name.to_owned(), bytes.to_vec());
+    files.insert(normalized, bytes.to_vec());
     Ok(())
 }
 
@@ -623,7 +632,7 @@ fn check_rule_data_name(name: &str) -> Result<String, ConfigError> {
 ///
 /// This must stay identical to `coraza::rule_data::Memory`'s normalization, or a
 /// name validated here would resolve to a different key at read time.
-fn normalize_rule_data_name(name: &str) -> String {
+pub(crate) fn normalize_rule_data_name(name: &str) -> String {
     name.split('/')
         .filter(|component| !component.is_empty() && *component != ".")
         .collect::<Vec<_>>()
