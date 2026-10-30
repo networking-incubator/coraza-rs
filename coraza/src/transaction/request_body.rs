@@ -163,13 +163,16 @@ impl Transaction {
             BodyProcessor::UrlEncoded => {
                 self.request_body.set(body);
                 self.request_body_length.set(body.len().to_string());
-                for (key, value) in parse_urlencoded(body) {
-                    // Stop decoding once the POST argument limit is reached (see
-                    // add_query_arguments): the lazy iterator skips the rest.
-                    if !self.within_argument_limit(self.args_post.value_count()) {
+                // Check each raw pair against the limit before decoding it, so pairs past
+                // the limit are never decoded or allocated.
+                let mut count = self.args_post.value_count();
+                for (key, value) in split_urlencoded(body) {
+                    if !self.within_argument_limit(count) {
                         break;
                     }
-                    self.add_post_argument(key, value);
+                    let (key, value) = decode_pair(key, value);
+                    self.insert_post_argument(&key, &value);
+                    count = count.saturating_add(1);
                 }
             },
             BodyProcessor::Multipart => {
@@ -588,22 +591,22 @@ fn save_to_temp(upload_dir: &Path, data: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Parses URLENCODED pairs in order, preserving decoded name and value bytes.
-pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+/// Splits URLENCODED pairs in order into raw name and value bytes, skipping empty pairs.
+pub(super) fn split_urlencoded(body: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
     body.split(|&byte| byte == b'&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = match pair.iter().position(|&byte| byte == b'=') {
-                Some(equals) => (
-                    pair.get(..equals).unwrap_or_default(),
-                    pair.get(equals.saturating_add(1)..).unwrap_or_default(),
-                ),
-                None => (pair, &b""[..]),
-            };
-            let key = url_decode(key).0;
-            let value = url_decode(value).0;
-            (key, value)
+        .map(|pair| match pair.iter().position(|&byte| byte == b'=') {
+            Some(equals) => (
+                pair.get(..equals).unwrap_or_default(),
+                pair.get(equals.saturating_add(1)..).unwrap_or_default(),
+            ),
+            None => (pair, &b""[..]),
         })
+}
+
+/// URL-decodes the name and value of one raw pair from `split_urlencoded`.
+pub(super) fn decode_pair(key: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (url_decode(key).0, url_decode(value).0)
 }
 
 /// Bounds the flattened form relative to the body that produced it.
