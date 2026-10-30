@@ -1459,15 +1459,17 @@ pub(crate) fn run_case(prepared: &PreparedCase) -> Result<Outcome, DriverError> 
 ///
 /// `after_call` observes the transaction after each call, which the outcome
 /// mode uses to attribute matches to phases. Interruption stops later calls
-/// and logging always runs. The transaction is returned boxed, because it is
-/// large enough that leaving it on a caller's stack trips `large_stack_frames`.
+/// and logging always runs. The transaction is returned boxed.
 fn drive_lifecycle(
     prepared: &PreparedCase,
     uri: &str,
     mut after_call: impl FnMut(&Transaction, u8),
 ) -> Result<Box<Transaction>, DriverError> {
     let case = &prepared.case;
-    let mut transaction = prepared.waf.new_transaction_with_id(case.case_id.clone());
+    // shortcut: Transaction grew past clippy's large_stack_frames when Map switched to
+    // IndexMap; boxing here clears it by ~300 B, so the next field addition re-trips it.
+    // Upgrade by shrinking Transaction itself.
+    let mut transaction = Box::new(prepared.waf.new_transaction_with_id(case.case_id.clone()));
     let mut logging_ran = false;
     for call in &case.phase_calls {
         drive_call(&mut transaction, case, uri, call)?;
@@ -1485,7 +1487,7 @@ fn drive_lifecycle(
             .map_err(|error| DriverError::Run(format!("case {} logging failed: {error}", case.case_id)))?;
         after_call(&transaction, 5);
     }
-    Ok(Box::new(transaction))
+    Ok(transaction)
 }
 
 /// Executes one lifecycle call.
