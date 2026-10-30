@@ -1,0 +1,61 @@
+# Nightly releases of the envoy-coraza WASM filter (see docs/ci.md).
+#
+# The wasm binaries are built by the nightly workflow (make/cargo, wasm32-wasip1
+# is not a target GoReleaser's Rust builder supports) and staged as
+# release-artifacts/{coraza-rs,coraza-rs-crs}.wasm before GoReleaser runs.
+# GoReleaser then uploads them as release assets and packages them into the
+# scratch Envoy WASMPlugin images.
+#
+# Nightlies are released under a dated tag (v0.0.0-nightly.YYYYMMDD) created by
+# the nightly workflow; regular releases would use a normal vX.Y.Z tag.
+version: 2
+
+project_name: coraza-rs
+
+builds:
+  - id: noop
+    skip: true
+
+git:
+  ignore_tags: ["v0.0.0-nightly.*"]
+
+release:
+  prerelease: true
+  make_latest: false
+  replace_existing_artifacts: true
+  extra_files:
+    - glob: release-artifacts/coraza-rs.wasm
+    - glob: release-artifacts/coraza-rs-crs.wasm
+
+changelog:
+  disable: true
+
+dockers_v2:
+  - id: coraza-rs
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/networking-incubator/coraza-rs
+    tags:
+      - nightly
+      - "nightly-{{ .Now.Format \"20060102\" }}"
+    extra_files:
+      - release-artifacts/coraza-rs.wasm
+    build_args:
+      WASM: coraza-rs.wasm
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]
+  - id: coraza-rs-crs
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/networking-incubator/coraza-rs-crs
+    tags:
+      - nightly
+      - "nightly-{{ .Now.Format \"20060102\" }}"
+    extra_files:
+      - release-artifacts/coraza-rs-crs.wasm
+    build_args:
+      WASM: coraza-rs-crs.wasm
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]

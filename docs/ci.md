@@ -216,3 +216,23 @@ git commit -S -s -m "type(scope): summary"
 - Third-party GitHub Actions must be pinned to commit SHAs.
 - Do not use floating refs (`@main`, `@master`, `@vX`).
 - Bump pinned SHAs regularly to current stable releases.
+
+## Nightly releases
+
+`.github/workflows/nightly.yml` publishes a nightly release at 03:00 UTC
+(also via `workflow_dispatch`). It builds the `envoy-coraza` filter for
+`wasm32-wasip1` (without and with the `embed-crs` feature, using the same
+`--locked --release` flags as `make build-envoy-wasm`/`build-envoy-wasm-crs`),
+stages the binaries as `release-artifacts/{coraza-rs,coraza-rs-crs}.wasm`, and
+runs GoReleaser (`.goreleaser.yaml`). GoReleaser uploads the raw `.wasm` files
+as release assets and packages each into a scratch Docker image
+(`ghcr.io/networking-incubator/coraza-rs` and `...-crs`, tags `nightly` and
+`nightly-YYYYMMDD`) usable directly as an Envoy `WASMPlugin` image.
+
+OSS GoReleaser has no nightly mode (Pro-only), so the workflow force-pushes a
+dated tag (`v0.0.0-nightly.YYYYMMDD`) and GoReleaser releases under it. To test
+packaging locally without publishing:
+
+```console
+goreleaser release --snapshot --clean
+```

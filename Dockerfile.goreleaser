@@ -1,0 +1,5 @@
+# Used by GoReleaser (dockers_v2) with the prebuilt WASM filter staged by the
+# before hooks. Mirrors the scratch WASMPlugin image pattern of coraza-proxy-wasm.
+FROM scratch
+ARG WASM
+COPY release-artifacts/${WASM} /plugin.wasm
