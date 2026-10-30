@@ -10,23 +10,33 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+
+# Serialize releases on the same ref; never cancel an in-flight release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     # Skip the run triggered by the nightly job pushing its own dated tag.
     if: github.event_name != 'push' || !contains(github.ref, 'nightly')
+    name: Release
     runs-on: ubuntu-24.04
+    permissions:
+      # GoReleaser creates the GitHub release and its assets.
+      contents: write
+      # Push the WASMPlugin images to GHCR.
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history and tags so GoReleaser can resolve the version.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: $/.github/actions/setup-rust
@@ -46,17 +56,22 @@ jobs:
           cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
 
       - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
       # OSS GoReleaser has no nightly support (Pro-only), so the dated tag is
       # created here and GoReleaser releases under it. Manual releases use the
       # pushed vX.Y.Z tag directly (GoReleaser detects it from the checkout).
       - name: Create dated nightly tag
         if: github.event_name != 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="v0.0.0-nightly.$(date -u +%Y%m%d)"
           git tag -f "$tag" "$GITHUB_SHA"
-          git push -f origin "refs/tags/$tag"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$tag"
 
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
