@@ -21,7 +21,7 @@
 //! Map collection implementation.
 //!
 //! Provides key-value storage with optional case-insensitive keys.
-//! Multiple values per key are supported.
+//! Multiple values per key are supported, and iteration follows insertion order.
 //!
 //! Keys are byte strings, so decoded names stay distinct even when they are not valid
 //! UTF-8. This is a deliberate deviation from Go, whose `strings.ToLower` folds every invalid
@@ -31,11 +31,11 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     hash::Hash,
     mem::{align_of, size_of},
 };
 
+use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::{transformations::text_of, types::RuleVariable};
@@ -54,9 +54,9 @@ use crate::{transformations::text_of, types::RuleVariable};
 pub struct Map {
     /// Whether keys are case-sensitive
     case_sensitive: bool,
-    /// Internal storage from `lookup_key` to `Vec<KeyValue>`.
+    /// Internal storage from `lookup_key` to `Vec<KeyValue>`, in insertion order.
     /// Keys are lowercase for case-insensitive maps.
-    data: HashMap<Key, Vec<KeyValue>>,
+    data: IndexMap<Key, Vec<KeyValue>>,
     /// The variable this collection represents
     variable: RuleVariable,
 }
@@ -224,7 +224,7 @@ impl Map {
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: false,
-            data: HashMap::new(),
+            data: IndexMap::new(),
             variable,
         }
     }
@@ -235,7 +235,7 @@ impl Map {
     pub(crate) fn new_case_sensitive(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: true,
-            data: HashMap::new(),
+            data: IndexMap::new(),
             variable,
         }
     }
@@ -250,7 +250,7 @@ impl Map {
         }
     }
 
-    /// Every key, with its original casing, and value, in no particular order.
+    /// Every key, with its original casing, and value, in insertion order.
     ///
     /// This is a lossy text view: keys that are not valid UTF-8 have their invalid bytes
     /// replaced with U+FFFD. Distinct byte keys still yield one entry each, so no entry is
@@ -259,7 +259,7 @@ impl Map {
         self.data.values().flatten().map(|kv| (kv.key.text(), kv.value()))
     }
 
-    /// Every key, exactly as stored, and value, in no particular order.
+    /// Every key, exactly as stored, and value, in insertion order.
     pub(crate) fn iter_bytes(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         self.data.values().flatten().map(|kv| (kv.key.as_bytes(), kv.value()))
     }
@@ -407,10 +407,10 @@ impl Map {
         }
     }
 
-    /// Removes `key` and all its values.
+    /// Removes `key` and all its values, keeping the other keys in insertion order.
     pub(crate) fn remove(&mut self, key: &str) {
         let lookup = self.lookup_key(key.as_bytes());
-        self.data.remove(lookup.as_ref());
+        self.data.shift_remove(lookup.as_ref());
     }
 
     /// Removes every key.
@@ -450,12 +450,11 @@ impl Map {
 
     /// Estimated bytes held by this map's backing allocations.
     ///
-    /// The estimate is deliberately conservative. `HashMap` never shrinks its table
-    /// when entries are removed, and its capacity is an element count, not the number
-    /// of allocated buckets, so the table is sized from the bucket count with one
-    /// control byte per bucket plus an allocator alignment allowance.
+    /// The estimate is deliberately conservative. `IndexMap` keeps its entries in a vector
+    /// plus a hash index, and neither allocation shrinks when entries are removed, so both
+    /// are sized from the map's capacity with an allocator alignment allowance.
     pub(crate) fn allocated_bytes(&self) -> usize {
-        let mut total = hash_table_bytes::<(Key, Vec<KeyValue>)>(self.data.capacity());
+        let mut total = index_table_bytes::<(Key, Vec<KeyValue>)>(self.data.capacity());
         for (key, values) in &self.data {
             total = total.saturating_add(key.allocated_bytes());
             total = total.saturating_add(values.capacity().saturating_mul(size_of::<KeyValue>()));
@@ -469,16 +468,20 @@ impl Map {
     }
 }
 
-/// Estimated bytes of a `HashMap` table that can hold `capacity` elements.
+/// Estimated bytes of an `IndexMap`'s backing allocations for `capacity` entries.
 ///
-/// Mirrors the standard library's capacity-to-bucket mapping (at least four buckets,
-/// otherwise `(capacity + 1) * 8 / 7` rounded up to a power of two) so the estimate
-/// over-counts rather than under-counts, including an allowance for allocator
-/// alignment. The table never shrinks on removal, so a cleared map keeps its cost.
-fn hash_table_bytes<T>(capacity: usize) -> usize {
+/// `IndexMap` stores entries in a vector of `(hash, key, value)` and looks them up through
+/// a hash index of bucket indices, so a `HashMap` bucket model does not describe it. The
+/// entry vector is sized from the capacity and the index is rounded up to a power of two,
+/// which over-counts rather than under-counts, including an allowance for allocator
+/// alignment. Neither allocation shrinks on removal, so a cleared map keeps its cost.
+fn index_table_bytes<T>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
     }
+    // The entry vector holds one hash word, the key, and the value per entry; three words
+    // cover the hash and the padding a `Bucket` may need before its key.
+    let entries = capacity.saturating_mul(size_of::<T>().saturating_add(3 * size_of::<usize>()));
     let buckets = capacity
         .saturating_add(1)
         .saturating_mul(8)
@@ -486,8 +489,8 @@ fn hash_table_bytes<T>(capacity: usize) -> usize {
         .checked_next_power_of_two()
         .unwrap_or(usize::MAX)
         .max(4);
-    buckets
-        .saturating_mul(size_of::<T>().saturating_add(1))
+    entries
+        .saturating_add(buckets.saturating_mul(size_of::<usize>().saturating_add(1)))
         .saturating_add(align_of::<T>().saturating_mul(2))
 }
 
@@ -512,20 +515,20 @@ impl std::fmt::Display for Map {
 
 #[cfg(test)]
 mod tests {
-    use super::hash_table_bytes;
+    use super::index_table_bytes;
 
     #[test]
     fn table_estimate_covers_capacity_and_never_undercounts() {
         for capacity in [0_usize, 1, 2, 3, 4, 7, 8, 9, 15, 16, 100, 1024] {
-            let bytes = hash_table_bytes::<(u64, u64)>(capacity);
+            let bytes = index_table_bytes::<(u64, u64)>(capacity);
             assert!(
                 bytes >= capacity.saturating_mul(size_of::<(u64, u64)>() + 1),
                 "capacity {capacity} underestimated: {bytes}"
             );
         }
-        assert_eq!(hash_table_bytes::<(u64, u64)>(0), 0, "an empty map has no table");
+        assert_eq!(index_table_bytes::<(u64, u64)>(0), 0, "an empty map has no table");
         assert!(
-            hash_table_bytes::<(u64, u64)>(9) >= hash_table_bytes::<(u64, u64)>(8),
+            index_table_bytes::<(u64, u64)>(9) >= index_table_bytes::<(u64, u64)>(8),
             "the estimate must not shrink as capacity grows"
         );
     }
@@ -690,6 +693,45 @@ mod tests {
         let values = map.get("id");
         assert_eq!(values.len(), 3);
         assert_eq!(values, vec!["123", "456", "789"]);
+    }
+
+    #[test]
+    fn iter_follows_insertion_order() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add("f0", "a");
+        map.add("f1", "b");
+        map.add("f0", "c");
+
+        let text: Vec<_> = map
+            .iter()
+            .map(|(key, value)| (key.to_owned(), value.to_vec()))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                ("f0".to_owned(), b"a".to_vec()),
+                ("f0".to_owned(), b"c".to_vec()),
+                ("f1".to_owned(), b"b".to_vec()),
+            ]
+        );
+        let bytes: Vec<_> = map
+            .iter_bytes()
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                (b"f0".to_vec(), b"a".to_vec()),
+                (b"f0".to_vec(), b"c".to_vec()),
+                (b"f1".to_vec(), b"b".to_vec()),
+            ]
+        );
+
+        // Removing and re-adding a key moves it to the end.
+        map.remove("f0");
+        map.add("f0", "d");
+        let keys: Vec<_> = map.iter_bytes().map(|(key, _)| key.to_vec()).collect();
+        assert_eq!(keys, [b"f1".to_vec(), b"f0".to_vec()]);
     }
 
     #[test]

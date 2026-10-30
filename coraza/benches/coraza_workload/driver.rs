@@ -1459,13 +1459,13 @@ pub(crate) fn run_case(prepared: &PreparedCase) -> Result<Outcome, DriverError> 
 ///
 /// `after_call` observes the transaction after each call, which the outcome
 /// mode uses to attribute matches to phases. Interruption stops later calls
-/// and logging always runs. The transaction is returned so the caller decides
-/// when it is dropped.
+/// and logging always runs. The transaction is returned boxed, because it is
+/// large enough that leaving it on a caller's stack trips `large_stack_frames`.
 fn drive_lifecycle(
     prepared: &PreparedCase,
     uri: &str,
     mut after_call: impl FnMut(&Transaction, u8),
-) -> Result<Transaction, DriverError> {
+) -> Result<Box<Transaction>, DriverError> {
     let case = &prepared.case;
     let mut transaction = prepared.waf.new_transaction_with_id(case.case_id.clone());
     let mut logging_ran = false;
@@ -1485,7 +1485,7 @@ fn drive_lifecycle(
             .map_err(|error| DriverError::Run(format!("case {} logging failed: {error}", case.case_id)))?;
         after_call(&transaction, 5);
     }
-    Ok(transaction)
+    Ok(Box::new(transaction))
 }
 
 /// Executes one lifecycle call.
