@@ -123,6 +123,32 @@ make lint
 make test
 ```
 
+`make` with no target also runs `make lint-extra`, which calls four binaries
+this repository does not install: `typos`, `taplo`, `actionlint` and
+`shellcheck`. The usual set is:
+
+```sh
+cargo install typos-cli --locked --version 1.42.1
+cargo install taplo-cli --locked --version 0.10.0
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.10
+# shellcheck comes from the distribution package, for example:
+sudo dnf install ShellCheck
+```
+
+`make audit` and `make coverage-check`, which the no-target run also reaches,
+need four cargo subcommands that are likewise not part of the workspace:
+
+```sh
+cargo install cargo-audit --locked --version 0.22.2
+cargo install cargo-deny --locked --version 0.20.2
+cargo install cargo-llvm-cov --locked --version 0.9.1
+cargo install cargo-nextest --locked --version 0.9.145
+```
+
+Those versions match CI; see [Lint tool trust](docs/ci.md#lint-tool-trust) for
+how the `meta-lint` job pins and verifies the downloaded binaries, and how the
+cargo subcommands are pinned.
+
 `make parity-differential` additionally compares against the pinned C and Go
 references. It needs the C checkout selected by
 `libperfusion/tests/parity/manifest.json` and the pinned Go toolchain. See the
