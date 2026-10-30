@@ -223,7 +223,10 @@ git commit -S -s -m "type(scope): summary"
 (03:00 UTC, also via `workflow_dispatch`) and on manual `vX.Y.Z` tag pushes. It
 builds the `envoy-coraza` filter for `wasm32-wasip1` (without and with the
 `embed-crs` feature, using the same `--locked --release` flags as
-`make build-envoy-wasm`/`build-envoy-wasm-crs`), stages the binaries as
+`make build-envoy-wasm`/`build-envoy-wasm-crs`), links the WASI ENOSYS stubs
+(`envoy-coraza/wasi-stub.wat`, via a pinned binaryen `wasm-as`/`wasm-merge`)
+into both binaries so they also load on Envoy below 1.40 (e.g. Istio 1.30),
+stages the results as
 `release-artifacts/{coraza-rs,coraza-rs-crs}.wasm`, and runs GoReleaser
 (`.goreleaser.yaml`). GoReleaser uploads the raw `.wasm` files as release
 assets and packages each into a scratch Docker image
@@ -242,9 +245,14 @@ the workflow does, then run the snapshot (the config expects them to exist):
 
 ```console
 ./envoy-coraza/crs-fetch.sh
+wasm-as envoy-coraza/wasi-stub.wat -o /tmp/wasi-stub.wasm
+link_stubs() {
+  wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
+    "$1" envoy-coraza -o "$2" --rename-export-conflicts --all-features
+}
 cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
-cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
+link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
 cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
-cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
 goreleaser release --snapshot --clean
 ```
