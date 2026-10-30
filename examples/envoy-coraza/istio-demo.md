@@ -1,14 +1,15 @@
 # Demo: run the Coraza WASM filter on an existing Istio cluster
 
-A self-contained, manual step-by-step: build the filter, serve it from an
-HTTP endpoint, and deploy a Gateway + EnvoyFilter that inserts it in front of
-a service you already have. No test harness and no files beyond this page.
-The automated harness and its 52 gating assertions live in PR #95
-(`examples/envoy-coraza/istio/`); it automates exactly these steps.
+A self-contained, manual step-by-step: download the released filter, serve it
+from an HTTP endpoint, and deploy a Gateway + EnvoyFilter that inserts it in
+front of a service you already have. No test harness, no Rust toolchain, and
+no files beyond this page. The automated harness and its 52 gating assertions
+live in PR #95 (`examples/envoy-coraza/istio/`); it automates exactly these
+steps.
 
 Verified against Istio 1.30.5 and 1.30.7 (Envoy 1.38.x) in Kind. On Envoy
 1.40 or newer the WASI-stub merge in step 2 is unnecessary (the host provides
-the stubs), but it is harmless to keep.
+the stubs); step 2 includes a direct-serve shortcut for that case.
 
 ## 0. Prerequisites
 
@@ -18,23 +19,36 @@ the stubs), but it is harmless to keep.
   `kubectl get crd gateways.gateway.networking.io`; if absent, install the
   standard channel:
   `kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.0/standard-install.yaml`.
-- From the repository root: `make`, `sha256sum`, `sed`, `python3`, and
-  binaryen's `wasm-as`/`wasm-merge` (version 123 was used for validation:
+- `curl`, `sha256sum`, `sed`, and `python3`. Binaryen's `wasm-as`/`wasm-merge`
+  is only needed on Envoy below 1.40 (step 2; version 123 was used for
+  validation:
   <https://github.com/WebAssembly/binaryen/releases/tag/version_123>).
 - An HTTP endpoint the Istio gateway pods can reach, to serve the wasm
   artifact. On Kind that is a plain `python3 -m http.server` bound to the
   docker bridge gateway (step 3); in any other cluster, use any plain-HTTP
   file server reachable from the gateway pods.
 
-## 1. Build the filter
+## 1. Download the filter
 
-From the repository root:
+The filter is published as release assets: `coraza-rs.wasm` (core rules only)
+and `coraza-rs-crs.wasm` (with the Core Rule Set embedded; same shape, bigger
+file). Releases are cut nightly (`v0.0.0-nightly.YYYYMMDD` prereleases) and
+on manual `vX.Y.Z` tags. Pick the newest one — nightly prereleases never
+become the `latest` release, so query the list rather than the `latest`
+endpoint:
 
 ```sh
-make build-envoy-wasm
+RELEASE_TAG=$(curl -fsSL https://api.github.com/repos/networking-incubator/coraza-rs/releases \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["tag_name"])')
+mkdir -p /tmp/coraza-demo
+curl -fsSL -o /tmp/coraza-demo/coraza-rs.wasm \
+  "https://github.com/networking-incubator/coraza-rs/releases/download/$RELEASE_TAG/coraza-rs.wasm"
 ```
 
-This produces `target/wasm32-wasip1/release/envoy_coraza.wasm`.
+To build the filter from source instead, run `make build-envoy-wasm` from the
+repository root and use `target/wasm32-wasip1/release/envoy_coraza.wasm` as
+the input of step 2; the release assets are built with the same locked
+release flags.
 
 ## 2. Link the WASI stubs (Envoy below 1.40, e.g. Istio 1.30)
 
@@ -44,7 +58,15 @@ load the module unless ENOSYS stubs are linked in. The stubs only satisfy
 the loader: the connector's validated configuration never reaches
 filesystem-backed features.
 
-Save this as `/tmp/wasi-stub.wat`:
+On Envoy 1.40 or newer, skip this section and serve the downloaded
+`coraza-rs.wasm` directly:
+
+```sh
+cp /tmp/coraza-demo/coraza-rs.wasm /tmp/coraza-demo/envoy_coraza_istio.wasm
+WASM_SHA256=$(sha256sum /tmp/coraza-demo/envoy_coraza_istio.wasm | cut -d' ' -f1)
+```
+
+Otherwise, save this as `/tmp/wasi-stub.wat`:
 
 ```wat
 (module
@@ -64,7 +86,7 @@ validation rejects):
 mkdir -p /tmp/coraza-demo
 wasm-as /tmp/wasi-stub.wat -o /tmp/wasi-stub.wasm
 wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
-    target/wasm32-wasip1/release/envoy_coraza.wasm envoy-coraza \
+    /tmp/coraza-demo/coraza-rs.wasm envoy-coraza \
     -o /tmp/coraza-demo/envoy_coraza_istio.wasm \
     --rename-export-conflicts --all-features
 WASM_SHA256=$(sha256sum /tmp/coraza-demo/envoy_coraza_istio.wasm | cut -d' ' -f1)
@@ -363,6 +385,12 @@ kill %1 %2 2>/dev/null || true   # port-forward and http.server
 ```
 
 ## Notes and footguns
+
+- The same artifacts also ship as scratch OCI images
+  (`ghcr.io/networking-incubator/coraza-rs`, tags `nightly` and
+  `nightly-YYYYMMDD`, plus a `-crs` variant) that can be pulled directly by
+  Istio's `WASMPlugin` `image` field; this demo sticks to EnvoyFilter remote
+  fetch.
 
 - The EnvoyFilter patches are scoped to listener port 80 and inserted
   immediately before `envoy.filters.http.router`. A second listener on the
