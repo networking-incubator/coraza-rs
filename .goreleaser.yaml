@@ -36,7 +36,8 @@ changelog:
 # Tag conventions used by both image variants:
 # - nightly run (tag v0.0.0-nightly.YYYYMMDD): v0.0.0-nightly.YYYYMMDD,
 #   nightly, nightly-YYYYMMDD
-# - manual release (tag vX.Y.Z): vX.Y.Z, latest
+# - manual release (tag vX.Y.Z): vX.Y.Z, and latest only for the newest tag
+#   (PUSH_LATEST is set by the release workflow)
 dockers_v2:
   - id: coraza-rs
     dockerfile: Dockerfile.goreleaser
@@ -46,7 +47,7 @@ dockers_v2:
       - "{{ .Tag }}"
       - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
       - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
-      - "{{ if not (contains .Tag \"nightly\") }}latest{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs.wasm
     build_args:
@@ -62,7 +63,7 @@ dockers_v2:
       - "{{ .Tag }}"
       - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
       - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
-      - "{{ if not (contains .Tag \"nightly\") }}latest{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs-crs.wasm
     build_args:

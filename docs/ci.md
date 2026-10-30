@@ -229,7 +229,8 @@ builds the `envoy-coraza` filter for `wasm32-wasip1` (without and with the
 assets and packages each into a scratch Docker image
 (`ghcr.io/networking-incubator/coraza-rs` and `...-crs`, usable directly as
 Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
-nightlies, or `vX.Y.Z` and `latest` for manual releases.
+nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
+tag is the newest one, so an older backported tag cannot move it backwards).
 
 OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
 the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
