@@ -737,15 +737,25 @@ First recorded run through the `benchmarks/coraza` coordinator ([#101](https://g
 ### Commands (reproducible)
 
 ```sh
-make coraza-parity
-cargo build --locked --release -p coraza --bench coraza_workload --message-format=json
-(cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go build -o "$RUN_BIN/coraza-go-driver" ./cmd/bench)
-make coraza-bench \
-  CORAZA_RUST_DRIVER_CMD="taskset -c 3 <rust-driver-from-cargo-json>" \
+RUN_BIN=/path/to/this/run        # writable directory for this run's prebuilt drivers
+mkdir -p "$RUN_BIN" && export RUN_BIN
+unset GOFLAGS                    # an inherited -modfile would select the local Go profile
+
+make coraza-parity CORAZA_GO_PROFILE=upstream
+
+cargo build --locked --release -p coraza --bench coraza_workload --message-format=json \
+  >"$RUN_BIN/rust-build.json"
+RUST_DRIVER="$(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="coraza_workload") | .executable' \
+  "$RUN_BIN/rust-build.json" | head -n 1)"
+(cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local GOFLAGS= \
+  go build -o "$RUN_BIN/coraza-go-driver" ./cmd/bench)
+
+make coraza-bench CORAZA_GO_PROFILE=upstream \
+  CORAZA_RUST_DRIVER_CMD="taskset -c 3 $RUST_DRIVER" \
   CORAZA_GO_DRIVER_CMD="taskset -c 3 $RUN_BIN/coraza-go-driver"
 ```
 
-The drivers are prebuilt with the coordinator's default build commands and pinned with `taskset` through the documented `CORAZA_*_DRIVER_CMD` overrides; the coordinator records the exact commands it ran in `run.json`. Defaults otherwise: 3 repetitions, 1000 iterations.
+The drivers are prebuilt with the coordinator's default build commands and pinned with `taskset` through the documented `CORAZA_*_DRIVER_CMD` overrides; the coordinator records the exact commands it ran in `run.json`. `CORAZA_GO_PROFILE=upstream` makes the identity gate require the published module — the recorded run used the default `auto`, which resolved to upstream — and clearing `GOFLAGS` prevents an inherited `-modfile` from silently selecting the local profile. Resolving the Rust driver path needs `jq`. Defaults otherwise: 3 repetitions, 1000 iterations.
 
 ### Correctness
 
@@ -764,7 +774,7 @@ Per-transaction medians over 3,000 samples per engine (3 repetitions × 1000 ite
 | json-benign | 6,693 | 7,785 | 0.860 | 6,282–21,290 | 5,661–150,834 |
 | json-attack | 7,113 | 9,397.5 | 0.757 | 6,712–17,653 | 6,763–124,685 |
 
-Rust is faster on every case (ratio 0.660–0.886). The Rust maximum is also lower on every case (for example `get-benign`: 86,072 ns against 467,399 ns); the Go tail is dominated by GC pauses, which the median does not show.
+Rust is faster on every case (ratio 0.660–0.886). The Rust maximum is also lower on every case (for example `get-benign`: 86,072 ns against 467,399 ns). The recorded maxima do not establish the cause of the Go tail; it may include garbage-collection pauses, which the medians do not reflect.
 
 ### Memory
 
