@@ -10,7 +10,7 @@ it matches a CRS rule.
 On an existing cluster, skip the first two commands.
 
 ```sh
-kind create cluster --name coraza-demo
+kind create cluster
 istioctl install -y --set profile=minimal
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
@@ -36,7 +36,7 @@ Envoy fetches the wasm module from an HTTP endpoint the gateway pods can
 reach. On Kind, serve it from the docker bridge gateway:
 
 ```sh
-FETCH_ADDRESS=$(docker network inspect coraza-demo --format '{{json .IPAM.Config}}' | python3 -c '
+FETCH_ADDRESS=$(docker network inspect kind --format '{{json .IPAM.Config}}' | python3 -c '
 import json, sys
 for config in json.load(sys.stdin):
     if ":" not in config["Gateway"]:

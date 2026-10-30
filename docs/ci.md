@@ -240,8 +240,11 @@ the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
 `GORELEASER_CURRENT_TAG` environment variable and GoReleaser creates the tag
 and prerelease when publishing; a same-day rerun fails instead of moving the
 existing tag. For a manual release, push a normal `vX.Y.Z` tag. To test
-packaging locally without publishing, first stage the WASM files exactly as
-the workflow does, then run the snapshot (the config expects them to exist):
+packaging locally without publishing, first install binaryen
+[version 123](https://github.com/WebAssembly/binaryen/releases/tag/version_123)
+— the version the workflow pins — and put its `bin/` on `PATH` (it provides
+`wasm-as` and `wasm-merge`). Then stage the WASM files exactly as the
+workflow does and run the snapshot (the config expects them to exist):
 
 ```console
 ./envoy-coraza/crs-fetch.sh
