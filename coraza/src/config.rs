@@ -31,12 +31,13 @@ pub const DEFAULT_ARGUMENT_LIMIT: usize = 1000;
 /// `SecResponseBodyJsonDepthLimit`), as in Go Coraza.
 pub const DEFAULT_JSON_DEPTH_LIMIT: usize = 1024;
 
-/// What happens when a detector operator cannot inspect a value.
+/// What happens when an operator reports that it cannot inspect a value.
 ///
-/// The `detectSQLi` and `detectXSS` operators scan values up to
-/// [`libperfusion::MAX_INPUT_LEN`] bytes, the bound of libperfusion's public detection
-/// wrappers. A longer value has no verdict, so the operator reports a skipped
-/// inspection. There is no SecLang directive for this setting, as in Go Coraza.
+/// The built-in `detectSQLi` and `detectXSS` operators scan every input, as Go does, so
+/// they never report a skip. This setting is retained for compatibility with callers
+/// that construct it; no built-in operator currently produces
+/// [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected).
+/// There is no SecLang directive for it, as in Go Coraza.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DetectorInspectionAction {
     /// Record the skipped inspection on the transaction and treat the value as not
@@ -221,13 +222,15 @@ pub struct WafConfig {
     /// HTTPS keeps its one-second whole-request budget.
     pub audit_log_connect_timeout: Option<std::time::Duration>,
 
-    /// Deadline for one audit log write; `None` (the default) waits indefinitely, as Go
-    /// Coraza does.
+    /// Deadline for one audit log write.
     ///
     /// There is no SecLang directive for this. It applies to syslog writes over TCP,
-    /// UDP and, where the platform supports socket write deadlines, Unix sockets. File
-    /// writes have no deadline, as a regular file write cannot time out. HTTPS keeps its
-    /// one-second whole-request budget.
+    /// UDP and, where the platform supports socket write deadlines, Unix sockets. When
+    /// unset, a stream syslog target (TCP or Unix stream) gets a 5-second deadline, so a
+    /// peer that stops reading cannot park every transaction on the syslog writer; a
+    /// datagram target keeps waiting indefinitely. File writes have no deadline, as a
+    /// regular file write cannot time out. HTTPS keeps its one-second whole-request
+    /// budget.
     pub audit_log_write_timeout: Option<std::time::Duration>,
 
     /// Path of the debug log, empty when unset (`SecDebugLog`). The sink is opened by

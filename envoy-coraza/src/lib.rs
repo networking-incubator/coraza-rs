@@ -33,7 +33,7 @@ mod test_hostcalls;
 
 use std::{cell::Cell, rc::Rc};
 
-use config::Config;
+use config::{Config, MAX_CONFIGURATION_BYTES};
 use policy::Generation;
 use proxy_wasm::{
     hostcalls,
@@ -41,12 +41,6 @@ use proxy_wasm::{
     types::{BufferType, ContextType, LogLevel},
 };
 use stream::CorazaHttp;
-
-/// Largest plugin configuration, in bytes, one `on_configure` call accepts.
-///
-/// `serde` cannot produce more directive text than the document's own bytes, so
-/// this single bound covers both the document and the directives it carries.
-const MAX_CONFIGURATION_BYTES: usize = 8 * 1024 * 1024;
 
 proxy_wasm::main! {{
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
@@ -133,6 +127,11 @@ impl RootContext for CorazaRoot {
         }
         match self.apply(&configuration) {
             Ok(()) => {
+                #[cfg(feature = "embed-crs")]
+                log_info(&format!(
+                    "envoy-coraza: embedded CRS {} files available to Include",
+                    policy::embedded_crs::EMBEDDED_CRS_VERSION
+                ));
                 if let Some(generation) = &self.generation {
                     for warning in generation.warnings() {
                         log_warn(warning);
@@ -173,6 +172,12 @@ fn log_warn(message: &str) {
     hostcalls::log(LogLevel::Warn, message).unwrap_or_default();
 }
 
+/// Writes one informational line to the Envoy log.
+#[cfg(feature = "embed-crs")]
+fn log_info(message: &str) {
+    hostcalls::log(LogLevel::Info, message).unwrap_or_default();
+}
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -182,6 +187,8 @@ fn log_warn(message: &str) {
 /// Configuration publishing tests.
 mod tests {
     use std::rc::Rc;
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     use super::{check_configuration_size, CorazaRoot, MAX_CONFIGURATION_BYTES};
 
@@ -229,6 +236,52 @@ mod tests {
             root.current_generation()
                 .is_some_and(|generation| generation.select("a.example").is_some()),
             "the rejected reload leaves the active generation in place"
+        );
+    }
+
+    #[test]
+    fn a_compressed_configuration_is_enforced_end_to_end() {
+        let mut root = root();
+        let compressed = STANDARD.encode(crate::config::gzip_fixture(
+            br#"{
+                "directives_map": {"p": "SecRule REQUEST_URI \"@contains attack\" \"id:12,phase:1,deny,status:403\""},
+                "default_directives": "p"
+            }"#,
+        ));
+        root.apply(format!(r#"{{"config_gzip_b64": "{compressed}"}}"#).as_bytes())
+            .expect("a compressed configuration is valid");
+        assert_eq!(
+            interrupting_rule(&root, "a.example"),
+            12,
+            "a rule from a compressed configuration is enforced"
+        );
+    }
+
+    #[test]
+    fn a_rejected_compressed_configuration_keeps_the_previous_generation() {
+        let mut root = root();
+        root.apply(br#"{"directives_map": {"p": []}, "default_directives": "p"}"#)
+            .expect("configuration is valid");
+        let compressed = STANDARD.encode(crate::config::gzip_fixture(
+            br#"{"directives_map": {"p": ["SecNotADirective x"]}}"#,
+        ));
+        let rejected = root.apply(format!(r#"{{"config_gzip_b64": "{compressed}"}}"#).as_bytes());
+        assert!(rejected.is_err(), "an invalid compressed policy is rejected");
+        assert!(
+            root.current_generation()
+                .is_some_and(|generation| generation.select("a.example").is_some()),
+            "the rejected compressed reload leaves the active generation in place"
+        );
+
+        // A decode failure is rejected on the same path.
+        let truncated = crate::config::gzip_fixture(br#"{"directives_map": {"q": []}}"#);
+        let truncated = STANDARD.encode(truncated.get(..truncated.len() - 4).unwrap());
+        let rejected = root.apply(format!(r#"{{"config_gzip_b64": "{truncated}"}}"#).as_bytes());
+        assert!(rejected.is_err(), "a truncated compressed document is rejected");
+        assert!(
+            root.current_generation()
+                .is_some_and(|generation| generation.select("a.example").is_some()),
+            "the rejected decode leaves the active generation in place"
         );
     }
 

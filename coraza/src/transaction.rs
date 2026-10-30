@@ -42,7 +42,7 @@ use std::{
 
 use body_buffer::BodyBuffer;
 pub use body_buffer::BodyIngestionStats;
-use request_body::parse_urlencoded;
+use request_body::{decode_pair, split_urlencoded};
 use variables::BodyProcessor;
 pub use variables::VariableCollection;
 
@@ -61,6 +61,7 @@ use crate::{
     transformations::text_of,
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
     utils::time::LocalTime,
+    waf::ConfigError,
 };
 
 /// Custom processor selections and lazily created instances for one transaction.
@@ -211,10 +212,6 @@ pub struct Transaction {
     matched_rules: Vec<MatchedRule>,
     /// Transaction start time, used in audit records.
     started: SystemTime,
-    /// Raw bodies retained only when an enabled audit entry requests them.
-    audit_request_body: Vec<u8>,
-    /// Retained response bytes for selected audit parts.
-    audit_response_body: Vec<u8>,
     /// The last phase evaluated.
     last_phase: Option<RulePhase>,
     /// Whether the audit write was attempted; an attempt is never repeated.
@@ -395,8 +392,36 @@ impl Transaction {
     }
 
     /// Create a transaction with the supplied WAF configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration fails the checks [`Transaction::try_with_config`]
+    /// documents. Use that method, or [`crate::Waf::new`], to validate a configuration
+    /// instead.
+    #[expect(
+        clippy::expect_used,
+        reason = "this constructor deliberately panics on an invalid configuration; try_with_config is the fallible form"
+    )]
     pub fn with_config(id: impl Into<String>, config: Arc<WafConfig>) -> Self {
-        Self::with_rules(config, Arc::new(RuleGroup::new()), id)
+        Self::try_with_config(id, config).expect("invalid WAF configuration")
+    }
+
+    /// Create a transaction with the supplied WAF configuration, validating it first.
+    ///
+    /// This is the fallible form of [`Transaction::with_config`]. It applies the same
+    /// configuration checks [`crate::Waf::new`] applies to a rule-less WAF: body and
+    /// collection limits, the debug log level, and the upload-directory requirement. It
+    /// does not validate audit-log sinks, which only a WAF that writes audit entries
+    /// prepares, and it pairs no compiled rules with the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration has invalid limits, such as a zero or
+    /// negative body limit, a body limit above `1 GiB`, or an in-memory limit above the
+    /// body limit.
+    pub fn try_with_config(id: impl Into<String>, config: Arc<WafConfig>) -> Result<Self, ConfigError> {
+        crate::waf::validate_config(&config)?;
+        Ok(Self::with_rules(config, Arc::new(RuleGroup::new()), id))
     }
 
     /// Create a transaction with shared WAF configuration and compiled rules.
@@ -454,8 +479,6 @@ impl Transaction {
             error_log: None,
             matched_rules: Vec::new(),
             started,
-            audit_request_body: Vec::new(),
-            audit_response_body: Vec::new(),
             config,
             rules,
             last_phase: None,
@@ -753,8 +776,8 @@ impl Transaction {
     /// Estimate dynamic memory retained for request and response body data.
     ///
     /// This includes body buffers, raw body variables, parsed body collections,
-    /// audit copies, and match data. Collection backing capacities are counted,
-    /// so this is a conservative estimate for connector retained-body budgets.
+    /// and match data. Collection backing capacities are counted, so this is a
+    /// conservative estimate for connector retained-body budgets.
     pub fn body_memory_bytes(&self) -> usize {
         let maps = [
             &self.args,
@@ -781,8 +804,6 @@ impl Transaction {
             .chain([
                 self.request_body_buffer.allocated_bytes(),
                 self.response_body_buffer.allocated_bytes(),
-                self.audit_request_body.capacity(),
-                self.audit_response_body.capacity(),
                 self.matched_rules_memory_bytes(),
             ])
             .fold(0_usize, usize::saturating_add)
@@ -1027,7 +1048,7 @@ impl Transaction {
         };
         if should_log {
             self.debug_log(DebugLevel::Debug, "Transaction marked for audit logging", || []);
-            let entry = self.audit_log();
+            let entry = self.audit_log_checked();
             if let Some(callback) = &self.audit_log_callback {
                 callback.write(&entry);
             }
@@ -1091,13 +1112,63 @@ impl Transaction {
     }
 
     /// Build this transaction's audit entry using the current audit parts.
+    ///
+    /// The body parts are read from the retained buffers, so call this before
+    /// [`Transaction::finish`] resets them; `finish` itself reads them before resetting.
+    pub fn audit_log(&self) -> AuditLog {
+        let has = |part| self.audit_log_parts.contains(&part);
+        // Go reads the retained body here, at log time, rather than when it was
+        // ingested, so a phase 2/4/5 `ctl:auditLogParts=+C` still captures it
+        // (`internal/corazawaf/transaction.go:1584-1592`, v3.8.1). This accessor is
+        // best-effort; the write path uses `audit_log_checked` to report a spill failure.
+        let request_body =
+            has(AuditLogPart::RequestBody).then(|| self.request_body_buffer.retained().unwrap_or(Cow::Borrowed(&[])));
+        let response_body = has(AuditLogPart::IntermediaryResponseBody)
+            .then(|| self.response_body_buffer.retained().unwrap_or(Cow::Borrowed(&[])));
+        self.audit_log_with(request_body.as_deref(), response_body.as_deref())
+    }
+
+    /// Build the audit entry for the write path, recording a spill read failure.
+    ///
+    /// `audit_log` is best-effort because it cannot mutate the transaction; `finish`
+    /// uses this so a disappeared spill file is reported by `finish` instead of silently
+    /// producing an entry with an empty body.
+    fn audit_log_checked(&mut self) -> AuditLog {
+        let has = |part| self.audit_log_parts.contains(&part);
+        let request_body = if has(AuditLogPart::RequestBody) {
+            match self.request_body_buffer.retained() {
+                Ok(body) => Some(body.into_owned()),
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        let response_body = if has(AuditLogPart::IntermediaryResponseBody) {
+            match self.response_body_buffer.retained() {
+                Ok(body) => Some(body.into_owned()),
+                Err(error) => {
+                    self.finalization_errors.push(Failure::new(&error));
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        self.audit_log_with(request_body.as_deref(), response_body.as_deref())
+    }
+
+    /// Build the audit entry from bodies already read, or `None` when the part is off.
     #[expect(
         clippy::too_many_lines,
         reason = "builds the typed record from all selected transaction fields"
     )]
-    pub fn audit_log(&self) -> AuditLog {
+    fn audit_log_with(&self, request_body: Option<&[u8]>, response_body: Option<&[u8]>) -> AuditLog {
         let elapsed = self.started.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let at = LocalTime::from_unix(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+        let has = |part| self.audit_log_parts.contains(&part);
         let mut transaction = AuditTransaction {
             timestamp: format!(
                 "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -1114,7 +1185,7 @@ impl Transaction {
                 method: self.request_method.get().into_owned(),
                 protocol: self.request_protocol.get().into_owned(),
                 uri: self.request_uri.get().into_owned(),
-                length: i32::try_from(self.audit_request_body.len()).unwrap_or(i32::MAX),
+                length: i32::try_from(request_body.map_or(0, <[u8]>::len)).unwrap_or(i32::MAX),
                 args: self
                     .args
                     .iter()
@@ -1127,12 +1198,11 @@ impl Transaction {
             ..AuditTransaction::default()
         };
 
-        let has = |part| self.audit_log_parts.contains(&part);
         if has(AuditLogPart::RequestHeaders) {
             transaction.request.headers = Some(self.request_headers.entries());
         }
-        if has(AuditLogPart::RequestBody) {
-            transaction.request.body = text_of(&self.audit_request_body).into_owned();
+        if let Some(body) = request_body {
+            transaction.request.body = text_of(body).into_owned();
         }
         if has(AuditLogPart::UploadedFiles) {
             transaction.request.files = Some(
@@ -1154,16 +1224,15 @@ impl Transaction {
                     .collect(),
             );
         }
-        if has(AuditLogPart::IntermediaryResponseBody)
-            || has(AuditLogPart::ResponseBody)
-            || has(AuditLogPart::ResponseHeaders)
-        {
+        if has(AuditLogPart::IntermediaryResponseBody) || has(AuditLogPart::ResponseHeaders) {
             let mut response = AuditResponse {
                 protocol: self.response_protocol.get().into_owned(),
                 ..AuditResponse::default()
             };
-            if has(AuditLogPart::IntermediaryResponseBody) || has(AuditLogPart::ResponseBody) {
-                response.body = text_of(&self.audit_response_body).into_owned();
+            // Part E is the only response-body part: Go leaves part G empty
+            // (`internal/auditlog/formats.go:160-171`, v3.8.1).
+            if let Some(body) = response_body {
+                response.body = text_of(body).into_owned();
             }
             if has(AuditLogPart::ResponseHeaders) {
                 response.status = self.response_status.get().parse().unwrap_or(0);
@@ -1268,6 +1337,10 @@ impl Transaction {
             rule.evaluate(self, phase);
         }
         self.skip = 0;
+        // `skipAfter` is phase-scoped (Go's own action documentation says so). Clearing
+        // it here keeps a missing target marker from disabling every later phase,
+        // including logging, which Go's implementation accidentally does.
+        self.skip_after = None;
         if self.allow == AllowType::Phase {
             self.allow = AllowType::Unset;
         }
@@ -1495,8 +1568,15 @@ impl Transaction {
 
     /// Add the decoded pairs of a raw query string to the GET collections.
     fn add_query_arguments(&mut self, query: &[u8]) {
-        for (key, value) in parse_urlencoded(query) {
-            self.add_get_argument(key, value);
+        let mut count = self.args_get.value_count();
+        for (key, value) in split_urlencoded(query) {
+            // Check the raw pair before decoding it, so pairs past the limit are never decoded.
+            if !self.within_argument_limit(count) {
+                break;
+            }
+            let (key, value) = decode_pair(key, value);
+            self.insert_get_argument(&key, &value);
+            count = count.saturating_add(1);
         }
     }
 
@@ -1505,10 +1585,17 @@ impl Transaction {
         let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_get.value_count()) {
-            self.args_get.add_bytes(key, value);
-            self.args.add_bytes(key, value);
-            self.update_args_combined_size(key, value);
+            self.insert_get_argument(key, value);
         }
+    }
+
+    /// Insert an admitted query argument into `ARGS_GET` and `ARGS`.
+    ///
+    /// The caller has already checked the argument limit.
+    fn insert_get_argument(&mut self, key: &[u8], value: &[u8]) {
+        self.args_get.add_bytes(key, value);
+        self.args.add_bytes(key, value);
+        self.update_args_combined_size(key, value);
     }
 
     /// Add a request body argument to `ARGS_POST` and `ARGS`, keeping the decoded name bytes.
@@ -1516,10 +1603,17 @@ impl Transaction {
         let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_post.value_count()) {
-            self.args_post.add_bytes(key, value);
-            self.args.add_bytes(key, value);
-            self.update_args_combined_size(key, value);
+            self.insert_post_argument(key, value);
         }
+    }
+
+    /// Insert an admitted request body argument into `ARGS_POST` and `ARGS`.
+    ///
+    /// The caller has already checked the argument limit.
+    fn insert_post_argument(&mut self, key: &[u8], value: &[u8]) {
+        self.args_post.add_bytes(key, value);
+        self.args.add_bytes(key, value);
+        self.update_args_combined_size(key, value);
     }
 
     /// Add a connector-supplied path argument to `ARGS_PATH` and `ARGS`, keeping the name bytes.
@@ -1614,15 +1708,12 @@ impl Transaction {
         self.arguments_limit_reached.get_bytes() == b"1"
     }
 
-    /// Whether a detector operator skipped an input because it was too large to inspect.
+    /// Whether an operator reported that it could not inspect an input.
     ///
-    /// The `detectSQLi` and `detectXSS` operators scan values up to
-    /// [`libperfusion::MAX_INPUT_LEN`] bytes, the bound of libperfusion's public
-    /// detection wrappers. A longer value has no verdict, so the operator reports
-    /// [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected)
-    /// instead of matching. This method returns `true` once at least one detector
-    /// operator skipped an input, and the transaction variable
-    /// `TX.inspection_incomplete` is set to `"1"`; both stay clear otherwise.
+    /// The built-in `detectSQLi` and `detectXSS` operators scan every input, as Go does,
+    /// so they never set this. The signal is retained for a future operator with no
+    /// verdict: this method returns `true` and `TX.inspection_incomplete` is set to
+    /// `"1"` once such an operator reports it.
     ///
     /// By default the affected rule continues as a miss. Set
     /// [`WafConfig::detector_inspection_action`] to
@@ -1631,7 +1722,7 @@ impl Transaction {
         self.inspection_incomplete
     }
 
-    /// Record that a detector operator skipped an input and apply the configured policy.
+    /// Record that an operator could not inspect an input and apply the configured policy.
     ///
     /// The signal is recorded once, but `FailClosed` applies on every skipped input,
     /// including after a `ctl` switches the rule engine from `DetectionOnly` to `On`.
@@ -2131,7 +2222,11 @@ impl Drop for Transaction {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "transaction tests use fixed valid inputs")]
+#[expect(
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "transaction tests use fixed valid inputs"
+)]
 mod tests {
     use std::sync::{
         Arc, Mutex,
@@ -2139,7 +2234,7 @@ mod tests {
     };
 
     use super::{
-        BodyIngestionStats, Transaction, VariableCollection,
+        BodyIngestionStats, RuleGroup, Transaction, VariableCollection,
         body_buffer::{BufferFailure, inject_failure},
     };
     use crate::{
@@ -2164,6 +2259,61 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    #[test]
+    fn try_with_config_rejects_invalid_body_limits() {
+        for config in [
+            WafConfig {
+                request_body_limit: 0,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                request_body_limit: -1,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                response_body_limit: 0,
+                ..WafConfig::default()
+            },
+            WafConfig {
+                request_body_limit: 1_073_741_825,
+                ..WafConfig::default()
+            },
+        ] {
+            let Err(error) = Transaction::try_with_config("invalid-limit", Arc::new(config)) else {
+                panic!("invalid limit is accepted");
+            };
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn try_with_config_accepts_a_valid_limit_and_processes_the_body() {
+        let config = WafConfig {
+            request_body_access: true,
+            request_body_limit: 1024,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::try_with_config("valid-limit", Arc::new(config)).unwrap();
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"name=value"), None);
+
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsPost, Some("name")).as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid WAF configuration")]
+    fn with_config_panics_on_a_zero_body_limit() {
+        let config = WafConfig {
+            request_body_limit: 0,
+            ..WafConfig::default()
+        };
+        let _unused = Transaction::with_config("zero-limit", Arc::new(config));
     }
 
     #[test]
@@ -2641,6 +2791,148 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
     }
 
     #[test]
+    fn process_uri_stops_decoding_query_arguments_at_the_limit() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-limit", Arc::new(config));
+        tx.process_uri("/p?a=1&b=2&c=3&d=4", "GET", "HTTP/1.1");
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_get.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")).as_deref(), Some("2"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("c")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("d")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsCombinedSize, None).as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn urlencoded_body_stops_decoding_post_arguments_at_the_limit() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-body-limit", Arc::new(config));
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"a=1&b=2&c=3&d=4"), None);
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_post.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("b")).as_deref(), Some("2"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("c")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("d")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsCombinedSize, None).as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn query_limit_counts_arguments_already_present() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-prefilled", Arc::new(config));
+        tx.add_get_argument("pre", "0");
+        tx.process_uri("/p?a=1&b=2", "GET", "HTTP/1.1");
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_get.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")), None);
+    }
+
+    #[test]
+    fn query_limit_is_not_flagged_when_the_query_fits_exactly() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut fits = Transaction::with_config("tx-query-fits", Arc::new(config.clone()));
+        fits.process_uri("/p?a=1&b=2", "GET", "HTTP/1.1");
+
+        assert!(!fits.arguments_limit_reached());
+        assert_eq!(fits.args_get.value_count(), 2);
+
+        let mut over = Transaction::with_config("tx-query-over", Arc::new(config));
+        over.process_uri("/p?a=1&b=2&c=3", "GET", "HTTP/1.1");
+
+        assert!(over.arguments_limit_reached());
+        assert_eq!(over.args_get.value_count(), 2);
+    }
+
+    #[test]
+    fn query_limit_ignores_empty_pairs() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-empty", Arc::new(config));
+        tx.process_uri("/p?&&a=1&&b=2&&", "GET", "HTTP/1.1");
+
+        assert!(!tx.arguments_limit_reached());
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn urlencoded_body_limit_counts_arguments_already_present() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-body-prefilled", Arc::new(config));
+        tx.add_post_argument("pre", "0");
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"a=1&b=2"), None);
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_post.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("b")), None);
+    }
+
+    #[test]
+    fn urlencoded_body_limit_is_not_flagged_when_the_body_fits_exactly() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        // A body can be processed once per transaction, so each case gets its own one.
+        let body_tx = |id: &str, body: &[u8]| {
+            let mut tx = Transaction::with_config(id, Arc::new(config.clone()));
+            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            tx.process_request_headers();
+            assert_eq!(tx.process_request_body(body), None);
+            tx
+        };
+
+        let fits = body_tx("tx-body-fits", b"a=1&b=2");
+        assert!(!fits.arguments_limit_reached());
+        assert_eq!(fits.args_post.value_count(), 2);
+
+        let over = body_tx("tx-body-over", b"a=1&b=2&c=3");
+        assert!(over.arguments_limit_reached());
+        assert_eq!(over.args_post.value_count(), 2);
+
+        let empty = body_tx("tx-body-empty", b"&&a=1&&b=2&&");
+        assert!(!empty.arguments_limit_reached());
+        assert_eq!(empty.args_post.value_count(), 2);
+    }
+
+    #[test]
     fn operator_outputs_clear_stale_tx_capture_variables() {
         let mut tx = Transaction::new("tx-captures");
         for index in 0..10 {
@@ -2901,10 +3193,16 @@ field value\r\n\
         assert_eq!(tx.process_request_body(body), None);
 
         let files = tx.find_matches(&VariableSpec::new_string(RuleVariable::Files, String::new()));
-        assert_eq!(files.len(), 1);
         assert_eq!(
-            files.first().map(|matched| matched.value.as_slice()),
-            Some(&b"first.txt"[..])
+            files.iter().map(|matched| matched.value.as_slice()).collect::<Vec<_>>(),
+            [&b"first.txt"[..], &b"second.txt"[..]],
+            "past the limit every upload is still recorded in FILES"
+        );
+        assert_eq!(
+            tx.find_matches(&VariableSpec::new_string(RuleVariable::FilesTmpNames, String::new()))
+                .len(),
+            1,
+            "only the first upload is written to disk"
         );
         assert_eq!(
             tx.get_variable(RuleVariable::ArgsPost, Some("after")).as_deref(),
@@ -3110,6 +3408,11 @@ payload\r\n\
         );
     }
 
+    /// Build a transaction without config validation so zero limits stay testable.
+    fn transaction_with_unvalidated_config(id: &str, config: WafConfig) -> Transaction {
+        Transaction::with_rules(Arc::new(config), Arc::new(RuleGroup::new()), id)
+    }
+
     /// Build a transaction that inspects a RAW request body with the supplied limits.
     fn request_body_transaction(id: &str, limit: i64, action: BodyLimitAction) -> Transaction {
         let config = WafConfig {
@@ -3118,7 +3421,7 @@ payload\r\n\
             request_body_limit_action: action,
             ..WafConfig::default()
         };
-        let mut tx = Transaction::with_config(id, Arc::new(config));
+        let mut tx = transaction_with_unvalidated_config(id, config);
         tx.process_request_headers();
         tx.set_request_body_processor("RAW");
         tx
@@ -3400,7 +3703,7 @@ payload\r\n\
             audit_engine: AuditEngineStatus::On,
             audit_log_parts: vec![
                 AuditLogPart::Header,
-                AuditLogPart::ResponseBody,
+                AuditLogPart::IntermediaryResponseBody,
                 AuditLogPart::EndMarker,
             ],
             ..WafConfig::default()
@@ -3418,6 +3721,30 @@ payload\r\n\
         );
         assert_eq!(tx.response_body_stats(), BodyIngestionStats::default());
         assert_eq!(tx.audit_log().transaction.response.unwrap().body, "");
+    }
+
+    #[test]
+    fn audit_part_g_is_empty_and_only_e_carries_the_response_body() {
+        let config = WafConfig {
+            response_body_access: true,
+            response_body_limit: 16,
+            response_body_mime_types: vec!["text/plain".to_owned()],
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABCDEFGHZ").unwrap(),
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("audit-part-g", Arc::new(config));
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.process_response_body(b"secret");
+
+        let log = tx.audit_log();
+        assert_eq!(log.transaction.response.as_ref().unwrap().body, "secret");
+        let native = log.format(crate::types::AuditLogFormat::Native);
+        assert!(native.contains("-E--\nsecret\n"), "part E holds the body: {native}");
+        assert!(native.contains("-G--\n\n"), "part G stays empty: {native}");
     }
 
     #[test]
@@ -4329,7 +4656,7 @@ v\r\n\
                 response_body_mime_types: vec!["text/plain".to_owned()],
                 ..WafConfig::default()
             };
-            let mut tx = Transaction::with_config("response-limit-zero", Arc::new(config));
+            let mut tx = transaction_with_unvalidated_config("response-limit-zero", config);
             tx.process_request_headers();
             tx.process_request_body(b"");
             tx.add_response_header("Content-Type", "text/plain");
@@ -4349,7 +4676,7 @@ v\r\n\
                 response_body_mime_types: vec!["text/plain".to_owned()],
                 ..WafConfig::default()
             };
-            let mut tx = Transaction::with_config("response-limit-zero-body", Arc::new(config));
+            let mut tx = transaction_with_unvalidated_config("response-limit-zero-body", config);
             tx.process_request_headers();
             tx.process_request_body(b"");
             tx.add_response_header("Content-Type", "text/plain");
@@ -4379,7 +4706,7 @@ v\r\n\
             response_body_mime_types: vec!["text/plain".to_owned()],
             ..WafConfig::default()
         };
-        let mut tx = Transaction::with_config("empty-response-limit", Arc::new(config));
+        let mut tx = transaction_with_unvalidated_config("empty-response-limit", config);
         tx.process_request_headers();
         tx.process_request_body(b"");
         tx.add_response_header("Content-Type", "text/plain");
@@ -4836,6 +5163,23 @@ v\r\n\
     }
 
     #[test]
+    fn a_missing_skip_after_marker_does_not_leak_into_the_next_phase() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:20,phase:1,skipAfter:NO_MARKER,pass\"\n\
+                 SecAction \"id:21,phase:1,deny\"\n\
+                 SecAction \"id:22,phase:2,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("skip-after-missing");
+
+        assert!(tx.process_request_headers().is_none());
+        assert_eq!(tx.process_request_body(b"").unwrap().rule_id, 22);
+    }
+
+    #[test]
     fn audit_logging_records_matches_and_request_response_data_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.json");
@@ -4846,7 +5190,7 @@ v\r\n\
             audit_engine: AuditEngineStatus::On,
             audit_log: path.to_string_lossy().into_owned(),
             audit_log_format: crate::types::AuditLogFormat::Json,
-            audit_log_parts: crate::types::parse_audit_log_parts("ABCFGHKZ").unwrap(),
+            audit_log_parts: crate::types::parse_audit_log_parts("ABCEFHKZ").unwrap(),
             request_body_access: true,
             response_body_access: true,
             response_body_mime_types: vec!["text/plain".to_owned()],
@@ -6374,7 +6718,7 @@ content\r\n\
     }
 
     #[test]
-    fn detector_reports_an_over_bound_input_as_not_inspected() {
+    fn detector_scans_an_input_past_the_wrapper_bound() {
         for (operator, payload, rule_id) in [
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 612),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 613),
@@ -6387,13 +6731,9 @@ content\r\n\
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
 
             assert!(tx.process_request_headers().is_none());
-            assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
-            assert!(tx.inspection_incomplete());
-            assert_eq!(
-                tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                    .as_deref(),
-                Some("1")
-            );
+            assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
+            assert!(!tx.inspection_incomplete());
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
         }
     }
 
@@ -6415,7 +6755,7 @@ content\r\n\
     }
 
     #[test]
-    fn fail_closed_interrupts_when_a_detector_cannot_inspect() {
+    fn fail_closed_does_not_interrupt_a_scanned_detector() {
         for (operator, payload, rule_id) in [
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 616),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 617),
@@ -6427,11 +6767,9 @@ content\r\n\
             let mut tx = waf.new_transaction_with_id(format!("detector-fail-closed-{operator}"));
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
 
-            let interruption = tx.process_request_headers().unwrap();
-            assert_eq!(interruption.rule_id, rule_id);
-            assert_eq!(interruption.action, "deny");
-            assert!(interruption.data.contains("inspection bound"));
-            assert!(tx.inspection_incomplete());
+            assert!(tx.process_request_headers().is_none());
+            assert!(!tx.inspection_incomplete());
+            assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
         }
     }
 
@@ -6450,7 +6788,7 @@ content\r\n\
     }
 
     #[test]
-    fn fail_closed_interrupts_after_ctl_switches_from_detection_only() {
+    fn a_ctl_switching_to_on_still_scans_over_bound_detector_input() {
         let waf = detector_waf(
             "SecRuleEngine DetectionOnly\n\
              SecRule ARGS:q \"@detectSQLi\" \"id:630,phase:1,pass\"\n\
@@ -6462,15 +6800,11 @@ content\r\n\
         let mut tx = waf.new_transaction_with_id("detector-fail-closed-ctl-on");
         tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1));
 
-        let interruption = tx.process_request_headers().unwrap();
-        assert_eq!(interruption.rule_id, 633);
-        assert_eq!(interruption.action, "deny");
-        assert_eq!(interruption.status, 500);
-        assert!(interruption.data.contains("inspection bound"));
-        // Detection-only mode keeps the first would-be interruption from rule 630.
-        let would_be = tx.would_be_interruption().unwrap();
-        assert_eq!(would_be.rule_id, 630);
-        assert!(tx.inspection_incomplete());
+        assert!(tx.process_request_headers().is_none());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 630));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 633));
+        assert!(tx.would_be_interruption().is_none());
+        assert!(!tx.inspection_incomplete());
     }
 
     #[test]
@@ -6496,7 +6830,7 @@ content\r\n\
     }
 
     #[test]
-    fn record_only_keeps_repeated_skipped_inputs_non_blocking() {
+    fn record_only_detects_every_over_bound_input() {
         let waf = detector_waf(
             "SecRule ARGS:q \"@detectSQLi\" \"id:634,phase:1,pass\"\n\
              SecRule ARGS:r \"@detectXSS\" \"id:635,phase:1,pass\"",
@@ -6510,17 +6844,13 @@ content\r\n\
         );
 
         assert!(tx.process_request_headers().is_none());
-        assert!(tx.inspection_incomplete());
-        assert_eq!(
-            tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                .as_deref(),
-            Some("1")
-        );
-        assert!(tx.matched_rules().is_empty());
+        assert!(!tx.inspection_incomplete());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 634));
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 635));
     }
 
     #[test]
-    fn inspection_signal_survives_a_rule_chain() {
+    fn a_detector_chain_matches_over_bound_input_without_a_signal() {
         let waf = detector_waf(
             "SecRule ARGS:q \"@contains needle\" \"id:619,phase:1,pass,chain\"\n\
              SecRule ARGS:q \"@detectSQLi\" \"\"\n\
@@ -6534,9 +6864,9 @@ content\r\n\
         );
 
         assert!(tx.process_request_headers().is_none());
-        assert!(tx.inspection_incomplete());
-        assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
-        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
+        assert!(!tx.inspection_incomplete());
+        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
+        assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
     }
 
     #[test]

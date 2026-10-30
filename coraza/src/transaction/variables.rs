@@ -304,14 +304,13 @@ impl Transaction {
     }
 
     /// Find the values selected by a rule after applying transaction-local target removals.
+    ///
+    /// Exclusions are applied while selecting, before a `&VAR` count is taken, as Go does
+    /// (`internal/corazawaf/transaction.go:681-712`, v3.8.1): a removed key is not counted,
+    /// and a count-mode match is never dropped.
     pub(crate) fn find_matches_for_rule(&self, spec: &VariableSpec, id: i32) -> Vec<MatchData> {
         if !self.removed_rule_targets.contains_key(&id) {
             return self.find_matches(spec);
-        }
-        if !self.multiphase_evaluation() {
-            let mut matches = self.find_matches(spec);
-            matches.retain(|matched| !self.is_rule_target_removed(id, matched.variable, &matched.key));
-            return matches;
         }
         let collection = self.collection(spec.variable()).map(|collection| match collection {
             VariableCollection::Single(single) => CollectionView::Single(single),

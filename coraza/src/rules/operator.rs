@@ -46,10 +46,10 @@ impl RuleOperator {
         self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
     }
 
-    /// Whether the wrapped operator is a detector bounded by the inspection limit.
+    /// Whether the wrapped operator reports the transaction's inspection signal.
     ///
-    /// Only a detector's [`OperatorOutcome::NotInspected`] is the transaction's
-    /// inspection-incomplete signal; see [`OperatorEnum::is_detector`].
+    /// See [`OperatorEnum::is_detector`]; the built-in detectors scan every input,
+    /// so an [`OperatorOutcome::NotInspected`] from another operator is a plain miss.
     pub(crate) fn is_detector(&self) -> bool {
         self.operator.is_detector()
     }
@@ -57,10 +57,9 @@ impl RuleOperator {
     /// Evaluate one value, applying SecLang negation after the operator runs.
     ///
     /// Negation flips [`OperatorOutcome::Matched`] and
-    /// [`OperatorOutcome::NotMatched`]. A detector's skipped inspection stays
-    /// [`OperatorOutcome::NotInspected`], because a negated detector has no verdict for
-    /// the input either. A host operator reports `NotMatched` when it cannot run, so its
-    /// negation matches on that failure as Go's does.
+    /// [`OperatorOutcome::NotMatched`]. An operator that reports
+    /// [`OperatorOutcome::NotInspected`] keeps that outcome, because it has no
+    /// verdict for the input either.
     pub(crate) fn evaluate_outcome(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
         match self.operator.evaluate_outcome(tx, input, out) {
             OperatorOutcome::Matched if self.negated => OperatorOutcome::NotMatched,
@@ -96,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn negation_keeps_a_skipped_inspection() {
+    fn negation_inverts_a_scanned_detector() {
         let operator = OperatorEnum::new("detectSQLi", "").unwrap();
         let operator = RuleOperator::new(operator, true);
         let tx = Transaction::new("test");
@@ -104,7 +103,7 @@ mod tests {
 
         assert_eq!(
             operator.evaluate_outcome(&tx, &input, &mut Outputs::default()),
-            OperatorOutcome::NotInspected
+            OperatorOutcome::Matched
         );
     }
 }

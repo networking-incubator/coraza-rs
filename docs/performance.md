@@ -721,3 +721,108 @@ Rust 1.99.1 ran on the AMD Ryzen 7 PRO 7840HS under Linux 7.2.12 with CPU
 frequency unlocked. The 0.91 candidate/base median ratio is within the base's
 same-tree spread; body-processor dispatch shares the single-match cost measured
 for custom actions.
+
+## Coraza Go-versus-Rust coordinator baseline (2026-10-30)
+
+First recorded run through the `benchmarks/coraza` coordinator ([#101](https://github.com/networking-incubator/coraza-rs/issues/101)): identity gate, correctness parity, then paired alternating timing repetitions. This section is the retained summary record; the raw `run.json` and per-round logs are not committed (see `BENCH_OUT/bench-<id>/` locally).
+
+### Identity
+
+- Repository revision `fa24e79d1ca46e0a4b0bede7ca24216d7b2bd166` (tracked files unmodified, `dirty: false`), including the argument-limit fix (#134).
+- Go engine: **upstream profile**, `github.com/corazawaf/coraza/v3 v3.8.1` resolved from the module cache (no local checkout, no replace).
+- Workload `coraza-common-subset-v1`, 6 cases, manifest SHA-256 `b899cf424c2aa81b3291b807d578b65114a98fc84bd600fb26f78c72fd1094a3`.
+- Tools: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `cargo 1.99.1 (5f94df478 2026-08-27)`, `go version go1.27.3-X:nodwarf5 linux/amd64`.
+- Host: AMD Ryzen 7 PRO 7840HS (8 cores / 16 threads), laptop, CPU governor not forced. Both timing drivers were pinned to one core.
+
+### Commands (reproducible)
+
+```sh
+RUN_BIN=/path/to/this/run        # writable directory for this run's prebuilt drivers
+mkdir -p "$RUN_BIN" && export RUN_BIN
+unset GOFLAGS                    # an inherited -modfile would select the local Go profile
+
+make coraza-parity CORAZA_GO_PROFILE=upstream
+
+cargo build --locked --release -p coraza --bench coraza_workload --message-format=json \
+  >"$RUN_BIN/rust-build.json"
+RUST_DRIVER="$(jq -r 'select(.reason=="compiler-artifact" and .executable!=null and .target.name=="coraza_workload") | .executable' \
+  "$RUN_BIN/rust-build.json" | head -n 1)"
+(cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local GOFLAGS= \
+  go build -o "$RUN_BIN/coraza-go-driver" ./cmd/bench)
+
+make coraza-bench CORAZA_GO_PROFILE=upstream \
+  CORAZA_RUST_DRIVER_CMD="taskset -c 3 $RUST_DRIVER" \
+  CORAZA_GO_DRIVER_CMD="taskset -c 3 $RUN_BIN/coraza-go-driver"
+```
+
+The drivers are prebuilt with the coordinator's default build commands and pinned with `taskset` through the documented `CORAZA_*_DRIVER_CMD` overrides; the coordinator records the exact commands it ran in `run.json`. `CORAZA_GO_PROFILE=upstream` makes the identity gate require the published module — the recorded run used the default `auto`, which resolved to upstream — and clearing `GOFLAGS` prevents an inherited `-modfile` from silently selecting the local profile. Resolving the Rust driver path needs `jq`. Defaults otherwise: 3 repetitions, 1000 iterations.
+
+### Correctness
+
+The parity gate passed all 6 cases before any timing (a ratio is published only for cases that passed).
+
+### Timing
+
+Per-transaction medians over 3,000 samples per engine (3 repetitions × 1000 iterations, alternating engine order, both pinned to one core). `ratio` is the Rust median divided by the Go median; below 1 means Rust was faster.
+
+| case | Rust median (ns) | Go median (ns) | ratio | Rust min–max (ns) | Go min–max (ns) |
+|---|---:|---:|---:|---|---|
+| get-benign | 5,199 | 5,866 | 0.886 | 4,880–86,072 | 4,108–467,399 |
+| get-attack | 5,641 | 7,213 | 0.782 | 5,290–15,599 | 5,350–273,384 |
+| form-benign | 5,411 | 7,414 | 0.730 | 5,060–51,386 | 5,300–225,995 |
+| form-attack | 6,001 | 9,087 | 0.660 | 5,571–27,121 | 6,452–300,175 |
+| json-benign | 6,693 | 7,785 | 0.860 | 6,282–21,290 | 5,661–150,834 |
+| json-attack | 7,113 | 9,397.5 | 0.757 | 6,712–17,653 | 6,763–124,685 |
+
+Rust is faster on every case (ratio 0.660–0.886). The Rust maximum is also lower on every case (for example `get-benign`: 86,072 ns against 467,399 ns). The recorded maxima do not establish the cause of the Go tail; it may include garbage-collection pauses, which the medians do not reflect.
+
+### Memory
+
+- Driver peak RSS over the same workload (1000 iterations, pinned, `/usr/bin/time %M`): **Rust 6,056 KB against Go 19,608 KB** (about 3.2× less resident memory).
+- Per-transaction heap allocations under CRS v4.30.0 PL1 (supplementary, external instrumentation — a counting global allocator for Rust and `runtime.MemStats` for Go, because the in-repo allocation seam on the collection types does not exist yet; that seam remains deferred as #101 allowed):
+
+| request family | Rust allocs | Rust bytes | Go allocs | Go bytes |
+|---|---:|---:|---:|---:|
+| benign GET | 8,469 | 522,302 | 2,860 | 186,200 |
+| GET, 50 arguments | 81,244 | 3,817,750 | 5,525 | 3,282,416 |
+| urlencoded POST, 30 fields | 51,494 | 2,261,439 | 5,975 | 955,336 |
+| JSON POST | 43,990 | 2,284,605 | 4,891 | 746,104 |
+
+Rust allocates more often per transaction (about 3–15×) yet is faster on every measured latency and throughput workload; the allocation counts do not gate performance here. Context and further measurements: [#123](https://github.com/networking-incubator/coraza-rs/issues/123).
+
+### Qualifications
+
+- The workload is the 6-case common subset with small policies, not CRS; the supplementary allocation numbers above are the CRS-context measurements. The audit's wider CRS PL1/PL4 latency, throughput and scaling measurements used a separate external harness and are recorded in [#123](https://github.com/networking-incubator/coraza-rs/issues/123); they agree in direction with this run.
+- Laptop host with frequency scaling; medians over 3,000 pinned samples per engine, but treat small percentage differences as noise.
+- The libperfusion `speed`/`compare`/`scaling` benches are a separate gate for detector changes and are tracked in [#137](https://github.com/networking-incubator/coraza-rs/issues/137).
+
+On this workload and host, coraza-rs at `fa24e79` is faster than Go Coraza v3.8.1 on every case and uses less resident memory. That is the extent of the claim this record supports.
+
+## Map insertion-order change (2026-10-30)
+
+Before/after gate for the `Map` collection switching from `HashMap` to `IndexMap` storage so iteration follows insertion order ([#136](https://github.com/networking-incubator/coraza-rs/issues/136); keyless variable selections had hash-random order, which could flip verdicts for identical requests). The libperfusion `speed`/`compare`/`scaling` benches do not exercise `coraza`'s collections, so the applicable gate is the coordinator protocol above.
+
+### Identity
+
+- Base: `d2db26b` plus a bench-only commit applying the candidate's workload-driver boxing (`gate/base-plus-driverbox`, `6a4fb45`), so both trees pay the same per-transaction harness allocation and the comparison isolates the engine change. Candidate: `42cf930` (the two-commit insertion-order change).
+- Same workload (`coraza-common-subset-v1`, 6 cases), tools (`rustc 1.99.1`, `go1.27.3-X:nodwarf5`), host (AMD Ryzen 7 PRO 7840HS, Linux 7.2.12, frequency unlocked) and pinned drivers (CPU 3) as the coordinator baseline record above. `GOFLAGS` cleared; Go profile `upstream`.
+- Four `make coraza-bench` rounds per tree (3 repetitions × 1,000 iterations each, alternating engine order inside every round), alternating which tree ran first across rounds (base-first twice, candidate-first twice). The coordinator's correctness parity gate passed on every round for both trees.
+
+### Timing
+
+Per-transaction Rust medians over 4 rounds (each itself the median of 3,000 samples); `ratio` is candidate over base:
+
+| case | base median (ns) | base range | candidate median (ns) | candidate range | ratio |
+|---|---:|---|---:|---|---:|
+| get-benign | 5,155 | 5,089–5,240 | 5,160 | 5,090–5,190 | 1.001 |
+| get-attack | 5,568 | 5,511–5,651 | 5,550 | 5,430–5,571 | 0.997 |
+| form-benign | 5,485 | 5,381–5,581 | 5,520 | 5,430–5,541 | 1.006 |
+| form-attack | 5,921 | 5,861–5,971 | 5,946 | 5,851–5,991 | 1.004 |
+| json-benign | 6,612 | 6,492–6,652 | 6,748 | 6,703–6,783 | 1.020 |
+| json-attack | 6,943 | 6,863–7,074 | 7,084 | 7,003–7,203 | 1.020 |
+
+The GET and form cases are within repeated-run spread. The JSON cases show a consistent ~2% regression (non-overlapping round ranges on `json-benign`; ~135–140 ns per transaction), attributed to `IndexMap` maintenance on the JSON argument ingestion path (each distinct key now appends to the entry vector and the hash index, and both allocations grow together). This host cannot resolve effects near 1%, so the ~2% JSON figure is an upper bound on the real cost.
+
+### Verdict
+
+Accepted. The change removes non-deterministic verdicts (a correctness defect) for a cost within spread on four of six cases and ~2% on the JSON cases. Rust remains faster than Go on every case in the paired rounds. Per-transaction allocation counts were not re-measured for this change; the JSON ingestion path performs more bookkeeping allocations per distinct key by construction.

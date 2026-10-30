@@ -13,11 +13,19 @@ This repository uses GitHub Actions to block risky changes early.
   feature set, so the feature-gated operators keep their tests.
 - `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
   integration checks against the pinned Envoy 1.40.0 image.
+- `envoy-wasm-crs`: fetches the CRS release pinned in `envoy-coraza/crs.pin`
+  (verifying its SHA-256), builds the filter with the non-default `embed-crs`
+  feature, and runs `make test-envoy-wasm-crs`. It also runs the Envoy lifecycle
+  harness against the feature-on artifact via
+  `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs`; that run adds a `crs.local`
+  policy that includes the embedded tree and asserts a SQL injection request is
+  denied by CRS rule 949110.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
-- Feature matrix: test and lint each feature combo with `cargo-hack`; also test
-  the digest-free FIPS profile with
+- Feature matrix: test and lint each feature combo with `cargo-hack`; the job
+  fetches the pinned CRS release first so `envoy-coraza`'s `embed-crs` feature
+  can build. Also test the digest-free FIPS profile with
   `cargo test -p coraza --no-default-features --features fips`, then assert its
   graph omits both digest crates with
   `tree=$(cargo tree -p coraza --no-default-features --features fips) && ! printf '%s\n' "$tree" | grep -Eq '(^|[[:space:]])(md-5|sha1) v'`.
@@ -126,6 +134,8 @@ by the fixture regeneration command.
 - `cargo deny check`
 - `cargo deny --all-features check`, which also resolves the feature-gated
   dependencies (`MIT-0` among them)
+- Any `envoy-coraza/crs.pin` bump must be reconciled by a reviewer against the
+  upstream release notes and the published asset digest before merging.
 
 ### `coverage`
 
@@ -151,6 +161,8 @@ by the fixture regeneration command.
 make lint
 make lint-extra
 make test
+make crs-fetch
+make test-envoy-wasm-crs
 make go-harness-check
 make ftw-runner-check
 make coraza-example-test
@@ -204,3 +216,35 @@ git commit -S -s -m "type(scope): summary"
 - Third-party GitHub Actions must be pinned to commit SHAs.
 - Do not use floating refs (`@main`, `@master`, `@vX`).
 - Bump pinned SHAs regularly to current stable releases.
+
+## Releases
+
+`.github/workflows/release.yml` publishes releases on a nightly schedule
+(03:00 UTC, also via `workflow_dispatch`) and on manual `vX.Y.Z` tag pushes. It
+builds the `envoy-coraza` filter for `wasm32-wasip1` (without and with the
+`embed-crs` feature, using the same `--locked --release` flags as
+`make build-envoy-wasm`/`build-envoy-wasm-crs`), stages the binaries as
+`release-artifacts/{coraza-rs,coraza-rs-crs}.wasm`, and runs GoReleaser
+(`.goreleaser.yaml`). GoReleaser uploads the raw `.wasm` files as release
+assets and packages each into a scratch Docker image
+(`ghcr.io/networking-incubator/coraza-rs` and `...-crs`, usable directly as
+Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
+nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
+tag is the newest one, so an older backported tag cannot move it backwards).
+
+OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
+the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
+`GORELEASER_CURRENT_TAG` environment variable and GoReleaser creates the tag
+and prerelease when publishing; a same-day rerun fails instead of moving the
+existing tag. For a manual release, push a normal `vX.Y.Z` tag. To test
+packaging locally without publishing, first stage the WASM files exactly as
+the workflow does, then run the snapshot (the config expects them to exist):
+
+```console
+./envoy-coraza/crs-fetch.sh
+cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
+cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
+cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
+cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+goreleaser release --snapshot --clean
+```

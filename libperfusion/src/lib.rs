@@ -78,12 +78,13 @@ pub mod internals {
     }
 }
 
-/// Maximum input length accepted by the top-level detection functions.
+/// Maximum input length accepted by the convenience detection functions.
 ///
-/// Inputs longer than 65 536 bytes are rejected (returning `None` / `false`)
-/// without scanning, providing a defense-in-depth bound on per-request work.
-/// The fuzzer uses a 4× larger window (`-max_len=262144`) to stress-test
-/// the rejection path.
+/// [`sqli()`], [`sqli_with_dialect()`], [`xss()`], [`xss_with_context()`] and
+/// [`xss_in_context()`] reject inputs longer than 65 536 bytes without scanning,
+/// providing a defense-in-depth bound on per-request work. Callers that must
+/// inspect any length, as Coraza's operators do, use [`sqli_with_limit()`] or
+/// [`xss_with_limit()`] with `input.len()`.
 pub const MAX_INPUT_LEN: usize = 65_536;
 
 /// Checks `input` for SQL injection.

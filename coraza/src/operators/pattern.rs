@@ -18,7 +18,7 @@
 // Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regular expression matching with transaction macro expansion.
+//! Regular expression matching.
 
 use std::path::Path;
 
@@ -26,25 +26,23 @@ use aho_corasick::AhoCorasick;
 
 use super::{Datasets, Macro, MacroError, Operator, Outputs, simple::contains_bytes};
 use crate::{
-    rule_data::{FileSystem, RuleData, read_to_string},
+    rule_data::{FileSystem, RuleData},
     transaction::Transaction,
-    transformations::text_of,
+    transformations::{RegexText, lowercase},
     utils::strings::x2c,
 };
 
 /// Regular expression operator with Coraza's multiline and dotall defaults.
 #[derive(Debug, Clone)]
 pub struct Rx {
-    /// Pattern text with parsed transaction-variable references.
-    macro_param: Macro,
-    /// Compiled pattern when the parameter has no transaction variables.
-    cached_regex: Option<CompiledRx>,
+    /// Compiled pattern.
+    regex: CompiledRx,
 }
 
 /// A compiled pattern that matches either Unicode text or raw bytes.
 #[derive(Debug, Clone)]
 enum CompiledRx {
-    /// A Unicode regular expression using lossy input text when needed.
+    /// A Unicode regular expression over Go-decoded text.
     Text(regex::Regex),
     /// A byte regular expression for patterns that spell invalid UTF-8 bytes.
     Bytes(regex::bytes::Regex),
@@ -60,6 +58,7 @@ impl CompiledRx {
                 .build()
                 .map(Self::Bytes)
         } else {
+            let pattern = ascii_perl_classes(pattern);
             regex::Regex::new(&format!("(?sm){pattern}")).map(Self::Text)
         }
     }
@@ -67,7 +66,7 @@ impl CompiledRx {
     /// Check whether the pattern matches the supplied bytes.
     fn is_match(&self, input: &[u8]) -> bool {
         match self {
-            Self::Text(regex) => regex.is_match(&text_of(input)),
+            Self::Text(regex) => regex.is_match(RegexText::for_match(input).as_str()),
             Self::Bytes(regex) => regex.is_match(input),
         }
     }
@@ -75,12 +74,20 @@ impl CompiledRx {
     /// Return the match and all capture groups as bytes.
     fn captures(&self, input: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
         match self {
-            Self::Text(regex) => regex.captures(&text_of(input)).map(|captures| {
-                captures
-                    .iter()
-                    .map(|group| group.map(|group| group.as_str().as_bytes().to_vec()))
-                    .collect()
-            }),
+            Self::Text(regex) => {
+                let text = RegexText::new(input);
+                regex.captures(text.as_str()).map(|captures| {
+                    captures
+                        .iter()
+                        .map(|group| {
+                            group.map(|group| {
+                                let range = text.original_range(group.start(), group.end());
+                                input.get(range).unwrap_or_default().to_vec()
+                            })
+                        })
+                        .collect()
+                })
+            },
             Self::Bytes(regex) => regex.captures(input).map(|captures| {
                 captures
                     .iter()
@@ -89,6 +96,237 @@ impl CompiledRx {
             }),
         }
     }
+}
+
+/// Rewrite Go's ASCII-only Perl classes as Unicode-disabled inline groups.
+///
+/// Go defines `\b`, `\B`, `\w`, `\W`, `\d`, `\D`, `\s` and `\S` in terms of
+/// ASCII. Escaped literals such as `\\w` and `\b` inside a character class
+/// (a backspace there) are left alone.
+fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
+    let mut result = String::with_capacity(pattern.len());
+    let mut changed = false;
+    let mut offset = 0;
+
+    while let Some(rest) = pattern.get(offset..) {
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        let length = character.len_utf8();
+
+        if character == '['
+            && let Some(end) = class_end(pattern, offset)
+        {
+            let class = pattern.get(offset..end).unwrap_or_default();
+            if let Some(rewritten) = rewrite_class(class) {
+                result.push_str(&rewritten);
+                changed = true;
+            } else {
+                result.push_str(class);
+            }
+            offset = end;
+            continue;
+        }
+
+        if character == '\\' {
+            if let Some(escaped) = rest.get(length..).and_then(|tail| tail.chars().next()) {
+                let escaped_length = escaped.len_utf8();
+                match escaped {
+                    'b' | 'B' => {
+                        result.push_str("(?-u:\\");
+                        result.push(escaped);
+                        result.push(')');
+                    },
+                    // A class, not `(?-u:\w)`: under `(?i)` Go folds the ASCII
+                    // word class to `ſ` and Kelvin sign, as the class does.
+                    'w' => result.push_str("[0-9A-Za-z_]"),
+                    'W' => result.push_str("[^0-9A-Za-z_]"),
+                    'd' => result.push_str("[0-9]"),
+                    'D' => result.push_str("[^0-9]"),
+                    // Rust's ASCII `\s` includes vertical tab; Go's does not.
+                    's' => result.push_str(r"[\t\n\x0c\r ]"),
+                    'S' => result.push_str(r"[^\t\n\x0c\r ]"),
+                    _ => {
+                        result.push('\\');
+                        result.push(escaped);
+                    },
+                }
+                changed |= matches!(escaped, 'b' | 'B' | 'w' | 'W' | 'd' | 'D' | 's' | 'S');
+                offset += length + escaped_length;
+                continue;
+            }
+            result.push('\\');
+            offset += length;
+            continue;
+        }
+
+        result.push(character);
+        offset += length;
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(result)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    }
+}
+
+/// The byte offset just past a `[:name:]` POSIX class, or `None` if it is not one.
+fn posix_class_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'[') || bytes.get(start + 1) != Some(&b':') {
+        return None;
+    }
+    let mut offset = start + 2;
+    while offset + 1 < bytes.len() {
+        if bytes.get(offset) == Some(&b':') && bytes.get(offset + 1) == Some(&b']') {
+            return Some(offset + 2);
+        }
+        offset += 1;
+    }
+    None
+}
+
+/// The byte offset just past the character class starting at `start`.
+fn class_end(pattern: &str, start: usize) -> Option<usize> {
+    let bytes = pattern.as_bytes();
+    let mut offset = start.checked_add(1)?;
+    if bytes.get(offset) == Some(&b'^') {
+        offset += 1;
+    }
+    let mut first = true;
+    while let Some(&byte) = bytes.get(offset) {
+        match byte {
+            b'\\' => {
+                offset = offset.saturating_add(2);
+                first = false;
+            },
+            b'[' if bytes.get(offset + 1) == Some(&b':') => {
+                // Only `[:name:]` is a POSIX class; `[.` and `[=` are literal
+                // brackets in Go. An unterminated `[:` stays a literal `[` so a
+                // later `]` still closes the class.
+                if let Some(end) = posix_class_end(bytes, offset) {
+                    offset = end;
+                } else {
+                    offset += 1;
+                }
+                first = false;
+            },
+            b']' if first => {
+                offset += 1;
+                first = false;
+            },
+            b']' => return Some(offset + 1),
+            _ => {
+                offset += 1;
+                first = false;
+            },
+        }
+    }
+    None
+}
+
+/// Rewrite one character class containing a Perl class or Rust-only class syntax.
+///
+/// Rust's regex supports class nesting, so `[\s\S]` becomes
+/// `[[\t\n\x0c\r ][^\t\n\x0c\r ]]`, which is exhaustive, and `[^\W]` becomes
+/// `[^[^0-9A-Za-z_]]`, the ASCII word class. Rust's class-set operators and nested
+/// `[` syntax are escaped so Go's literal reading survives. This preserves Go's
+/// positive and negative semantics without lookaround (which the regex crate does
+/// not support).
+fn rewrite_class(class: &str) -> Option<String> {
+    let inner = class.strip_prefix('[')?.strip_suffix(']')?;
+    // Go treats `--` as a range/literal run while Rust reads it as class
+    // difference. Leave those classes alone rather than guess; ordinary ranges
+    // and the exhaustive `[\s\S]`/`[\w\W]` forms are handled below.
+    //
+    // shortcut: a class containing `--` keeps its pre-existing Rust parsing;
+    // a full Go class parser is needed before rewriting hyphen runs.
+    if inner.contains("--") {
+        return None;
+    }
+    let mut rewritten = String::with_capacity(class.len());
+    rewritten.push('[');
+    let mut offset = 0;
+    if inner.as_bytes().first() == Some(&b'^') {
+        rewritten.push('^');
+        offset = 1;
+    }
+    let mut changed = false;
+
+    while let Some(&byte) = inner.as_bytes().get(offset) {
+        if byte == b'\\' {
+            let Some(escaped) = inner.get(offset + 1..).and_then(|tail| tail.chars().next()) else {
+                rewritten.push('\\');
+                offset += 1;
+                continue;
+            };
+            let replacement = match escaped {
+                'w' => Some("[0-9A-Za-z_]"),
+                'W' => Some("[^0-9A-Za-z_]"),
+                'd' => Some("[0-9]"),
+                'D' => Some("[^0-9]"),
+                's' => Some(r"[\t\n\x0c\r ]"),
+                'S' => Some(r"[^\t\n\x0c\r ]"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                rewritten.push_str(replacement);
+                changed = true;
+            } else {
+                rewritten.push('\\');
+                rewritten.push(escaped);
+            }
+            offset += 1 + escaped.len_utf8();
+            continue;
+        }
+
+        // Rust treats `&&`, `--` and `~~` as class-set operators; Go treats
+        // those bytes literally. A raw `[` starts a nested class in Rust, and
+        // `]`/`^` are only literal in specific class positions. Escape them so
+        // the nested-class wrapper does not change the original set.
+        if byte == b'['
+            && let Some(end) = posix_class_end(inner.as_bytes(), offset)
+        {
+            rewritten.push_str(inner.get(offset..end).unwrap_or_default());
+            offset = end;
+            continue;
+        }
+        match byte {
+            b'&' => {
+                rewritten.push_str(r"\x26");
+                changed = true;
+            },
+            b'~' => {
+                rewritten.push_str(r"\x7e");
+                changed = true;
+            },
+            b'[' => {
+                rewritten.push_str(r"\x5b");
+                changed = true;
+            },
+            b']' => {
+                rewritten.push_str(r"\x5d");
+                changed = true;
+            },
+            b'^' => {
+                rewritten.push_str(r"\x5e");
+                changed = true;
+            },
+            _ => {
+                let length = inner
+                    .get(offset..)
+                    .and_then(|tail| tail.chars().next())
+                    .map_or(1, char::len_utf8);
+                rewritten.push_str(inner.get(offset..offset.saturating_add(length)).unwrap_or_default());
+                offset += length;
+                continue;
+            },
+        }
+        offset += 1;
+    }
+
+    rewritten.push(']');
+    changed.then_some(rewritten)
 }
 
 /// Whether escaped bytes in `pattern` form invalid UTF-8.
@@ -182,23 +420,11 @@ fn byte_escape(pattern: &[u8]) -> Option<(u8, usize)> {
 }
 
 impl Operator for Rx {
-    fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
-        let expanded;
-        let regex = if let Some(regex) = &self.cached_regex {
-            regex
-        } else {
-            let pattern = self.macro_param.expand(tx);
-            let Ok(compiled) = CompiledRx::new(&pattern) else {
-                return false;
-            };
-            expanded = compiled;
-            &expanded
-        };
-
+    fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
         if !out.wants_captures() {
-            return regex.is_match(input);
+            return self.regex.is_match(input);
         }
-        let Some(groups) = regex.captures(input) else {
+        let Some(groups) = self.regex.captures(input) else {
             return false;
         };
         for (index, group) in groups.iter().take(10).enumerate() {
@@ -210,22 +436,15 @@ impl Operator for Rx {
 
 /// Create a regular expression operator.
 ///
-/// Patterns without transaction variables are compiled immediately. Patterns
-/// containing variables are compiled when evaluated.
+/// The pattern is compiled verbatim when the rule loads, as Go's `newRX` does;
+/// `%{...}` is not expanded.
 ///
 /// # Errors
 ///
-/// Returns an error for malformed macros or an invalid static regular expression.
+/// Returns an error for an invalid regular expression.
 pub fn rx(pattern: &str) -> Result<Rx, Box<dyn std::error::Error>> {
-    let macro_param = Macro::new(pattern)?;
-    let cached_regex = if pattern.contains("%{") {
-        None
-    } else {
-        Some(CompiledRx::new(pattern)?)
-    };
     Ok(Rx {
-        macro_param,
-        cached_regex,
+        regex: CompiledRx::new(pattern)?,
     })
 }
 
@@ -245,10 +464,9 @@ impl Operator for Pm {
             matcher
         } else {
             let patterns = self.macro_param.expand(tx).to_lowercase();
-            let dict: Vec<&str> = patterns.split(' ').filter(|phrase| !phrase.trim().is_empty()).collect();
-            if dict.is_empty() {
-                return false;
-            }
+            // Go keeps empty phrases from `strings.Split`: an empty phrase
+            // matches every input.
+            let dict: Vec<&str> = patterns.split(' ').collect();
             match AhoCorasick::builder().ascii_case_insensitive(true).build(&dict) {
                 Ok(matcher) => {
                     expanded = matcher;
@@ -281,12 +499,8 @@ pub fn pm(patterns: &str) -> Result<Pm, MacroError> {
         None
     } else {
         let patterns = patterns.to_lowercase();
-        let dict: Vec<&str> = patterns.split(' ').filter(|phrase| !phrase.trim().is_empty()).collect();
-        if dict.is_empty() {
-            None
-        } else {
-            AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
-        }
+        let dict: Vec<&str> = patterns.split(' ').collect();
+        AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
     };
     Ok(Pm {
         macro_param,
@@ -314,7 +528,7 @@ impl Phrases {
     /// # Errors
     ///
     /// Returns an error if the phrase set cannot be compiled.
-    fn new(patterns: &[String]) -> Result<Self, String> {
+    fn new(patterns: Vec<Vec<u8>>) -> Result<Self, String> {
         let matcher = AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .build(patterns)
@@ -341,7 +555,7 @@ impl PmFromFile {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or no phrases are found.
+    /// Returns an error if the file cannot be read.
     pub fn new(file_path: impl AsRef<Path>) -> Result<Self, String> {
         Self::with_rule_data(file_path, &FileSystem)
     }
@@ -350,22 +564,20 @@ impl PmFromFile {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or no phrases are found.
+    /// Returns an error if the file cannot be read.
     pub(crate) fn with_rule_data(file_path: impl AsRef<Path>, rule_data: &dyn RuleData) -> Result<Self, String> {
         let file_path = file_path.as_ref();
-        let content = read_to_string(rule_data, file_path)
+        let content = rule_data
+            .read(file_path)
             .map_err(|error| format!("failed to read {}: {error}", file_path.display()))?;
-        let patterns: Vec<_> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(str::to_owned)
+        let patterns = content
+            .split(|byte| *byte == b'\n')
+            .map(<[u8]>::trim_ascii)
+            .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+            .map(|line| lowercase(line).0)
             .collect();
-        if patterns.is_empty() {
-            return Err(format!("no valid patterns found in {}", file_path.display()));
-        }
         Ok(Self {
-            phrases: Phrases::new(&patterns)?,
+            phrases: Phrases::new(patterns)?,
         })
     }
 }
@@ -398,8 +610,9 @@ pub fn pm_from_dataset(name: &str, datasets: &Datasets) -> Result<PmFromDataset,
     let items = datasets
         .get(name)
         .ok_or_else(|| format!("dataset \"{name}\" not found"))?;
+    let patterns = items.iter().map(|item| item.as_bytes().to_vec()).collect();
     Ok(PmFromDataset {
-        phrases: Phrases::new(items)?,
+        phrases: Phrases::new(patterns)?,
     })
 }
 
@@ -407,7 +620,7 @@ pub fn pm_from_dataset(name: &str, datasets: &Datasets) -> Result<PmFromDataset,
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or no phrases are found.
+/// Returns an error if the file cannot be read.
 pub fn pm_from_file(file_path: impl AsRef<Path>) -> Result<PmFromFile, String> {
     PmFromFile::new(file_path)
 }
@@ -472,13 +685,15 @@ pub struct RestPath {
 
 impl Operator for RestPath {
     fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
-        let input = text_of(input);
-        let Some(captures) = self.regex.captures(&input) else {
+        let text = RegexText::new(input);
+        let Some(captures) = self.regex.captures(text.as_str()) else {
             return false;
         };
         for name in self.regex.capture_names().flatten() {
             if let Some(segment) = captures.name(name) {
-                out.add_path_argument(name, segment.as_str());
+                let range = text.original_range(segment.start(), segment.end());
+                let value = String::from_utf8_lossy(input.get(range).unwrap_or_default());
+                out.add_path_argument(name, &value);
             }
         }
         true
@@ -524,10 +739,9 @@ mod tests {
     }
 
     #[test]
-    fn regex_expands_macros_and_captures_at_most_ten_groups() {
-        let mut tx = Transaction::new("operator-test");
-        tx.set_tx_variable("pattern", b"(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)");
-        let operator = rx("%{TX.pattern}").unwrap();
+    fn regex_captures_at_most_ten_groups() {
+        let tx = Transaction::new("operator-test");
+        let operator = rx("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)").unwrap();
         let mut out = Outputs::new(true);
         assert!(operator.evaluate(&tx, b"abcdefghij", &mut out));
         let captures: Vec<_> = out.take_captures().collect();
@@ -537,15 +751,134 @@ mod tests {
     }
 
     #[test]
-    fn invalid_patterns_are_errors_or_non_matches() {
-        assert!(rx("(").is_err());
-        assert!(rx("%{TX.pattern}").is_ok());
+    fn regex_does_not_expand_macros() {
         let mut tx = Transaction::new("operator-test");
-        tx.set_tx_variable("pattern", b"(");
-        assert!(
-            !rx("%{TX.pattern}")
-                .unwrap()
-                .evaluate(&tx, b"input", &mut Outputs::default())
+        tx.set_tx_variable("pattern", b"abc");
+
+        // `%{2,}` is the regex quantifier over `%`, not a transaction variable.
+        let operator = rx("%{2,}").unwrap();
+        assert!(operator.evaluate(&tx, b"%%", &mut Outputs::default()));
+        assert!(!operator.evaluate(&tx, b"abc", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn invalid_patterns_are_errors() {
+        assert!(rx("(").is_err());
+    }
+
+    #[test]
+    fn perl_classes_are_ascii_only_like_go() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        assert!(matches(r"\bfoo\b", "éfooé".as_bytes()));
+        assert!(matches(r"\bselect\b", "éselecté".as_bytes()));
+        assert!(!matches(r"^[\w.-]+$", "naïve".as_bytes()));
+        assert!(!matches(r"\d", "٣".as_bytes()));
+        assert!(!matches(r"\s", "\u{a0}".as_bytes()));
+        assert!(!matches(r"\s", b"\x0b"), "Go's \\s excludes vertical tab");
+        assert!(matches(r"\S", b"\x0b"), "Go's \\S includes vertical tab");
+        assert!(matches(r"\W", "é".as_bytes()));
+        // Go's `(?i)\w` folds the ASCII class to ſ and Kelvin sign; `(?-u:\w)` would not.
+        assert!(matches(r"(?i)\w", "ſ".as_bytes()));
+        assert!(!matches(r"(?i)\W", "ſ".as_bytes()));
+        assert!(matches(r"\Bfoo", b"xfoo"));
+        // `.` stays Unicode-aware.
+        assert!(matches("^.$", "é".as_bytes()));
+        // Nested classes keep the negation ASCII-only.
+        assert!(!matches(r"[^\W]", "é".as_bytes()));
+        assert!(matches(r"[\W]", "é".as_bytes()));
+        assert!(matches(r"[^\d]", "١".as_bytes()));
+        // A '-' after a class escape is literal, not a range beside the expansion.
+        assert!(matches(r"[\w-a]", b"-"));
+        assert!(matches(r"[\w-.]", b"."));
+        // A positive class and its negation stay exhaustive after the rewrite.
+        assert!(matches(r"[\s\S]", b"\x0b"));
+        assert!(matches(r"[\s\S]", "\u{a0}".as_bytes()));
+        assert!(matches(r"[\w\W]", "é".as_bytes()));
+        assert!(matches(r"[\d\D]", "١".as_bytes()));
+        assert!(matches(r"[^\W_]", b"a"));
+        assert!(!matches(r"[^\W_]", b"_"));
+        assert!(!matches(r"[^\W_]", "é".as_bytes()));
+    }
+
+    #[test]
+    fn class_rewrite_escapes_rust_only_syntax() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        // Rust's class-set operators must not swallow Go's literal bytes.
+        assert!(matches(r"[\w&&]", b"&"));
+        assert!(matches(r"[\w~~]", b"~"));
+        assert!(matches(r"[\w[]", b"["));
+        assert!(matches(r"[\w^]", b"^"));
+        // The rewrite also covers Rust-only class syntax when no Perl class is present.
+        assert!(matches("[&&]", b"&"));
+        assert!(matches("[a&&b]", b"&"));
+        assert!(matches("[~~]", b"~"));
+        assert!(matches("[[]", b"["));
+    }
+
+    #[test]
+    fn posix_class_scanning_treats_dot_and_equals_as_literal_brackets() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        assert!(matches("[[.]", b"["));
+        assert!(matches("[[.]", b"."));
+        assert!(!matches("[[.]", b"]"));
+        assert!(matches("[[=]", b"["));
+        assert!(matches("[[=]", b"="));
+        assert!(!matches("[[=]", b"]"));
+        assert!(matches(r"[\w[.]", b"["));
+        assert!(matches(r"[\w[.]", b"."));
+        assert!(matches(r"[\w[.]", b"a"));
+    }
+
+    #[test]
+    fn perl_class_scanner_leaves_literals_and_class_backspace_alone() {
+        use super::ascii_perl_classes;
+
+        assert_eq!(
+            ascii_perl_classes(r"\bfoo\b [\b] \\w \d \S"),
+            r"(?-u:\b)foo(?-u:\b) [\b] \\w [0-9] [^\t\n\x0c\r ]"
+        );
+        assert_eq!(ascii_perl_classes(r"[\w.-]+"), "[[0-9A-Za-z_].-]+");
+        assert_eq!(ascii_perl_classes(r"[[:alpha:]\w]"), "[[:alpha:][0-9A-Za-z_]]");
+        assert_eq!(ascii_perl_classes(r"[\W-a]"), "[[^0-9A-Za-z_]-a]");
+    }
+
+    #[test]
+    fn invalid_utf8_is_one_replacement_character_per_byte() {
+        let tx = Transaction::new("operator-test");
+        let mut out = Outputs::default();
+
+        assert!(rx("^..$").unwrap().evaluate(&tx, b"\xff\xfe", &mut out));
+        assert!(!rx("^.$").unwrap().evaluate(&tx, b"\xff\xfe", &mut out));
+        assert!(rx("^.$").unwrap().evaluate(&tx, "é".as_bytes(), &mut out));
+    }
+
+    #[test]
+    fn captures_return_the_original_invalid_bytes() {
+        let tx = Transaction::new("operator-test");
+        let mut out = Outputs::new(true);
+
+        assert!(rx("a(.*)b").unwrap().evaluate(&tx, b"a\xffb", &mut out));
+        assert_eq!(
+            out.take_captures().collect::<Vec<_>>(),
+            [(0, b"a\xffb".to_vec()), (1, b"\xff".to_vec())]
+        );
+
+        // A valid multibyte character before the invalid byte keeps its bytes too.
+        let mut out = Outputs::new(true);
+        assert!(rx("(é)(.)").unwrap().evaluate(&tx, b"\xc3\xa9\xff", &mut out));
+        assert_eq!(
+            out.take_captures().collect::<Vec<_>>(),
+            [
+                (0, b"\xc3\xa9\xff".to_vec()),
+                (1, b"\xc3\xa9".to_vec()),
+                (2, b"\xff".to_vec()),
+            ]
         );
     }
 
@@ -562,15 +895,41 @@ mod tests {
     }
 
     #[test]
-    fn phrase_operators_ignore_empty_patterns() {
+    fn phrase_operators_keep_empty_phrases_like_go() {
         let mut tx = Transaction::new("operator-test");
         tx.set_tx_variable("empty", b"");
 
         for patterns in ["", "   ", " \t\n ", "%{TX.empty}"] {
             let operator = pm(patterns).unwrap();
-            assert!(!operator.evaluate(&tx, b"", &mut Outputs::default()));
-            assert!(!operator.evaluate(&tx, b"anything", &mut Outputs::default()));
+            assert!(operator.evaluate(&tx, b"", &mut Outputs::default()));
+            assert!(operator.evaluate(&tx, b"anything", &mut Outputs::default()));
         }
+        // `@pm foo  bar` splits into `foo`, ``, `bar`; the empty phrase matches.
+        assert!(
+            pm("foo  bar")
+                .unwrap()
+                .evaluate(&tx, b"nothing", &mut Outputs::default())
+        );
+        assert!(
+            !pm("foo bar")
+                .unwrap()
+                .evaluate(&tx, b"nothing", &mut Outputs::default())
+        );
+    }
+
+    #[test]
+    fn pm_from_file_reads_bytes_and_accepts_an_empty_file() {
+        let tx = Transaction::new("operator-test");
+        let directory = tempfile::tempdir().unwrap();
+        let phrases = directory.path().join("phrases.data");
+        std::fs::write(&phrases, b"# comment\nBAD\xffWORD\nNeedle\n").unwrap();
+        let operator = super::pm_from_file(&phrases).unwrap();
+        assert!(operator.evaluate(&tx, b"a NEEDLE here", &mut Outputs::default()));
+
+        let empty = directory.path().join("empty.data");
+        std::fs::write(&empty, b"# only comments\n\n").unwrap();
+        let operator = super::pm_from_file(&empty).unwrap();
+        assert!(!operator.evaluate(&tx, b"anything", &mut Outputs::default()));
     }
 
     #[test]

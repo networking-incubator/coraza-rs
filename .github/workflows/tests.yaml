@@ -98,6 +98,35 @@ jobs:
       - name: Run Envoy integration checks
         run: ./examples/envoy-libperfusion/test-envoy.sh
 
+  envoy-wasm-crs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: envoy-wasm-crs
+
+      - name: Fetch the pinned CRS release
+        run: make crs-fetch
+
+      - name: Build Envoy filter with embedded CRS
+        run: make build-envoy-wasm-crs
+
+      - name: Test the embedded CRS policy
+        run: make test-envoy-wasm-crs
+
+      - name: Run Envoy lifecycle checks against the CRS build
+        run: bash examples/envoy-coraza/test-envoy.sh
+        env:
+          ENVOY_CORAZA_MAKE_TARGET: build-envoy-wasm-crs
+
   meta-lint:
     runs-on: ubuntu-24.04
     permissions:
@@ -163,6 +192,9 @@ jobs:
       - name: Install cargo-hack
         if: steps.cache-hack.outputs.cache-hit != 'true'
         run: cargo install cargo-hack --version 0.6.45 --locked
+
+      - name: Fetch the pinned CRS release
+        run: make crs-fetch
 
       - name: Clippy each feature
         run: cargo hack clippy --workspace --each-feature --all-targets -- -D warnings

@@ -71,6 +71,103 @@ pub(crate) fn text_of(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Text for regular expression matching that maps matches back to input bytes.
+///
+/// Valid UTF-8 stays borrowed. Otherwise each invalid byte becomes one U+FFFD,
+/// as Go's rune decoding does, and [`original_range`](Self::original_range)
+/// returns the original byte range of a match or capture.
+pub(crate) struct RegexText<'a> {
+    /// The decoded text to match.
+    text: std::borrow::Cow<'a, str>,
+    /// Text byte offset of each replacement character, in increasing order.
+    ///
+    /// A replacement is three text bytes standing for one original byte, so the
+    /// original offset of a text boundary is `boundary - 2 * replacements_before`.
+    replacements: Vec<usize>,
+}
+
+impl<'a> RegexText<'a> {
+    /// Decode `bytes` for matching without collapsing invalid sequences.
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self::with_offsets(bytes, true)
+    }
+
+    /// Decode `bytes` for a match-only call, without recording replacement offsets.
+    pub(crate) fn for_match(bytes: &'a [u8]) -> Self {
+        Self::with_offsets(bytes, false)
+    }
+
+    /// Decode `bytes`, optionally recording replacement positions for captures.
+    fn with_offsets(bytes: &'a [u8], record_offsets: bool) -> Self {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            let (text, replacements) = decode_invalid(bytes, record_offsets);
+            return Self {
+                text: std::borrow::Cow::Owned(text),
+                replacements,
+            };
+        };
+        Self {
+            text: std::borrow::Cow::Borrowed(text),
+            replacements: Vec::new(),
+        }
+    }
+
+    /// The decoded text to match.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The original byte range of the text byte range `start..end`.
+    pub(crate) fn original_range(&self, start: usize, end: usize) -> std::ops::Range<usize> {
+        self.original_offset(start)..self.original_offset(end)
+    }
+
+    /// Map a text byte boundary to its original byte offset.
+    fn original_offset(&self, boundary: usize) -> usize {
+        let replacements = self.replacements.partition_point(|&start| start < boundary);
+        boundary.saturating_sub(replacements.saturating_mul(2))
+    }
+}
+
+/// Decode `bytes` with one U+FFFD per invalid byte, as Go's rune decoding does.
+///
+/// When `record_offsets` is set, also return the text offset of every replacement
+/// character. A replacement is three text bytes for one original byte.
+fn decode_invalid(bytes: &[u8], record_offsets: bool) -> (String, Vec<usize>) {
+    let mut text = String::with_capacity(bytes.len());
+    let mut replacements = Vec::new();
+    let mut offset = 0;
+    while let Some(remaining) = bytes.get(offset..) {
+        if remaining.is_empty() {
+            break;
+        }
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                text.push_str(valid);
+                break;
+            },
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                if let Some(valid) = remaining
+                    .get(..valid_len)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                {
+                    text.push_str(valid);
+                }
+                offset = offset.saturating_add(valid_len);
+                if offset < bytes.len() {
+                    if record_offsets {
+                        replacements.push(text.len());
+                    }
+                    text.push(char::REPLACEMENT_CHARACTER);
+                    offset += 1;
+                }
+            },
+        }
+    }
+    (text, replacements)
+}
+
 /// Error reported by a transformation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformationError {

@@ -451,7 +451,20 @@ fn is_black_url(url: &[u8]) -> bool {
         .any(|scheme| htmlencode_startswith(scheme, url))
 }
 
+/// Check one context, also trying a NUL-as-space reading when the input has NULs.
+///
+/// The tokenizer keeps NUL inside attribute names and unquoted values so
+/// `black_attr` can fold `on\0error` to `onerror`. That same reading hides
+/// `<a href=x\0onerror=...>`, where C treats the NUL as whitespace and sees a new
+/// attribute. Trying both readings is a superset of either engine's detection.
 pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) -> bool {
+    if is_xss_raw(input, context, data_start, false) {
+        return true;
+    }
+    input.contains(&0) && is_xss_raw(input, context, data_start, true)
+}
+
+fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>, nul_as_space: bool) -> bool {
     let mut attr = None;
     let mut tokenizer = match context {
         Context::Data => {
@@ -465,8 +478,13 @@ pub(crate) fn is_xss(input: &[u8], context: Context, data_start: Option<usize>) 
             }) else {
                 return false;
             };
-            Tokenizer::new_data_at(input, start)
+            if nul_as_space {
+                Tokenizer::new_data_at_nul_as_space(input, start)
+            } else {
+                Tokenizer::new_data_at(input, start)
+            }
         },
+        _ if nul_as_space => Tokenizer::new_nul_as_space(input, context),
         _ => Tokenizer::new(input, context),
     };
     for token in &mut tokenizer {
@@ -646,6 +664,8 @@ mod tests {
         assert_eq!(detect_with_context(b"hello world"), None);
         assert!(!is_xss(b"plain text", Context::Data, None));
         assert!(is_xss(b"plain text <script>alert(1)</script>", Context::Data, None));
+        // C treats NUL as whitespace here, so the event attribute starts a new token.
+        assert!(is_xss(b"<a href=x\0onerror=alert(1)>", Context::Data, None));
         assert_eq!(detect_with_context(b"prefix <script>"), Some(Context::Data));
 
         for len in 0..=4 {
@@ -686,6 +706,13 @@ mod tests {
         assert!(is_xss(b"<a attributename=onclick>", Context::Data, None));
         assert!(!is_xss(b"<a attributename=href>", Context::Data, None));
         assert!(!is_xss(b"<a attributename=style>", Context::Data, None));
+    }
+
+    #[test]
+    fn nul_as_space_splits_a_tag_name_at_nul() {
+        let input = b"<script\x00foo>";
+        assert!(!is_xss_raw(input, Context::Data, None, false));
+        assert!(is_xss(input, Context::Data, None));
     }
 
     #[test]

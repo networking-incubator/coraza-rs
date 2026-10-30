@@ -1,0 +1,73 @@
+# Releases of the envoy-coraza WASM filter (see docs/ci.md): nightly (dated
+# v0.0.0-nightly.YYYYMMDD tag, created by the release workflow) and manual
+# (push a vX.Y.Z tag).
+#
+# The wasm binaries are built by the release workflow (cargo, wasm32-wasip1 is
+# not a target GoReleaser's Rust builder supports) and staged as
+# release-artifacts/{coraza-rs,coraza-rs-crs}.wasm before GoReleaser runs.
+# GoReleaser then uploads them as release assets and packages them into the
+# scratch Envoy WASMPlugin images.
+version: 2
+
+project_name: coraza-rs
+
+builds:
+  - id: noop
+    skip: true
+
+git:
+  # Keep the nightly tags (created by GoReleaser from GORELEASER_CURRENT_TAG on
+  # nightly runs) out of previous-version discovery; see the release workflow.
+  ignore_tags: ["v0.0.0-nightly.*"]
+
+release:
+  # Nightly tags (v0.0.0-nightly.*) publish as prereleases that never become
+  # latest; manual vX.Y.Z tags publish as regular latest releases.
+  prerelease: "{{ contains .Tag \"nightly\" }}"
+  make_latest: "{{ if contains .Tag \"nightly\" }}false{{ else }}true{{ end }}"
+  replace_existing_artifacts: true
+  extra_files:
+    - glob: release-artifacts/coraza-rs.wasm
+    - glob: release-artifacts/coraza-rs-crs.wasm
+
+changelog:
+  disable: true
+
+# Tag conventions used by both image variants:
+# - nightly run (tag v0.0.0-nightly.YYYYMMDD): v0.0.0-nightly.YYYYMMDD,
+#   nightly, nightly-YYYYMMDD
+# - manual release (tag vX.Y.Z): vX.Y.Z, and latest only for the newest tag
+#   (PUSH_LATEST is set by the release workflow)
+dockers_v2:
+  - id: coraza-rs
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/networking-incubator/coraza-rs
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+    extra_files:
+      - release-artifacts/coraza-rs.wasm
+    build_args:
+      WASM: coraza-rs.wasm
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]
+  - id: coraza-rs-crs
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/networking-incubator/coraza-rs-crs
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+    extra_files:
+      - release-artifacts/coraza-rs-crs.wasm
+    build_args:
+      WASM: coraza-rs-crs.wasm
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]

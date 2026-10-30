@@ -135,6 +135,11 @@ pub struct BodyProcessorOutput {
 /// Error reported when a custom processor exceeds its cumulative output budget.
 const OUTPUT_BYTE_LIMIT_ERROR: &str = "custom body processor output exceeded byte limit";
 
+/// Estimated engine-side copies per file: the `FILES`, `FILES_SIZES`, `FILES_NAMES`,
+/// `MULTIPART_PART_HEADERS`, `MULTIPART_NAME` and `MULTIPART_FILENAME` entries,
+/// including the `Content-Type: ` prefix and the decimal size text.
+const FILE_COLLECTION_OVERHEAD: usize = 64;
+
 /// 256 bytes preserves useful diagnostic context while bounding transaction and log storage.
 pub(crate) const CUSTOM_BODY_PROCESSOR_TEXT_LIMIT: usize = 256;
 
@@ -212,12 +217,15 @@ impl BodyProcessorOutput {
     /// Add a file whose bytes the engine will write to its private temporary-file path.
     ///
     /// The processor cannot select or invent the path. Files beyond the resolved upload
-    /// limit are dropped. Unlike the built-in multipart processor, custom files cannot
-    /// reproduce wire part headers: this deliberately narrow API has no raw-header input,
-    /// so `MULTIPART_PART_HEADERS` contains only `Content-Type: <content_type>`. Rules
-    /// that depend on wire part headers, including `Content-Disposition`, must use the
-    /// built-in multipart processor. WASI targets reject file output until a connector
-    /// provides a memory-backed sink.
+    /// limit are still recorded and flagged, so the engine still publishes `FILES`,
+    /// `FILES_SIZES` and `FILES_NAMES`; only the temporary-file write and the
+    /// `FILES_TMPNAMES` entry stop. Unlike the built-in
+    /// multipart processor, custom files cannot reproduce wire part headers: this
+    /// deliberately narrow API has no raw-header input, so `MULTIPART_PART_HEADERS`
+    /// contains only `Content-Type: <content_type>`. Rules that depend on wire part
+    /// headers, including `Content-Disposition`, must use the built-in multipart
+    /// processor. WASI targets reject file output until a connector provides a
+    /// memory-backed sink.
     pub fn add_file(&mut self, name: &[u8], filename: &[u8], content_type: &[u8], bytes: &[u8]) {
         if !self.file_storage_available {
             self.set_error("file-producing body processors are unavailable on WASI without a connector memory sink");
@@ -225,9 +233,15 @@ impl BodyProcessorOutput {
         }
         if self.files.len() >= self.file_capacity {
             self.file_limit_reached = true;
-            return;
         }
-        if !self.reserve_bytes(&[name, filename, content_type, bytes], size_of::<BodyProcessorFile>()) {
+        // Charge the copies the engine makes later, in `add_body_processor_file`, not only
+        // the staged struct: the byte budget is the only bound on a processor's output.
+        let metadata = size_of::<BodyProcessorFile>()
+            .saturating_add(name.len().saturating_mul(5))
+            .saturating_add(filename.len().saturating_mul(3))
+            .saturating_add(content_type.len())
+            .saturating_add(FILE_COLLECTION_OVERHEAD);
+        if !self.reserve_bytes(&[name, filename, content_type, bytes], metadata) {
             return;
         }
         self.files.push(BodyProcessorFile {
@@ -267,7 +281,7 @@ pub(crate) mod xml;
 
 #[cfg(test)]
 mod tests {
-    use super::BodyProcessorOutput;
+    use super::{BodyProcessorFile, BodyProcessorOutput};
 
     #[test]
     fn file_output_is_rejected_without_a_storage_sink() {
@@ -300,6 +314,22 @@ mod tests {
         output.add_argument(b"later", b"ignored");
         assert_eq!(output.output_bytes, capacity);
         assert_eq!(output.arguments.len(), 1);
+    }
+
+    #[test]
+    fn file_metadata_counts_against_the_output_byte_budget() {
+        // Enough for the staged struct and the file bytes, but not for the engine-side
+        // FILES*/MULTIPART_* copies that `add_body_processor_file` makes from them.
+        let capacity = size_of::<BodyProcessorFile>() + 4;
+        let mut output = BodyProcessorOutput::new(4, 4, capacity, true);
+        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+
+        assert!(output.files.is_empty());
+        assert!(output.byte_limit_reached);
+        assert_eq!(
+            output.error.as_deref(),
+            Some("custom body processor output exceeded byte limit")
+        );
     }
 
     #[test]

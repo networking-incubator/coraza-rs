@@ -252,6 +252,11 @@ fn confirm_opened(_file: &File, _base: &Path) -> Result<(), String> {
 /// An empty root means the process' current directory, which is where the
 /// relative paths of a default operator context already resolve.
 fn canonical_base(base_dir: &Path) -> Result<PathBuf, String> {
+    // `std::env::current_dir` and filesystem schema access are not available in the
+    // WASI sandbox; return a load error instead of aborting the VM.
+    if cfg!(target_os = "wasi") {
+        return Err("filesystem schema paths are unavailable on WASI".to_owned());
+    }
     if base_dir.as_os_str().is_empty() {
         return std::env::current_dir().map_err(|error| format!("reading schema from root FS: {error}"));
     }

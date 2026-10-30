@@ -148,8 +148,9 @@ pub(crate) struct Part<'a> {
 /// RFC 2046 requires a boundary of at most 70 characters. Go's
 /// `mime/multipart` has no explicit length check, but its 4096-byte read
 /// buffer makes a delimiter line much longer than about 4090 bytes fail.
-/// This is a Rust-only hardening limit, well above real clients and RFC 2046.
-const MAX_BOUNDARY_LEN: usize = 1024;
+/// This is a Rust-only hardening limit at that same effective bound, well above
+/// real clients and RFC 2046.
+const MAX_BOUNDARY_LEN: usize = 4090;
 
 /// Maximum number of parts in one body.
 ///
@@ -304,6 +305,12 @@ impl<'a> MultipartParser<'a> {
                 .data
                 .get(pos..)
                 .ok_or_else(|| ParseError::Parse("missing final boundary".to_owned()))?;
+            if remaining.is_empty() {
+                // A body that ends right after a delimiter line is not truncated: Go's
+                // `NextPart` reports a plain `io.EOF` and the processor ends without a
+                // strict error.
+                return Ok(());
+            }
             let (part_end, boundary_start) = match find_next_boundary(remaining, &boundary_marker, &boundary_table, nl)
             {
                 Some(found) => found,
@@ -316,7 +323,17 @@ impl<'a> MultipartParser<'a> {
                     }
                     return Ok(());
                 },
-                None => return Err(ParseError::Parse("missing final boundary".to_owned())),
+                None => {
+                    // A body that stops before its final delimiter still publishes the
+                    // part in progress: Go's `NextPart` returns it, and only reading it
+                    // fails with `io.ErrUnexpectedEOF`. A partial delimiter at the end is
+                    // trimmed like the limit-truncated case.
+                    if let Some(mut part) = parse_truncated_part(remaining, &mut total_header_bytes)? {
+                        part.data = trim_truncated_part_data(part.data, &boundary_marker, &nl_boundary_marker);
+                        parts.push(part);
+                    }
+                    return Err(ParseError::Parse("missing final boundary".to_owned()));
+                },
             };
             let next_boundary_pos = pos
                 .checked_add(part_end)
@@ -735,7 +752,7 @@ fn extract_content_disposition(headers: &Headers) -> ContentDisposition {
         repeats_param: false,
         quoted_extended_filename,
     };
-    if let Some(extended) = param(b"filename*") {
+    if let Some(extended) = raw_param(disposition, b"filename*").map(coraza_unquote) {
         let segments: Vec<&[u8]> = extended.splitn(3, |&byte| byte == b'\'').collect();
         match segments.as_slice() {
             [charset, language, value] => {
@@ -1246,6 +1263,15 @@ file content\r\n\
         ] {
             assert_eq!(rfc2231_fields(disposition).0, expected, "{disposition}");
         }
+    }
+
+    #[test]
+    fn a_quoted_extended_filename_uses_coraza_unquoting() {
+        // Go Coraza resolves `filename*` with `findParam` and `unquoteIfQuoted`, which
+        // drops every backslash, so a quoted value resolves as if unquoted.
+        let (_, filename, alt, _) = rfc2231_fields(r#"form-data; name=f; filename*="utf-8''x.p\hp""#);
+        assert_eq!(filename.as_deref(), Some(&b"x.php"[..]));
+        assert_eq!(alt, None);
     }
 
     #[test]
@@ -2051,6 +2077,17 @@ more\r\n\
     }
 
     #[test]
+    fn a_boundary_go_accepts_is_not_rejected() {
+        // Go's only implicit boundary bound is its 4096-byte read buffer, so a
+        // 1025-byte boundary parses there and must parse here too.
+        let boundary = "a".repeat(1025);
+        let body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nv\r\n--{boundary}--");
+        let parts = MultipartParser::new(boundary, body.as_bytes()).parse_ok().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"v");
+    }
+
+    #[test]
     fn long_dash_run_before_the_first_boundary_terminates() {
         // The concrete worst case for a naive delimiter scan: a boundary made
         // of dashes followed by 'b' against a preamble of dash runs. Each line
@@ -2085,7 +2122,7 @@ more\r\n\
 
     #[test]
     fn part_count_budget_is_enforced() {
-        fn parse_parts(count: usize) -> Result<usize, ParseError> {
+        fn parse_parts(count: usize) -> (usize, Option<ParseError>) {
             let mut body = Vec::new();
             for index in 0..count {
                 body.extend_from_slice(
@@ -2093,12 +2130,30 @@ more\r\n\
                 );
             }
             body.extend_from_slice(b"--b--");
-            MultipartParser::new("b", &body).parse_ok().map(|parts| parts.len())
+            let (parts, error) = MultipartParser::new("b", &body).parse();
+            (parts.len(), error)
         }
 
-        assert_eq!(parse_parts(MAX_PARTS).unwrap(), MAX_PARTS);
-        let error = parse_parts(MAX_PARTS.saturating_add(1)).unwrap_err();
-        assert!(matches!(error, ParseError::Limit(_)));
+        let (parts, error) = parse_parts(MAX_PARTS);
+        assert_eq!(parts, MAX_PARTS);
+        assert!(error.is_none());
+        let (parts, error) = parse_parts(MAX_PARTS.saturating_add(1));
+        assert_eq!(parts, MAX_PARTS, "the parts parsed before the budget are published");
+        assert!(matches!(error, Some(ParseError::Limit(_))));
+    }
+
+    #[test]
+    fn a_header_budget_hit_keeps_the_parts_parsed_before_it() {
+        let mut body = b"--b\r\nContent-Disposition: form-data; name=\"ok\"\r\n\r\nv\r\n\
+--b\r\nContent-Disposition: form-data; name=\"q\"\r\nX: "
+            .to_vec();
+        body.extend(std::iter::repeat_n(b'a', MAX_HEADER_BLOCK));
+        body.extend_from_slice(b"\r\n\r\nv\r\n--b--");
+
+        let (parts, error) = MultipartParser::new("b", &body).parse();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().name.as_slice(), b"ok");
+        assert!(matches!(error, Some(ParseError::Limit(_))));
     }
 
     #[test]
@@ -2121,6 +2176,41 @@ more\r\n\
 
         let error = MultipartParser::new("b", &body).parse_ok().unwrap_err();
         assert!(matches!(error, ParseError::Limit(_)));
+    }
+
+    #[test]
+    fn a_body_ending_after_a_delimiter_is_not_malformed() {
+        // Go's `NextPart` sees a plain `io.EOF` after a delimiter line and reports no
+        // strict error; only a cut part is `io.ErrUnexpectedEOF`.
+        for body in [
+            b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nv\r\n--b\r\n".as_slice(),
+            b"--b\r\n".as_slice(),
+        ] {
+            let (parts, error) = MultipartParser::new("b", body).parse();
+            assert!(parts.is_empty() || parts.first().is_some_and(|part| part.data == b"v"));
+            assert!(error.is_none(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_without_a_final_boundary_keeps_its_last_part() {
+        // Go's `NextPart` returns the part in progress and only reading it fails with
+        // `io.ErrUnexpectedEOF`, so the part is still inspected.
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nattack";
+        let (parts, error) = MultipartParser::new("b", body).parse();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().name.as_slice(), b"q");
+        assert_eq!(parts.first().unwrap().data, b"attack");
+        assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
+    }
+
+    #[test]
+    fn a_partial_delimiter_at_the_end_is_not_part_of_the_last_part() {
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nattack\r\n--";
+        let (parts, error) = MultipartParser::new("b", body).parse();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"attack");
+        assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
     }
 
     #[test]

@@ -40,45 +40,44 @@ fn unescape_reference(input: &[u8], output: &mut Vec<u8>) -> usize {
     }
 
     if input.get(1) == Some(&b'#') {
-        // At least "&#" and one more byte
-        if input.len() <= 3 {
+        // At least "&#"
+        if input.len() <= 2 {
             output.push(b'&');
             return 1;
         }
         let hex = matches!(input.get(2), Some(b'x' | b'X'));
         let mut i = if hex { 3 } else { 2 };
-        // Go's rune arithmetic, which wraps
-        let mut code: i32 = 0;
+        let first_digit = i;
+        // Clamp the accumulation as Go does: once the value passes U+10FFFF,
+        // further digits are consumed but do not change it.
+        let mut code: u32 = 0;
         while let Some(&byte) = input.get(i) {
-            i += 1;
             let digit = match byte {
                 b'0'..=b'9' => byte - b'0',
                 b'a'..=b'f' if hex => byte - b'a' + 10,
                 b'A'..=b'F' if hex => byte - b'A' + 10,
-                _ => {
-                    if byte != b';' {
-                        i -= 1;
-                    }
-                    break;
-                },
+                _ => break,
             };
-            code = code
-                .wrapping_mul(if hex { 16 } else { 10 })
-                .wrapping_add(i32::from(digit));
+            if code <= 0x0010_FFFF {
+                code = code * if hex { 16 } else { 10 } + u32::from(digit);
+            }
+            i += 1;
         }
-        // As Go counts it: "&#5" and "&#x" alone aren't references, "&#x;" is zero
-        if i <= 3 {
+        if i == first_digit {
             output.push(b'&');
             return 1;
         }
-        let c = match u32::try_from(code) {
-            Ok(code @ 0x80..=0x9F) => usize::try_from(code - 0x80)
+        if input.get(i) == Some(&b';') {
+            i += 1;
+        }
+        let c = match code {
+            0x80..=0x9F => usize::try_from(code - 0x80)
                 .ok()
                 .and_then(|index| WINDOWS_1252.get(index))
                 .copied()
                 .unwrap_or(char::REPLACEMENT_CHARACTER),
-            Ok(0) | Err(_) => char::REPLACEMENT_CHARACTER,
-            Ok(code) => char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER),
+            0 | 0xD800..=0xDFFF | 0x0011_0000.. => char::REPLACEMENT_CHARACTER,
+            _ => char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER),
         };
         push(output, c);
         return i;
@@ -1582,10 +1581,12 @@ const ENTITIES: &[(&str, &str)] = &[
     ("multimap;", "\u{22b8}"),
     ("mumap;", "\u{22b8}"),
     ("nGg;", "\u{22d9}\u{338}"),
+    ("nGt;", "\u{226b}\u{20d2}"),
     ("nGtv;", "\u{226b}\u{338}"),
     ("nLeftarrow;", "\u{21cd}"),
     ("nLeftrightarrow;", "\u{21ce}"),
     ("nLl;", "\u{22d8}\u{338}"),
+    ("nLt;", "\u{226a}\u{20d2}"),
     ("nLtv;", "\u{226a}\u{338}"),
     ("nRightarrow;", "\u{21cf}"),
     ("nVDash;", "\u{22af}"),
@@ -2391,16 +2392,27 @@ mod tests {
             ("&#x41&#66;&#xZZ;", "AB&#xZZ;"),
             ("&unknown;&lt", "&unknown;<"),
             ("&#128;&#0;&#xD800;&#x110000;", "€\u{FFFD}\u{FFFD}\u{FFFD}"),
-            ("&#4294967356;", "<"),
+            ("&#4294967356;", "\u{FFFD}"),
+            ("&#x10000003c;", "\u{FFFD}"),
+            ("a&#9", "a\t"),
+            ("&#0", "\u{FFFD}"),
+            ("&#x;", "&#x;"),
             ("&ngE;", "≧\u{338}"),
+            ("&nLt;", "\u{226a}\u{20d2}"),
+            ("&nGt;", "\u{226b}\u{20d2}"),
             ("& &# &#; &", "& &# &#; &"),
             (
                 "&#5 &#5x &#5; &#x; &#x4 &#55 &#X41; &#xg",
-                "&#5 &#5x \u{5} \u{FFFD} \u{4} 7 A &#xg",
+                "\u{5} \u{5}x \u{5} &#x; \u{4} 7 A &#xg",
             ),
         ] {
             assert_eq!(unescape(input.as_bytes()), output.as_bytes(), "{input:?}");
         }
         assert_eq!(unescape(b"\xff&lt;\xfe"), b"\xff<\xfe");
+    }
+
+    #[test]
+    fn entity_table_has_every_name() {
+        assert_eq!(ENTITIES.len(), 2231);
     }
 }

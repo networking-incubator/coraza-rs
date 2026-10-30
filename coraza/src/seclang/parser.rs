@@ -73,6 +73,7 @@ use crate::{
         CompileError, parse_actions,
         rule_compiler::{
             DefaultActions, apply_actions, compile_sec_action_in, compile_sec_marker, compile_sec_rule_in,
+            warn_block_without_default,
         },
         variable_parser::VariableList,
     },
@@ -204,6 +205,10 @@ struct DirectiveOptions<'a> {
     /// Whether a directive that fails from now on is skipped rather than returned; see
     /// [`Parser::skip_failed_directives`]
     skip_failed: &'a mut bool,
+
+    /// Load-time warnings collected from the directives parsed so far; see
+    /// [`Parser::warnings`]
+    warnings: &'a mut Vec<String>,
 }
 
 /// `SecLang` parser state
@@ -302,6 +307,9 @@ pub struct Parser {
     /// Directives skipped because they failed, in parse order
     skipped: Vec<ParseError>,
 
+    /// Load-time warnings, in parse order
+    warnings: Vec<String>,
+
     /// Optional callback for rules with the `log` action.
     error_log: Option<ErrorLog>,
 
@@ -344,6 +352,7 @@ impl Parser {
             budget_exhausted: false,
             dropping_chain: false,
             skipped: Vec::new(),
+            warnings: Vec::new(),
             error_log: None,
             debug_logger: None,
             audit_log: None,
@@ -551,11 +560,14 @@ impl Parser {
         self.audit_log = Some(AuditLogCallback::new(log));
     }
 
-    /// Makes later parsing skip directives that fail, instead of stopping at the first one.
+    /// Makes later parsing skip rule directives that fail, instead of stopping at the first
+    /// one.
     ///
-    /// Use this to load a rule set the engine only partly supports. Each skipped
-    /// directive's error is kept, in order, and returned by [`Parser::skipped`].
-    /// A chain with a skipped link is dropped whole.
+    /// Only `SecRule` failures are skipped, as Go Coraza does: a failing `SecAction`,
+    /// `SecMarker`, configuration directive, `Include`, unknown directive or exhausted
+    /// budget still ends the parse. Use this to load a rule set the engine only partly
+    /// supports. Each skipped directive's error is kept, in order, and returned by
+    /// [`Parser::skipped`]. A chain with a skipped link is dropped whole.
     pub fn skip_failed_directives(&mut self) {
         self.skip_failed = true;
     }
@@ -564,6 +576,15 @@ impl Parser {
     /// [`Parser::skip_failed_directives`] was called.
     pub fn skipped(&self) -> &[ParseError] {
         &self.skipped
+    }
+
+    /// Load-time warnings from the directives parsed so far, in parse order.
+    ///
+    /// A warning says a directive loaded but has no effect: `initcol` and `expirevar`
+    /// (persistent collections are unsupported), or `block` with no applicable
+    /// `SecDefaultAction`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Parse directives from a string.
@@ -749,8 +770,11 @@ impl Parser {
             match self.evaluate_line(&directive) {
                 // A budget failure is not a directive the embedder may skip: continuing
                 // would compile every remaining rule before rejecting it, or accept a
-                // truncated include set.
-                Err(e) if self.skip_failed && !self.budget_exhausted => {
+                // truncated include set. Only `SecRule` is skippable, as Go's
+                // `SecIgnoreRuleCompilationErrors` applies to `SecRule` alone: a failing
+                // `SecAction`, `SecMarker`, configuration directive or unknown directive
+                // must still stop the parse.
+                Err(e) if self.skip_failed && !self.budget_exhausted && skippable_directive(&directive) => {
                     let chain_status = super::rule_compiler::directive_chain_status(&directive);
                     let discarded_chain = self.rules.discard_open_chain();
                     if let Some(has_chain) = chain_status {
@@ -836,6 +860,7 @@ impl Parser {
                 rule_observer: self.rule_observer.as_deref(),
                 rule_data: self.rule_data.as_ref(),
                 skip_failed: &mut self.skip_failed,
+                warnings: &mut self.warnings,
             }),
         };
         let result = result
@@ -895,11 +920,26 @@ fn written_directive<'i>(input: &mut &'i str) -> ModalResult<Cow<'i, str>, Empty
             }
             line = closing;
         }
-        written += line.trim_end_matches('\\');
+        // Only the continuation backslash is removed, as Go's reader does: a line ending
+        // in two keeps one.
+        written += line.strip_suffix('\\').unwrap_or(line);
         if !line.ends_with('\\') {
             return Ok(written);
         }
     }
+}
+
+/// Whether a failed directive may be skipped rather than ending the parse.
+///
+/// Go Coraza's `SecIgnoreRuleCompilationErrors` is read only by its `SecRule` handler
+/// (`internal/seclang/directives.go:186-206`, v3.8.1). `SecAction` and `SecMarker`
+/// return their errors unconditionally, as do configuration and `Include` failures.
+fn skippable_directive(line: &str) -> bool {
+    // Match `evaluate_line` exactly: the directive name ends at the first ASCII space,
+    // not at a tab or other whitespace. A tab-separated `SecRule` is an unknown
+    // directive to the dispatcher and must not be skipped.
+    let (name, _) = line.split_once(' ').unwrap_or((line, ""));
+    name.eq_ignore_ascii_case("secrule")
 }
 
 /// What follows the line opening a backtick block: the lines inside it, then the one
@@ -1025,6 +1065,7 @@ fn parse_boolean(value: &str) -> Result<bool, String> {
 fn add_rule(options: &mut DirectiveOptions<'_>, rule: Result<Rule, CompileError>) -> Result<(), String> {
     let mut rule = rule.map_err(|e| e.message)?;
     let metadata = rule.metadata_mut();
+    options.warnings.append(&mut metadata.warnings);
     options.file.clone_into(&mut metadata.file);
     metadata.line = options.line;
     options.raw.clone_into(&mut metadata.raw);
@@ -1070,7 +1111,7 @@ fn directive_sec_action(options: &mut DirectiveOptions<'_>) -> Result<(), String
 fn directive_sec_default_action(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     options
         .default_actions
-        .add(&options.opts, options.action_compile_context)
+        .add(&options.opts, options.action_compile_context, options.warnings)
         .map_err(|e| e.message)
 }
 
@@ -1147,6 +1188,9 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateActionById ID \"ACTIONS\"")?;
     let actions = parse_actions(actions).map_err(|e| e.message)?;
     let mut staged_rules = options.rules.clone();
+    // Collect warnings from the staged copy only; a failed update must not publish
+    // warnings for actions that never reach the live rule set.
+    let mut added_warnings = Vec::new();
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
@@ -1155,7 +1199,10 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
             .iter_mut()
             .filter(|rule| range.contains(&rule.metadata().id))
         {
+            let first_warning = rule.metadata().warnings.len();
             apply_actions(rule, &actions, true, false, options.action_compile_context).map_err(|e| e.message)?;
+            warn_block_without_default(rule, options.default_actions);
+            added_warnings.extend(rule.metadata_mut().warnings.split_off(first_warning));
             found = true;
         }
         if !found && range.start() == range.end() {
@@ -1163,6 +1210,7 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
         }
     }
     *options.rules = staged_rules;
+    options.warnings.append(&mut added_warnings);
     Ok(())
 }
 
@@ -1616,10 +1664,11 @@ fn directive_sec_audit_log_storage_dir(options: &mut DirectiveOptions<'_>) -> Re
 
 /// `SecIgnoreRuleCompilationErrors` On|Off
 ///
-/// With `On`, later directives that fail are skipped, as with
+/// With `On`, later `SecRule` directives that fail are skipped, as with
 /// [`Parser::skip_failed_directives`]. Go Coraza acts on it for `SecRule`: a rule that
 /// fails to compile is skipped and its error logged
-/// (`internal/seclang/directives.go:186-206`, v3.8.1).
+/// (`internal/seclang/directives.go:186-206`, v3.8.1). `SecAction`, `SecMarker`,
+/// configuration and `Include` failures keep their errors.
 fn directive_sec_ignore_rule_compilation_errors(options: &mut DirectiveOptions<'_>) -> Result<(), String> {
     *options.skip_failed = parse_boolean(&options.opts)?;
     Ok(())
@@ -2191,6 +2240,14 @@ SecRuleEngine \
 On
 ";
         assert!(parser.from_string(input).is_ok());
+    }
+
+    #[test]
+    fn a_line_ending_with_two_backslashes_keeps_one() {
+        // Only the continuation backslash is removed, as Go's reader does.
+        let mut parser = Parser::new();
+        parser.from_string("SecWebAppId one\\\\\ntwo").unwrap();
+        assert_eq!(parser.config().web_app_id, r"one\two");
     }
 
     #[test]
@@ -3345,7 +3402,6 @@ SecWebAppId production
         parser
             .from_string(
                 r#"
-                SecNoSuchDirective On
                 SecRule ARGS "@nosuchop x" "id:1"
                 SecRule ARGS "@contains attack" "id:2,phase:1,deny"
                 "#,
@@ -3353,8 +3409,146 @@ SecWebAppId production
             .unwrap();
 
         let lines: Vec<usize> = parser.skipped().iter().map(|e| e.line).collect();
-        assert_eq!(lines, vec![2, 3]);
+        assert_eq!(lines, vec![2]);
         assert_eq!(parser.rule_count(), 1);
+    }
+
+    #[test]
+    fn skip_failed_directives_does_not_swallow_a_configuration_error() {
+        for directive in [
+            "SecNoSuchDirective On",
+            "SecRuleEngine Maybe",
+            "SecRequestBodyLimit abc",
+            "SecDefaultAction \"phase:9\"",
+            "SecRuleRemoveById not-a-range",
+        ] {
+            let mut parser = Parser::new();
+            parser.skip_failed_directives();
+            let error = parser.from_string(directive).unwrap_err();
+            assert!(!error.message.is_empty(), "{directive}");
+            assert!(
+                parser.skipped().is_empty(),
+                "{directive} must fail instead of being skipped: {:?}",
+                parser.skipped()
+            );
+        }
+    }
+
+    #[test]
+    fn tab_separated_secrule_is_not_skipped() {
+        let mut parser = Parser::new();
+        parser.skip_failed_directives();
+        let error = parser
+            .from_string("SecRule\tARGS \"@contains x\" \"id:1,phase:1,pass\"")
+            .unwrap_err();
+        assert!(error.message.contains("unknown directive"), "{error:?}");
+        assert!(parser.skipped().is_empty(), "{:?}", parser.skipped());
+    }
+
+    #[test]
+    fn block_without_a_phase_default_warns() {
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS \"@contains x\" \"id:1,phase:1,block\"")
+            .unwrap();
+        assert!(
+            parser
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("block has no SecDefaultAction")),
+            "{:?}",
+            parser.warnings()
+        );
+    }
+
+    #[test]
+    fn persistent_collection_actions_load_with_a_warning() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,pass,initcol:IP=%{REMOTE_ADDR}\"\n\
+                 SecAction \"id:2,phase:1,pass,expirevar:IP=60\"",
+            )
+            .unwrap();
+
+        assert_eq!(parser.rule_count(), 2);
+        assert_eq!(parser.warnings().len(), 2);
+        assert!(parser.warnings().iter().any(|warning| warning.contains("initcol")));
+        assert!(parser.warnings().iter().any(|warning| warning.contains("expirevar")));
+    }
+
+    #[test]
+    fn default_action_publishes_persistent_collection_warnings() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecDefaultAction \"phase:1,pass,initcol:IP=%{REMOTE_ADDR}\"\n\
+                 SecDefaultAction \"phase:2,pass,expirevar:IP=60\"",
+            )
+            .unwrap();
+
+        assert!(parser.warnings().iter().any(|warning| warning.contains("initcol")));
+        assert!(parser.warnings().iter().any(|warning| warning.contains("expirevar")));
+    }
+
+    #[test]
+    fn rejected_default_action_does_not_publish_warnings() {
+        for directive in [
+            "SecDefaultAction \"phase:1,pass,initcol:IP=x,msg:hello\"",
+            "SecDefaultAction \"phase:1,pass\"\nSecDefaultAction \"phase:1,pass,initcol:IP=x\"",
+        ] {
+            let mut parser = Parser::new();
+            assert!(parser.from_string(directive).is_err(), "{directive}");
+            assert!(parser.warnings().is_empty(), "{directive}: {:?}", parser.warnings());
+        }
+    }
+
+    #[test]
+    fn update_action_publishes_its_new_warnings() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains x\" \"id:1,phase:1,pass\"\n\
+                 SecRuleUpdateActionById 1 \"initcol:IP=%{REMOTE_ADDR}\"",
+            )
+            .unwrap();
+        assert!(
+            parser.warnings().iter().any(|warning| warning.contains("initcol")),
+            "{:?}",
+            parser.warnings()
+        );
+    }
+
+    #[test]
+    fn update_action_warns_for_block_without_a_phase_default() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains x\" \"id:1,phase:1,pass\"\n\
+                 SecRuleUpdateActionById 1 \"block\"",
+            )
+            .unwrap();
+        assert!(
+            parser
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("block has no SecDefaultAction")),
+            "{:?}",
+            parser.warnings()
+        );
+    }
+
+    #[test]
+    fn failed_update_action_does_not_publish_warnings() {
+        let mut parser = Parser::new();
+        let error = parser
+            .from_string(
+                "SecRule ARGS \"@contains x\" \"id:1,phase:1,pass\"\n\
+                 SecRuleUpdateActionById 1 \"initcol:IP=x,noSuchAction\"",
+            )
+            .unwrap_err();
+        assert!(error.message.contains("unknown action"), "{error:?}");
+        assert!(parser.warnings().is_empty(), "{:?}", parser.warnings());
     }
 
     #[test]
@@ -3420,17 +3614,19 @@ SecWebAppId production
         parser
             .from_string(
                 "SecRule ARGS \"@contains a\" \"id:1,phase:1,deny,chain\"\n\
-                 SecNoSuchDirective On\n\
+                 SecRule ARGS \"@nosuchop x\" \"id:4,phase:1,pass\"\n\
                  SecRule ARGS \"@contains b\" \"id:2,phase:1,deny\"\n\
                  SecAction \"id:3,phase:1,pass\"",
             )
             .unwrap();
 
+        // The failed SecRule discards the open chain; the next rule is a new
+        // top-level rule, exactly as Go's `DiscardPendingChain` leaves it.
         assert!(parser.rules.find_by_id(1).is_none());
-        assert!(parser.rules.find_by_id(2).is_none());
+        assert!(parser.rules.find_by_id(2).is_some());
         assert!(parser.rules.find_by_id(3).is_some());
-        assert_eq!(parser.rule_count(), 1);
-        assert_eq!(parser.skipped().len(), 2);
+        assert_eq!(parser.rule_count(), 2);
+        assert_eq!(parser.skipped().len(), 1);
     }
 
     #[test]
@@ -3514,9 +3710,9 @@ SecWebAppId production
         parser.skip_failed_directives();
         let error = parser
             .from_string(
-                "SecAction \"id:1,pass\"\n\
-                 SecAction \"id:1,pass\"\n\
-                 SecAction \"id:1,pass\"",
+                "SecRule ARGS \"@contains x\" \"id:1,pass\"\n\
+                 SecRule ARGS \"@contains x\" \"id:1,pass\"\n\
+                 SecRule ARGS \"@contains x\" \"id:1,pass\"",
             )
             .unwrap_err();
         assert!(
@@ -3529,7 +3725,7 @@ SecWebAppId production
     fn rule_limit_counts_failed_compilation_attempts() {
         for directive in [
             "SecRule REQUEST_URI \"@unknown_operator value\" \"id:1,pass\"",
-            "SecAction \"id:not-a-number,pass\"",
+            "SecRule ARGS \"@contains x\" \"id:not-a-number,pass\"",
         ] {
             let mut parser = Parser::new().with_rule_limit(2);
             parser.skip_failed_directives();

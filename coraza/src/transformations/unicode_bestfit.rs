@@ -313,6 +313,7 @@ const BEST_FIT_ASCII: &[(u16, u8)] = &[
     (0x2039, 0x3C), // U+2039 SINGLE LEFT-POINTING ANGLE QUOTATION MARK maps to '<'
     (0x203A, 0x3E), // U+203A SINGLE RIGHT-POINTING ANGLE QUOTATION MARK maps to '>'
     (0x2122, 0x54), // U+2122 TRADE MARK SIGN maps to 'T'
+    (0x3002, 0x2E), // U+3002 IDEOGRAPHIC FULL STOP maps to '.'
     (0xFF01, 0x21), // U+FF01 FULLWIDTH EXCLAMATION MARK maps to '!'
     (0xFF02, 0x22), // U+FF02 FULLWIDTH QUOTATION MARK maps to '"'
     (0xFF03, 0x23), // U+FF03 FULLWIDTH NUMBER SIGN maps to '#'
@@ -406,6 +407,7 @@ const BEST_FIT_ASCII: &[(u16, u8)] = &[
     (0xFF5C, 0x7C), // U+FF5C FULLWIDTH VERTICAL LINE maps to '|'
     (0xFF5D, 0x7D), // U+FF5D FULLWIDTH RIGHT CURLY BRACKET maps to '}'
     (0xFF5E, 0x7E), // U+FF5E FULLWIDTH TILDE maps to '~'
+    (0xFF61, 0x2E), // U+FF61 HALFWIDTH IDEOGRAPHIC FULL STOP maps to '.'
 ];
 
 #[cfg(test)]
@@ -423,9 +425,12 @@ mod tests {
 
     #[test]
     fn best_fit_ascii_maps() {
+        assert_eq!(BEST_FIT_ASCII.len(), 372);
         assert_eq!(best_fit_ascii(0x201C), Some(b'"'));
         assert_eq!(best_fit_ascii(0x00E9), Some(b'e'));
+        assert_eq!(best_fit_ascii(0x3002), Some(b'.'));
         assert_eq!(best_fit_ascii(0xFF5E), Some(b'~'));
+        assert_eq!(best_fit_ascii(0xFF61), Some(b'.'));
         assert_eq!(best_fit_ascii(0x0041), None);
         assert_eq!(best_fit_ascii(0x4E2D), None);
     }

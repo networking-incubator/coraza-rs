@@ -306,13 +306,23 @@ impl Default for Waf {
     }
 }
 
+/// Go's `_1gib`: the largest body limit a configuration may set
+/// (`internal/corazawaf/waf.go:322,443-464`, v3.8.1).
+const MAX_BODY_LIMIT: i64 = 1_073_741_824;
+
 /// Validate settings enforced by WAF and transaction construction.
-fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
-    if config.request_body_limit < 0 {
-        return Err(ConfigError("request body limit must be non-negative".to_owned()));
+pub(crate) fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
+    if config.request_body_limit <= 0 {
+        return Err(ConfigError("request body limit must be greater than 0".to_owned()));
     }
-    if config.response_body_limit < 0 {
-        return Err(ConfigError("response body limit must be non-negative".to_owned()));
+    if config.request_body_limit > MAX_BODY_LIMIT {
+        return Err(ConfigError("request body limit must be at most 1GiB".to_owned()));
+    }
+    if config.response_body_limit <= 0 {
+        return Err(ConfigError("response body limit must be greater than 0".to_owned()));
+    }
+    if config.response_body_limit > MAX_BODY_LIMIT {
+        return Err(ConfigError("response body limit must be at most 1GiB".to_owned()));
     }
     if config.request_body_in_memory_limit < 0 {
         return Err(ConfigError(
@@ -706,6 +716,54 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_body_limits_outside_go_range() {
+        for limit in [0, -1, 1_073_741_825] {
+            assert!(
+                Waf::new(WafConfig {
+                    request_body_limit: limit,
+                    ..WafConfig::default()
+                })
+                .is_err(),
+                "request body limit {limit}"
+            );
+        }
+        assert!(
+            Waf::new(WafConfig {
+                response_body_limit: 0,
+                ..WafConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Waf::new(WafConfig {
+                response_body_limit: -1,
+                ..WafConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Waf::new(WafConfig {
+                response_body_limit: 1_073_741_825,
+                ..WafConfig::default()
+            })
+            .is_err()
+        );
+
+        for limit in [1, 1024, 1_073_741_824] {
+            assert!(
+                Waf::new(WafConfig {
+                    request_body_limit: limit,
+                    response_body_limit: limit,
+                    request_body_in_memory_limit: 0,
+                    ..WafConfig::default()
+                })
+                .is_ok(),
+                "body limit {limit}"
+            );
+        }
     }
 
     #[test]

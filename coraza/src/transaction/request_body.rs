@@ -34,7 +34,7 @@ use crate::{
         BodyProcessorOptions, BodyProcessorOutput, multipart, truncate_custom_body_text, xml,
     },
     transformations::url_decode,
-    types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RulePhase},
+    types::{BodyLimitAction, RulePhase},
 };
 
 #[expect(
@@ -65,8 +65,10 @@ impl Transaction {
 
         let mut ingest_error = false;
         if self.request_body_access && !body.is_empty() {
-            let limit = usize::try_from(self.request_body_limit).unwrap_or(0);
-            let configured_memory = usize::try_from(self.config.request_body_in_memory_limit).unwrap_or(0);
+            // A conversion failure must not disable inspection: fail closed with the
+            // largest usable bound instead of retaining nothing.
+            let limit = usize::try_from(self.request_body_limit).unwrap_or(usize::MAX);
+            let configured_memory = usize::try_from(self.config.request_body_in_memory_limit).unwrap_or(usize::MAX);
             // Zero means unset: follow the body limit, as in Go
             // (internal/corazawaf/waf.go:242-247).
             let memory_limit = if configured_memory == 0 {
@@ -87,14 +89,6 @@ impl Transaction {
             }
             if self.request_body_buffer.accept(body).is_err() {
                 ingest_error = true;
-            }
-        }
-
-        if self.audit_engine != AuditEngineStatus::Off && self.audit_log_parts.contains(&AuditLogPart::RequestBody) {
-            self.audit_request_body.clear();
-            match self.request_body_buffer.contiguous() {
-                Ok(retained) => self.audit_request_body.extend_from_slice(&retained),
-                Err(_) => ingest_error = true,
             }
         }
 
@@ -125,7 +119,7 @@ impl Transaction {
                 // Go's multipart processor treats any >= limit hit as partial, even when
                 // no bytes were discarded. Keep that separate from the custom option.
                 let partial = stats.truncated || stats.supplied >= u64::try_from(self.request_body_limit).unwrap_or(0);
-                let mut buffer = std::mem::take(&mut self.request_body_buffer);
+                let buffer = std::mem::take(&mut self.request_body_buffer);
                 let inspected = buffer.contiguous().map(|body| {
                     let length = body.len();
                     self.inspect_request_body(&body, truncated, partial);
@@ -169,8 +163,16 @@ impl Transaction {
             BodyProcessor::UrlEncoded => {
                 self.request_body.set(body);
                 self.request_body_length.set(body.len().to_string());
-                for (key, value) in parse_urlencoded(body) {
-                    self.add_post_argument(key, value);
+                // Check each raw pair against the limit before decoding it, so pairs past
+                // the limit are never decoded or allocated.
+                let mut count = self.args_post.value_count();
+                for (key, value) in split_urlencoded(body) {
+                    if !self.within_argument_limit(count) {
+                        break;
+                    }
+                    let (key, value) = decode_pair(key, value);
+                    self.insert_post_argument(&key, &value);
+                    count = count.saturating_add(1);
                 }
             },
             BodyProcessor::Multipart => {
@@ -251,11 +253,6 @@ impl Transaction {
         if failure.as_ref().is_some_and(|failure| failure.strict) {
             self.multipart_strict_error.set("1");
         }
-        let upload_dir = if self.config.upload_dir.is_empty() {
-            std::env::temp_dir()
-        } else {
-            PathBuf::from(&self.config.upload_dir)
-        };
         let mut total_size = 0_u64;
         let mut file_count = self.uploaded_paths.len();
 
@@ -307,26 +304,12 @@ impl Transaction {
                 total_size = total_size
                     .checked_add(size)
                     .ok_or_else(|| "multipart size overflow".to_owned())?;
-                if file_count >= self.config.upload_file_limit {
+                // Past the limit `FILES`, `FILES_SIZES` and `FILES_NAMES` still record the
+                // upload, as Go always does: only the temporary file write stops.
+                let over_limit = file_count >= self.config.upload_file_limit;
+                if over_limit {
                     self.multipart_strict_error.set("1");
-                    continue;
                 }
-                if reject_uploads {
-                    self.files.add("", filename);
-                    self.files_sizes.set_index(filename, 0, size.to_string());
-                    if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
-                        self.files.add("", alt_filename);
-                        self.files_sizes.set_index(alt_filename, 0, size.to_string());
-                    }
-                    self.files_names.add("", &part.name);
-                    file_count += 1;
-                    continue;
-                }
-                let path =
-                    save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
-                self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
-                self.uploaded_paths.push(path);
-                file_count += 1;
                 self.files.add("", filename);
                 self.files_sizes.set_index(filename, 0, size.to_string());
                 if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
@@ -334,6 +317,23 @@ impl Transaction {
                     self.files_sizes.set_index(alt_filename, 0, size.to_string());
                 }
                 self.files_names.add("", &part.name);
+                file_count += 1;
+                // A rejected upload and one past the limit are recorded but not written
+                // to disk.
+                if over_limit || reject_uploads {
+                    continue;
+                }
+                // Compute the fallback only when a file actually needs a temporary file.
+                // `std::env::temp_dir()` aborts on WASI, and a field-only multipart body
+                // never has to touch the filesystem.
+                let Some(upload_dir) = upload_directory(&self.config.upload_dir) else {
+                    self.multipart_strict_error.set("1");
+                    continue;
+                };
+                let path =
+                    save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
+                self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
+                self.uploaded_paths.push(path);
             } else {
                 self.add_post_argument(&part.name, part.data);
             }
@@ -381,11 +381,8 @@ pub(super) fn process_custom_body_processor(
     truncated: bool,
     processor: &dyn CustomBodyProcessor,
 ) {
-    let upload_dir = if tx.config.upload_dir.is_empty() {
-        std::env::temp_dir()
-    } else {
-        PathBuf::from(&tx.config.upload_dir)
-    };
+    let upload_dir = upload_directory(&tx.config.upload_dir);
+    let options_upload_dir = upload_dir.as_deref().unwrap_or_else(|| Path::new(""));
     // Both directions pass the raw `Content-Type` header, parameters included, so a
     // custom processor sees the same shape the built-in processors and Go receive
     // (`internal/corazawaf/transaction.go:1132-1135`). `RESPONSE_CONTENT_TYPE` is a
@@ -410,7 +407,7 @@ pub(super) fn process_custom_body_processor(
     );
     let options = BodyProcessorOptions {
         mime,
-        upload_dir: &upload_dir,
+        upload_dir: options_upload_dir,
         upload_file_limit: tx.config.upload_file_limit,
         upload_file_mode: tx.config.upload_file_mode,
         upload_keep_files: tx.config.upload_keep_files,
@@ -466,7 +463,13 @@ pub(super) fn process_custom_body_processor(
         }
     }
     for file in &output.files {
-        if let Err(message) = add_body_processor_file(tx, &upload_dir, file) {
+        let Some(upload_dir) = upload_dir.as_deref() else {
+            if error.is_none() {
+                error = Some("file uploads are unavailable on this host".to_owned());
+            }
+            break;
+        };
+        if let Err(message) = add_body_processor_file(tx, upload_dir, file) {
             if error.is_none() {
                 error = Some(message);
             }
@@ -529,12 +532,22 @@ fn add_response_body_argument(tx: &mut Transaction, name: &[u8], value: &[u8]) {
     }
 }
 
+/// The directory for temporary uploads, or `None` when WASI has no configured one.
+///
+/// `std::env::temp_dir()` aborts on WASI. Callers use this only when they actually
+/// need to write a file; a field-only body or a rejected upload never calls it.
+fn upload_directory(configured: &str) -> Option<PathBuf> {
+    if !configured.is_empty() {
+        return Some(PathBuf::from(configured));
+    }
+    if cfg!(target_os = "wasi") {
+        return None;
+    }
+    Some(std::env::temp_dir())
+}
+
 /// Store a custom file using the same private temporary-file path as multipart uploads.
 fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyProcessorFile) -> Result<(), String> {
-    if tx.uploaded_paths.len() >= tx.config.upload_file_limit {
-        tx.multipart_strict_error.set("1");
-        return Ok(());
-    }
     let size = u64::try_from(file.bytes.len()).map_err(|error| format!("upload size overflow: {error}"))?;
     let current_size = std::str::from_utf8(tx.files_combined_size.get_bytes())
         .ok()
@@ -543,20 +556,27 @@ fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyP
     let total_size = current_size
         .checked_add(size)
         .ok_or_else(|| "upload size overflow".to_owned())?;
-    let path = save_to_temp(upload_dir, &file.bytes)?;
 
     let mut content_type = Vec::with_capacity(file.content_type.len().saturating_add(14));
     content_type.extend_from_slice(b"Content-Type: ");
     content_type.extend_from_slice(&file.content_type);
     tx.multipart_part_headers.add_bytes(&file.name, content_type);
-    tx.files_tmp_names.add_bytes(b"", path.to_string_lossy().as_bytes());
-    tx.uploaded_paths.push(path);
+    // Past the limit `FILES`, `FILES_SIZES` and `FILES_NAMES` still record the upload,
+    // as the built-in multipart processor does: only the temporary file write stops.
     tx.files.add_bytes(b"", &file.filename);
     tx.multipart_name.add_bytes(&file.name, &file.name);
     tx.multipart_filename.add_bytes(&file.name, &file.filename);
     tx.files_sizes.set_index(&file.filename, 0, size.to_string());
     tx.files_names.add_bytes(b"", &file.name);
     tx.files_combined_size.set(total_size.to_string());
+
+    if tx.uploaded_paths.len() >= tx.config.upload_file_limit {
+        tx.multipart_strict_error.set("1");
+        return Ok(());
+    }
+    let path = save_to_temp(upload_dir, &file.bytes)?;
+    tx.files_tmp_names.add_bytes(b"", path.to_string_lossy().as_bytes());
+    tx.uploaded_paths.push(path);
     Ok(())
 }
 
@@ -571,22 +591,22 @@ fn save_to_temp(upload_dir: &Path, data: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Parses URLENCODED pairs in order, preserving decoded name and value bytes.
-pub(super) fn parse_urlencoded(body: &[u8]) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+/// Splits URLENCODED pairs in order into raw name and value bytes, skipping empty pairs.
+pub(super) fn split_urlencoded(body: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
     body.split(|&byte| byte == b'&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = match pair.iter().position(|&byte| byte == b'=') {
-                Some(equals) => (
-                    pair.get(..equals).unwrap_or_default(),
-                    pair.get(equals.saturating_add(1)..).unwrap_or_default(),
-                ),
-                None => (pair, &b""[..]),
-            };
-            let key = url_decode(key).0;
-            let value = url_decode(value).0;
-            (key, value)
+        .map(|pair| match pair.iter().position(|&byte| byte == b'=') {
+            Some(equals) => (
+                pair.get(..equals).unwrap_or_default(),
+                pair.get(equals.saturating_add(1)..).unwrap_or_default(),
+            ),
+            None => (pair, &b""[..]),
         })
+}
+
+/// URL-decodes the name and value of one raw pair from `split_urlencoded`.
+pub(super) fn decode_pair(key: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (url_decode(key).0, url_decode(value).0)
 }
 
 /// Bounds the flattened form relative to the body that produced it.
@@ -1836,6 +1856,33 @@ mod multipart_tests {
     }
 
     #[test]
+    fn upload_directory_follows_the_platform() {
+        #[cfg(target_os = "wasi")]
+        assert!(super::upload_directory("").is_none());
+        #[cfg(not(target_os = "wasi"))]
+        assert!(super::upload_directory("").is_some());
+        assert_eq!(super::upload_directory("/tmp/uploads"), Some("/tmp/uploads".into()));
+    }
+
+    #[test]
+    fn field_only_multipart_does_not_need_an_upload_directory() {
+        // A field-only body must not touch `std::env::temp_dir()`, which aborts on WASI.
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-field-only");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=X");
+        tx.process_request_headers();
+
+        assert_eq!(
+            tx.process_request_body(b"--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nAlice\r\n--X--\r\n",),
+            None
+        );
+        assert_eq!(tx.args_post.first(b"name"), Some(&b"Alice"[..]));
+        assert_eq!(tx.files.value_count(), 0);
+    }
+
+    #[test]
     fn host_policy_rejects_multipart_files_before_creating_a_temporary_upload() {
         let mut parser = crate::seclang::Parser::new();
         parser.from_string("SecRequestBodyAccess On").unwrap();
@@ -1905,7 +1952,13 @@ post-attack\r\n\
         );
         assert_eq!(tx.files.first(""), Some(&b"x.txt"[..]));
         assert_eq!(tx.files_names.first(""), Some(&b"upload"[..]));
-        assert_eq!(tx.files.value_count(), 1, "the configured file limit still applies");
+        assert_eq!(
+            tx.files.values("").collect::<Vec<_>>(),
+            [&b"x.txt"[..], &b"y.txt"[..]],
+            "past the file limit FILES still records every upload"
+        );
+        assert_eq!(tx.files_sizes.value_count(), 2);
+        assert_eq!(tx.files_names.value_count(), 2);
         assert_eq!(tx.files_combined_size.get(), "12");
         assert_eq!(tx.files_tmp_names.value_count(), 0);
         assert!(tx.uploaded_paths.is_empty());
@@ -1918,6 +1971,63 @@ post-attack\r\n\
         assert_eq!(tx.multipart_name.first(b"second-upload"), Some(&b"second-upload"[..]));
         assert_eq!(tx.multipart_name.first(b"after"), Some(&b"after"[..]));
         assert_eq!(tx.multipart_strict_error.get(), "1");
+    }
+
+    #[test]
+    fn uploads_past_the_file_limit_still_reach_the_files_collections() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"decoy\"; filename=\"decoy.txt\"\r\n\
+\r\n\
+x\r\n\
+--b\r\n\
+Content-Disposition: form-data; name=\"real\"; filename=\"shell.php\"\r\n\
+\r\n\
+<?php ?>\r\n\
+--b--\r\n";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        parser.config_mut().upload_file_limit = 1;
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("upload-limit-files");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+
+        assert_eq!(tx.process_request_body(body), None);
+        assert_eq!(
+            tx.files.values("").collect::<Vec<_>>(),
+            [&b"decoy.txt"[..], &b"shell.php"[..]]
+        );
+        assert_eq!(
+            tx.files_sizes.value_count(),
+            2,
+            "the decoy must not hide the real upload's size"
+        );
+        assert_eq!(
+            tx.files_names.values("").collect::<Vec<_>>(),
+            [&b"decoy"[..], &b"real"[..]]
+        );
+        assert_eq!(
+            tx.files_tmp_names.value_count(),
+            1,
+            "only the first upload is written to disk"
+        );
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+    }
+
+    #[test]
+    fn a_body_without_a_final_boundary_publishes_its_last_field() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+attack";
+        let tx = process(body);
+
+        assert_eq!(
+            tx.args_post.first(b"q"),
+            Some(&b"attack"[..]),
+            "the last part must reach ARGS_POST"
+        );
+        assert_eq!(tx.reqbody_error.get(), "1", "the missing boundary is still reported");
     }
 
     #[test]

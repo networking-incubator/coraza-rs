@@ -13,7 +13,11 @@ standard library to send request trailers, so curl does not need optional
 
 The runner builds both Envoy Wasm artifacts, validates the HCM configuration,
 starts Envoy and the backend, then removes its containers, image, and temporary
-files. The filter config sets
+files. Set `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs` to build the
+embedded-CRS artifact; that run uses `envoy-crs.yaml` — the same fixture
+configuration plus a `crs.local` policy that includes `crs/crs-setup.conf`
+and `crs/rules/*.conf`, usable as a CRS demo config — then checks that a SQL
+injection request is denied by CRS rule 949110. The filter config sets
 `allow_on_headers_stop_iteration: true`; this HCM profile also requires
 `proxy_100_continue: false` because request headers stay paused while phase 1
 runs.
@@ -31,6 +35,27 @@ Trailer callbacks complete body phases and leave Envoy's trailer maps untouched.
 The locally pinned Go Coraza v3.8.1 public transaction API has no request or
 response trailer ingestion method and exports no `REQUEST_TRAILERS` or
 `RESPONSE_TRAILERS` variables, so trailer values are not Coraza rule inputs.
+
+## Compressed configuration
+
+The plugin configuration may be carried gzip-compressed and base64-encoded.
+Compress the same JSON document and wrap the output in a one-key document:
+
+```sh
+gzip -c config.json | base64 -w0
+```
+
+```json
+{"config_gzip_b64": "H4sIA..."}
+```
+
+`-w0` is required: the value must be standard padded base64 on one line, so
+GNU base64's default 76-column wrapping is rejected. Plain JSON stays the
+default. `config_gzip_b64` must be the only key in the wrapper, the
+decompressed document is capped at 8 MiB, and it must not itself contain
+`config_gzip_b64`. Exactly one gzip member is accepted, with nothing after it
+(a concatenated second member is rejected). The decompressed document follows
+the same schema as the plain form.
 
 ## Observability
 

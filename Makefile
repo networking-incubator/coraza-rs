@@ -19,11 +19,15 @@ CORAZA_RUST_DRIVER_CMD ?=
 CORAZA_GO_BUILD_CMD ?=
 CORAZA_GO_DRIVER_CMD ?=
 
+# CRS state lives in envoy-coraza/crs-fetch.sh: the tracked pin
+# (envoy-coraza/crs.pin) is the single source of truth and the fetched tree
+# path is fixed there, not overridable.
+
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build build-envoy-wasm build-envoy-wasm-image check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check coraza-coordinator-check coraza-parity coraza-bench ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build build-envoy-wasm build-envoy-wasm-crs test-envoy-wasm-crs run-envoy-crs build-envoy-wasm-image crs-fetch crs-clean crs-restamp check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check coraza-coordinator-check coraza-parity coraza-bench ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -40,6 +44,32 @@ check:
 build-envoy-wasm:
 	rustup target add wasm32-wasip1
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion -p envoy-coraza
+
+build-envoy-wasm-crs: crs-fetch
+	rustup target add wasm32-wasip1
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo build --locked --release --target wasm32-wasip1 -p envoy-libperfusion -p envoy-coraza --features envoy-coraza/embed-crs
+
+test-envoy-wasm-crs: crs-fetch
+	cargo test -p envoy-coraza --features embed-crs $(_NOCAPTURE)
+
+# Brings up the example Envoy with the embedded CRS and leaves it running for
+# manual requests; no test assertions. Stop with the compose command it prints.
+run-envoy-crs: crs-fetch
+	ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs ENVOY_CORAZA_INTERACTIVE=1 bash examples/envoy-coraza/test-envoy.sh
+
+# Downloads the pinned CRS release and keeps only the files the filter includes.
+crs-fetch:
+	@./envoy-coraza/crs-fetch.sh
+
+# Restamps a locally modified envoy-coraza/crs/ tree (see the README) so the
+# feature build accepts it. Needed when edits add or remove files: crs-fetch
+# replaces the tree only when the marker or file count no longer matches, so
+# content-only edits that keep the count are kept.
+crs-restamp:
+	@./envoy-coraza/crs-fetch.sh restamp
+
+crs-clean:
+	@./envoy-coraza/crs-fetch.sh clean
 
 build-envoy-wasm-image:
 	docker build --file envoy-libperfusion/Dockerfile --tag "$(ENVOY_WASM_IMAGE)" .
@@ -212,6 +242,12 @@ help:
 	@echo "Build:"
 	@echo "  build      cargo build --workspace"
 	@echo "  build-envoy-wasm       build the release Envoy filter for wasm32-wasip1"
+	@echo "  build-envoy-wasm-crs   fetch the pinned CRS release and build the filter with it embedded"
+	@echo "  run-envoy-crs          run the example Envoy with the embedded CRS, no test assertions"
+	@echo "  test-envoy-wasm-crs    fetch the pinned CRS release and run the embedded-CRS tests"
+	@echo "  crs-fetch              download and verify the CRS release pinned in envoy-coraza/crs.pin"
+	@echo "  crs-restamp            accept a locally modified CRS tree (see envoy-coraza/README.md)"
+	@echo "  crs-clean              remove envoy-coraza/crs"
 	@echo "  build-envoy-wasm-image build/tag a scratch OCI image using Docker's Rust build stage"
 	@echo "    ENVOY_WASM_IMAGE=...  image tag (default: $(ENVOY_WASM_IMAGE))"
 	@echo "  check      cargo check --workspace"

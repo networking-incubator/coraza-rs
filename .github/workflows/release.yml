@@ -1,0 +1,92 @@
+name: release
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly, 03:00 UTC daily
+  workflow_dispatch:
+  # Manual releases: push a vX.Y.Z tag. Nightlies never push a tag (GoReleaser
+  # creates it when publishing), so only manual tags reach this trigger.
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Serialize all runs of this workflow: nightly and manual releases publish
+# the same GHCR tags, so they must not overlap. Never cancel an in-flight
+# release.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Defense in depth: never release from a nightly-named tag push (the
+    # nightly run does not push tags, but a manual one should not release).
+    if: github.event_name != 'push' || !contains(github.ref, 'nightly')
+    name: Release
+    runs-on: ubuntu-24.04
+    permissions:
+      # GoReleaser creates the GitHub release and its assets.
+      contents: write
+      # Push the WASMPlugin images to GHCR.
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and tags so GoReleaser can resolve the version.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: nightly
+
+      - name: Add wasm target
+        run: rustup target add wasm32-wasip1
+
+      - name: Build WASM filters
+        run: |
+          ./envoy-coraza/crs-fetch.sh
+          mkdir -p release-artifacts
+          cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
+          cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
+          cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
+          cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+
+      - name: Login to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      # OSS GoReleaser has no nightly support (Pro-only), so the nightly tag is
+      # passed to GoReleaser via GORELEASER_CURRENT_TAG instead: GoReleaser
+      # creates the tag (at this commit) and the release when publishing, and
+      # an existing same-day tag is never moved. Manual releases use the pushed
+      # vX.Y.Z tag directly (GoReleaser detects it from the checkout).
+      - name: Set nightly tag for GoReleaser
+        if: github.event_name != 'push'
+        run: echo "GORELEASER_CURRENT_TAG=v0.0.0-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
+
+      # Only the newest vX.Y.Z release may publish the shared `latest` image
+      # tags, so a delayed or backported older tag cannot move them backwards.
+      - name: Check whether to publish latest image tags
+        if: github.event_name == 'push'
+        run: |
+          newest="$(git tag --list 'v[0-9]*' | grep -v -- '-nightly\.' | sort -V | tail -1)"
+          if [ "$newest" = "${GITHUB_REF_NAME}" ]; then
+            echo "PUSH_LATEST=true" >> "$GITHUB_ENV"
+          else
+            echo "PUSH_LATEST=false" >> "$GITHUB_ENV"
+          fi
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -14,7 +14,9 @@ detecting.
 | `ftw-runner/` | Optional Go FTW integration harness for the Coraza crate. |
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
+| [`envoy-coraza/`](envoy-coraza/README.md) | Envoy Proxy-Wasm HTTP filter backed by the `coraza` crate, with an optional build that embeds a pinned OWASP CRS release. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
+| `examples/envoy-coraza/` | Standalone Envoy lifecycle harness for the Coraza filter, including an embedded-CRS run. |
 | `xtask/` | Internal commands for checking and refreshing pinned corpora and generated tables. |
 | `docs/` | CI, performance, and design documentation. |
 | `.github/workflows/` | Build, test, parity, fuzz, coverage, and supply-chain workflows. |
@@ -120,6 +122,32 @@ From the repository root, run the standard checks:
 make lint
 make test
 ```
+
+`make` with no target also runs `make lint-extra`, which calls four binaries
+this repository does not install: `typos`, `taplo`, `actionlint` and
+`shellcheck`. The usual set is:
+
+```sh
+cargo install typos-cli --locked --version 1.42.1
+cargo install taplo-cli --locked --version 0.10.0
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.10
+# shellcheck comes from the distribution package, for example:
+sudo dnf install ShellCheck
+```
+
+`make audit` and `make coverage-check`, which the no-target run also reaches,
+need four cargo subcommands that are likewise not part of the workspace:
+
+```sh
+cargo install cargo-audit --locked --version 0.22.2
+cargo install cargo-deny --locked --version 0.20.2
+cargo install cargo-llvm-cov --locked --version 0.9.1
+cargo install cargo-nextest --locked --version 0.9.145
+```
+
+Those versions match CI; see [Lint tool trust](docs/ci.md#lint-tool-trust) for
+how the `meta-lint` job pins and verifies the downloaded binaries, and how the
+cargo subcommands are pinned.
 
 `make parity-differential` additionally compares against the pinned C and Go
 references. It needs the C checkout selected by
