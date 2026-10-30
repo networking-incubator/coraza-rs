@@ -797,3 +797,32 @@ Rust allocates more often per transaction (about 3–15×) yet is faster on ever
 - The libperfusion `speed`/`compare`/`scaling` benches are a separate gate for detector changes and are tracked in [#137](https://github.com/networking-incubator/coraza-rs/issues/137).
 
 On this workload and host, coraza-rs at `fa24e79` is faster than Go Coraza v3.8.1 on every case and uses less resident memory. That is the extent of the claim this record supports.
+
+## Map insertion-order change (2026-10-30)
+
+Before/after gate for the `Map` collection switching from `HashMap` to `IndexMap` storage so iteration follows insertion order ([#136](https://github.com/networking-incubator/coraza-rs/issues/136); keyless variable selections had hash-random order, which could flip verdicts for identical requests). The libperfusion `speed`/`compare`/`scaling` benches do not exercise `coraza`'s collections, so the applicable gate is the coordinator protocol above.
+
+### Identity
+
+- Base: `d2db26b` plus a bench-only commit applying the candidate's workload-driver boxing (`gate/base-plus-driverbox`, `6a4fb45`), so both trees pay the same per-transaction harness allocation and the comparison isolates the engine change. Candidate: `42cf930` (the two-commit insertion-order change).
+- Same workload (`coraza-common-subset-v1`, 6 cases), tools (`rustc 1.99.1`, `go1.27.3-X:nodwarf5`), host (AMD Ryzen 7 PRO 7840HS, Linux 7.2.12, frequency unlocked) and pinned drivers (CPU 3) as the coordinator baseline record above. `GOFLAGS` cleared; Go profile `upstream`.
+- Four `make coraza-bench` rounds per tree (3 repetitions × 1,000 iterations each, alternating engine order inside every round), alternating which tree ran first across rounds (base-first twice, candidate-first twice). The coordinator's correctness parity gate passed on every round for both trees.
+
+### Timing
+
+Per-transaction Rust medians over 4 rounds (each itself the median of 3,000 samples); `ratio` is candidate over base:
+
+| case | base median (ns) | base range | candidate median (ns) | candidate range | ratio |
+|---|---:|---|---:|---|---:|
+| get-benign | 5,155 | 5,089–5,240 | 5,160 | 5,090–5,190 | 1.001 |
+| get-attack | 5,568 | 5,511–5,651 | 5,550 | 5,430–5,571 | 0.997 |
+| form-benign | 5,485 | 5,381–5,581 | 5,520 | 5,430–5,541 | 1.006 |
+| form-attack | 5,921 | 5,861–5,971 | 5,946 | 5,851–5,991 | 1.004 |
+| json-benign | 6,612 | 6,492–6,652 | 6,748 | 6,703–6,783 | 1.020 |
+| json-attack | 6,943 | 6,863–7,074 | 7,084 | 7,003–7,203 | 1.020 |
+
+The GET and form cases are within repeated-run spread. The JSON cases show a consistent ~2% regression (non-overlapping round ranges on `json-benign`; ~135–140 ns per transaction), attributed to `IndexMap` maintenance on the JSON argument ingestion path (each distinct key now appends to the entry vector and the hash index, and both allocations grow together). This host cannot resolve effects near 1%, so the ~2% JSON figure is an upper bound on the real cost.
+
+### Verdict
+
+Accepted. The change removes non-deterministic verdicts (a correctness defect) for a cost within spread on four of six cases and ~2% on the JSON cases. Rust remains faster than Go on every case in the paired rounds. Per-transaction allocation counts were not re-measured for this change; the JSON ingestion path performs more bookkeeping allocations per distinct key by construction.
