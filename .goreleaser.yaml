@@ -1,13 +1,12 @@
-# Nightly releases of the envoy-coraza WASM filter (see docs/ci.md).
+# Releases of the envoy-coraza WASM filter (see docs/ci.md): nightly (dated
+# v0.0.0-nightly.YYYYMMDD tag, created by the release workflow) and manual
+# (push a vX.Y.Z tag).
 #
-# The wasm binaries are built by the nightly workflow (make/cargo, wasm32-wasip1
-# is not a target GoReleaser's Rust builder supports) and staged as
+# The wasm binaries are built by the release workflow (cargo, wasm32-wasip1 is
+# not a target GoReleaser's Rust builder supports) and staged as
 # release-artifacts/{coraza-rs,coraza-rs-crs}.wasm before GoReleaser runs.
 # GoReleaser then uploads them as release assets and packages them into the
 # scratch Envoy WASMPlugin images.
-#
-# Nightlies are released under a dated tag (v0.0.0-nightly.YYYYMMDD) created by
-# the nightly workflow; regular releases would use a normal vX.Y.Z tag.
 version: 2
 
 project_name: coraza-rs
@@ -20,8 +19,10 @@ git:
   ignore_tags: ["v0.0.0-nightly.*"]
 
 release:
-  prerelease: true
-  make_latest: false
+  # Nightly tags (v0.0.0-nightly.*) publish as prereleases that never become
+  # latest; manual vX.Y.Z tags publish as regular latest releases.
+  prerelease: "{{ contains .Tag \"nightly\" }}"
+  make_latest: "{{ if contains .Tag \"nightly\" }}false{{ else }}true{{ end }}"
   replace_existing_artifacts: true
   extra_files:
     - glob: release-artifacts/coraza-rs.wasm
@@ -30,14 +31,20 @@ release:
 changelog:
   disable: true
 
+# Tag conventions used by both image variants:
+# - nightly run (tag v0.0.0-nightly.YYYYMMDD): v0.0.0-nightly.YYYYMMDD,
+#   nightly, nightly-YYYYMMDD
+# - manual release (tag vX.Y.Z): vX.Y.Z, latest
 dockers_v2:
   - id: coraza-rs
     dockerfile: Dockerfile.goreleaser
     images:
       - ghcr.io/networking-incubator/coraza-rs
     tags:
-      - nightly
-      - "nightly-{{ .Now.Format \"20060102\" }}"
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if not (contains .Tag \"nightly\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs.wasm
     build_args:
@@ -50,8 +57,10 @@ dockers_v2:
     images:
       - ghcr.io/networking-incubator/coraza-rs-crs
     tags:
-      - nightly
-      - "nightly-{{ .Now.Format \"20060102\" }}"
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if not (contains .Tag \"nightly\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs-crs.wasm
     build_args:
