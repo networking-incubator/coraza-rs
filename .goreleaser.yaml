@@ -16,6 +16,8 @@ builds:
     skip: true
 
 git:
+  # Keep the nightly tags (created by GoReleaser from GORELEASER_CURRENT_TAG on
+  # nightly runs) out of previous-version discovery; see the release workflow.
   ignore_tags: ["v0.0.0-nightly.*"]
 
 release:

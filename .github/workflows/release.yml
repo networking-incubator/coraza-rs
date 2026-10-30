@@ -4,9 +4,8 @@ on:
   schedule:
     - cron: "0 3 * * *" # nightly, 03:00 UTC daily
   workflow_dispatch:
-  # Manual releases: push a vX.Y.Z tag. The nightly run's own dated tag push
-  # (v0.0.0-nightly.*) also matches this filter but is skipped by the job's
-  # `if` guard below.
+  # Manual releases: push a vX.Y.Z tag. Nightlies never push a tag (GoReleaser
+  # creates it when publishing), so only manual tags reach this trigger.
   push:
     tags: ["v*"]
 
@@ -22,7 +21,8 @@ concurrency:
 
 jobs:
   release:
-    # Skip the run triggered by the nightly job pushing its own dated tag.
+    # Defense in depth: never release from a nightly-named tag push (the
+    # nightly run does not push tags, but a manual one should not release).
     if: github.event_name != 'push' || !contains(github.ref, 'nightly')
     name: Release
     runs-on: ubuntu-24.04
@@ -61,17 +61,14 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
-      # OSS GoReleaser has no nightly support (Pro-only), so the dated tag is
-      # created here and GoReleaser releases under it. Manual releases use the
-      # pushed vX.Y.Z tag directly (GoReleaser detects it from the checkout).
-      - name: Create dated nightly tag
+      # OSS GoReleaser has no nightly support (Pro-only), so the nightly tag is
+      # passed to GoReleaser via GORELEASER_CURRENT_TAG instead: GoReleaser
+      # creates the tag (at this commit) and the release when publishing, and
+      # an existing same-day tag is never moved. Manual releases use the pushed
+      # vX.Y.Z tag directly (GoReleaser detects it from the checkout).
+      - name: Set nightly tag for GoReleaser
         if: github.event_name != 'push'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag="v0.0.0-nightly.$(date -u +%Y%m%d)"
-          git tag -f "$tag" "$GITHUB_SHA"
-          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$tag"
+        run: echo "GORELEASER_CURRENT_TAG=v0.0.0-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
 
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:

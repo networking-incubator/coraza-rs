@@ -231,11 +231,19 @@ assets and packages each into a scratch Docker image
 Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
 nightlies, or `vX.Y.Z` and `latest` for manual releases.
 
-OSS GoReleaser has no nightly mode (Pro-only), so the workflow force-pushes a
-dated tag (`v0.0.0-nightly.YYYYMMDD`) and GoReleaser releases under it as a
-prerelease. For a manual release, push a normal `vX.Y.Z` tag. To test
-packaging locally without publishing:
+OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
+the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
+`GORELEASER_CURRENT_TAG` environment variable and GoReleaser creates the tag
+and prerelease when publishing; a same-day rerun fails instead of moving the
+existing tag. For a manual release, push a normal `vX.Y.Z` tag. To test
+packaging locally without publishing, first stage the WASM files exactly as
+the workflow does, then run the snapshot (the config expects them to exist):
 
 ```console
+./envoy-coraza/crs-fetch.sh
+cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
+cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
+cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
+cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
 goreleaser release --snapshot --clean
 ```
