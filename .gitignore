@@ -11,6 +11,12 @@ benchmarks/coraza/go/local.sum
 # Fetched OWASP CRS tree for the envoy-coraza `embed-crs` feature
 envoy-coraza/crs/
 
+# Staged WASM filters for GoReleaser releases (see .goreleaser.yaml)
+release-artifacts/
+
+# GoReleaser output
+dist/
+
 # Rustfmt backup files
 **/*.rs.bk
 
