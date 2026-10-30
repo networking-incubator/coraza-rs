@@ -3,8 +3,8 @@
 Shared workload layer, Rust and Go drivers, a correctness-first parity runner
 and a local coordinator for the local Go-versus-Rust Coraza comparison. The
 workload, both drivers, cross-engine outcome comparison, the coordinator and
-both timing drivers are in place. This branch makes no performance claim and
-establishes no baseline; `make coraza-bench` produces raw samples and derived
+both timing drivers are in place. The first recorded baseline run (2026-10-30) is in
+[`docs/performance.md`](../../docs/performance.md); `make coraza-bench` produces raw samples and derived
 statistics in `run.json`, and speed ratios are published only for cases that
 pass correctness parity.
 
@@ -487,7 +487,7 @@ Every raw timing file and log is preserved and referenced from `run.json`. A
 failed run still writes `run.json` with `status: failed`, the error and every
 artifact produced so far.
 
-This wave publishes no benchmark numbers or baseline. The coordinator,
+The first recorded baseline run is in [`docs/performance.md`](../../docs/performance.md). The coordinator,
 identity gate, collector and protocol are exercised with mock drivers and
 synthetic documents by `make coraza-coordinator-check`; the Go timing driver is
 covered by the Go tests, and the Rust timing mode by the `coraza_workload` Rust
