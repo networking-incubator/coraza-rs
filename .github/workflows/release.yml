@@ -48,14 +48,36 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-wasip1
 
+      # Pinned binaryen release (the same version the Istio demo validates
+      # with) for the wasm-as/wasm-merge pair that links the WASI stubs into
+      # the published artifacts.
+      - name: Install binaryen
+        run: |
+          mkdir -p /tmp/binaryen
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz \
+            | tar xz -C /tmp/binaryen --strip-components=2 \
+              binaryen-version_123-x86_64-linux/bin/wasm-as \
+              binaryen-version_123-x86_64-linux/bin/wasm-merge
+          echo "/tmp/binaryen" >> "$GITHUB_PATH"
+
       - name: Build WASM filters
         run: |
           ./envoy-coraza/crs-fetch.sh
           mkdir -p release-artifacts
+          # Link the WASI ENOSYS stubs (envoy-coraza/wasi-stub.wat) into the
+          # published artifacts so they also load on Envoy below 1.40 (e.g.
+          # Istio 1.30), whose Proxy-Wasm host does not provide those imports;
+          # on newer Envoy the extra imports are unused.
+          wasm-as envoy-coraza/wasi-stub.wat -o /tmp/wasi-stub.wasm
+          link_stubs() {
+            wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
+              "$1" envoy-coraza -o "$2" \
+              --rename-export-conflicts --all-features
+          }
           cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
-          cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
+          link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
           cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
-          cp target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+          link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
 
       - name: Login to GHCR
         env:
