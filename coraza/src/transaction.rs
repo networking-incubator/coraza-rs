@@ -42,7 +42,7 @@ use std::{
 
 use body_buffer::BodyBuffer;
 pub use body_buffer::BodyIngestionStats;
-use request_body::parse_urlencoded;
+use request_body::{decode_pair, split_urlencoded};
 use variables::BodyProcessor;
 pub use variables::VariableCollection;
 
@@ -1568,14 +1568,15 @@ impl Transaction {
 
     /// Add the decoded pairs of a raw query string to the GET collections.
     fn add_query_arguments(&mut self, query: &[u8]) {
-        for (key, value) in parse_urlencoded(query) {
-            // Stop decoding once the GET argument limit is reached; the lazy
-            // iterator then never decodes the remaining pairs. within_argument_limit
-            // sets ARGUMENTS_LIMIT_REACHED when it reports the limit is hit.
-            if !self.within_argument_limit(self.args_get.value_count()) {
+        let mut count = self.args_get.value_count();
+        for (key, value) in split_urlencoded(query) {
+            // Check the raw pair before decoding it, so pairs past the limit are never decoded.
+            if !self.within_argument_limit(count) {
                 break;
             }
-            self.add_get_argument(key, value);
+            let (key, value) = decode_pair(key, value);
+            self.insert_get_argument(&key, &value);
+            count = count.saturating_add(1);
         }
     }
 
@@ -1584,10 +1585,17 @@ impl Transaction {
         let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_get.value_count()) {
-            self.args_get.add_bytes(key, value);
-            self.args.add_bytes(key, value);
-            self.update_args_combined_size(key, value);
+            self.insert_get_argument(key, value);
         }
+    }
+
+    /// Insert an admitted query argument into `ARGS_GET` and `ARGS`.
+    ///
+    /// The caller has already checked the argument limit.
+    fn insert_get_argument(&mut self, key: &[u8], value: &[u8]) {
+        self.args_get.add_bytes(key, value);
+        self.args.add_bytes(key, value);
+        self.update_args_combined_size(key, value);
     }
 
     /// Add a request body argument to `ARGS_POST` and `ARGS`, keeping the decoded name bytes.
@@ -1595,10 +1603,17 @@ impl Transaction {
         let key = key.as_ref();
         let value = value.as_ref();
         if self.within_argument_limit(self.args_post.value_count()) {
-            self.args_post.add_bytes(key, value);
-            self.args.add_bytes(key, value);
-            self.update_args_combined_size(key, value);
+            self.insert_post_argument(key, value);
         }
+    }
+
+    /// Insert an admitted request body argument into `ARGS_POST` and `ARGS`.
+    ///
+    /// The caller has already checked the argument limit.
+    fn insert_post_argument(&mut self, key: &[u8], value: &[u8]) {
+        self.args_post.add_bytes(key, value);
+        self.args.add_bytes(key, value);
+        self.update_args_combined_size(key, value);
     }
 
     /// Add a connector-supplied path argument to `ARGS_PATH` and `ARGS`, keeping the name bytes.
@@ -2818,6 +2833,103 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
             tx.get_variable(RuleVariable::ArgsCombinedSize, None).as_deref(),
             Some("4")
         );
+    }
+
+    #[test]
+    fn query_limit_counts_arguments_already_present() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-prefilled", Arc::new(config));
+        tx.add_get_argument("pre", "0");
+        tx.process_uri("/p?a=1&b=2", "GET", "HTTP/1.1");
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_get.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")), None);
+    }
+
+    #[test]
+    fn query_limit_is_not_flagged_when_the_query_fits_exactly() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut fits = Transaction::with_config("tx-query-fits", Arc::new(config.clone()));
+        fits.process_uri("/p?a=1&b=2", "GET", "HTTP/1.1");
+
+        assert!(!fits.arguments_limit_reached());
+        assert_eq!(fits.args_get.value_count(), 2);
+
+        let mut over = Transaction::with_config("tx-query-over", Arc::new(config));
+        over.process_uri("/p?a=1&b=2&c=3", "GET", "HTTP/1.1");
+
+        assert!(over.arguments_limit_reached());
+        assert_eq!(over.args_get.value_count(), 2);
+    }
+
+    #[test]
+    fn query_limit_ignores_empty_pairs() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-empty", Arc::new(config));
+        tx.process_uri("/p?&&a=1&&b=2&&", "GET", "HTTP/1.1");
+
+        assert!(!tx.arguments_limit_reached());
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn urlencoded_body_limit_counts_arguments_already_present() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-body-prefilled", Arc::new(config));
+        tx.add_post_argument("pre", "0");
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"a=1&b=2"), None);
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_post.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("b")), None);
+    }
+
+    #[test]
+    fn urlencoded_body_limit_is_not_flagged_when_the_body_fits_exactly() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        // A body can be processed once per transaction, so each case gets its own one.
+        let body_tx = |id: &str, body: &[u8]| {
+            let mut tx = Transaction::with_config(id, Arc::new(config.clone()));
+            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            tx.process_request_headers();
+            assert_eq!(tx.process_request_body(body), None);
+            tx
+        };
+
+        let fits = body_tx("tx-body-fits", b"a=1&b=2");
+        assert!(!fits.arguments_limit_reached());
+        assert_eq!(fits.args_post.value_count(), 2);
+
+        let over = body_tx("tx-body-over", b"a=1&b=2&c=3");
+        assert!(over.arguments_limit_reached());
+        assert_eq!(over.args_post.value_count(), 2);
+
+        let empty = body_tx("tx-body-empty", b"&&a=1&&b=2&&");
+        assert!(!empty.arguments_limit_reached());
+        assert_eq!(empty.args_post.value_count(), 2);
     }
 
     #[test]
