@@ -1,9 +1,14 @@
-name: nightly
+name: release
 
 on:
   schedule:
-    - cron: "0 3 * * *" # 03:00 UTC daily
+    - cron: "0 3 * * *" # nightly, 03:00 UTC daily
   workflow_dispatch:
+  # Manual releases: push a vX.Y.Z tag. The nightly run's own dated tag push
+  # (v0.0.0-nightly.*) also matches this filter but is skipped by the job's
+  # `if` guard below.
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -13,7 +18,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  nightly:
+  release:
+    # Skip the run triggered by the nightly job pushing its own dated tag.
+    if: github.event_name != 'push' || !contains(github.ref, 'nightly')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,8 +49,10 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       # OSS GoReleaser has no nightly support (Pro-only), so the dated tag is
-      # created here and GoReleaser releases under it.
+      # created here and GoReleaser releases under it. Manual releases use the
+      # pushed vX.Y.Z tag directly (GoReleaser detects it from the checkout).
       - name: Create dated nightly tag
+        if: github.event_name != 'push'
         run: |
           tag="v0.0.0-nightly.$(date -u +%Y%m%d)"
           git tag -f "$tag" "$GITHUB_SHA"
