@@ -1569,6 +1569,12 @@ impl Transaction {
     /// Add the decoded pairs of a raw query string to the GET collections.
     fn add_query_arguments(&mut self, query: &[u8]) {
         for (key, value) in parse_urlencoded(query) {
+            // Stop decoding once the GET argument limit is reached; the lazy
+            // iterator then never decodes the remaining pairs. within_argument_limit
+            // sets ARGUMENTS_LIMIT_REACHED when it reports the limit is hit.
+            if !self.within_argument_limit(self.args_get.value_count()) {
+                break;
+            }
             self.add_get_argument(key, value);
         }
     }
@@ -2766,6 +2772,51 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
         assert_eq!(
             tx.get_variable(RuleVariable::ArgumentsLimitReached, None).as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn process_uri_stops_decoding_query_arguments_at_the_limit() {
+        let config = WafConfig {
+            argument_limit: 2,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-query-limit", Arc::new(config));
+        tx.process_uri("/p?a=1&b=2&c=3&d=4", "GET", "HTTP/1.1");
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_get.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("b")).as_deref(), Some("2"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("c")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsGet, Some("d")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsCombinedSize, None).as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn urlencoded_body_stops_decoding_post_arguments_at_the_limit() {
+        let config = WafConfig {
+            argument_limit: 2,
+            request_body_access: true,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("tx-body-limit", Arc::new(config));
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(b"a=1&b=2&c=3&d=4"), None);
+
+        assert!(tx.arguments_limit_reached());
+        assert_eq!(tx.args_post.value_count(), 2);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("a")).as_deref(), Some("1"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("b")).as_deref(), Some("2"));
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("c")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("d")), None);
+        assert_eq!(
+            tx.get_variable(RuleVariable::ArgsCombinedSize, None).as_deref(),
+            Some("4")
         );
     }
 

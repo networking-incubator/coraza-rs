@@ -164,6 +164,11 @@ impl Transaction {
                 self.request_body.set(body);
                 self.request_body_length.set(body.len().to_string());
                 for (key, value) in parse_urlencoded(body) {
+                    // Stop decoding once the POST argument limit is reached (see
+                    // add_query_arguments): the lazy iterator skips the rest.
+                    if !self.within_argument_limit(self.args_post.value_count()) {
+                        break;
+                    }
                     self.add_post_argument(key, value);
                 }
             },
