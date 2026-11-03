@@ -36,6 +36,13 @@ release:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+  extra_files:
+    - glob: release-artifacts/coraza-rs.wasm
+    - glob: release-artifacts/coraza-rs-crs.wasm
+    - glob: release-artifacts/coraza-rs-dynamic.so
+    - glob: release-artifacts/coraza-rs-dynamic-crs.so
+    - glob: release-artifacts/coraza-rs-dynamic-linux-arm64.so
+    - glob: release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
 
 changelog:
   disable: true

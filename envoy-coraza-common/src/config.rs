@@ -748,7 +748,9 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
         if authority.is_empty() {
             return Err(ConfigError::EmptyAuthority);
         }
-        if crate::authority::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority) {
+        if crate::authority::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority)
+            || crate::authority::has_explicit_default_port(authority)
+        {
             return Err(ConfigError::InvalidAuthority {
                 authority: authority.clone(),
             });
@@ -1197,10 +1199,20 @@ mod tests {
             );
         }
 
-        for authority in ["a.example:80", "a.example:443", "[2001:db8::1]:443"] {
-            let input =
-                format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
-            assert!(Config::parse(input.as_bytes()).is_ok(), "authority {authority:?}");
+        for authority in [
+            "a.example:80",
+            "a.example:443",
+            "a.example:080",
+            "[2001:db8::1]:80",
+            "[2001:db8::1]:443",
+        ] {
+            let error = parse_error(&format!(
+                r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#
+            ));
+            assert!(
+                error.contains("is invalid or not lowercase"),
+                "authority {authority:?} was accepted: {error}"
+            );
         }
     }
 

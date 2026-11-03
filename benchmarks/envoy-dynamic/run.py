@@ -19,6 +19,7 @@ import re
 import socket
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -40,8 +41,18 @@ BODY_BYTES = 512 * 1024
 FRAGMENTED_BYTES = 64 * 1024
 
 
-def run(command: list[str], *, capture: bool = False) -> str:
-    result = subprocess.run(command, check=True, text=True, capture_output=capture)
+def run(
+    command: list[str],
+    *,
+    cwd: pathlib.Path = ROOT,
+    capture: bool = False,
+    check: bool = True,
+    timeout: float = 300,
+) -> str:
+    try:
+        result = subprocess.run(command, cwd=cwd, check=check, text=True, capture_output=capture, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"command timed out after {timeout:g}s: {command!r}") from error
     return result.stdout if capture else ""
 
 
@@ -278,16 +289,22 @@ def http2_requests(count: int, trace_path: pathlib.Path) -> tuple[list[int], lis
         "--parallel-immediate",
         "--parallel-max",
         str(CONCURRENCY),
-        "--parallel-max-host",
-        "1",
-        "--http2-prior-knowledge",
-        "--resolve",
-        "example.test:10001:127.0.0.1",
-        "--silent",
-        "--show-error",
-        "--trace-ascii",
-        str(trace_path),
     ]
+    if "--parallel-max-host" in run(["curl", "--help", "all"], capture=True):
+        command.extend(["--parallel-max-host", "1"])
+    command.extend(
+        [
+            "--max-time",
+            "30",
+            "--http2-prior-knowledge",
+            "--resolve",
+            "example.test:10001:127.0.0.1",
+            "--silent",
+            "--show-error",
+            "--trace-ascii",
+            str(trace_path),
+        ]
+    )
     url = "http://example.test:10001/healthy"
     for _ in range(count):
         command.extend(
@@ -311,10 +328,11 @@ def http2_requests(count: int, trace_path: pathlib.Path) -> tuple[list[int], lis
 
 
 class ResourceSampler:
-    def __init__(self, project: str):
-        ids = run(["docker", "compose", "-p", project, "ps", "-q"], capture=True).split()
+    def __init__(self, compose_file: pathlib.Path, project: str):
+        ids = run(["docker", "compose", "-f", str(compose_file), "-p", project, "ps", "-q", "envoy"],
+                  capture=True).split()
         if not ids:
-            raise RuntimeError("cannot sample resources: Compose has no running containers")
+            raise RuntimeError("cannot sample resources: Compose has no running Envoy container")
         self.pids = [
             int(run(["docker", "inspect", "--format", "{{.State.Pid}}", container], capture=True).strip())
             for container in ids
@@ -575,7 +593,7 @@ def benchmark_variant(
             wait_ready()
             startup = time.perf_counter() - started
             checks = preflight(ruleset, variant)
-            sampler = ResourceSampler(project)
+            sampler = ResourceSampler(compose, project)
             workloads = run_load(ruleset, variant, sampler, temp)
             return {
                 "ruleset": ruleset,
@@ -589,7 +607,10 @@ def benchmark_variant(
                 "workloads": workloads,
             }
         finally:
-            subprocess.run([*compose_command, "down", "--volumes"], check=False, capture_output=True, text=True)
+            try:
+                run([*compose_command, "down", "--volumes"], check=False, capture=True, timeout=30)
+            except RuntimeError as error:
+                print(f"warning: benchmark cleanup failed: {error}", file=sys.stderr)
 
 
 def summarize(records: list[dict]) -> list[dict]:
@@ -657,14 +678,7 @@ def artifact_identity(path: pathlib.Path) -> dict:
 def main() -> None:
     global ENVOY_IMAGE
     if not ENVOY_IMAGE:
-        pin = subprocess.run(
-            ["make", "--no-print-directory", "print-envoy-image"],
-            cwd=ROOT,
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        ENVOY_IMAGE = pin.stdout.strip()
+        ENVOY_IMAGE = run(["make", "--no-print-directory", "print-envoy-image"], capture=True).strip()
     if not ENVOY_IMAGE:
         raise SystemExit("make print-envoy-image returned an empty pin")
 
@@ -694,6 +708,7 @@ def main() -> None:
     if "HTTP2" not in curl_version:
         raise SystemExit("curl with HTTP/2 support is required")
     docker_version = run(["docker", "buildx", "version"], capture=True).strip()
+    run(["docker", "pull", ENVOY_IMAGE], timeout=900)
     available = sorted(os.sched_getaffinity(0))
     cpus = available[:2]
     if not cpus:

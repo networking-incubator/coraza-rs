@@ -32,16 +32,25 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "examples/envoy-coraza-dynamic"
 COMPOSE_FILE = EXAMPLE / "compose.yaml"
+COMMAND_TIMEOUT = 900
+
+
+class CommandTimeout(RuntimeError):
+    pass
 
 
 def command(args: list[str], *, cwd: pathlib.Path = ROOT, env: dict[str, str] | None = None,
-            capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+            capture: bool = False, check: bool = True,
+            timeout: float = COMMAND_TIMEOUT) -> subprocess.CompletedProcess:
     merged = os.environ.copy()
     if env:
         merged.update(env)
-    result = subprocess.run(
-        args, cwd=cwd, env=merged, text=True, capture_output=capture, check=False
-    )
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, env=merged, text=True, capture_output=capture, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CommandTimeout(f"command timed out after {timeout:g}s: {args!r}") from error
     if check and result.returncode:
         detail = "\n".join(part for part in (result.stdout, result.stderr) if part)
         raise RuntimeError(f"command failed ({result.returncode}): {args!r}\n{detail[-6000:]}")
@@ -54,16 +63,17 @@ class Compose:
         self.env = env or {}
 
     def run(self, *args: str, env: dict[str, str] | None = None,
-            capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+            capture: bool = False, check: bool = True,
+            timeout: float = COMMAND_TIMEOUT) -> subprocess.CompletedProcess:
         return command([*self.prefix, *args], env={**self.env, **(env or {})},
-                       capture=capture, check=check)
+                       capture=capture, check=check, timeout=timeout)
 
     def logs(self, service: str) -> str:
         return self.run("logs", "--no-color", "--no-log-prefix", service,
-                        capture=True, check=False).stdout
+                        capture=True, check=False, timeout=10).stdout
 
     def down(self) -> None:
-        self.run("down", "--volumes", capture=True, check=False)
+        self.run("down", "--volumes", capture=True, check=False, timeout=60)
 
 
 def assert_ports_free(ports: tuple[int, ...] = (9901, 10001), timeout: float = 30) -> None:
@@ -414,8 +424,11 @@ def check_startup_rejected(compose: Compose, label: str, config: pathlib.Path,
     if module_dir is not None:
         args.extend(["--volume", f"{module_dir}:/opt/envoy/modules:ro"])
     args.append("envoy")
-    result = compose.run(*args, env={"ENVOY_CORAZA_DYNAMIC_CONFIG": str(config)},
-                         capture=True, check=False)
+    try:
+        result = compose.run(*args, env={"ENVOY_CORAZA_DYNAMIC_CONFIG": str(config)},
+                             capture=True, check=False, timeout=30)
+    except CommandTimeout as error:
+        raise RuntimeError(f"{label}: Envoy timed out instead of rejecting invalid configuration") from error
     if result.returncode == 0:
         raise RuntimeError(f"{label}: Envoy unexpectedly accepted invalid module/config")
     try:
@@ -1060,8 +1073,11 @@ mode: default
         if os.environ.get("FTW_INCLUDE_TESTS"):
             args.extend(["--include", os.environ["FTW_INCLUDE_TESTS"]])
         with (artifact / "runner.log").open("wb") as output:
-            runner = subprocess.run(args, cwd=ROOT, env={**os.environ, **go_env},
-                                    stdout=output, stderr=subprocess.STDOUT, check=False)
+            try:
+                runner = subprocess.run(args, cwd=ROOT, env={**os.environ, **go_env},
+                                        stdout=output, stderr=subprocess.STDOUT, check=False, timeout=35 * 60)
+            except subprocess.TimeoutExpired as error:
+                raise CommandTimeout(f"go-ftw timed out after 35 minutes; see {artifact / 'runner.log'}") from error
         runner_status = runner.returncode
         stop_process(log_process)
         log_process = None

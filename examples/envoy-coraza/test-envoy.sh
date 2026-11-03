@@ -400,8 +400,8 @@ grep --ignore-case --quiet --fixed-strings 'set-cookie: injected=1' \
     "$temp_dir/request-crlf-redirect.headers" && fail 'Wasm request redirect injected a downstream header'
 grep --ignore-case --quiet '^location:' "$temp_dir/request-crlf-redirect.headers" \
     && fail 'Wasm unsafe request redirect reached Location'
-[[ $(cat "$temp_dir/request-crlf-redirect-response") == 'Request inspection unavailable' ]] \
-    || fail 'Wasm unsafe request redirect did not return the explicit denial body'
+[[ $(cat "$temp_dir/request-crlf-redirect-response") == 'Request denied' ]] \
+    || fail 'Wasm unsafe request redirect did not return Request denied'
 [[ $(backend_count /echo) == "$before" ]] || fail 'Wasm unsafe request redirect reached the backend'
 
 status=$(request "$temp_dir/response-crlf-redirect" --dump-header "$temp_dir/response-crlf-redirect.headers" \

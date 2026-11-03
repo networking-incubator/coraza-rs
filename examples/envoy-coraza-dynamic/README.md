@@ -17,6 +17,13 @@ The checked-in `envoy.yaml` uses `{}` as an explicit uninspected baseline; it is
 not a protective policy configuration to deploy unchanged. Filter-state output
 uses the explicit legacy `wasm.io.coraza.waf.*` compatibility keys.
 
+Response body inspection accepts identity encoding only. An upstream response
+with another `Content-Encoding` returns 502 when response body access is enabled
+and the response MIME type is inspectable.
+Put Envoy's decompressor after Coraza in the filter list so reverse response
+filter order decompresses first, or disable response body access on routes that
+serve compressed responses.
+
 Run the CRS FTW suite through the native module with `make test-envoy-dynamic-ftw`.
 By default this checks out the pinned CRS test source and records a new run
 directory under `target/envoy-coraza-dynamic-ftw/`. It invokes the pinned

@@ -57,6 +57,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_ROOT_RETAINED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 const REQUEST_BLOCK_BODY: &[u8] = b"";
+const REQUEST_DENY_BODY: &[u8] = b"Request denied\n";
 const RESPONSE_BLOCK_BODY: &[u8] = b"Upstream response blocked\n";
 const REQUEST_INCOMPLETE_BODY: &[u8] = b"Request inspection unavailable\n";
 const RESPONSE_INCOMPLETE_BODY: &[u8] = b"Response inspection unavailable\n";
@@ -1174,7 +1175,7 @@ impl CorazaHttp {
         let body = if self.request_method.eq_ignore_ascii_case("HEAD") {
             &[][..]
         } else if redirect_action && !valid_redirect {
-            REQUEST_INCOMPLETE_BODY
+            REQUEST_DENY_BODY
         } else if valid_redirect {
             &[][..]
         } else {

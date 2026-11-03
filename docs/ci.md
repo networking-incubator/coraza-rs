@@ -298,10 +298,12 @@ packaging locally without publishing, first install binaryen
 [version 123](https://github.com/WebAssembly/binaryen/releases/tag/version_123)
 — the version the workflow pins — and put its `bin/` on `PATH` (it provides
 `wasm-as` and `wasm-merge`). Then stage the WASM files exactly as the
-workflow does and run the snapshot (the config expects them to exist):
+workflow does, stage the native assets with Buildx and arm64 emulation, then run
+the snapshot (the config expects all six assets to exist):
 
 ```console
 ./envoy-coraza/crs-fetch.sh
+mkdir -p release-artifacts
 wasm-as envoy-coraza/wasi-stub.wat -o /tmp/wasi-stub.wasm
 link_stubs() {
   wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
@@ -311,5 +313,26 @@ cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
 link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
 cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
 link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+
+ENVOY_IMAGE=$(make --no-print-directory print-envoy-image)
+export ENVOY_IMAGE
+mkdir -p release-artifacts/.native-build
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --file Dockerfile.goreleaser-dynamic --target artifacts \
+  --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES= \
+  --output type=local,dest=release-artifacts/.native-build/dynamic .
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --file Dockerfile.goreleaser-dynamic --target artifacts \
+  --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES=embed-crs \
+  --output type=local,dest=release-artifacts/.native-build/dynamic-crs .
+cp release-artifacts/.native-build/dynamic/linux_amd64/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic.so
+cp release-artifacts/.native-build/dynamic/linux_arm64/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic-linux-arm64.so
+cp release-artifacts/.native-build/dynamic-crs/linux_amd64/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic-crs.so
+cp release-artifacts/.native-build/dynamic-crs/linux_arm64/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
+
 goreleaser release --snapshot --clean
 ```

@@ -245,8 +245,62 @@ fn try_reserve(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
 }
 
 enum Reply {
-    Status { status: u16, body: &'static [u8] },
+    Status {
+        status: u16,
+        body: &'static [u8],
+        outcome: TerminalOutcome,
+    },
     Interruption(Interruption),
+}
+
+impl Reply {
+    fn incomplete(status: u16, phase: &'static str) -> Self {
+        Self::Status {
+            status,
+            body: REQUEST_ERROR_BODY,
+            outcome: TerminalOutcome::Incomplete { phase, status },
+        }
+    }
+
+    fn invalid_lifecycle(status: u16, phase: &'static str) -> Self {
+        Self::Status {
+            status,
+            body: REQUEST_ERROR_BODY,
+            outcome: TerminalOutcome::InvalidLifecycle { phase, status },
+        }
+    }
+
+    fn invalid_authority() -> Self {
+        Self::Status {
+            status: 400,
+            body: REQUEST_ERROR_BODY,
+            outcome: TerminalOutcome::InvalidAuthority { status: 400 },
+        }
+    }
+
+    fn unsupported(status: u16, phase: &'static str) -> Self {
+        Self::Status {
+            status,
+            body: UNSUPPORTED_BODY,
+            outcome: TerminalOutcome::Unsupported(phase),
+        }
+    }
+
+    fn body_too_large(phase: &'static str) -> Self {
+        Self::Status {
+            status: 413,
+            body: REQUEST_ERROR_BODY,
+            outcome: TerminalOutcome::BodyTooLarge { phase, status: 413 },
+        }
+    }
+
+    fn retained_body_budget_exhausted(phase: &'static str) -> Self {
+        Self::Status {
+            status: 503,
+            body: REQUEST_ERROR_BODY,
+            outcome: TerminalOutcome::RetainedBodyBudgetExhausted { phase },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -347,15 +401,12 @@ impl RequestFilter {
         }
     }
 
-    fn reject(&self, envoy: &mut impl EnvoyHttpFilter, status: u16, body: &'static [u8]) {
+    fn reject(&self, envoy: &mut impl EnvoyHttpFilter, status: u16, body: &'static [u8], outcome: TerminalOutcome) {
         self.terminal.set(true);
         if let Ok(mut state) = self.state.try_borrow_mut() {
             if let Some(state) = state.as_mut() {
                 state.stage = Stage::Terminal;
-                state.outcome = Some(TerminalOutcome::Incomplete {
-                    phase: "request-inspection",
-                    status,
-                });
+                state.outcome = Some(outcome);
             }
         }
         let is_head = self.is_head();
@@ -443,32 +494,24 @@ impl RequestFilter {
 
     fn fail_closed(&self, envoy: &mut impl EnvoyHttpFilter, reply: Reply) {
         match reply {
-            Reply::Status { status, body } => self.reject(envoy, status, body),
+            Reply::Status { status, body, outcome } => self.reject(envoy, status, body, outcome),
             Reply::Interruption(interruption) => self.send_interruption(envoy, &interruption),
         }
     }
 
     fn on_headers(&self, envoy: &mut impl EnvoyHttpFilter, end_of_stream: bool) -> Result<HeadersAction, Reply> {
-        let mut slot = self.state.try_borrow_mut().map_err(|_error| Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let mut slot = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_error| Reply::invalid_lifecycle(503, "request-headers-state-borrow"))?;
         let state = slot.get_or_insert_with(|| StreamState::new(Arc::clone(&self.generation)));
         if state.stage != Stage::New {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_lifecycle(503, "request-headers-order"));
         }
-        let headers = copy_headers(envoy.get_request_headers()).map_err(|_error| Reply::Status {
-            status: 431,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let headers =
+            copy_headers(envoy.get_request_headers()).map_err(|_error| Reply::incomplete(431, "request-headers"))?;
         if !headers_within_limits(&headers, headers.len()) {
-            return Err(Reply::Status {
-                status: 431,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::incomplete(431, "request-headers"));
         }
         #[cfg(feature = "panic-probe")]
         check_panic_probe(state, &headers);
@@ -479,10 +522,7 @@ impl RequestFilter {
             .or_else(|| attribute_bytes(envoy, AttributeId::RequestScheme))
             .unwrap_or_default();
         let Some(authority) = normalize_authority(&raw_authority, &scheme) else {
-            return Err(Reply::Status {
-                status: 400,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_authority());
         };
         let generation = Arc::clone(&state.generation);
         let Some((_name, policy)) = generation.select_named(&authority) else {
@@ -494,10 +534,7 @@ impl RequestFilter {
             return Ok(HeadersAction::Continue);
         };
         let Some(metadata) = request_metadata(envoy, &headers, &raw_authority) else {
-            return Err(Reply::Status {
-                status: 400,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::incomplete(400, "request-metadata"));
         };
         state.method.clone_from(&metadata.method);
         state.protocol.clone_from(&metadata.protocol);
@@ -516,17 +553,14 @@ impl RequestFilter {
             state.outcome = Some(TerminalOutcome::EngineOff);
             return Ok(HeadersAction::Continue);
         }
-        if metadata.method.eq_ignore_ascii_case("CONNECT") || has_upgrade(&headers) {
-            return Err(Reply::Status {
-                status: 501,
-                body: UNSUPPORTED_BODY,
-            });
+        if metadata.method.eq_ignore_ascii_case("CONNECT") {
+            return Err(Reply::unsupported(501, "request-connect"));
+        }
+        if has_upgrade(&headers) {
+            return Err(Reply::unsupported(501, "request-upgrade"));
         }
         if state.body_access && has_unsupported_content_encoding(&headers) {
-            return Err(Reply::Status {
-                status: 415,
-                body: UNSUPPORTED_BODY,
-            });
+            return Err(Reply::unsupported(415, "request-content-encoding"));
         }
         if state.body_access && !end_of_stream {
             let current = envoy.get_buffer_limit();
@@ -542,19 +576,16 @@ impl RequestFilter {
         let result = phase2(state, EMPTY_BODY);
         let retained = state.transaction.as_ref().map_or(0, |tx| tx.body_memory_bytes());
         if !state.reservation.resize(retained) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body"));
         }
         result.map(|()| HeadersAction::Continue)
     }
 
     fn on_body(&self, envoy: &mut impl EnvoyHttpFilter, end_of_stream: bool) -> Result<BodyAction, Reply> {
-        let mut slot = self.state.try_borrow_mut().map_err(|_error| Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let mut slot = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_error| Reply::invalid_lifecycle(503, "request-body-state-borrow"))?;
         let Some(state) = slot.as_mut() else {
             return Ok(BodyAction::Continue);
         };
@@ -562,10 +593,7 @@ impl RequestFilter {
             return Ok(BodyAction::Continue);
         }
         if state.stage != Stage::Held || state.phase2_done {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_lifecycle(503, "request-body-order"));
         }
         let received_buffered = envoy.received_buffered_request_body();
         let received_size = envoy.get_received_request_body_size();
@@ -573,28 +601,18 @@ impl RequestFilter {
         let body_size = if received_buffered {
             received_size
         } else {
-            buffered_size.checked_add(received_size).ok_or(Reply::Status {
-                status: 413,
-                body: REQUEST_ERROR_BODY,
-            })?
+            buffered_size
+                .checked_add(received_size)
+                .ok_or_else(|| Reply::body_too_large("request-body-size-overflow"))?
         };
         if body_size < state.body_bytes {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_lifecycle(503, "request-body-size-regressed"));
         }
         if body_size > MAX_REQUEST_BODY_BYTES {
-            return Err(Reply::Status {
-                status: 413,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::body_too_large("request-body"));
         }
         if !state.reservation.resize(body_size) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body"));
         }
         state.body_bytes = body_size;
         if !end_of_stream {
@@ -606,25 +624,17 @@ impl RequestFilter {
             .and_then(|size| size.checked_add(prior_engine_bytes));
         let target = scratch_and_engine.and_then(|size| body_size.checked_add(size));
         if !target.is_some_and(|target| state.reservation.resize(target)) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body-inspection"));
         }
-        let body = copy_terminal_body(envoy, received_buffered, body_size, false).ok_or(Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let body = copy_terminal_body(envoy, received_buffered, body_size, false)
+            .ok_or_else(|| Reply::incomplete(503, "request-body-buffer"))?;
         drop(slot);
-        let mut slot = self.state.try_borrow_mut().map_err(|_error| Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let mut slot = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_error| Reply::invalid_lifecycle(503, "request-body-state-borrow"))?;
         let Some(state) = slot.as_mut() else {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_lifecycle(503, "request-body-state-missing"));
         };
         state.phase2_done = true;
         state.stage = Stage::Complete;
@@ -633,56 +643,42 @@ impl RequestFilter {
         let retained = state.transaction.as_ref().map_or(0, |tx| tx.body_memory_bytes());
         let host_and_engine = state.body_bytes.checked_add(retained);
         if !host_and_engine.is_some_and(|target| state.reservation.resize(target)) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body"));
         }
         result.map(|()| BodyAction::Continue)
     }
 
     fn on_trailers(&self, envoy: &mut impl EnvoyHttpFilter) -> Result<(), Reply> {
-        let mut slot = self.state.try_borrow_mut().map_err(|_error| Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let mut slot = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_error| Reply::invalid_lifecycle(503, "request-trailers-state-borrow"))?;
         let Some(state) = slot.as_mut() else {
             return Ok(());
         };
         if self.terminal.get() || matches!(state.stage, Stage::Bypassed | Stage::Terminal) {
             return Ok(());
         }
-        let trailers = copy_headers(envoy.get_request_trailers()).map_err(|_error| Reply::Status {
-            status: 431,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let trailers =
+            copy_headers(envoy.get_request_trailers()).map_err(|_error| Reply::incomplete(431, "request-trailers"))?;
         if !headers_within_limits(&trailers, trailers.len()) {
-            return Err(Reply::Status {
-                status: 431,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::incomplete(431, "request-trailers"));
         }
         if state.stage == Stage::Complete {
             return Ok(());
         }
         if state.stage != Stage::Held || state.phase2_done {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::invalid_lifecycle(503, "request-trailers-order"));
         }
         let body_size = envoy.get_buffered_request_body_size();
-        if body_size < state.body_bytes || body_size > MAX_REQUEST_BODY_BYTES {
-            return Err(Reply::Status {
-                status: if body_size > MAX_REQUEST_BODY_BYTES { 413 } else { 503 },
-                body: REQUEST_ERROR_BODY,
-            });
+        if body_size < state.body_bytes {
+            return Err(Reply::invalid_lifecycle(503, "request-body-size-regressed"));
+        }
+        if body_size > MAX_REQUEST_BODY_BYTES {
+            return Err(Reply::body_too_large("request-body"));
         }
         if !state.reservation.resize(body_size) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body"));
         }
         let prior_engine_bytes = state.transaction.as_ref().map_or(0, |tx| tx.body_memory_bytes());
         let target = body_size
@@ -690,15 +686,10 @@ impl RequestFilter {
             .and_then(|size| size.checked_add(prior_engine_bytes))
             .and_then(|size| body_size.checked_add(size));
         if !target.is_some_and(|target| state.reservation.resize(target)) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body-inspection"));
         }
-        let body = copy_terminal_body(envoy, false, body_size, true).ok_or(Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        })?;
+        let body = copy_terminal_body(envoy, false, body_size, true)
+            .ok_or_else(|| Reply::incomplete(503, "request-body-buffer"))?;
         state.phase2_done = true;
         state.stage = Stage::Complete;
         let result = phase2(state, &body);
@@ -706,10 +697,7 @@ impl RequestFilter {
         let retained = state.transaction.as_ref().map_or(0, |tx| tx.body_memory_bytes());
         let host_and_engine = state.body_bytes.max(body_size).checked_add(retained);
         if !host_and_engine.is_some_and(|target| state.reservation.resize(target)) {
-            return Err(Reply::Status {
-                status: 503,
-                body: REQUEST_ERROR_BODY,
-            });
+            return Err(Reply::retained_body_budget_exhausted("request-body"));
         }
         state.body_bytes = body_size;
         result
@@ -1093,11 +1081,26 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for RequestFilter {
     fn on_local_reply(
         &self,
         _envoy: &mut EHF,
-        _response_code: u32,
+        response_code: u32,
         _details: EnvoyBuffer<'_>,
         _reset_imminent: bool,
     ) -> LocalReplyStatus {
-        // Request local replies are terminal and must never become Coraza input.
+        self.terminal.set(true);
+        if let Ok(mut slot) = self.state.try_borrow_mut() {
+            if let Some(state) = slot.as_mut() {
+                if state.stage == Stage::Held {
+                    state.stage = Stage::Terminal;
+                    let status = u16::try_from(response_code)
+                        .ok()
+                        .filter(|status| (100..=599).contains(status))
+                        .unwrap_or(503);
+                    state.outcome.get_or_insert(TerminalOutcome::Incomplete {
+                        phase: "local-reply",
+                        status,
+                    });
+                }
+            }
+        }
         LocalReplyStatus::Continue
     }
 
@@ -1113,7 +1116,7 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for RequestFilter {
 
     fn on_response_body(&self, envoy: &mut EHF, end_of_stream: bool) -> ResponseBodyStatus {
         #[cfg(feature = "panic-probe")]
-        {
+        if !self.terminal.get() {
             let probe = self
                 .state
                 .try_borrow()
@@ -1200,19 +1203,13 @@ fn terminal_outcome(state: &StreamState) -> TerminalOutcome {
 
 fn phase2(state: &mut StreamState, body: &[u8]) -> Result<(), Reply> {
     let Some(transaction) = state.transaction.as_mut() else {
-        return Err(Reply::Status {
-            status: 503,
-            body: REQUEST_ERROR_BODY,
-        });
+        return Err(Reply::invalid_lifecycle(503, "request-transaction-missing"));
     };
     if let Some(interruption) = transaction.process_request_body(body) {
         return Err(Reply::Interruption(interruption));
     }
     if transaction.arguments_limit_reached() {
-        return Err(Reply::Status {
-            status: 413,
-            body: REQUEST_ERROR_BODY,
-        });
+        return Err(Reply::incomplete(413, "request-arguments-limit"));
     }
     Ok(())
 }
@@ -1691,6 +1688,86 @@ mod tests {
     }
 
     #[test]
+    fn invalid_authority_rejection_retains_its_terminal_outcome() {
+        let filter = FilterConfig::new(generation("SecRuleEngine On")).new_stream();
+        let mut envoy = MockEnvoyHttpFilter::default();
+        envoy.expect_get_request_headers().returning(|| {
+            vec![
+                (EnvoyBuffer::new(b":method"), EnvoyBuffer::new(b"GET")),
+                (EnvoyBuffer::new(b":path"), EnvoyBuffer::new(b"/")),
+                (EnvoyBuffer::new(b":scheme"), EnvoyBuffer::new(b"http")),
+                (EnvoyBuffer::new(b":authority"), EnvoyBuffer::new(b"bad host")),
+            ]
+        });
+        envoy.expect_get_attribute_string().returning(|id| match id {
+            AttributeId::RequestProtocol => Some(EnvoyBuffer::new(b"HTTP/2")),
+            _ => None,
+        });
+        envoy.expect_get_attribute_int().returning(|_| None);
+        envoy
+            .expect_get_downstream_direct_remote_address()
+            .returning_st(|| None);
+        envoy
+            .expect_send_response()
+            .returning_st(|status, _, _, _| assert_eq!(status, 400));
+
+        assert_eq!(
+            filter.on_request_headers(&mut envoy, true),
+            RequestHeadersStatus::StopIteration
+        );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::InvalidAuthority { status: 400 })
+            )
+        }));
+    }
+
+    #[test]
+    fn local_reply_terminates_a_held_request_before_response_callbacks() {
+        let filter = FilterConfig::new(generation(
+            "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit 16777216",
+        ))
+        .new_stream();
+        let mut request_envoy = MockEnvoyHttpFilter::default();
+        prepare_header_mock(&mut request_envoy, b"POST", b"/local-reply");
+        prepare_body_hold(&mut request_envoy);
+        assert_eq!(
+            filter.on_request_headers(&mut request_envoy, false),
+            RequestHeadersStatus::StopIteration
+        );
+        #[cfg(feature = "panic-probe")]
+        if let Some(state) = filter.state.borrow_mut().as_mut() {
+            state.response_panic_probe = true;
+        }
+
+        let mut reply_envoy = MockEnvoyHttpFilter::default();
+        assert_eq!(
+            filter.on_local_reply(&mut reply_envoy, 503, EnvoyBuffer::new(b"upstream failure"), false),
+            LocalReplyStatus::Continue
+        );
+        assert!(filter.terminal.get());
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            state.stage == Stage::Terminal
+                && matches!(
+                    state.outcome.as_ref(),
+                    Some(TerminalOutcome::Incomplete {
+                        phase: "local-reply",
+                        status: 503
+                    })
+                )
+        }));
+        assert_eq!(
+            filter.on_response_headers(&mut reply_envoy, false),
+            ResponseHeadersStatus::Continue
+        );
+        assert_eq!(
+            filter.on_response_body(&mut reply_envoy, true),
+            ResponseBodyStatus::Continue
+        );
+    }
+
+    #[test]
     fn oversized_request_trailer_returns_431_before_body_inspection() {
         let filter = Rc::new(
             FilterConfig::new(generation(
@@ -1789,6 +1866,53 @@ mod tests {
             filter.on_request_body(&mut envoy, true),
             RequestBodyStatus::StopIterationNoBuffer
         );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::Denied {
+                    phase: "request",
+                    status: 413
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn host_request_body_ceiling_uses_body_too_large_outcome() {
+        let filter = FilterConfig::new(generation(
+            "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit 16777216",
+        ))
+        .new_stream();
+        let mut envoy = MockEnvoyHttpFilter::default();
+        prepare_header_mock(&mut envoy, b"POST", b"/upload");
+        prepare_body_hold(&mut envoy);
+        assert_eq!(
+            filter.on_request_headers(&mut envoy, false),
+            RequestHeadersStatus::StopIteration
+        );
+
+        envoy.expect_received_buffered_request_body().return_const(false);
+        envoy
+            .expect_get_received_request_body_size()
+            .return_const(super::MAX_REQUEST_BODY_BYTES + 1);
+        envoy.expect_get_buffered_request_body_size().return_const(0_usize);
+        envoy
+            .expect_send_response()
+            .returning_st(|status, _, _, _| assert_eq!(status, 413));
+
+        assert_eq!(
+            filter.on_request_body(&mut envoy, true),
+            RequestBodyStatus::StopIterationNoBuffer
+        );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::BodyTooLarge {
+                    phase: "request-body",
+                    status: 413
+                })
+            )
+        }));
     }
 
     #[test]
@@ -1979,6 +2103,80 @@ mod tests {
             filter.on_request_headers(&mut envoy, true),
             RequestHeadersStatus::StopIteration
         );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::Unsupported("request-connect"))
+            )
+        }));
+    }
+
+    #[test]
+    fn unsupported_request_encoding_keeps_its_terminal_outcome() {
+        let filter = FilterConfig::new(generation(
+            "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit 16777216",
+        ))
+        .new_stream();
+        let mut envoy = MockEnvoyHttpFilter::default();
+        envoy.expect_get_request_headers().returning(|| {
+            vec![
+                (EnvoyBuffer::new(b":method"), EnvoyBuffer::new(b"POST")),
+                (EnvoyBuffer::new(b":path"), EnvoyBuffer::new(b"/upload")),
+                (EnvoyBuffer::new(b":scheme"), EnvoyBuffer::new(b"http")),
+                (EnvoyBuffer::new(b":authority"), EnvoyBuffer::new(b"example.test")),
+                (EnvoyBuffer::new(b"content-type"), EnvoyBuffer::new(b"text/plain")),
+                (EnvoyBuffer::new(b"content-encoding"), EnvoyBuffer::new(b"gzip")),
+            ]
+        });
+        envoy.expect_get_attribute_string().returning(|id| match id {
+            AttributeId::RequestProtocol => Some(EnvoyBuffer::new(b"HTTP/2")),
+            _ => None,
+        });
+        envoy.expect_get_attribute_int().returning(|_| None);
+        envoy
+            .expect_get_downstream_direct_remote_address()
+            .returning_st(|| None);
+        envoy
+            .expect_send_response()
+            .returning_st(|status, _, _, _| assert_eq!(status, 415));
+
+        assert_eq!(
+            filter.on_request_headers(&mut envoy, false),
+            RequestHeadersStatus::StopIteration
+        );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::Unsupported("request-content-encoding"))
+            )
+        }));
+    }
+
+    #[test]
+    fn request_body_callback_order_failure_keeps_its_terminal_outcome() {
+        let filter = FilterConfig::new(generation("SecRuleEngine On")).new_stream();
+        let mut state = StreamState::new(Arc::clone(&filter.generation));
+        state.stage = Stage::Held;
+        state.phase2_done = true;
+        *filter.state.borrow_mut() = Some(state);
+        let mut envoy = MockEnvoyHttpFilter::default();
+        envoy
+            .expect_send_response()
+            .returning_st(|status, _, _, _| assert_eq!(status, 503));
+
+        assert_eq!(
+            filter.on_request_body(&mut envoy, true),
+            RequestBodyStatus::StopIterationNoBuffer
+        );
+        assert!(filter.state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.outcome.as_ref(),
+                Some(TerminalOutcome::InvalidLifecycle {
+                    phase: "request-body-order",
+                    status: 503
+                })
+            )
+        }));
     }
 
     #[test]
@@ -2147,6 +2345,15 @@ mod tests {
                     reply_filter.on_local_reply(&mut callback_envoy, status, EnvoyBuffer::new(b""), false),
                     LocalReplyStatus::Continue
                 );
+                assert!(reply_filter.state.borrow().as_ref().is_some_and(|state| {
+                    matches!(
+                        state.outcome.as_ref(),
+                        Some(TerminalOutcome::Denied {
+                            phase: "response-body",
+                            status: 451
+                        })
+                    )
+                }));
             });
 
         assert_eq!(
