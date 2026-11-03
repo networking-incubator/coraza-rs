@@ -254,9 +254,7 @@ path and populate `FILES`, `FILES_NAMES`, `FILES_SIZES`, `FILES_TMPNAMES`,
 limit drops follow the transaction's existing flags. A
 processor error (returned or set with `set_error`) sets the corresponding
 `REQBODY_*` or response body error variables while retaining output already
-published. Body processor errors do not set `TX.inspection_incomplete`, which
-is reserved for detector inputs that could not be inspected.
-The engine caps cumulative output bytes at the applicable request or response
+published. The engine caps cumulative output bytes at the applicable request or response
 body limit; exceeding it stops further output, keeps output already accepted,
 and sets the direction's data-error and body-processor error variables.
 `set_processor` is host-reported and not authoritative: it may differ
@@ -333,9 +331,7 @@ another operator:
   resolver failure is a plain miss, as in Go. A lookup past the 500 ms budget,
   above the 64-lookups-in-flight cap, or a failed lookup-thread spawn reports
   `NotMatched` too, because Go returns `false` on its timeout; a negated
-  `!@rbl` therefore matches on failure exactly as it does in Go. No
-  host-operator outcome sets `TX.inspection_incomplete` or triggers
-  `FailClosed`.
+  `!@rbl` therefore matches on failure exactly as it does in Go.
 - `host-operators` is the umbrella feature that enables `inspect-file` and
   `rbl`.
 - `validate-schema` adds `@validateSchema`, which validates JSON documents.

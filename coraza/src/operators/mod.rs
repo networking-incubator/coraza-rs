@@ -79,8 +79,7 @@ pub enum OperatorOutcome {
     /// detector operators scan every input, and a host operator (`inspectFile`, `rbl`,
     /// `validateSchema`) reports [`OperatorOutcome::NotMatched`] when it cannot run,
     /// because Go returns `false` for every operational error. The value is kept for
-    /// embedder-supplied operators that need three-valued logic; an embedder's report
-    /// does not raise the transaction's inspection-incomplete signal.
+    /// embedder-supplied operators that need three-valued logic.
     NotInspected,
 }
 
@@ -448,16 +447,6 @@ impl OperatorEnum {
             Self::ValidateSchema(operator) => operator.evaluate_outcome(tx, input, out),
         }
     }
-
-    /// Whether this operator's [`OperatorOutcome::NotInspected`] is the
-    /// transaction's inspection-incomplete signal.
-    ///
-    /// The built-in detectors scan every input, so they no longer report a skip.
-    /// Other operators report a plain [`OperatorOutcome::NotMatched`] when they
-    /// cannot run, so they never raise that signal.
-    pub(crate) fn is_detector(&self) -> bool {
-        matches!(self, Self::DetectSQLi(_) | Self::DetectXSS(_))
-    }
 }
 
 /// Implement conversions from supported operator types to [`OperatorEnum`].
@@ -580,34 +569,6 @@ mod tests {
             OperatorEnum::new("noSuchOp", "").unwrap_err(),
             "unknown operator: noSuchOp"
         );
-    }
-
-    #[test]
-    fn only_the_detectors_own_the_inspection_signal() {
-        assert!(OperatorEnum::new("detectSQLi", "").unwrap().is_detector());
-        assert!(OperatorEnum::new("detectXSS", "").unwrap().is_detector());
-        for name in ["contains", "rx", "unconditionalMatch"] {
-            assert!(!OperatorEnum::new(name, "value").unwrap().is_detector(), "{name}");
-        }
-
-        #[cfg(feature = "inspect-file")]
-        assert!(!OperatorEnum::new("inspectFile", "/bin/true").unwrap().is_detector());
-        #[cfg(feature = "rbl")]
-        assert!(!OperatorEnum::new("rbl", "zen.spamhaus.org").unwrap().is_detector());
-        #[cfg(feature = "validate-schema")]
-        {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("schema.json"), r#"{"type": "object"}"#).unwrap();
-            let datasets = Datasets::new();
-            let context = OperatorContext {
-                base_dir: dir.path(),
-                datasets: &datasets,
-                custom: None,
-                ..OperatorContext::default()
-            };
-            let operator = OperatorEnum::with_context("validateSchema", "schema.json", &context).unwrap();
-            assert!(!operator.is_detector());
-        }
     }
 
     #[test]

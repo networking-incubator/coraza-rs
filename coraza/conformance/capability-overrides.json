@@ -176,7 +176,7 @@
         "differences": [
           "Registered only with the rbl crate feature, which host-operators also enables; the default build rejects the name.",
           "Only A/AAAA records are queried. Go also reads the TXT record, sets TX.httpbl_msg from its first entry, copies it into capture 0, and reports no match when the TXT lookup fails; without a DNS dependency this port matches on the address record alone.",
-          "A resolver failure is a plain miss, as in Go, where LookupHost returns an error and the rule does not match. A lookup past the 500 ms budget, above the 64-in-flight cap, or a failed thread spawn is also a plain miss (OperatorOutcome::NotMatched), because Go returns false on its timeout and the rule negates that result; a negated !@rbl therefore matches on failure. No host-operator outcome sets TX.inspection_incomplete or triggers FailClosed.",
+          "A resolver failure is a plain miss, as in Go, where LookupHost returns an error and the rule does not match. A lookup past the 500 ms budget, above the 64-in-flight cap, or a failed thread spawn is also a plain miss (OperatorOutcome::NotMatched), because Go returns false on its timeout and the rule negates that result; a negated !@rbl therefore matches on failure.",
           "The configured service is trimmed of surrounding whitespace and must not be empty, so an empty service is rejected when the rule loads; Go appends it verbatim and relies on the TXT lookup to reject the self-resolving name it would build.",
           "The value is decoded with String::from_utf8_lossy before it is appended, where Go appends the raw bytes of its value string, so invalid UTF-8 reaches the resolver as U+FFFD here."
         ]

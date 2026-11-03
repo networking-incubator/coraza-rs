@@ -218,7 +218,7 @@ fn run_case(waf: &Waf, context: &OperatorContext<'_>, case: &Case) -> CaseResult
         OperatorOutcome::Matched => 1,
         OperatorOutcome::NotMatched => 0,
         OperatorOutcome::NotInspected => {
-            return CaseResult::Skipped("the detector skipped the input as too large to inspect");
+            return CaseResult::Skipped("the operator reported no verdict for the input");
         },
     };
     if actual == *ret {

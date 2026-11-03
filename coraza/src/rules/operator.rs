@@ -46,14 +46,6 @@ impl RuleOperator {
         self.evaluate_outcome(tx, input, out) == OperatorOutcome::Matched
     }
 
-    /// Whether the wrapped operator reports the transaction's inspection signal.
-    ///
-    /// See [`OperatorEnum::is_detector`]; the built-in detectors scan every input,
-    /// so an [`OperatorOutcome::NotInspected`] from another operator is a plain miss.
-    pub(crate) fn is_detector(&self) -> bool {
-        self.operator.is_detector()
-    }
-
     /// Evaluate one value, applying SecLang negation after the operator runs.
     ///
     /// Negation flips [`OperatorOutcome::Matched`] and

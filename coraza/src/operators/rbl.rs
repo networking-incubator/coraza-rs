@@ -222,12 +222,10 @@ mod tests {
 
     use super::{LOOKUP_STACK, Limiter, MAX_IN_FLIGHT, Rbl, bounded, verdict};
     use crate::{
-        config::DetectorInspectionAction,
         operators::{Operator as _, OperatorContext, OperatorEnum, OperatorOutcome, Outputs},
         seclang::Parser,
         transaction::Transaction,
         types::RuleVariable,
-        waf::Waf,
     };
 
     fn operator(service: &str) -> Rbl {
@@ -329,22 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_does_not_interrupt_a_resolver_error() {
-        let waf = rbl_waf(DetectorInspectionAction::FailClosed);
-        let mut tx = waf.new_transaction_with_id("rbl-resolver-error");
-        tx.add_get_argument("q", b"192.0.2.1\0");
-
-        assert!(
-            tx.process_request_headers().is_none(),
-            "an address the resolver rejects is not listed, so it must not interrupt"
-        );
-        assert!(
-            tx.matched_rules().is_empty(),
-            "a not-listed address must not match the rule"
-        );
-    }
-
-    #[test]
     fn a_negated_rule_matches_when_the_lookup_fails() {
         // Go's `Evaluate` returns false on a resolver error or its timeout and
         // the rule negates that result, so `!@rbl` matches. Observed against
@@ -363,17 +345,6 @@ mod tests {
             1,
             "the negated rule must match on the failed lookup"
         );
-    }
-
-    #[test]
-    fn a_resolver_error_leaves_the_inspection_signal_unset() {
-        let waf = rbl_waf(DetectorInspectionAction::RecordOnly);
-        let mut tx = waf.new_transaction_with_id("rbl-resolver-error-record-only");
-        tx.add_get_argument("q", b"192.0.2.1\0");
-
-        assert!(tx.process_request_headers().is_none());
-        assert!(!tx.inspection_incomplete());
-        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
     }
 
     #[test]
@@ -402,16 +373,6 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "a quick lookup must not wait for the deadline"
         );
-    }
-
-    /// Build a WAF whose only rule looks `ARGS:q` up in a blocklist.
-    fn rbl_waf(detector_inspection_action: DetectorInspectionAction) -> Waf {
-        let mut parser = Parser::new();
-        parser
-            .from_string("SecRule ARGS:q \"@rbl zen.spamhaus.org\" \"id:960,phase:1,pass\"")
-            .unwrap();
-        parser.config_mut().detector_inspection_action = detector_inspection_action;
-        parser.into_waf().unwrap()
     }
 
     #[test]
