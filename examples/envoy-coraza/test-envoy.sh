@@ -230,14 +230,15 @@ if [[ $interactive == 1 ]]; then
     trap - EXIT
     rm -rf "$temp_dir"
     escaped_script_dir=$(printf '%q' "$script_dir")
+    escaped_envoy_image=$(printf '%q' "$ENVOY_IMAGE")
     cat <<EOF
 Envoy is up with the embedded CRS (crs.local authority).
 
     try:    curl -i -H 'Host: crs.local' 'http://127.0.0.1:10001/crs-sqli?q=1%27%20OR%201%3D1'
     expect: HTTP/1.1 403 Forbidden and [id "949110"] in the Envoy log
 
-    logs:   docker compose -f $escaped_script_dir/compose.yaml -p $project logs envoy
-    stop:   docker compose -f $escaped_script_dir/compose.yaml -p $project down --volumes
+    logs:   ENVOY_IMAGE=$escaped_envoy_image docker compose -f $escaped_script_dir/compose.yaml -p $project logs envoy
+    stop:   ENVOY_IMAGE=$escaped_envoy_image docker compose -f $escaped_script_dir/compose.yaml -p $project down --volumes
 EOF
     exit 0
 fi
