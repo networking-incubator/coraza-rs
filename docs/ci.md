@@ -29,7 +29,7 @@ This repository uses GitHub Actions to block risky changes early.
   native module with `embed-crs`, then runs the native Envoy harness including
   benign and malicious CRS requests.
 - `envoy-dynamic-derived-images`: builds and smoke-tests the packaged Envoy
-  images for amd64 and arm64, both with and without embedded CRS. This covers
+  amd64 images, both with and without embedded CRS. This covers
   module loading, invalid filter rejection, and deny/allow behavior in the
   derived runtime images, rather than repeating those smoke tests during
   release publication. It reads the base pin from the Dependabot-managed
@@ -278,8 +278,8 @@ Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
 nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
 tag is the newest one, so an older backported tag cannot move it backwards).
 
-The same release workflow stages the native `.so` assets for amd64 and arm64,
-with and without embedded CRS, then GoReleaser uploads the libraries (with its
+The same release workflow stages the native `.so` assets for amd64, with and
+without embedded CRS, then GoReleaser uploads the libraries (with its
 SHA-256 checksum file) and builds/pushes the derived Envoy images. Derived-image
 load/deny/allow smoke tests run in the `envoy-dynamic-derived-images` CI matrix
 instead of being repeated during release publication. Detailed provenance
@@ -298,8 +298,8 @@ packaging locally without publishing, first install binaryen
 [version 123](https://github.com/WebAssembly/binaryen/releases/tag/version_123)
 — the version the workflow pins — and put its `bin/` on `PATH` (it provides
 `wasm-as` and `wasm-merge`). Then stage the WASM files exactly as the
-workflow does, stage the native assets with Buildx and arm64 emulation, then run
-the snapshot (the config expects all six assets to exist):
+workflow does, stage the amd64 native assets with Buildx, then run the snapshot
+(the config expects all four assets to exist):
 
 ```console
 ./envoy-coraza/crs-fetch.sh
@@ -317,22 +317,18 @@ link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/cora
 ENVOY_IMAGE=$(make --no-print-directory print-envoy-image)
 export ENVOY_IMAGE
 mkdir -p release-artifacts/.native-build
-docker buildx build --platform linux/amd64,linux/arm64 \
+docker buildx build --platform linux/amd64 \
   --file Dockerfile.goreleaser-dynamic --target artifacts \
   --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES= \
   --output type=local,dest=release-artifacts/.native-build/dynamic .
-docker buildx build --platform linux/amd64,linux/arm64 \
+docker buildx build --platform linux/amd64 \
   --file Dockerfile.goreleaser-dynamic --target artifacts \
   --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES=embed-crs \
   --output type=local,dest=release-artifacts/.native-build/dynamic-crs .
-cp release-artifacts/.native-build/dynamic/linux_amd64/coraza-rs-dynamic.so \
+cp release-artifacts/.native-build/dynamic/coraza-rs-dynamic.so \
   release-artifacts/coraza-rs-dynamic.so
-cp release-artifacts/.native-build/dynamic/linux_arm64/coraza-rs-dynamic.so \
-  release-artifacts/coraza-rs-dynamic-linux-arm64.so
-cp release-artifacts/.native-build/dynamic-crs/linux_amd64/coraza-rs-dynamic.so \
+cp release-artifacts/.native-build/dynamic-crs/coraza-rs-dynamic.so \
   release-artifacts/coraza-rs-dynamic-crs.so
-cp release-artifacts/.native-build/dynamic-crs/linux_arm64/coraza-rs-dynamic.so \
-  release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
 
 goreleaser release --snapshot --clean
 ```

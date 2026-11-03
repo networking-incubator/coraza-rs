@@ -192,16 +192,8 @@ jobs:
             platform: linux/amd64
             profile: default
             cargo_features: ""
-          - architecture: arm64
-            platform: linux/arm64
-            profile: default
-            cargo_features: ""
           - architecture: amd64
             platform: linux/amd64
-            profile: crs
-            cargo_features: embed-crs
-          - architecture: arm64
-            platform: linux/arm64
             profile: crs
             cargo_features: embed-crs
     permissions:
@@ -214,10 +206,6 @@ jobs:
       - name: Read pinned Envoy image
         id: envoy-image
         run: echo "image=$(make --no-print-directory print-envoy-image)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
-        with:
-          platforms: arm64
 
       - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 

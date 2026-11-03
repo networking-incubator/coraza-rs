@@ -31,8 +31,6 @@ release:
     - glob: release-artifacts/coraza-rs-crs.wasm
     - glob: release-artifacts/coraza-rs-dynamic.so
     - glob: release-artifacts/coraza-rs-dynamic-crs.so
-    - glob: release-artifacts/coraza-rs-dynamic-linux-arm64.so
-    - glob: release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
 checksum:
   name_template: checksums.txt
   algorithm: sha256
@@ -41,8 +39,6 @@ checksum:
     - glob: release-artifacts/coraza-rs-crs.wasm
     - glob: release-artifacts/coraza-rs-dynamic.so
     - glob: release-artifacts/coraza-rs-dynamic-crs.so
-    - glob: release-artifacts/coraza-rs-dynamic-linux-arm64.so
-    - glob: release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
 
 changelog:
   disable: true
@@ -108,7 +104,7 @@ dockers_v2:
     build_args:
       ENVOY_IMAGE: "{{ .Env.ENVOY_IMAGE }}"
       CARGO_FEATURES: ""
-    platforms: [linux/amd64, linux/arm64]
+    platforms: [linux/amd64]
     sbom: false
     flags: ["--provenance=false"]
   - id: coraza-rs-dynamic-crs-envoy
@@ -134,6 +130,6 @@ dockers_v2:
     build_args:
       ENVOY_IMAGE: "{{ .Env.ENVOY_IMAGE }}"
       CARGO_FEATURES: embed-crs
-    platforms: [linux/amd64, linux/arm64]
+    platforms: [linux/amd64]
     sbom: false
     flags: ["--provenance=false"]

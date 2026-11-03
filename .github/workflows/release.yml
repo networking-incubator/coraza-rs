@@ -44,10 +44,6 @@ jobs:
         id: envoy-image
         run: echo "image=$(make --no-print-directory print-envoy-image)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
-        with:
-          platforms: arm64
-
       - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Set up Rust
@@ -102,23 +98,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts/.native-build
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --platform linux/amd64 \
             --file Dockerfile.goreleaser-dynamic --target artifacts \
             --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES= \
             --output "type=local,dest=release-artifacts/.native-build/dynamic" .
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --platform linux/amd64 \
             --file Dockerfile.goreleaser-dynamic --target artifacts \
             --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES=embed-crs \
             --output "type=local,dest=release-artifacts/.native-build/dynamic-crs" .
 
-          cp release-artifacts/.native-build/dynamic/linux_amd64/coraza-rs-dynamic.so \
+          cp release-artifacts/.native-build/dynamic/coraza-rs-dynamic.so \
             release-artifacts/coraza-rs-dynamic.so
-          cp release-artifacts/.native-build/dynamic/linux_arm64/coraza-rs-dynamic.so \
-            release-artifacts/coraza-rs-dynamic-linux-arm64.so
-          cp release-artifacts/.native-build/dynamic-crs/linux_amd64/coraza-rs-dynamic.so \
+          cp release-artifacts/.native-build/dynamic-crs/coraza-rs-dynamic.so \
             release-artifacts/coraza-rs-dynamic-crs.so
-          cp release-artifacts/.native-build/dynamic-crs/linux_arm64/coraza-rs-dynamic.so \
-            release-artifacts/coraza-rs-dynamic-crs-linux-arm64.so
 
       - name: Login to GHCR
         env:

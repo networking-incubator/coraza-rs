@@ -43,7 +43,7 @@ the [evidence branch](https://github.com/rikatz/coraza-rs/tree/envoy-coraza-dyna
 Run the derived-image and native/Wasm rollback checks with:
 
 ```sh
-ENVOY_IMAGE=my-derived-image ENVOY_PLATFORM=linux/arm64 python3 examples/envoy-coraza-dynamic/test.py derived-image
+ENVOY_IMAGE=my-derived-image ENVOY_PLATFORM=linux/amd64 python3 examples/envoy-coraza-dynamic/test.py derived-image
 python3 examples/envoy-coraza-dynamic/test.py rollback
 ```
 

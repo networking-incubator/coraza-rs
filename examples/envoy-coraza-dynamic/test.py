@@ -1161,7 +1161,7 @@ def readelf_symbols(output: str, *, imports: bool) -> set[str]:
 
 def test_derived_image() -> None:
     base_image = os.environ.get("ENVOY_IMAGE")
-    platform = os.environ.get("PLATFORM", os.environ.get("ENVOY_PLATFORM", "linux/arm64"))
+    platform = os.environ.get("PLATFORM", os.environ.get("ENVOY_PLATFORM", "linux/amd64"))
     expected_arch = platform.rsplit("/", 1)[-1]
     assert_ports_free((9901, 10001, 3000))
     if os.environ.get("PROFILE"):
@@ -1224,7 +1224,7 @@ def test_derived_image() -> None:
                 def do_GET(self):
                     with counts.open("a") as output:
                         output.write(self.path + "\n")
-                    body = b"arm64-smoke-allow"
+                    body = b"derived-image-smoke-allow"
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
                     self.send_header("Content-Length", str(len(body)))
@@ -1264,7 +1264,7 @@ def test_derived_image() -> None:
                 raise RuntimeError("denied request reached the backend")
             status, _, body = request("/allow", port=10001)
             assert_status(status, 200, "derived image allow")
-            assert_body(body, b"arm64-smoke-allow", "derived image backend response")
+            assert_body(body, b"derived-image-smoke-allow", "derived image backend response")
             if counts.read_text() != "/allow\n":
                 raise RuntimeError("expected only the allowed request to reach the backend")
 
