@@ -28,7 +28,7 @@ ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
-.PHONY: all build print-envoy-image build-envoy-wasm build-envoy-wasm-crs test-envoy-wasm-crs run-envoy-crs build-envoy-wasm-image build-envoy-dynamic build-envoy-dynamic-crs test-envoy-dynamic test-envoy-dynamic-ftw crs-fetch crs-clean crs-restamp check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check coraza-coordinator-check coraza-parity coraza-bench ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
+.PHONY: all build print-envoy-image build-envoy-wasm build-envoy-wasm-crs test-envoy-wasm-crs run-envoy-crs build-envoy-wasm-image build-envoy-dynamic build-envoy-dynamic-crs run-envoy-dynamic-crs test-envoy-dynamic test-envoy-dynamic-ftw crs-fetch crs-clean crs-restamp check clean test conformance-check conformance-refresh parity-manifest-check parity-differential go-harness-check coraza-coordinator-check coraza-parity coraza-bench ftw-runner-check coraza-example-test ftw-smoke lint lint-extra audit coverage-check fmt doc setup-hooks help
 
 all: build fmt lint lint-extra test audit coverage-check
 
@@ -67,6 +67,10 @@ test-envoy-dynamic:
 
 test-envoy-dynamic-ftw:
 	python3 examples/envoy-coraza-dynamic/test.py ftw
+
+# Builds the embedded-CRS module, starts the demo stack and leaves it running.
+run-envoy-dynamic-crs:
+	python3 examples/envoy-coraza-dynamic/test.py demo-crs
 
 test-envoy-wasm-crs: crs-fetch
 	cargo test -p envoy-coraza --features embed-crs $(_NOCAPTURE)

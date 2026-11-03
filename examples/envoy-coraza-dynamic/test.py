@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import select
+import shlex
 import shutil
 import socket
 import struct
@@ -1391,6 +1392,68 @@ def test_rollback() -> None:
         module.unlink(missing_ok=True)
 
 
+def run_crs_demo() -> None:
+    assert_ports_free()
+    command(["make", "--no-print-directory", "-C", str(ROOT), "build-envoy-dynamic-crs"], capture=True)
+
+    policy = {
+        "directives_map": {
+            "crs": [
+                "SecRuleEngine On",
+                "SecRequestBodyAccess On",
+                "SecRequestBodyLimit 13107200",
+                "SecRequestBodyInMemoryLimit 13107200",
+                "Include crs/crs-setup.conf",
+                "Include crs/rules/*.conf",
+            ]
+        },
+        "default_directives": "crs",
+    }
+    config = ROOT / "target/envoy-coraza-dynamic-crs-demo/envoy.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    write_bootstrap(config, policy)
+
+    target_dir = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+    if not target_dir.is_absolute():
+        target_dir = ROOT / target_dir
+    module = ROOT / "target" / f"envoy-coraza-dynamic-crs-demo-{os.getpid()}.so"
+    module.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(target_dir / "release/libenvoy_coraza_dynamic.so", module)
+
+    project = "envoy-coraza-dynamic-crs-demo"
+    env = {
+        "ENVOY_CORAZA_DYNAMIC_CONFIG": str(config),
+        "ENVOY_CORAZA_DYNAMIC_MODULE": f"target/{module.name}",
+    }
+    compose = Compose(COMPOSE_FILE, project, env=env)
+    path = "/crs-sqli?q=1%27%20OR%201%3D1"
+    try:
+        compose.run("up", "--detach", "--build", capture=True)
+        wait_backend(compose)
+        wait_ready()
+        before = backend_count("/crs-sqli")
+        status, _, _ = request(path, headers={"Host": "crs.local"})
+        assert_status(status, 403, "embedded CRS SQLi demo")
+        if backend_count("/crs-sqli") != before:
+            raise RuntimeError("CRS-blocked request reached the backend")
+    except Exception:
+        logs = compose.logs("envoy")
+        if logs:
+            print("--- Envoy logs ---", file=sys.stderr)
+            print("\n".join(logs.splitlines()[-60:]), file=sys.stderr)
+        compose.down()
+        raise
+    finally:
+        module.unlink(missing_ok=True)
+
+    compose_prefix = ["docker", "compose", "-f", str(COMPOSE_FILE), "-p", project]
+    image_env = f"ENVOY_CORAZA_DYNAMIC_CONFIG={config}"
+    print("Envoy is running with the embedded CRS; the SQLi demo request returned 403.")
+    print(f"try:    curl -i -H 'Host: crs.local' 'http://127.0.0.1:10001{path}'")
+    print(f"logs:   {shlex.join([image_env, *compose_prefix, 'logs', 'envoy'])}")
+    print(f"stop:   {shlex.join([image_env, *compose_prefix, 'down', '--volumes'])}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="test", required=True)
@@ -1399,6 +1462,7 @@ def main() -> int:
         ("ftw", "Run the native CRS FTW suite", test_ftw),
         ("derived-image", "Smoke-test a derived Envoy image", test_derived_image),
         ("rollback", "Compare native and Wasm using identical policy bytes", test_rollback),
+        ("demo-crs", "Run an interactive embedded-CRS Envoy demo", run_crs_demo),
     ):
         subparser = subparsers.add_parser(name, help=description)
         subparser.set_defaults(run=run)

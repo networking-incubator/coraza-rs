@@ -44,3 +44,14 @@ python3 examples/envoy-coraza-dynamic/test.py rollback
 
 Set `ARCHITECTURE`, `PLATFORM`, and `PROFILE` to build the derived image with
 Docker Buildx before the smoke test.
+
+## Run the embedded-CRS demo
+
+```sh
+make run-envoy-dynamic-crs
+```
+
+This builds the CRS-enabled module, starts Envoy and the backend, and leaves
+them running. It verifies that a sample SQL injection is blocked; the command
+prints a repeatable test request, a log command, and the Compose command to stop
+the demo.
