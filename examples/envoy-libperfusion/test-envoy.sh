@@ -16,6 +16,9 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/../.." && pwd)
+ENVOY_IMAGE=${ENVOY_IMAGE:-$(make --no-print-directory -C "$repo_root" print-envoy-image)}
+export ENVOY_IMAGE
 compose=(docker compose -f "$script_dir/compose.yaml" -p libperfusion-envoy-test)
 temp_dir=$(mktemp -d)
 compat_config="$script_dir/.envoy-istio-compatible.$$.yaml"

@@ -7,10 +7,21 @@ inputs:
     description: Nightly toolchain version for rustfmt.
     required: false
     default: nightly
+  libclang:
+    description: Install clang and libclang for workspace crates using bindgen.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
   steps:
+    - name: Install bindgen prerequisites
+      if: inputs.libclang == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends clang libclang-dev
+
     - name: Read stable Rust version from toolchain file
       id: rust
       shell: bash

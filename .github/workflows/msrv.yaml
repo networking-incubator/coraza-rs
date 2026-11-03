@@ -30,6 +30,7 @@ jobs:
         uses: $/.github/actions/setup-rust
         with:
           cache-suffix: msrv
+          libclang: true
 
       - name: Check workspace compiles on MSRV
         run: cargo check --workspace

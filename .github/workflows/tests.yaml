@@ -36,6 +36,8 @@ jobs:
 
       - name: Set up Rust (stable + nightly fmt)
         uses: $/.github/actions/setup-rust-lint
+        with:
+          libclang: true
 
       - name: Cache cargo-machete
         id: cache-machete
@@ -73,6 +75,8 @@ jobs:
 
       - name: Set up Rust
         uses: $/.github/actions/setup-rust
+        with:
+          libclang: true
 
       - name: Test
         run: make test
@@ -126,6 +130,148 @@ jobs:
         run: bash examples/envoy-coraza/test-envoy.sh
         env:
           ENVOY_CORAZA_MAKE_TARGET: build-envoy-wasm-crs
+
+  envoy-dynamic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: envoy-dynamic
+          libclang: true
+
+      - name: Build native Envoy module
+        run: make build-envoy-dynamic
+
+      - name: Run native Envoy integration checks
+        run: make test-envoy-dynamic
+
+  envoy-dynamic-crs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: envoy-dynamic-crs
+          libclang: true
+
+      - name: Fetch the pinned CRS release
+        run: make crs-fetch
+
+      - name: Build native Envoy module with embedded CRS
+        run: make build-envoy-dynamic-crs
+
+      - name: Test the embedded CRS policy
+        run: cargo test -p envoy-coraza-dynamic --features embed-crs
+
+      - name: Run native Envoy integration checks
+        run: make test-envoy-dynamic
+
+  envoy-dynamic-derived-images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            profile: default
+            cargo_features: ""
+          - architecture: arm64
+            platform: linux/arm64
+            profile: default
+            cargo_features: ""
+          - architecture: amd64
+            platform: linux/amd64
+            profile: crs
+            cargo_features: embed-crs
+          - architecture: arm64
+            platform: linux/arm64
+            profile: crs
+            cargo_features: embed-crs
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read pinned Envoy image
+        id: envoy-image
+        run: echo "image=$(make --no-print-directory print-envoy-image)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Fetch the pinned CRS release
+        if: matrix.profile == 'crs'
+        run: make crs-fetch
+
+      - name: Build and smoke-test derived Envoy image
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          PLATFORM: ${{ matrix.platform }}
+          PROFILE: ${{ matrix.profile }}
+          CARGO_FEATURES: ${{ matrix.cargo_features }}
+          ENVOY_IMAGE: ${{ steps.envoy-image.outputs.image }}
+        run: python3 examples/envoy-coraza-dynamic/test.py derived-image
+
+  envoy-dynamic-ftw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      FTW_INCLUDE_TESTS: '^(932161-7|934120-23|941120-49|949110-4|944110-18|911100-1|920100-1|932161-1|942100-1|949110-1)$'
+      FTW_ALLOW_FAILURES_FILE: examples/envoy-coraza-dynamic/ftw-ci-allowed-failures.txt
+      FTW_EXPECTED_SELECTED_TESTS: '10'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: envoy-dynamic-ftw
+          libclang: true
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ftw-runner/go.mod
+          cache-dependency-path: ftw-runner/go.sum
+
+      - name: Run bounded native CRS FTW gate
+        run: make test-envoy-dynamic-ftw
+        env:
+          FTW_OUTPUT_DIR: ${{ runner.temp }}/envoy-dynamic-ftw
+
+      - name: Upload FTW logs and manifest
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: envoy-dynamic-ftw-${{ github.run_id }}
+          path: ${{ runner.temp }}/envoy-dynamic-ftw
+          if-no-files-found: warn
 
   meta-lint:
     runs-on: ubuntu-24.04
@@ -181,6 +327,7 @@ jobs:
         uses: $/.github/actions/setup-rust
         with:
           cache-suffix: features
+          libclang: true
 
       - name: Cache cargo-hack
         id: cache-hack

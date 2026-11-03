@@ -15,8 +15,11 @@ detecting.
 | `libperfusion/` | Reusable SQLi/XSS library, parser APIs, tests, reference corpora, and benchmarks. |
 | `envoy-libperfusion/` | Envoy Proxy-Wasm HTTP filter backed by `libperfusion`; this adapter is not published as a crate. |
 | [`envoy-coraza/`](envoy-coraza/README.md) | Envoy Proxy-Wasm HTTP filter backed by the `coraza` crate, with an optional build that embeds a pinned OWASP CRS release. |
+| `envoy-coraza-common/` | Shared Coraza configuration, policy compilation, authority selection, and formatting used by the Wasm and native Envoy adapters. |
+| [`envoy-coraza-dynamic/`](envoy-coraza-dynamic/README.md) | Experimental native Envoy 1.40.0 dynamic HTTP module backed by `coraza`, with an optional embedded-CRS build; it is an alternative to, not a replacement for, the Wasm filter. |
 | `examples/envoy-libperfusion/` | Local Envoy and Istio examples for the filter. |
 | `examples/envoy-coraza/` | Standalone Envoy lifecycle harness for the Coraza filter, including an embedded-CRS run. |
+| `examples/envoy-coraza-dynamic/` | Pinned standalone Envoy harness for native request/response enforcement and lifecycle checks. |
 | `xtask/` | Internal commands for checking and refreshing pinned corpora and generated tables. |
 | `docs/` | CI, performance, and design documentation. |
 | `.github/workflows/` | Build, test, parity, fuzz, coverage, and supply-chain workflows. |

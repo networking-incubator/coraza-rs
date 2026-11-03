@@ -9,6 +9,7 @@ runs:
       uses: $/.github/actions/setup-rust
       with:
         cache-suffix: coverage
+        libclang: true
 
     - name: Cache cargo-llvm-cov
       id: cache-llvm-cov

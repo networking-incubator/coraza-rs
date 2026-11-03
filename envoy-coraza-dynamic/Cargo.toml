@@ -1,0 +1,29 @@
+[package]
+name = "envoy-coraza-dynamic"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Envoy dynamic HTTP filter for Coraza"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+panic-probe = []
+embed-crs = ["envoy-coraza-common/embed-crs"]
+
+[dependencies]
+coraza = { path = "../coraza" }
+envoy-coraza-common = { path = "../envoy-coraza-common" }
+envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy", rev = "9e5580933739775e8bce696a57a2e1bc99368f23" }
+
+[dev-dependencies]
+envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy", rev = "9e5580933739775e8bce696a57a2e1bc99368f23", features = [
+  "mock",
+] }
+
+[lints]
+workspace = true
