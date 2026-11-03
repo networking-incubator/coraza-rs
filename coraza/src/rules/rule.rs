@@ -371,7 +371,6 @@ impl Rule {
                         },
                         // An embedder operator can report no verdict for a value; the
                         // rule treats it as a miss. Built-in detectors scan every input.
-                        OperatorOutcome::NotInspected if operator.is_detector() => tx.record_inspection_incomplete(id),
                         OperatorOutcome::NotMatched | OperatorOutcome::NotInspected => {},
                     }
                 }
@@ -468,16 +467,14 @@ mod tests {
     use super::Rule;
     use crate::{
         actions::{ActionImplementation, ActionType, CompiledAction},
-        config::DetectorInspectionAction,
         seclang::Parser,
         types::{RulePhase, RuleVariable},
         waf::Waf,
     };
 
-    fn build_waf(rules: &str, detector_inspection_action: DetectorInspectionAction) -> Waf {
+    fn build_waf(rules: &str) -> Waf {
         let mut parser = Parser::new();
         parser.from_string(rules).unwrap();
-        parser.config_mut().detector_inspection_action = detector_inspection_action;
         parser.into_waf().unwrap()
     }
 
@@ -541,29 +538,23 @@ mod tests {
 
     #[cfg(feature = "inspect-file")]
     #[test]
-    fn a_host_operator_that_cannot_run_is_a_miss_under_fail_closed() {
-        let waf = build_waf(
-            "SecRule ARGS:q \"@inspectFile /nonexistent/coraza-inspect-file-test\" \"id:960,phase:1,pass\"",
-            DetectorInspectionAction::FailClosed,
-        );
+    fn a_host_operator_that_cannot_run_is_a_miss() {
+        let waf =
+            build_waf("SecRule ARGS:q \"@inspectFile /nonexistent/coraza-inspect-file-test\" \"id:960,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("inspect-file-spawn-failure");
         tx.add_get_argument("q", b"value");
 
         assert!(
             tx.process_request_headers().is_none(),
-            "a spawn failure is not over-long detector input, so it must not interrupt"
+            "a spawn failure is not a verdict, so it must not interrupt"
         );
-        assert!(!tx.inspection_incomplete());
-        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
+        assert!(tx.matched_rules().is_empty());
     }
 
     #[cfg(feature = "rbl")]
     #[test]
-    fn a_resolver_error_is_a_miss_under_fail_closed() {
-        let waf = build_waf(
-            "SecRule ARGS:q \"@rbl zen.spamhaus.org\" \"id:961,phase:1,pass\"",
-            DetectorInspectionAction::FailClosed,
-        );
+    fn a_resolver_error_is_a_miss() {
+        let waf = build_waf("SecRule ARGS:q \"@rbl zen.spamhaus.org\" \"id:961,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("rbl-resolver-error");
         // A NUL byte cannot be part of a resolver request, so this fails without
         // reaching the network, as `LookupHost` does for the same value in Go.
@@ -573,16 +564,12 @@ mod tests {
             tx.process_request_headers().is_none(),
             "a not-listed value must not interrupt"
         );
-        assert!(!tx.inspection_incomplete());
-        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
+        assert!(tx.matched_rules().is_empty());
     }
 
     #[test]
     fn a_detector_input_over_the_old_bound_is_still_inspected() {
-        let waf = build_waf(
-            "SecRule ARGS:q \"@detectSQLi\" \"id:962,phase:1,pass\"",
-            DetectorInspectionAction::FailClosed,
-        );
+        let waf = build_waf("SecRule ARGS:q \"@detectSQLi\" \"id:962,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("detector-input-bound");
         let mut input = b"1' OR '1'='1".to_vec();
         input.resize(libperfusion::MAX_INPUT_LEN + 1, b' ');
@@ -590,16 +577,11 @@ mod tests {
 
         assert!(tx.process_request_headers().is_none());
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 962));
-        assert!(!tx.inspection_incomplete());
-        assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
     }
 
     #[test]
     fn count_mode_reports_go_key_str_as_the_matched_name() {
-        let waf = build_waf(
-            "SecRule &REQUEST_HEADERS:X-Foo \"@ge 1\" \"id:963,phase:1,pass\"",
-            DetectorInspectionAction::RecordOnly,
-        );
+        let waf = build_waf("SecRule &REQUEST_HEADERS:X-Foo \"@ge 1\" \"id:963,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("count-header-name");
         tx.add_request_header("X-Foo", b"bar");
         assert!(tx.process_request_headers().is_none());
@@ -610,10 +592,7 @@ mod tests {
             Some("REQUEST_HEADERS:x-foo")
         );
 
-        let waf = build_waf(
-            "SecRule &ARGS:/re/ \"@ge 1\" \"id:964,phase:1,pass\"",
-            DetectorInspectionAction::RecordOnly,
-        );
+        let waf = build_waf("SecRule &ARGS:/re/ \"@ge 1\" \"id:964,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("count-args-name");
         tx.add_get_argument("re1", b"one");
         assert!(tx.process_request_headers().is_none());

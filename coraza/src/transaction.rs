@@ -54,7 +54,7 @@ use crate::{
     },
     body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory},
     collection::{Map, MatchData, Single},
-    config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
+    config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
     operators::Macro,
     rules::{RuleGroup, VariableException},
@@ -370,8 +370,6 @@ pub struct Transaction {
     res_body_processor_error_msg: Single,
     /// Highest matched rule severity, or 255 when none matched.
     highest_severity: Single,
-    /// Whether a detector operator skipped an input as too large to inspect.
-    inspection_incomplete: bool,
 }
 
 /// The `TX` capture keys, `"0"` through `"10"`.
@@ -590,7 +588,6 @@ impl Transaction {
                 value.set("255");
                 value
             },
-            inspection_incomplete: false,
         };
         // Go seeds its capture variables `TX:0`..`TX:10` to empty on every transaction
         // (`internal/corazawaf/waf.go:264-268` in v3.8.1). Seeding them here means the
@@ -1708,37 +1705,6 @@ impl Transaction {
         self.arguments_limit_reached.get_bytes() == b"1"
     }
 
-    /// Whether an operator reported that it could not inspect an input.
-    ///
-    /// The built-in `detectSQLi` and `detectXSS` operators scan every input, as Go does,
-    /// so they never set this. The signal is retained for a future operator with no
-    /// verdict: this method returns `true` and `TX.inspection_incomplete` is set to
-    /// `"1"` once such an operator reports it.
-    ///
-    /// By default the affected rule continues as a miss. Set
-    /// [`WafConfig::detector_inspection_action`] to
-    /// [`DetectorInspectionAction::FailClosed`] to interrupt the transaction instead.
-    pub fn inspection_incomplete(&self) -> bool {
-        self.inspection_incomplete
-    }
-
-    /// Record that an operator could not inspect an input and apply the configured policy.
-    ///
-    /// The signal is recorded once, but `FailClosed` applies on every skipped input,
-    /// including after a `ctl` switches the rule engine from `DetectionOnly` to `On`.
-    /// An interruption that is already set is never replaced, so the first disruptive
-    /// action keeps its rule, status and data.
-    pub(crate) fn record_inspection_incomplete(&mut self, rule_id: i32) {
-        if !self.inspection_incomplete {
-            self.inspection_incomplete = true;
-            self.set_tx_variable("inspection_incomplete", "1");
-        }
-        if self.config.detector_inspection_action == DetectorInspectionAction::FailClosed && self.interruption.is_none()
-        {
-            self.interrupt(rule_id, "deny", 500, "detector input exceeds the inspection bound");
-        }
-    }
-
     /// Check the per-collection argument limit and set its flag when reached.
     fn within_argument_limit(&mut self, current_count: usize) -> bool {
         let within = current_count < self.config.argument_limit;
@@ -2239,7 +2205,7 @@ mod tests {
     };
     use crate::{
         Waf,
-        config::{DetectorInspectionAction, UploadKeepFiles, WafConfig},
+        config::{UploadKeepFiles, WafConfig},
         operators::Outputs,
         rules::VariableSpec,
         types::{AuditEngineStatus, AuditLogPart, BodyLimitAction, RuleEngineStatus, RulePhase, RuleVariable},
@@ -6683,11 +6649,10 @@ content\r\n\
         }
     }
 
-    /// Build a WAF from SecLang rules with one detector inspection policy.
-    fn detector_waf(rules: &str, detector_inspection_action: DetectorInspectionAction) -> Waf {
+    /// Build a WAF from SecLang rules.
+    fn detector_waf(rules: &str) -> Waf {
         let mut parser = crate::seclang::Parser::new();
         parser.from_string(rules).unwrap();
-        parser.config_mut().detector_inspection_action = detector_inspection_action;
         parser.into_waf().unwrap()
     }
 
@@ -6704,15 +6669,11 @@ content\r\n\
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 610),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 611),
         ] {
-            let waf = detector_waf(
-                &format!("SecRule ARGS:q \"@{operator}\" \"id:{rule_id},phase:1,pass\""),
-                DetectorInspectionAction::RecordOnly,
-            );
+            let waf = detector_waf(&format!("SecRule ARGS:q \"@{operator}\" \"id:{rule_id},phase:1,pass\""));
             let mut tx = waf.new_transaction_with_id(format!("detector-bound-{operator}"));
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN));
 
             assert!(tx.process_request_headers().is_none());
-            assert!(!tx.inspection_incomplete());
             assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
         }
     }
@@ -6723,150 +6684,62 @@ content\r\n\
             ("detectSQLi", b"1' OR '1'='1".as_slice(), 612),
             ("detectXSS", b"<script>alert(1)</script>".as_slice(), 613),
         ] {
-            let waf = detector_waf(
-                &format!("SecRule ARGS:q \"@{operator}\" \"id:{rule_id},phase:1,pass\""),
-                DetectorInspectionAction::RecordOnly,
-            );
+            let waf = detector_waf(&format!("SecRule ARGS:q \"@{operator}\" \"id:{rule_id},phase:1,pass\""));
             let mut tx = waf.new_transaction_with_id(format!("detector-over-bound-{operator}"));
             tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
 
             assert!(tx.process_request_headers().is_none());
             assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
-            assert!(!tx.inspection_incomplete());
-            assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
         }
     }
 
     #[test]
-    fn in_bounds_detector_inputs_leave_the_signal_clear() {
+    fn detector_inputs_leave_no_inspection_variable() {
         let waf = detector_waf(
             "SecRule ARGS \"@detectSQLi\" \"id:614,phase:1,pass\"\n\
              SecRule ARGS \"@detectXSS\" \"id:615,phase:1,pass\"",
-            DetectorInspectionAction::RecordOnly,
         );
         let mut tx = waf.new_transaction_with_id("detector-in-bounds");
         tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN));
         tx.add_get_argument("r", detector_input(b"<script>alert(1)</script>", 1024));
 
         tx.process_request_headers();
-        assert!(!tx.inspection_incomplete());
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("inspection_incomplete")), None);
         assert_eq!(tx.matched_rules().len(), 2);
     }
 
     #[test]
-    fn fail_closed_does_not_interrupt_a_scanned_detector() {
-        for (operator, payload, rule_id) in [
-            ("detectSQLi", b"1' OR '1'='1".as_slice(), 616),
-            ("detectXSS", b"<script>alert(1)</script>".as_slice(), 617),
-        ] {
-            let waf = detector_waf(
-                &format!("SecRule ARGS:q \"@{operator}\" \"id:{rule_id},phase:1,pass\""),
-                DetectorInspectionAction::FailClosed,
-            );
-            let mut tx = waf.new_transaction_with_id(format!("detector-fail-closed-{operator}"));
-            tx.add_get_argument("q", detector_input(payload, libperfusion::MAX_INPUT_LEN + 1));
-
-            assert!(tx.process_request_headers().is_none());
-            assert!(!tx.inspection_incomplete());
-            assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == rule_id));
-        }
-    }
-
-    #[test]
-    fn fail_closed_does_not_interrupt_in_bounds_inputs() {
-        let waf = detector_waf(
-            "SecRule ARGS:q \"@detectSQLi\" \"id:618,phase:1,pass\"",
-            DetectorInspectionAction::FailClosed,
-        );
-        let mut tx = waf.new_transaction_with_id("detector-fail-closed-in-bounds");
-        tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN));
-
-        assert!(tx.process_request_headers().is_none());
-        assert!(!tx.inspection_incomplete());
-        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 618));
-    }
-
-    #[test]
-    fn a_ctl_switching_to_on_still_scans_over_bound_detector_input() {
+    fn a_detector_input_over_the_old_bound_is_matched_in_every_rule_engine_mode() {
         let waf = detector_waf(
             "SecRuleEngine DetectionOnly\n\
              SecRule ARGS:q \"@detectSQLi\" \"id:630,phase:1,pass\"\n\
              SecRule ARGS:q \"@detectXSS\" \"id:631,phase:1,pass\"\n\
              SecAction \"id:632,phase:1,ctl:ruleEngine=On,pass\"\n\
              SecRule ARGS:q \"@detectSQLi\" \"id:633,phase:1,pass\"",
-            DetectorInspectionAction::FailClosed,
         );
-        let mut tx = waf.new_transaction_with_id("detector-fail-closed-ctl-on");
+        let mut tx = waf.new_transaction_with_id("detector-ctl-on");
         tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1));
 
         assert!(tx.process_request_headers().is_none());
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 630));
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 633));
         assert!(tx.would_be_interruption().is_none());
-        assert!(!tx.inspection_incomplete());
     }
 
     #[test]
-    fn fail_closed_does_not_replace_an_existing_interruption() {
-        let config = WafConfig {
-            detector_inspection_action: DetectorInspectionAction::FailClosed,
-            ..WafConfig::default()
-        };
-        let mut tx = Transaction::with_config("detector-fail-closed-existing", Arc::new(config));
-        tx.interrupt(7, "deny", 403, "original action data");
-        tx.record_inspection_incomplete(9);
-
-        let interruption = tx.interruption().unwrap();
-        assert_eq!(interruption.rule_id, 7);
-        assert_eq!(interruption.status, 403);
-        assert_eq!(interruption.data, "original action data");
-        assert!(tx.inspection_incomplete());
-        assert_eq!(
-            tx.get_variable(RuleVariable::TX, Some("inspection_incomplete"))
-                .as_deref(),
-            Some("1")
-        );
-    }
-
-    #[test]
-    fn record_only_detects_every_over_bound_input() {
-        let waf = detector_waf(
-            "SecRule ARGS:q \"@detectSQLi\" \"id:634,phase:1,pass\"\n\
-             SecRule ARGS:r \"@detectXSS\" \"id:635,phase:1,pass\"",
-            DetectorInspectionAction::RecordOnly,
-        );
-        let mut tx = waf.new_transaction_with_id("detector-record-only-repeated");
-        tx.add_get_argument("q", detector_input(b"1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1));
-        tx.add_get_argument(
-            "r",
-            detector_input(b"<script>alert(1)</script>", libperfusion::MAX_INPUT_LEN + 1),
-        );
-
-        assert!(tx.process_request_headers().is_none());
-        assert!(!tx.inspection_incomplete());
-        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 634));
-        assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 635));
-    }
-
-    #[test]
-    fn a_detector_chain_matches_over_bound_input_without_a_signal() {
+    fn a_detector_chain_matches_over_bound_input() {
         let waf = detector_waf(
             "SecRule ARGS:q \"@contains needle\" \"id:619,phase:1,pass,chain\"\n\
-             SecRule ARGS:q \"@detectSQLi\" \"\"\n\
-             SecRule TX:inspection_incomplete \"@streq 1\" \"id:620,phase:1,pass\"",
-            DetectorInspectionAction::RecordOnly,
+             SecRule ARGS:q \"@detectSQLi\" \"\"",
         );
-        let mut tx = waf.new_transaction_with_id("detector-chain-signal");
+        let mut tx = waf.new_transaction_with_id("detector-chain");
         tx.add_get_argument(
             "q",
             detector_input(b"needle 1' OR '1'='1", libperfusion::MAX_INPUT_LEN + 1),
         );
 
         assert!(tx.process_request_headers().is_none());
-        assert!(!tx.inspection_incomplete());
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 619));
-        assert!(!tx.matched_rules().iter().any(|matched| matched.rule.id == 620));
     }
 
     #[test]

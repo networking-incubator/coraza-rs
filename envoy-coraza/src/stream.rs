@@ -593,7 +593,7 @@ impl CorazaHttp {
         if let Some(interruption) = interruption {
             return self.reject_interruption(&interruption, "request-body", InterruptionPhase::RequestBody);
         }
-        if self.tx.as_deref().is_some_and(request_inspection_incomplete) {
+        if self.tx.as_ref().is_some_and(|tx| tx.arguments_limit_reached()) {
             return self.reject_request(
                 413,
                 REQUEST_INCOMPLETE_BODY,
@@ -1139,16 +1139,6 @@ impl CorazaHttp {
             });
             let result = self.replace_interruption(&interruption, body_size);
             return self.response_mutation_action(result);
-        }
-        if self.tx.as_deref().is_some_and(response_inspection_incomplete) {
-            return self.reject_response(
-                502,
-                RESPONSE_INCOMPLETE_BODY,
-                TerminalOutcome::Incomplete {
-                    phase: "response-body-inspection",
-                    status: 502,
-                },
-            );
         }
         if self.tx.as_ref().is_some_and(|tx| tx.response_body_stats().truncated) {
             self.outcome
@@ -1771,14 +1761,6 @@ fn has_upgrade(headers: &[(String, Vec<u8>)]) -> bool {
                     .map(trim_ascii)
                     .any(|token| token.eq_ignore_ascii_case(b"upgrade")))
     })
-}
-
-fn request_inspection_incomplete(tx: &Transaction) -> bool {
-    tx.inspection_incomplete() || tx.arguments_limit_reached()
-}
-
-fn response_inspection_incomplete(tx: &Transaction) -> bool {
-    tx.inspection_incomplete()
 }
 
 fn valid_status(status: u16) -> u16 {

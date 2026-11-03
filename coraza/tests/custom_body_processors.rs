@@ -831,7 +831,6 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
         Some("1")
     );
     assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("0"));
-    assert!(!tx.inspection_incomplete());
 
     let mut parser = Parser::new();
     parser.config_mut().request_body_access = true;
@@ -862,7 +861,6 @@ fn custom_argument_limits_and_errors_keep_existing_body_error_semantics() {
         tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).as_deref(),
         Some("reported parse failure")
     );
-    assert!(!tx.inspection_incomplete());
 
     let tx = request_transaction(&waf, b"returned-error", b"application/x-custom");
     assert_eq!(
@@ -989,7 +987,6 @@ fn custom_response_processor_populates_outputs_and_matches_request_error_semanti
             tx.get_variable(RuleVariable::ResBodyProcessorErrorMsg, None).as_deref(),
             Some("response failure")
         );
-        assert!(!tx.inspection_incomplete());
     }
 }
 

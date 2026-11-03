@@ -31,33 +31,6 @@ pub const DEFAULT_ARGUMENT_LIMIT: usize = 1000;
 /// `SecResponseBodyJsonDepthLimit`), as in Go Coraza.
 pub const DEFAULT_JSON_DEPTH_LIMIT: usize = 1024;
 
-/// What happens when an operator reports that it cannot inspect a value.
-///
-/// The built-in `detectSQLi` and `detectXSS` operators scan every input, as Go does, so
-/// they never report a skip. This setting is retained for compatibility with callers
-/// that construct it; no built-in operator currently produces
-/// [`OperatorOutcome::NotInspected`](crate::operators::OperatorOutcome::NotInspected).
-/// There is no SecLang directive for it, as in Go Coraza.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DetectorInspectionAction {
-    /// Record the skipped inspection on the transaction and treat the value as not
-    /// matched.
-    ///
-    /// This is the default and keeps detection compatible with earlier releases: a
-    /// value above the bound is a miss. The transaction sets `TX.inspection_incomplete`
-    /// to `"1"` and
-    /// [`Transaction::inspection_incomplete`](crate::transaction::Transaction::inspection_incomplete)
-    /// returns `true`, so an embedder can still tell that inspection did not run.
-    #[default]
-    RecordOnly,
-    /// Interrupt the transaction when a detector operator cannot inspect a value.
-    ///
-    /// This is the safer setting: it fails closed instead of letting an uninspected
-    /// value through. The interruption follows the rule engine mode, like any
-    /// disruptive action.
-    FailClosed,
-}
-
 /// Whether uploaded files are kept after the transaction ends (`SecUploadKeepFiles`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UploadKeepFiles {
@@ -261,14 +234,6 @@ pub struct WafConfig {
     /// transaction. There is no SecLang directive for this setting.
     pub multiphase_evaluation: bool,
 
-    /// What happens when a detector operator cannot inspect a value that exceeds
-    /// libperfusion's input bound.
-    ///
-    /// [`DetectorInspectionAction::RecordOnly`], the default, keeps the miss and records
-    /// the skipped inspection. [`DetectorInspectionAction::FailClosed`] interrupts the
-    /// transaction instead. There is no SecLang directive for this, as in Go Coraza.
-    pub detector_inspection_action: DetectorInspectionAction,
-
     /// Application id; apps sharing it share persistent collections (`SecWebAppId`).
     pub web_app_id: String,
 
@@ -350,7 +315,6 @@ impl Default for WafConfig {
             argument_limit: DEFAULT_ARGUMENT_LIMIT,
             case_sensitive_args_keys: false,
             multiphase_evaluation: false,
-            detector_inspection_action: DetectorInspectionAction::RecordOnly,
             web_app_id: String::new(),
             sensor_id: String::new(),
             server_signature: String::new(),
@@ -390,7 +354,6 @@ mod tests {
         assert_eq!(config.argument_limit, 1000);
         assert!(!config.case_sensitive_args_keys);
         assert!(!config.multiphase_evaluation);
-        assert_eq!(config.detector_inspection_action, DetectorInspectionAction::RecordOnly);
         assert_eq!(config.audit_log_format, AuditLogFormat::Native);
         assert_eq!(config.audit_log_type, AuditLogType::Serial);
         assert!(!config.request_body_access);
