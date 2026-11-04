@@ -421,7 +421,8 @@ def raw_response_status(request_bytes: bytes, *, port: int = 10001) -> bytes:
 
 def check_startup_rejected(compose: Compose, label: str, config: pathlib.Path,
                            module_dir: pathlib.Path | None = None) -> None:
-    args = ["run", "--rm", "--no-deps", "--service-ports"]
+    probe_container = f"coraza-dynamic-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    args = ["run", "--rm", "--name", probe_container, "--no-deps", "--service-ports"]
     if module_dir is not None:
         args.extend(["--volume", f"{module_dir}:/opt/envoy/modules:ro"])
     args.append("envoy")
@@ -429,6 +430,18 @@ def check_startup_rejected(compose: Compose, label: str, config: pathlib.Path,
         result = compose.run(*args, env={"ENVOY_CORAZA_DYNAMIC_CONFIG": str(config)},
                              capture=True, check=False, timeout=30)
     except CommandTimeout as error:
+        try:
+            cleanup = command(["docker", "rm", "--force", probe_container],
+                              capture=True, check=False, timeout=15)
+            if cleanup.returncode:
+                print(
+                    f"warning: failed to remove timed-out probe container {probe_container}: "
+                    f"{cleanup.stderr.strip()}",
+                    file=sys.stderr,
+                )
+        except (CommandTimeout, OSError) as cleanup_error:
+            print(f"warning: failed to remove timed-out probe container {probe_container}: {cleanup_error}",
+                  file=sys.stderr)
         raise RuntimeError(f"{label}: Envoy timed out instead of rejecting invalid configuration") from error
     if result.returncode == 0:
         raise RuntimeError(f"{label}: Envoy unexpectedly accepted invalid module/config")
@@ -1447,11 +1460,12 @@ def run_crs_demo() -> None:
         module.unlink(missing_ok=True)
 
     compose_prefix = ["docker", "compose", "-f", str(COMPOSE_FILE), "-p", project]
-    image_env = f"ENVOY_CORAZA_DYNAMIC_CONFIG={config}"
+    image_env = f"ENVOY_CORAZA_DYNAMIC_CONFIG={shlex.quote(str(config))}"
+    compose_cli = shlex.join(compose_prefix)
     print("Envoy is running with the embedded CRS; the SQLi demo request returned 403.")
     print(f"try:    curl -i -H 'Host: crs.local' 'http://127.0.0.1:10001{path}'")
-    print(f"logs:   {shlex.join([image_env, *compose_prefix, 'logs', 'envoy'])}")
-    print(f"stop:   {shlex.join([image_env, *compose_prefix, 'down', '--volumes'])}")
+    print(f"logs:   {image_env} {compose_cli} logs envoy")
+    print(f"stop:   {image_env} {compose_cli} down --volumes")
 
 
 def main() -> int:

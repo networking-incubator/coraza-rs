@@ -607,10 +607,25 @@ def benchmark_variant(
                 "workloads": workloads,
             }
         finally:
+            cleanup_command = [*compose_command, "down", "--volumes"]
             try:
-                run([*compose_command, "down", "--volumes"], check=False, capture=True, timeout=30)
-            except RuntimeError as error:
+                cleanup = subprocess.run(
+                    cleanup_command,
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
                 print(f"warning: benchmark cleanup failed: {error}", file=sys.stderr)
+            else:
+                if cleanup.returncode:
+                    details = "\n".join(part.strip() for part in (cleanup.stderr, cleanup.stdout) if part.strip())
+                    print(
+                        f"warning: benchmark cleanup exited {cleanup.returncode}: {cleanup_command!r}\n{details}",
+                        file=sys.stderr,
+                    )
 
 
 def summarize(records: list[dict]) -> list[dict]:
