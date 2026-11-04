@@ -24,17 +24,18 @@
 //! Terminal data, filter-state properties, and selected audit records
 //! are published through checked Proxy-Wasm hostcalls.
 
-mod config;
 mod observability;
-mod policy;
 mod stream;
 #[cfg(test)]
 mod test_hostcalls;
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
-use config::{Config, MAX_CONFIGURATION_BYTES};
-use policy::Generation;
+use envoy_coraza_common::{
+    config::{Config, MAX_CONFIGURATION_BYTES},
+    observability::Diagnostics,
+    policy::Generation,
+};
 use proxy_wasm::{
     hostcalls,
     traits::{Context, HttpContext, RootContext},
@@ -76,7 +77,16 @@ impl CorazaRoot {
             .next_generation_id
             .checked_add(1)
             .ok_or_else(|| "configuration generation id exhausted".to_owned())?;
-        let mut generation = Generation::compile(config).map_err(|error| error.to_string())?;
+        let diagnostics = Arc::new(Diagnostics::default());
+        let error_diagnostics = Arc::clone(&diagnostics);
+        let audit_diagnostics = Arc::clone(&diagnostics);
+        let mut generation = Generation::compile(
+            config,
+            diagnostics,
+            move |matched| observability::error_log(matched, &error_diagnostics),
+            move |entry, format| observability::audit_log(entry, format, &audit_diagnostics),
+        )
+        .map_err(|error| error.to_string())?;
         generation.set_id(next_id);
         self.generation = Some(Rc::new(generation));
         self.next_generation_id = next_id;
@@ -130,7 +140,7 @@ impl RootContext for CorazaRoot {
                 #[cfg(feature = "embed-crs")]
                 log_info(&format!(
                     "envoy-coraza: embedded CRS {} files available to Include",
-                    policy::embedded_crs::EMBEDDED_CRS_VERSION
+                    envoy_coraza_common::policy::embedded_crs_version()
                 ));
                 if let Some(generation) = &self.generation {
                     for warning in generation.warnings() {
@@ -188,8 +198,6 @@ fn log_info(message: &str) {
 mod tests {
     use std::rc::Rc;
 
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
     use super::{check_configuration_size, CorazaRoot, MAX_CONFIGURATION_BYTES};
 
     /// A root context with no configuration applied yet.
@@ -242,12 +250,7 @@ mod tests {
     #[test]
     fn a_compressed_configuration_is_enforced_end_to_end() {
         let mut root = root();
-        let compressed = STANDARD.encode(crate::config::gzip_fixture(
-            br#"{
-                "directives_map": {"p": "SecRule REQUEST_URI \"@contains attack\" \"id:12,phase:1,deny,status:403\""},
-                "default_directives": "p"
-            }"#,
-        ));
+        let compressed = "H4sIAAAAAAAC/6vmUkADSimZRanJJZllqcXxuYkFSlYK1UogUik4NTmoNCdVIcg1MNQ1OCQ+NMhTIUbJITk/ryQxM69YIbGkJDE5O0YJKJiZYmVopFOQkVicamWok5KaV6lTXJJYUlpsZWJgHKOkVKuDxdrUtMTSnJJ4hPUgSwuUUFTWAgBTZ6/EsAAAAA==";
         root.apply(format!(r#"{{"config_gzip_b64": "{compressed}"}}"#).as_bytes())
             .expect("a compressed configuration is valid");
         assert_eq!(
@@ -262,9 +265,7 @@ mod tests {
         let mut root = root();
         root.apply(br#"{"directives_map": {"p": []}, "default_directives": "p"}"#)
             .expect("configuration is valid");
-        let compressed = STANDARD.encode(crate::config::gzip_fixture(
-            br#"{"directives_map": {"p": ["SecNotADirective x"]}}"#,
-        ));
+        let compressed = "H4sIAAAAAAAC/6tWSsksSk0uySxLLY7PTSxQslKoVgKR0UrBqcl++SWOLjB5hQql2NpaADrpDCUxAAAA";
         let rejected = root.apply(format!(r#"{{"config_gzip_b64": "{compressed}"}}"#).as_bytes());
         assert!(rejected.is_err(), "an invalid compressed policy is rejected");
         assert!(
@@ -274,8 +275,7 @@ mod tests {
         );
 
         // A decode failure is rejected on the same path.
-        let truncated = crate::config::gzip_fixture(br#"{"directives_map": {"q": []}}"#);
-        let truncated = STANDARD.encode(truncated.get(..truncated.len() - 4).unwrap());
+        let truncated = "H4sIAAAAAAAC/6tWSsksSk0uySxLLY7PTSxQslKoVioEktGxtbUA3ZlscA==";
         let rejected = root.apply(format!(r#"{{"config_gzip_b64": "{truncated}"}}"#).as_bytes());
         assert!(rejected.is_err(), "a truncated compressed document is rejected");
         assert!(

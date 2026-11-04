@@ -20,6 +20,33 @@ This repository uses GitHub Actions to block risky changes early.
   `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs`; that run adds a `crs.local`
   policy that includes the embedded tree and asserts a SQL injection request is
   denied by CRS rule 949110.
+- `envoy-dynamic`: installs the native SDK's clang/libclang build prerequisites,
+  builds the native Envoy module, and runs the native harness against the
+  digest-pinned Envoy 1.40.0 image. The harness covers request/response
+  enforcement, two workers, concurrent HTTP/2 streams, cancellation, and
+  behavioral admission exhaustion.
+- `envoy-dynamic-crs`: fetches the same pinned CRS, builds and unit-tests the
+  native module with `embed-crs`, then runs the native Envoy harness including
+  benign and malicious CRS requests.
+- `envoy-dynamic-derived-images`: builds and smoke-tests the packaged Envoy
+  amd64 images, both with and without embedded CRS. This covers
+  module loading, invalid filter rejection, and deny/allow behavior in the
+  derived runtime images, rather than repeating those smoke tests during
+  release publication. It reads the base pin from the Dependabot-managed
+  `examples/envoy-coraza-dynamic/Dockerfile` through `make print-envoy-image`.
+- `envoy-dynamic-ftw`: runs ten selected cases from the pinned CRS v4.30.0 FTW
+  inventory through the native Envoy module. Five cases cover prior shared
+  failures (`932161-7`, `934120-23`, `941120-49`, `949110-4`, and
+  `944110-18`); five previously passing cases are controls. The four remaining
+  baseline failures are allow-listed, while `944110-18` must pass under the
+  deterministic marker wait. The gate detects new failures but is not a full
+  5,231-case conformance claim or a native/Wasm parity claim. Marker retries are
+  spaced by 25 ms (up to 100 attempts), and the job uploads its access log and
+  FTW manifest.
+- Workspace lint, test, feature-matrix, MSRV, and coverage jobs install
+  `clang` and `libclang-dev` through the Rust setup actions because compiling
+  the dynamic-module SDK runs bindgen. The Wasm artifact and build targets are
+  unchanged.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
@@ -161,6 +188,10 @@ by the fixture regeneration command.
 make lint
 make lint-extra
 make test
+make build-envoy-dynamic
+make test-envoy-dynamic
+make build-envoy-dynamic-crs
+make test-envoy-dynamic-ftw # full suite; writes a new artifact directory under docs/performance
 make crs-fetch
 make test-envoy-wasm-crs
 make go-harness-check
@@ -170,6 +201,18 @@ make ftw-smoke
 make audit
 make coverage-check
 ```
+
+Native module builds require `clang` and `libclang-dev` (for example,
+`sudo apt-get install --no-install-recommends clang libclang-dev` on Ubuntu).
+The harness additionally requires Docker Compose, curl with HTTP/2 support,
+Python 3, and an unused local port 9901.
+
+The FTW target also requires Go and Git. Without `FTW_INCLUDE_TESTS`, it runs
+the complete pinned CRS suite and records results even when known FTW cases
+fail. Set `FTW_INCLUDE_TESTS` to a Go regular expression to bound a run;
+`FTW_ALLOW_FAILURES_FILE` optionally permits a reviewed set of known failing
+IDs. The CI subset is intentionally limited to ten cases and does not replace
+the full manual run.
 
 To run the full gate set:
 
@@ -235,6 +278,17 @@ Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
 nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
 tag is the newest one, so an older backported tag cannot move it backwards).
 
+The same release workflow stages the native `.so` assets for amd64, with and
+without embedded CRS, then GoReleaser uploads the libraries (with its
+SHA-256 checksum file) and builds/pushes the derived Envoy images. Derived-image
+load/deny/allow smoke tests run in the `envoy-dynamic-derived-images` CI matrix
+instead of being repeated during release publication. Detailed provenance
+manifests and additional release-time ELF verification are deferred; the SDK
+revision is pinned in Cargo.toml, and the Envoy base image has one
+Dependabot-managed pin in `examples/envoy-coraza-dynamic/Dockerfile`. Workflows,
+Compose harnesses and the benchmark read that pin through `make
+print-envoy-image`.
+
 OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
 the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
 `GORELEASER_CURRENT_TAG` environment variable and GoReleaser creates the tag
@@ -244,10 +298,12 @@ packaging locally without publishing, first install binaryen
 [version 123](https://github.com/WebAssembly/binaryen/releases/tag/version_123)
 — the version the workflow pins — and put its `bin/` on `PATH` (it provides
 `wasm-as` and `wasm-merge`). Then stage the WASM files exactly as the
-workflow does and run the snapshot (the config expects them to exist):
+workflow does, stage the amd64 native assets with Buildx, then run the snapshot
+(the config expects all four assets to exist):
 
 ```console
 ./envoy-coraza/crs-fetch.sh
+mkdir -p release-artifacts
 wasm-as envoy-coraza/wasi-stub.wat -o /tmp/wasi-stub.wasm
 link_stubs() {
   wasm-merge /tmp/wasi-stub.wasm wasi_snapshot_preview1 \
@@ -257,5 +313,22 @@ cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza
 link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs.wasm
 cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
 link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
+
+ENVOY_IMAGE=$(make --no-print-directory print-envoy-image)
+export ENVOY_IMAGE
+mkdir -p release-artifacts/.native-build
+docker buildx build --platform linux/amd64 \
+  --file Dockerfile.goreleaser-dynamic --target artifacts \
+  --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES= \
+  --output type=local,dest=release-artifacts/.native-build/dynamic .
+docker buildx build --platform linux/amd64 \
+  --file Dockerfile.goreleaser-dynamic --target artifacts \
+  --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES=embed-crs \
+  --output type=local,dest=release-artifacts/.native-build/dynamic-crs .
+cp release-artifacts/.native-build/dynamic/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic.so
+cp release-artifacts/.native-build/dynamic-crs/coraza-rs-dynamic.so \
+  release-artifacts/coraza-rs-dynamic-crs.so
+
 goreleaser release --snapshot --clean
 ```

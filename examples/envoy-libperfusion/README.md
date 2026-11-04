@@ -11,6 +11,7 @@ From the repository root:
 ```sh
 make build-envoy-wasm
 cd examples/envoy-libperfusion
+export ENVOY_IMAGE="$(make --no-print-directory -C ../.. print-envoy-image)"
 docker compose up --detach
 ```
 

@@ -95,6 +95,18 @@ static_resources:
                                     "SecResponseBodyAccess Off",
                                     "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:105,phase:4,deny,status:502\""
                                   ],
+                                  "redirect": [
+                                    "SecRuleEngine On",
+                                    "SecRequestBodyAccess On",
+                                    "SecRequestBodyLimit 16777216",
+                                    "SecRequestBodyInMemoryLimit 16777216",
+                                    "SecAction \"id:106,phase:1,ctl:requestBodyProcessor=RAW,pass\"",
+                                    "SecRule REQUEST_BODY \"@contains request-crlf-redirect\" \"id:107,phase:2,redirect:https://example.test/blocked?value=%{REQUEST_BODY},status:307\"",
+                                    "SecResponseBodyAccess On",
+                                    "SecResponseBodyLimit 1048576",
+                                    "SecResponseBodyMimeType text/plain",
+                                    "SecRule RESPONSE_BODY \"@contains response-crlf-redirect\" \"id:108,phase:4,redirect:https://example.test/blocked?value=%{RESPONSE_BODY},status:307\""
+                                  ],
                                   "crs": [
                                     "SecRuleEngine On",
                                     "SecAuditEngine RelevantOnly",
@@ -111,7 +123,7 @@ static_resources:
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "crs.local": "crs"}
+                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "redirect.local": "redirect", "crs.local": "crs"}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

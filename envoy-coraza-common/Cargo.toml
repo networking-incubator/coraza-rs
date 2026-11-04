@@ -1,0 +1,23 @@
+[package]
+name = "envoy-coraza-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-independent configuration and policy layer for Coraza Envoy adapters"
+publish = false
+
+[features]
+embed-crs = []
+
+[dependencies]
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+coraza = { path = "../coraza" }
+miniz_oxide = { version = "0.9", default-features = false, features = [
+  "with-alloc",
+] }
+serde_json = "1"
+
+[lints]
+workspace = true

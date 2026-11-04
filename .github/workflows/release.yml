@@ -31,7 +31,7 @@ jobs:
     permissions:
       # GoReleaser creates the GitHub release and its assets.
       contents: write
-      # Push the WASMPlugin images to GHCR.
+      # Push the WasmPlugin and native Envoy images to GHCR.
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,6 +39,12 @@ jobs:
           # Full history and tags so GoReleaser can resolve the version.
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Read pinned Envoy image
+        id: envoy-image
+        run: echo "image=$(make --no-print-directory print-envoy-image)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Set up Rust
         uses: $/.github/actions/setup-rust
@@ -86,6 +92,26 @@ jobs:
           cargo build --locked --release --target wasm32-wasip1 -p envoy-coraza --features envoy-coraza/embed-crs
           link_stubs target/wasm32-wasip1/release/envoy_coraza.wasm release-artifacts/coraza-rs-crs.wasm
 
+      - name: Build native module release assets
+        env:
+          ENVOY_IMAGE: ${{ steps.envoy-image.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts/.native-build
+          docker buildx build --platform linux/amd64 \
+            --file Dockerfile.goreleaser-dynamic --target artifacts \
+            --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES= \
+            --output "type=local,dest=release-artifacts/.native-build/dynamic" .
+          docker buildx build --platform linux/amd64 \
+            --file Dockerfile.goreleaser-dynamic --target artifacts \
+            --build-arg "ENVOY_IMAGE=$ENVOY_IMAGE" --build-arg CARGO_FEATURES=embed-crs \
+            --output "type=local,dest=release-artifacts/.native-build/dynamic-crs" .
+
+          cp release-artifacts/.native-build/dynamic/coraza-rs-dynamic.so \
+            release-artifacts/coraza-rs-dynamic.so
+          cp release-artifacts/.native-build/dynamic-crs/coraza-rs-dynamic.so \
+            release-artifacts/coraza-rs-dynamic-crs.so
+
       - name: Login to GHCR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,3 +145,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENVOY_IMAGE: ${{ steps.envoy-image.outputs.image }}

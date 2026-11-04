@@ -17,7 +17,10 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 script_dir="$repo_root/examples/envoy-coraza"
-compose=(docker compose -f "$script_dir/compose.yaml" -p envoy-coraza-test)
+ENVOY_IMAGE=${ENVOY_IMAGE:-$(make --no-print-directory -C "$repo_root" print-envoy-image)}
+export ENVOY_IMAGE
+project="envoy-coraza-test-$$"
+compose=(docker compose -f "$script_dir/compose.yaml" -p "$project")
 temp_dir=$(mktemp -d)
 # Interactive mode (ENVOY_CORAZA_INTERACTIVE=1) skips the assertions and leaves
 # the stack running for manual requests.
@@ -29,7 +32,7 @@ cleanup() {
     if (( exit_code != 0 )); then
         "${compose[@]}" logs --no-color envoy backend 2>&1 | tail --lines=60 >&2 || true
     fi
-    "${compose[@]}" down --rmi local --volumes >/dev/null 2>&1 || true
+    "${compose[@]}" down --volumes >/dev/null 2>&1 || true
     rm -rf "$temp_dir"
     exit "$exit_code"
 }
@@ -41,6 +44,13 @@ fail() {
 }
 
 command -v python3 >/dev/null 2>&1 || fail 'python3 is required for chunked request trailers'
+command -v ss >/dev/null 2>&1 || fail 'ss is required to check Envoy harness ports'
+for _attempt in {1..30}; do
+    if ! ss -ltn 2>/dev/null | grep --quiet -E ':(9901|10001)([[:space:]]|$)'; then break; fi
+    sleep 1
+done
+ss -ltn 2>/dev/null | grep --quiet -E ':(9901|10001)([[:space:]]|$)' \
+    && fail 'port 9901 or 10001 is still occupied; stop only its owner, then retry'
 
 request() {
     local output=$1
@@ -220,14 +230,15 @@ if [[ $interactive == 1 ]]; then
     trap - EXIT
     rm -rf "$temp_dir"
     escaped_script_dir=$(printf '%q' "$script_dir")
+    escaped_envoy_image=$(printf '%q' "$ENVOY_IMAGE")
     cat <<EOF
 Envoy is up with the embedded CRS (crs.local authority).
 
     try:    curl -i -H 'Host: crs.local' 'http://127.0.0.1:10001/crs-sqli?q=1%27%20OR%201%3D1'
     expect: HTTP/1.1 403 Forbidden and [id "949110"] in the Envoy log
 
-    logs:   docker compose -f $escaped_script_dir/compose.yaml -p envoy-coraza-test logs envoy
-    stop:   docker compose -f $escaped_script_dir/compose.yaml -p envoy-coraza-test down --rmi local --volumes
+    logs:   ENVOY_IMAGE=$escaped_envoy_image docker compose -f $escaped_script_dir/compose.yaml -p $project logs envoy
+    stop:   ENVOY_IMAGE=$escaped_envoy_image docker compose -f $escaped_script_dir/compose.yaml -p $project down --volumes
 EOF
     exit 0
 fi
@@ -379,6 +390,30 @@ fi
 if grep --quiet --fixed-strings 'LEAK-MARKER' "$temp_dir/response"; then
     fail 'phase-4 denial with body access off leaked upstream response body bytes'
 fi
+
+printf 'request-crlf-redirect\r\nSet-Cookie: injected=1' >"$temp_dir/request-crlf-redirect"
+before=$(backend_count /echo)
+status=$(request "$temp_dir/request-crlf-redirect-response" --dump-header "$temp_dir/request-crlf-redirect.headers" \
+    --header 'Host: redirect.local' --header 'content-type: application/octet-stream' \
+    --request POST --data-binary "@$temp_dir/request-crlf-redirect" http://127.0.0.1:10001/echo)
+check_status 307 "$status" 'Wasm request redirect macro with CRLF body bytes'
+grep --ignore-case --quiet --fixed-strings 'set-cookie: injected=1' \
+    "$temp_dir/request-crlf-redirect.headers" && fail 'Wasm request redirect injected a downstream header'
+grep --ignore-case --quiet '^location:' "$temp_dir/request-crlf-redirect.headers" \
+    && fail 'Wasm unsafe request redirect reached Location'
+[[ $(cat "$temp_dir/request-crlf-redirect-response") == 'Request denied' ]] \
+    || fail 'Wasm unsafe request redirect did not return Request denied'
+[[ $(backend_count /echo) == "$before" ]] || fail 'Wasm unsafe request redirect reached the backend'
+
+status=$(request "$temp_dir/response-crlf-redirect" --dump-header "$temp_dir/response-crlf-redirect.headers" \
+    --header 'Host: redirect.local' http://127.0.0.1:10001/response-redirect-crlf)
+check_status 307 "$status" 'Wasm response redirect macro with CRLF body bytes'
+grep --ignore-case --quiet --fixed-strings 'set-cookie: injected=1' \
+    "$temp_dir/response-crlf-redirect.headers" && fail 'Wasm response redirect injected a downstream header'
+grep --ignore-case --quiet '^location:' "$temp_dir/response-crlf-redirect.headers" \
+    && fail 'Wasm unsafe response redirect reached Location'
+[[ $(cat "$temp_dir/response-crlf-redirect") == 'Upstream response blocked' ]] \
+    || fail 'Wasm unsafe response redirect did not fall back to the denial body'
 
 if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     before=$(backend_count /crs-sqli)

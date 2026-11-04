@@ -1,0 +1,5 @@
+# Existing native/Wasm CRS failure baseline; improvements are allowed.
+932161-7
+934120-23
+941120-49
+949110-4

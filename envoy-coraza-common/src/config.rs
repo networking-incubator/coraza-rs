@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Plugin configuration, compatible with the Go `coraza-proxy-wasm` connector.
+//! Host configuration, compatible with the Go `coraza-proxy-wasm` connector.
 //!
 //! The accepted keys are the ones the upstream connector reads at
 //! `corazawaf/coraza-proxy-wasm@b1770f5` (`wasmplugin/config.go`), plus the
@@ -105,7 +105,7 @@
 //!   `MAX_NAME_BYTES` (4096, with the engine's 64-component rule) for rule-data names; `MAX_AUTHORITIES`; and
 //!   `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's `MAX_INCLUDED_FILES` is per top-level parse, so
 //!   here it applies per policy. CRS 4.30 sets no request-body limit, so its engine default (128 `MiB`) is over the
-//!   `MAX_REQUEST_BODY_LIMIT` WASM ceiling; a CRS policy must set `SecRequestBodyLimit` explicitly, as the embedded-CRS
+//!   `MAX_REQUEST_BODY_LIMIT` host ceiling; a CRS policy must set `SecRequestBodyLimit` explicitly, as the embedded-CRS
 //!   example in `envoy-coraza/README.md` does. The rule caps are low because rule insertion scans for duplicate ids, so
 //!   collecting one policy is quadratic: 30,000 flat rules measured about 0.8 s natively (1.2 s with a realistic shape)
 //!   and 3.3 s of configure-plus-start in an Envoy 1.40 V8 worker, with 5.4 s at the generation cap. Re-measure before
@@ -128,10 +128,10 @@ use std::{
     path::Path,
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use miniz_oxide::{
-    inflate::stream::{inflate, InflateState},
     DataFormat, MZFlush, MZStatus,
+    inflate::stream::{InflateState, inflate},
 };
 use serde_json::{Map, Value};
 
@@ -146,7 +146,7 @@ const MAX_DISPLAY_NAME_BYTES: usize = 128;
 /// `serde` cannot produce more directive text than the document's own bytes, so
 /// this single bound covers both the document and the directives it carries.
 /// For `config_gzip_b64` it bounds the decompressed document.
-pub(crate) const MAX_CONFIGURATION_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CONFIGURATION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Most JSON value separators and structural bytes one configuration may hold.
 ///
@@ -192,7 +192,7 @@ pub(crate) const RULE_DATA_LIMITS: RuleDataLimits = RuleDataLimits {
 
 /// A validated plugin configuration.
 #[derive(Debug, Default)]
-pub(crate) struct Config {
+pub struct Config {
     /// Policy name to ordered `SecLang` directives.
     pub(crate) directives_map: BTreeMap<String, Vec<String>>,
     /// Policy used for an authority with no entry of its own.
@@ -207,7 +207,7 @@ pub(crate) struct Config {
 
 /// A configuration that cannot be used.
 #[derive(Debug)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     /// The input is not valid JSON.
     InvalidJson(serde_json::Error),
     /// `directives_map` is present but not an object.
@@ -378,7 +378,7 @@ impl Config {
     /// for a key whose shape, authority or `rule_data` entry breaks a bound, or
     /// one of the `config_gzip_b64` errors. Policy references are resolved
     /// during compilation, not here.
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
+    pub fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
         let Some(object) = Self::parse_object(bytes)? else {
             return Ok(Self::default());
         };
@@ -748,7 +748,8 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
         if authority.is_empty() {
             return Err(ConfigError::EmptyAuthority);
         }
-        if crate::stream::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority) {
+        // The key has no scheme; :80 and :443 can be non-default ports for requests using the other scheme.
+        if crate::authority::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority) {
             return Err(ConfigError::InvalidAuthority {
                 authority: authority.clone(),
             });
@@ -884,13 +885,13 @@ pub(crate) fn normalize_rule_data_name(name: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     use super::{
-        add_rule_data, check_json_value_count, check_rule_data_name, crc32, display_name, gzip_fixture, Config,
-        ConfigError, RuleDataLimits, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES, MAX_CONFIGURATION_BYTES,
-        MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES, MAX_RULE_DATA_FILE_BYTES,
-        RULE_DATA_LIMITS,
+        Config, ConfigError, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES, MAX_CONFIGURATION_BYTES,
+        MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILE_BYTES, MAX_RULE_DATA_FILES,
+        RULE_DATA_LIMITS, RuleDataLimits, add_rule_data, check_json_value_count, check_rule_data_name, crc32,
+        display_name, gzip_fixture,
     };
 
     /// Parses a document that must be accepted.
@@ -1197,10 +1198,20 @@ mod tests {
             );
         }
 
-        for authority in ["a.example:80", "a.example:443", "[2001:db8::1]:443"] {
-            let input =
-                format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
-            assert!(Config::parse(input.as_bytes()).is_ok(), "authority {authority:?}");
+        for authority in [
+            "a.example:80",
+            "a.example:443",
+            "a.example:080",
+            "[2001:db8::1]:80",
+            "[2001:db8::1]:443",
+        ] {
+            let config = parse(&format!(
+                r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#
+            ));
+            assert!(
+                config.per_authority_directives.contains_key(authority),
+                "valid explicit-port authority {authority:?} was rejected"
+            );
         }
     }
 

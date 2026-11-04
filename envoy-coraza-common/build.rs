@@ -28,10 +28,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The fetched tree, relative to this crate, that `make crs-fetch` populates.
-const CRS_DIR: &str = "crs";
-/// The tracked release pin, relative to this crate; the single source of truth.
-const PIN: &str = "crs.pin";
+/// The sibling fetched tree populated by `make crs-fetch`.
+const CRS_DIR: &str = "../envoy-coraza/crs";
+/// The sibling tracked release pin; it remains the single source of truth.
+const PIN: &str = "../envoy-coraza/crs.pin";
 /// Prefix every embedded name gets, so the CRS occupies its own namespace.
 const EMBEDDED_PREFIX: &str = "crs";
 /// The upstream name of the CRS setup file.
@@ -266,7 +266,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(&mut out, "    ({key:?}, include_bytes!({path:?})),")?;
     }
     out.push_str("];\n");
-    writeln!(&mut out, "/// The CRS release whose files this build embedded.\npub(crate) static EMBEDDED_CRS_VERSION: &str = {version:?};")?;
+    writeln!(
+        &mut out,
+        "/// The CRS release whose files this build embedded.\npub(crate) static EMBEDDED_CRS_VERSION: &str = {version:?};"
+    )?;
 
     let output_dir =
         env::var_os("OUT_DIR").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OUT_DIR is not set"))?;

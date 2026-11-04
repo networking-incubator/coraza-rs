@@ -3,6 +3,8 @@ resolver = "3"
 members = [
   "coraza",
   "envoy-coraza",
+  "envoy-coraza-common",
+  "envoy-coraza-dynamic",
   "envoy-libperfusion",
   "libperfusion",
   "xtask",

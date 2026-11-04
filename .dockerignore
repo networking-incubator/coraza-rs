@@ -9,3 +9,5 @@
 !xtask/Cargo.toml
 !xtask/src/
 !xtask/src/**
+!target/
+!target/envoy-coraza-dynamic-probe.so

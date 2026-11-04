@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: ../envoy-coraza
+      dockerfile: Dockerfile
+    expose:
+      - "3000"
+
+  envoy:
+    image: coraza-rs-dynamic-envoy:local
+    build:
+      context: ../..
+      dockerfile: examples/envoy-coraza-dynamic/Dockerfile
+      args:
+        DYNAMIC_MODULE_SOURCE: ${ENVOY_CORAZA_DYNAMIC_MODULE:-target/release/libenvoy_coraza_dynamic.so}
+    command:
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - info
+      - --concurrency
+      - ${ENVOY_CORAZA_DYNAMIC_CONCURRENCY:-0}
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:10001:10001"
+      - "127.0.0.1:9901:9901"
+    volumes:
+      - ${ENVOY_CORAZA_DYNAMIC_CONFIG:-./envoy.yaml}:/etc/envoy/envoy.yaml:ro

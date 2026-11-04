@@ -29,11 +29,21 @@ release:
   extra_files:
     - glob: release-artifacts/coraza-rs.wasm
     - glob: release-artifacts/coraza-rs-crs.wasm
+    - glob: release-artifacts/coraza-rs-dynamic.so
+    - glob: release-artifacts/coraza-rs-dynamic-crs.so
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  extra_files:
+    - glob: release-artifacts/coraza-rs.wasm
+    - glob: release-artifacts/coraza-rs-crs.wasm
+    - glob: release-artifacts/coraza-rs-dynamic.so
+    - glob: release-artifacts/coraza-rs-dynamic-crs.so
 
 changelog:
   disable: true
 
-# Tag conventions used by both image variants:
+# Tag conventions used by each Wasm and native image variant:
 # - nightly run (tag v0.0.0-nightly.YYYYMMDD): v0.0.0-nightly.YYYYMMDD,
 #   nightly, nightly-YYYYMMDD
 # - manual release (tag vX.Y.Z): vX.Y.Z, and latest only for the newest tag
@@ -68,6 +78,58 @@ dockers_v2:
       - release-artifacts/coraza-rs-crs.wasm
     build_args:
       WASM: coraza-rs-crs.wasm
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]
+  - id: coraza-rs-dynamic-envoy
+    dockerfile: Dockerfile.goreleaser-dynamic
+    images:
+      - ghcr.io/networking-incubator/coraza-rs-dynamic-envoy
+    extra_files:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - coraza
+      - envoy-coraza
+      - envoy-coraza-common
+      - envoy-coraza-dynamic
+      - envoy-libperfusion
+      - libperfusion
+      - xtask
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+    build_args:
+      ENVOY_IMAGE: "{{ .Env.ENVOY_IMAGE }}"
+      CARGO_FEATURES: ""
+    platforms: [linux/amd64]
+    sbom: false
+    flags: ["--provenance=false"]
+  - id: coraza-rs-dynamic-crs-envoy
+    dockerfile: Dockerfile.goreleaser-dynamic
+    images:
+      - ghcr.io/networking-incubator/coraza-rs-dynamic-crs-envoy
+    extra_files:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - coraza
+      - envoy-coraza
+      - envoy-coraza-common
+      - envoy-coraza-dynamic
+      - envoy-libperfusion
+      - libperfusion
+      - xtask
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
+      - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
+      - "{{ if and (not (contains .Tag \"nightly\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+    build_args:
+      ENVOY_IMAGE: "{{ .Env.ENVOY_IMAGE }}"
+      CARGO_FEATURES: embed-crs
     platforms: [linux/amd64]
     sbom: false
     flags: ["--provenance=false"]
