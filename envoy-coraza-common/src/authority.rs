@@ -69,13 +69,13 @@ pub fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
     let lower = authority.to_ascii_lowercase();
     let (host, port) = authority_parts(&lower)?;
     let default_port = if scheme.eq_ignore_ascii_case(b"http") {
-        Some("80")
+        Some(80)
     } else if scheme.eq_ignore_ascii_case(b"https") {
-        Some("443")
+        Some(443)
     } else {
         None
     };
-    if port == default_port {
+    if port.zip(default_port).is_some_and(|(port, default)| port == default) {
         Some(host.to_owned())
     } else {
         Some(lower)
@@ -86,7 +86,6 @@ pub fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
 pub(crate) fn has_explicit_default_port(authority: &str) -> bool {
     authority_parts(authority)
         .and_then(|(_, port)| port)
-        .and_then(|port| port.parse::<u16>().ok())
         .is_some_and(|port| matches!(port, 80 | 443))
 }
 
@@ -138,7 +137,7 @@ pub fn valid_status(status: u16) -> u16 {
 }
 
 /// Splits a validated normalized authority into host and optional port.
-fn authority_parts(authority: &str) -> Option<(&str, Option<&str>)> {
+fn authority_parts(authority: &str) -> Option<(&str, Option<u16>)> {
     if authority.starts_with('[') {
         let close = authority.find(']')?;
         let host = authority.get(..=close)?;
@@ -166,11 +165,11 @@ fn authority_parts(authority: &str) -> Option<(&str, Option<&str>)> {
 }
 
 /// Returns a numeric port when it fits the authority port range.
-fn valid_authority_port(port: &str) -> Option<&str> {
+fn valid_authority_port(port: &str) -> Option<u16> {
     if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    port.parse::<u16>().ok().map(|_| port)
+    port.parse::<u16>().ok()
 }
 
 /// Checks the URI registered-name syntax used for non-IPv6 hosts.
@@ -218,7 +217,7 @@ mod tests {
     };
 
     #[test]
-    fn authority_normalization_covers_case_default_ports_and_ipv6() {
+    fn authority_normalization_covers_case_numeric_default_ports_and_ipv6() {
         assert_eq!(
             normalize_authority(b"a.example:80", b"https").as_deref(),
             Some("a.example:80")
@@ -232,11 +231,29 @@ mod tests {
             Some("waf.example")
         );
         assert_eq!(
+            normalize_authority(b"WAF.EXAMPLE:080", b"http").as_deref(),
+            Some("waf.example")
+        );
+        assert_eq!(
+            normalize_authority(b"WAF.EXAMPLE:0443", b"https").as_deref(),
+            Some("waf.example")
+        );
+        assert_eq!(
             normalize_authority(b"WAF.EXAMPLE:8443", b"https").as_deref(),
             Some("waf.example:8443")
         );
+        for scheme in [b"https".as_slice(), b"ftp".as_slice()] {
+            assert_eq!(
+                normalize_authority(b"WAF.EXAMPLE:080", scheme).as_deref(),
+                Some("waf.example:080")
+            );
+        }
         assert_eq!(
             normalize_authority(b"[2001:DB8::1]:443", b"https").as_deref(),
+            Some("[2001:db8::1]")
+        );
+        assert_eq!(
+            normalize_authority(b"[2001:DB8::1]:0443", b"https").as_deref(),
             Some("[2001:db8::1]")
         );
         assert_eq!(

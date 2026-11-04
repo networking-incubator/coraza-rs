@@ -521,11 +521,14 @@ impl RequestFilter {
             .map(<[u8]>::to_vec)
             .or_else(|| attribute_bytes(envoy, AttributeId::RequestScheme))
             .unwrap_or_default();
-        let Some(authority) = normalize_authority(&raw_authority, &scheme) else {
+        let Some(authority_text) = str::from_utf8(&raw_authority).ok() else {
+            return Err(Reply::invalid_authority());
+        };
+        let Some(normalized_authority) = normalize_authority(authority_text.as_bytes(), &scheme) else {
             return Err(Reply::invalid_authority());
         };
         let generation = Arc::clone(&state.generation);
-        let Some((_name, policy)) = generation.select_named(&authority) else {
+        let Some((_name, policy)) = generation.select_named(&normalized_authority) else {
             state.stage = Stage::Bypassed;
             state.outcome = Some(TerminalOutcome::UnmatchedAuthority);
             envoy_proxy_dynamic_modules_rust_sdk::envoy_log_warn!(
@@ -538,7 +541,7 @@ impl RequestFilter {
         };
         state.method.clone_from(&metadata.method);
         state.protocol.clone_from(&metadata.protocol);
-        let (transaction, interruption) = create_transaction(envoy, policy, &authority, &headers, &metadata);
+        let (transaction, interruption) = create_transaction(envoy, policy, authority_text, &headers, &metadata);
         state.body_access = transaction.request_body_access();
         state.transaction = Some(transaction);
         if let Some(interruption) = interruption {
@@ -2090,6 +2093,46 @@ mod tests {
                 "the SDK supplies the actual protocol and direct client address to Coraza"
             );
         }
+    }
+
+    #[test]
+    fn request_host_rule_sees_default_port_after_normalized_policy_selection() {
+        let generation = Arc::new(
+            Generation::compile(
+                Config::parse(
+                    br#"{"directives_map":{"host_port":["SecRuleEngine On","SecRule REQUEST_HEADERS:Host \"@streq example.test:80\" \"id:22,phase:1,deny,status:421\""]},"per_authority_directives":{"example.test":"host_port"}}"#,
+                )
+                .unwrap(),
+                Arc::new(Diagnostics::default()),
+                |_| {},
+                |_, _| {},
+            )
+            .unwrap(),
+        );
+        let filter = Rc::new(FilterConfig::new(generation).new_stream());
+        let mut envoy = MockEnvoyHttpFilter::default();
+        envoy.expect_get_request_headers().returning(|| {
+            vec![
+                (EnvoyBuffer::new(b":method"), EnvoyBuffer::new(b"GET")),
+                (EnvoyBuffer::new(b":path"), EnvoyBuffer::new(b"/")),
+                (EnvoyBuffer::new(b":scheme"), EnvoyBuffer::new(b"http")),
+                (EnvoyBuffer::new(b":authority"), EnvoyBuffer::new(b"example.test:80")),
+            ]
+        });
+        envoy.expect_get_attribute_string().returning(|id| match id {
+            AttributeId::RequestProtocol => Some(EnvoyBuffer::new(b"HTTP/2")),
+            _ => None,
+        });
+        envoy.expect_get_attribute_int().returning(|_| None);
+        envoy
+            .expect_get_downstream_direct_remote_address()
+            .returning_st(|| None);
+        expect_inline_reply(&mut envoy, Rc::clone(&filter), 421);
+
+        assert_eq!(
+            filter.on_request_headers(&mut envoy, true),
+            RequestHeadersStatus::StopIteration
+        );
     }
 
     #[test]
