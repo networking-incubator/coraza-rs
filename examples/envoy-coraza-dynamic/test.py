@@ -189,7 +189,7 @@ def module_policy() -> dict:
                 'SecRule REQUEST_URI "@contains redirect-deny" "id:4,phase:1,redirect:https://example.test/blocked,status:307"',
                 'SecRule REQUEST_URI "@contains no-content" "id:5,phase:1,deny,status:204"',
                 'SecRule REQUEST_URI "@contains not-modified" "id:6,phase:1,deny,status:304"',
-                'SecRule RESPONSE_BODY "@contains secret" "id:8,phase:4,deny,status:451,auditlog,msg:\'stage-d-response-audit\'"',
+                'SecRule RESPONSE_BODY "@contains secret" "id:8,phase:4,deny,status:451,auditlog,msg:\'response-audit-test\'"',
                 'SecRule RESPONSE_HEADERS:x-deny-response "@streq yes" "id:9,phase:4,deny,status:452"',
                 'SecRule RESPONSE_BODY "@contains response-redirect" "id:10,phase:4,redirect:https://example.test/response-blocked,status:307"',
                 'SecRule RESPONSE_BODY "@contains response-crlf-redirect" "id:15,phase:4,redirect:https://example.test/blocked?value=%{RESPONSE_BODY},status:307"',
@@ -605,7 +605,7 @@ def test_envoy() -> None:
             require_access_log(harness.compose, "/response-deny",
                                "event=coraza_waf_blocked_request rule_id=8 phase=http_response_body action=deny status=451 reason=denied outcome=denied complete=true")
             logs = harness.compose.logs("envoy")
-            audit_lines = [line for line in logs.splitlines() if "stage-d-response-audit" in line]
+            audit_lines = [line for line in logs.splitlines() if "response-audit-test" in line]
             if len(audit_lines) != 1:
                 raise RuntimeError("response transaction did not emit exactly one audit record")
             if "event=coraza_waf_blocked_request rule_id=8 phase=http_response_body action=deny status=451" not in logs:
@@ -1325,8 +1325,8 @@ def test_rollback() -> None:
                 "                      type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm\n"
                 "                      value:\n"
                 "                        config:\n"
-                "                          name: coraza-stage-f-rollback\n"
-                "                          root_id: coraza-stage-f-rollback\n"
+                "                          name: coraza-dynamic-rollback\n"
+                "                          root_id: coraza-dynamic-rollback\n"
                 "                          failure_policy: FAIL_CLOSED\n"
                 "                          allow_on_headers_stop_iteration: true\n"
                 "                          vm_config:\n"

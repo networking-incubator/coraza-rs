@@ -7,7 +7,7 @@ services:
       - "3000"
 
   envoy:
-    image: envoy-coraza-dynamic-stage-c:local
+    image: coraza-rs-dynamic-envoy:local
     build:
       context: ../..
       dockerfile: examples/envoy-coraza-dynamic/Dockerfile

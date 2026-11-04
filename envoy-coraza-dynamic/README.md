@@ -42,10 +42,6 @@ from a local file in the pinned Envoy image, never from a remote module source.
   worker threads. Load only trusted local artifacts and roll binaries by
   restarting Envoy; safe module unloading is not established.
 
-See the [Stage A host-boundary evidence](../docs/envoy-coraza-dynamic-stage-a.md),
-[Stage C request-enforcement evidence](../docs/envoy-coraza-dynamic-stage-c.md),
-[Stage D response/finalization evidence](../docs/envoy-coraza-dynamic-stage-d.md),
-and [Stage E hardening and CI evidence](../docs/envoy-coraza-dynamic-stage-e.md)
-for the tested behaviors, compatibility ledger, and remaining gaps. The
-[integration harness guide](../examples/envoy-coraza-dynamic/README.md) covers
-local execution; [CI checks](../docs/ci.md) lists the reproducible jobs.
+The [integration harness guide](../examples/envoy-coraza-dynamic/README.md)
+covers local execution; [CI checks](../docs/ci.md) lists the reproducible test
+jobs.
