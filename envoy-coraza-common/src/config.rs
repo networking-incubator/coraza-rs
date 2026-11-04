@@ -748,9 +748,8 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
         if authority.is_empty() {
             return Err(ConfigError::EmptyAuthority);
         }
-        if crate::authority::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority)
-            || crate::authority::has_explicit_default_port(authority)
-        {
+        // The key has no scheme; :80 and :443 can be non-default ports for requests using the other scheme.
+        if crate::authority::normalize_authority(authority.as_bytes(), b"").as_deref() != Some(authority) {
             return Err(ConfigError::InvalidAuthority {
                 authority: authority.clone(),
             });
@@ -1206,12 +1205,12 @@ mod tests {
             "[2001:db8::1]:80",
             "[2001:db8::1]:443",
         ] {
-            let error = parse_error(&format!(
+            let config = parse(&format!(
                 r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#
             ));
             assert!(
-                error.contains("is invalid or not lowercase"),
-                "authority {authority:?} was accepted: {error}"
+                config.per_authority_directives.contains_key(authority),
+                "valid explicit-port authority {authority:?} was rejected"
             );
         }
     }

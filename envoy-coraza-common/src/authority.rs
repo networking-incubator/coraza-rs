@@ -82,13 +82,6 @@ pub fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
     }
 }
 
-/// Whether a valid authority explicitly uses HTTP's or HTTPS's default port.
-pub(crate) fn has_explicit_default_port(authority: &str) -> bool {
-    authority_parts(authority)
-        .and_then(|(_, port)| port)
-        .is_some_and(|port| matches!(port, 80 | 443))
-}
-
 /// Returns the host component used for Coraza's server-name metadata.
 pub fn authority_host(authority: &str) -> &str {
     if authority.starts_with('[') {
