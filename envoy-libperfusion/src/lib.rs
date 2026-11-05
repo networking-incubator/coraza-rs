@@ -51,7 +51,7 @@ impl RootContext for LibperfusionRoot {
 
     /// Loads Envoy configuration, using defaults when none is supplied.
     fn on_configure(&mut self, _plugin_configuration_size: usize) -> bool {
-        let Some(configuration) = self.get_plugin_configuration() else {
+        let Ok(Some(configuration)) = self.get_plugin_configuration() else {
             self.config = Config::default();
             return true;
         };
@@ -171,7 +171,7 @@ impl LibperfusionHttp {
     /// Sends a generic request-side rejection and marks the stream terminal.
     fn reject_request(&mut self, status: u32, message: &'static [u8]) -> Action {
         log::warn!("libperfusion: request outcome=reject status={status}");
-        self.send_http_response(
+        let _res = self.send_http_response(
             status,
             vec![
                 ("content-type", "text/plain; charset=utf-8"),
@@ -190,19 +190,19 @@ impl LibperfusionHttp {
 
     /// Rewrites held response headers before the response is released.
     fn block_response_headers(&self) {
-        for (name, _) in self.get_http_response_headers_bytes() {
+        for (name, _) in self.get_http_response_headers_bytes().unwrap_or_default() {
             if name != ":status" {
-                self.set_http_response_header(&name, None);
+                let _res = self.set_http_response_header(&name, None);
             }
         }
-        self.set_http_response_header(":status", Some("502"));
-        self.set_http_response_header("content-type", Some("text/plain; charset=utf-8"));
-        self.set_http_response_header("cache-control", Some("no-store"));
+        let _res = self.set_http_response_header(":status", Some("502"));
+        let _res = self.set_http_response_header("content-type", Some("text/plain; charset=utf-8"));
+        let _res = self.set_http_response_header("cache-control", Some("no-store"));
     }
 
     /// Replaces the held response body with a generic message.
     fn replace_blocked_response_body(&self, size: usize) {
-        self.set_http_response_body(0, size, b"Upstream response blocked\n");
+        let _res = self.set_http_response_body(0, size, b"Upstream response blocked\n");
     }
 
     /// Applies a response rejection and logs the terminal outcome.
@@ -220,7 +220,7 @@ impl LibperfusionHttp {
                 self.replace_blocked_response_body(body_size);
             }
         } else {
-            self.set_http_response_body(0, body_size, b"");
+            let _res = self.set_http_response_body(0, body_size, b"");
         }
         self.response_state = ResponseState::after_blocked_body(end_of_stream);
         if end_of_stream {
@@ -296,7 +296,7 @@ impl LibperfusionHttp {
             }
             return false;
         }
-        let Some(body) = self.get_http_request_body(0, body_size) else {
+        let Ok(Some(body)) = self.get_http_request_body(0, body_size) else {
             if let Some(inspection) = self.request.as_mut() {
                 inspection.mark_incomplete(Incomplete::BodyUnavailable);
             }
@@ -318,7 +318,7 @@ impl LibperfusionHttp {
             }
             return false;
         }
-        let Some(body) = self.get_http_response_body(0, body_size) else {
+        let Ok(Some(body)) = self.get_http_response_body(0, body_size) else {
             if let Some(inspection) = self.response.as_mut() {
                 inspection.mark_incomplete(Incomplete::BodyUnavailable);
             }
@@ -342,7 +342,7 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
 
-        let headers = self.get_http_request_headers_bytes();
+        let headers = self.get_http_request_headers_bytes().unwrap_or_default();
         let mut inspection = Inspection::new(&self.config);
         self.request_format = inspection.headers(&headers);
         let incomplete = inspection.incomplete();
@@ -428,7 +428,7 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
         if self.request_state == RequestState::Streaming {
-            let trailers = self.get_http_request_trailers_bytes();
+            let trailers = self.get_http_request_trailers_bytes().unwrap_or_default();
             if let Some(inspection) = self.request.as_mut() {
                 inspection.trailers(&trailers);
             }
@@ -440,7 +440,7 @@ impl HttpContext for LibperfusionHttp {
         if self.request_body_size <= self.config.max_request_body_bytes {
             let _ = self.scan_request_body(self.request_body_size);
         }
-        let trailers = self.get_http_request_trailers_bytes();
+        let trailers = self.get_http_request_trailers_bytes().unwrap_or_default();
         if let Some(inspection) = self.request.as_mut() {
             inspection.trailers(&trailers);
         }
@@ -453,7 +453,7 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
 
-        let headers = self.get_http_response_headers_bytes();
+        let headers = self.get_http_response_headers_bytes().unwrap_or_default();
         let mut inspection = Inspection::new(&self.config);
         self.response_format = inspection.headers(&headers);
         let incomplete = inspection.incomplete();
@@ -465,7 +465,7 @@ impl HttpContext for LibperfusionHttp {
             || incomplete.is_some() && self.reject_incomplete(self.response_mode());
         if reject_headers && streaming && !end_of_stream {
             self.response_state = ResponseState::Done;
-            self.send_http_response(
+            let _res = self.send_http_response(
                 502,
                 vec![
                     ("content-type", "text/plain; charset=utf-8"),
@@ -550,12 +550,12 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
         if self.response_state == ResponseState::Streaming {
-            let trailers = self.get_http_response_trailers_bytes();
+            let trailers = self.get_http_response_trailers_bytes().unwrap_or_default();
             if let Some(inspection) = self.response.as_mut() {
                 inspection.trailers(&trailers);
             }
             if self.should_block_response() {
-                self.set_http_response_trailers(Vec::new());
+                let _res = self.set_http_response_trailers(Vec::new());
                 self.response_state = ResponseState::Done;
                 log::warn!("libperfusion: response outcome=blocked_trailers");
                 return Action::Continue;
@@ -566,7 +566,7 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
         if let Some(state) = self.response_state.after_blocked_trailers() {
-            self.set_http_response_trailers(Vec::new());
+            let _res = self.set_http_response_trailers(Vec::new());
             self.response_state = state;
             log::warn!("libperfusion: response outcome=blocked status=502");
             return Action::Continue;
@@ -577,12 +577,12 @@ impl HttpContext for LibperfusionHttp {
         if self.response_body_size <= self.config.max_response_body_bytes {
             let _ = self.scan_response_body(self.response_body_size);
         }
-        let trailers = self.get_http_response_trailers_bytes();
+        let trailers = self.get_http_response_trailers_bytes().unwrap_or_default();
         if let Some(inspection) = self.response.as_mut() {
             inspection.trailers(&trailers);
         }
         if self.should_block_response() {
-            self.set_http_response_trailers(Vec::new());
+            let _res = self.set_http_response_trailers(Vec::new());
         }
         self.finish_response(self.response_body_size)
     }
