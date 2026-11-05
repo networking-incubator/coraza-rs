@@ -150,7 +150,13 @@ fn add_actions(
         .iter()
         .any(|action| action.action_type() == ActionType::Disruptive)
     {
-        apply_actions(&mut rule, [&defaults.disruptive], false, false, action_context)?;
+        apply_actions(
+            &mut rule,
+            std::slice::from_ref(&defaults.disruptive),
+            false,
+            false,
+            action_context,
+        )?;
     }
     Ok(rule)
 }
@@ -179,9 +185,9 @@ pub(crate) fn warn_block_without_default(rule: &mut Rule, defaults: &DefaultActi
 
 /// Applies parsed actions to `rule` in order: metadata actions update its metadata,
 /// the others are added to it (a later disruptive action replaces an earlier one).
-pub(crate) fn apply_actions<'a>(
+pub(crate) fn apply_actions(
     rule: &mut Rule,
-    parsed_actions: impl IntoIterator<Item = &'a ParsedAction>,
+    parsed_actions: &[ParsedAction],
     explicit: bool,
     defer_block: bool,
     action_context: ActionCompileContext<'_>,
