@@ -3694,6 +3694,63 @@ SecWebAppId production
     }
 
     #[test]
+    fn ignore_errors_chain_detection_matches_go_quoting_and_spacing() {
+        // Go strips wrapping quotes from a directive's options before chain detection
+        // and reads the last token without trimming leading spaces. Shapes whose
+        // options are wholly quoted have no last token, so the next rule loads and
+        // fires; extra unquoted spaces still leave one, so the next rule is
+        // swallowed as a link of the dropped chain, as in Go.
+        for standalone in [
+            "SecRule \"id:1,phase:1,chain\"",
+            "SecRule \"id:1,phase:1,chain \"",
+            "SecRule \"chain\"",
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine On\n\
+                     SecIgnoreRuleCompilationErrors On\n\
+                     {standalone}\n\
+                     SecRule ARGS \"@contains attack\" \"id:200,phase:1,deny,status:403\"",
+                ))
+                .unwrap();
+            let waf = parser.compile().unwrap();
+            let mut tx = waf.new_transaction_with_id("quoted-chain-options");
+            tx.process_uri("/?q=attack", "GET", "HTTP/1.1");
+            tx.process_request_headers();
+            tx.process_request_body(b"");
+
+            assert_eq!(
+                tx.interruption()
+                    .map(|interruption| (interruption.rule_id, interruption.status)),
+                Some((200, 403)),
+                "the rule after the malformed {standalone} starter must load and fire"
+            );
+        }
+        for swallowed in ["SecRule  id:1,phase:1,chain", "SecRule   id:1,phase:1,chain  "] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine On\n\
+                     SecIgnoreRuleCompilationErrors On\n\
+                     {swallowed}\n\
+                     SecRule ARGS \"@contains attack\" \"id:200,phase:1,deny,status:403\"",
+                ))
+                .unwrap();
+            let waf = parser.compile().unwrap();
+            let mut tx = waf.new_transaction_with_id("spaced-chain-options");
+            tx.process_uri("/?q=attack", "GET", "HTTP/1.1");
+            tx.process_request_headers();
+            tx.process_request_body(b"");
+
+            assert!(
+                tx.interruption().is_none(),
+                "the rule after the malformed {swallowed} starter is a link of the dropped chain, as in Go"
+            );
+        }
+    }
+
+    #[test]
     fn secmarker_ends_a_chain_dropped_for_an_ignored_compile_error() {
         let mut parser = Parser::new();
         parser
