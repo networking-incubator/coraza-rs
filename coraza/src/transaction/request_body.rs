@@ -1900,6 +1900,44 @@ mod multipart_tests {
     }
 
     #[test]
+    fn braces_in_content_disposition_parameters_preserve_upload_detection() {
+        let body = b"--b\r\n\
+Content-Disposition: form-data; name=\"up\"; filename=\"shell.php\"; x=y{z}\r\n\
+\r\n\
+PAYLOAD\r\n\
+--b--\r\n";
+        let tx = process_with_rules(
+            body,
+            "SecRequestBodyAccess On\n\
+             SecRule FILES \"@streq shell.php\" \"id:1,phase:2,deny,status:403\"",
+        );
+
+        assert_eq!(tx.files.first(""), Some(&b"shell.php"[..]));
+        assert_eq!(tx.files_names.first(""), Some(&b"up"[..]));
+        assert_eq!(tx.multipart_filename.first(b"up"), Some(&b"shell.php"[..]));
+        assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(403));
+    }
+
+    #[test]
+    fn braces_in_content_type_boundary_select_the_multipart_processor() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-brace-boundary");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=ab{c");
+        tx.process_request_headers();
+
+        assert_eq!(
+            tx.process_request_body(
+                b"--ab{c\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--ab{c--\r\n",
+            ),
+            None
+        );
+        assert_eq!(tx.args_post.first(b"field"), Some(&b"value"[..]));
+        assert_eq!(tx.reqbody_error.get(), "0");
+    }
+
+    #[test]
     fn upload_directory_follows_the_platform() {
         #[cfg(target_os = "wasi")]
         assert!(super::upload_directory("").is_none());

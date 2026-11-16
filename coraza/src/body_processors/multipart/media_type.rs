@@ -445,7 +445,7 @@ fn consume_value(value: &[u8]) -> (Option<Vec<u8>>, &[u8]) {
 
 /// Whether `byte` is an RFC 2045 token character.
 fn is_token_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    byte > 0x20 && byte < 0x7F && !is_tspecial(byte)
 }
 
 /// Whether `byte` is one of RFC 2045's tspecials.
@@ -472,6 +472,13 @@ mod tests {
             parse(b"multipart/form-data; name=a; name=a").unwrap().param(b"name"),
             Some(&b"a"[..])
         );
+    }
+
+    #[test]
+    fn parses_braces_in_rfc_2045_token_parameters() {
+        let parsed = parse(b"multipart/form-data; boundary=ab{c}; x=y{z}").unwrap();
+        assert_eq!(parsed.param(b"boundary"), Some(&b"ab{c}"[..]));
+        assert_eq!(parsed.param(b"x"), Some(&b"y{z}"[..]));
     }
 
     #[test]
