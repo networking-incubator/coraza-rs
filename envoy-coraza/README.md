@@ -36,17 +36,18 @@ could not parse is neither inspected nor blocked.
 | 200004, 200005 | Deny with 400 when arguments were dropped at `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`). |
 | 200009 | Denies with 400 when the request target does not parse (`URI_PARSE_ERROR`). |
 
-The file is [`recommended.conf`](recommended.conf). It is the engine copy,
+The file has a single source, the engine copy
 [`coraza/coraza.conf-recommended`](../coraza/coraza.conf-recommended), which
 `cargo xtask go-fixtures-check` keeps byte-identical to the pinned Go Coraza
-release, without its `SecRequestBodyInMemoryLimit` and `SecDataDir`: this filter
-has no filesystem and keeps the whole request body in memory. A test fails if the
-two copies differ in anything else. Like upstream, the file also starts the
-engine in `DetectionOnly`, so put `SecRuleEngine On` after the `Include`; the
-filter logs a configure-time warning for a policy left in `DetectionOnly`. It
-also enables request and response body access with upstream's limits and
-`RelevantOnly` audit logging. Override any of those with directives after the
-`Include`.
+release. [`build.rs`](build.rs) derives the built-in file from it on every build:
+it adds a header and comments out `SecRequestBodyInMemoryLimit` and `SecDataDir`,
+because this filter has no filesystem and keeps the whole request body in memory.
+Every other line is the engine copy's, and a test checks that. Like upstream, the
+file also starts the engine in `DetectionOnly`, so put `SecRuleEngine On` after
+the `Include`; the filter logs a configure-time warning for a policy left in
+`DetectionOnly`. It also enables request and response body access with upstream's
+limits and `RelevantOnly` audit logging. Override any of those with directives
+after the `Include`.
 
 The `Include` must name the file exactly: no wildcard pattern selects it, not
 even a bare `Include *`, so a wildcard after `SecRuleEngine On` cannot load its

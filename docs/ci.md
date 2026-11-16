@@ -108,10 +108,10 @@ where downloaded tool integrity is enforced.
   `FIXTURE_*` count constants in `coraza/tests/go_operators.rs` and
   `coraza/tests/go_profiles_replay.rs`. This writes both `profiles.json` and
   `profiles-multiphase.json`, and copies the module's `coraza.conf-recommended`
-  to `coraza/coraza.conf-recommended`. Apply any change in that file to
-  `envoy-coraza/recommended.conf` as well: an envoy-coraza test fails until the
-  two copies differ only in the directives that need a filesystem. The command
-  needs the pinned module in the Go module cache (`go mod download`).
+  to `coraza/coraza.conf-recommended`. That is the only copy: envoy-coraza's
+  `build.rs` derives the built-in `@recommended-conf` from it on every build, and
+  fails if a directive it comments out for the Wasm filter is no longer set. The
+  command needs the pinned module in the Go module cache (`go mod download`).
   `cargo xtask go-fixtures-check` compares the checked-in operator and profile
   data bytes and the recommended configuration with that module and validates
   the operator and profile inventories against the `OPERATOR_*` and `PROFILE_*`

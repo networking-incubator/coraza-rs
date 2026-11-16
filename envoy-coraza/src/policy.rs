@@ -58,9 +58,10 @@ pub(crate) mod embedded_crs {
 /// even a bare `Include *` (see [`CountingRuleData::glob`]).
 const RECOMMENDED_CONF_NAME: &str = "@recommended-conf";
 
-/// Go Coraza's `coraza.conf-recommended` without the directives that need a
-/// filesystem; see the file's header.
-const RECOMMENDED_CONF: &[u8] = include_bytes!("../recommended.conf");
+/// The engine's `coraza.conf-recommended` with the directives that need a
+/// filesystem commented out, derived at build time by `build.rs`; see the
+/// derived file's header.
+const RECOMMENDED_CONF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/recommended.conf"));
 
 /// Adds the built-in files that the configuration does not override: the
 /// recommended baseline in every build and, with `embed-crs`, the CRS tree.
@@ -1084,25 +1085,83 @@ mod tests {
         directives
     }
 
+    /// The directives `build.rs` comments out of the built-in baseline: they need a filesystem.
+    const FILESYSTEM_DIRECTIVES: [&str; 2] = ["SecRequestBodyInMemoryLimit", "SecDataDir"];
+
+    /// The filesystem directive `line` sets, if any.
+    fn filesystem_directive(line: &str) -> Option<&'static str> {
+        let first = line.split_whitespace().next()?;
+        FILESYSTEM_DIRECTIVES
+            .into_iter()
+            .find(|name| name.eq_ignore_ascii_case(first))
+    }
+
     #[test]
     fn the_built_in_baseline_differs_from_upstream_only_in_filesystem_directives() {
-        // The engine copy is byte-identical to Go Coraza's file (`cargo xtask
-        // go-fixtures-check`). This host leaves out only the two directives that
-        // need a filesystem, so every rule and every other setting stays upstream's.
-        const FILESYSTEM_DIRECTIVES: [&str; 2] = ["SecRequestBodyInMemoryLimit 131072", "SecDataDir /tmp/"];
+        // build.rs derives the built-in copy from the engine copy, which is
+        // byte-identical to Go Coraza's file (`cargo xtask go-fixtures-check`), and
+        // leaves out only the two directives that need a filesystem, so every rule
+        // and every other setting stays upstream's.
         let upstream = directives(coraza::seclang::RECOMMENDED_CONF);
         let host = directives(std::str::from_utf8(super::RECOMMENDED_CONF).unwrap());
-        for directive in FILESYSTEM_DIRECTIVES {
+        for name in FILESYSTEM_DIRECTIVES {
             assert!(
-                upstream.iter().any(|upstream| upstream == directive),
-                "upstream no longer sets {directive:?}; review the built-in copy"
+                upstream
+                    .iter()
+                    .any(|directive| filesystem_directive(directive) == Some(name)),
+                "upstream no longer sets {name}; review WASM_DISABLED_DIRECTIVES in build.rs"
             );
         }
         let expected: Vec<String> = upstream
             .into_iter()
-            .filter(|directive| !FILESYSTEM_DIRECTIVES.contains(&directive.as_str()))
+            .filter(|directive| filesystem_directive(directive).is_none())
             .collect();
         assert_eq!(host, expected);
+    }
+
+    #[test]
+    fn build_rs_derives_the_built_in_baseline_from_the_engine_copy() {
+        // Undoing the derivation must give back the engine copy byte for byte: drop
+        // the comment header and each note, and uncomment the directive below it.
+        let derived = std::str::from_utf8(super::RECOMMENDED_CONF).unwrap();
+        let (header, body) = derived.split_once("\n\n").expect("a blank line ends the header");
+        assert!(
+            header.lines().all(|line| line.starts_with('#')),
+            "the header is only comments:\n{header}"
+        );
+        assert!(
+            header.contains("coraza/coraza.conf-recommended"),
+            "the header names its source:\n{header}"
+        );
+        let mut restored = String::new();
+        let mut disabled = Vec::new();
+        let mut lines = body.split_inclusive('\n');
+        while let Some(line) = lines.next() {
+            if !line.starts_with("# Disabled for WASM: ") {
+                restored.push_str(line);
+                continue;
+            }
+            // A note runs up to the commented-out directive: its first line without "# ".
+            let commented = lines
+                .find(|line| !line.starts_with("# "))
+                .expect("a note precedes a directive");
+            let directive = commented
+                .strip_prefix('#')
+                .expect("the directive below a note is commented out");
+            disabled.push(filesystem_directive(directive).expect("only filesystem directives are disabled"));
+            restored.push_str(directive);
+        }
+        disabled.sort_unstable();
+        let mut expected = FILESYSTEM_DIRECTIVES;
+        expected.sort_unstable();
+        assert_eq!(disabled, expected);
+        for name in FILESYSTEM_DIRECTIVES {
+            assert!(
+                header.contains(&format!("\n# - {name}\n")),
+                "the header lists {name}:\n{header}"
+            );
+        }
+        assert_eq!(restored, coraza::seclang::RECOMMENDED_CONF);
     }
 
     #[cfg(feature = "embed-crs")]
