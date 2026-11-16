@@ -3663,6 +3663,37 @@ SecWebAppId production
     }
 
     #[test]
+    fn ignore_errors_does_not_invent_a_chain_when_options_have_no_space() {
+        // Go leaves the action list empty when a malformed rule's options contain no
+        // space (`LastIndexByte(' ') < 0`), so no chain is declared and the next rule
+        // loads standalone. Using the whole options as the last token instead set
+        // `dropping_chain`, which silently swallowed the following rule.
+        for malformed in ["SecRule id:1,phase:1,chain", "SecRule chain"] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine On\n\
+                     SecIgnoreRuleCompilationErrors On\n\
+                     {malformed}\n\
+                     SecRule ARGS \"@contains attack\" \"id:200,phase:1,deny,status:403\"",
+                ))
+                .unwrap();
+            let waf = parser.compile().unwrap();
+            let mut tx = waf.new_transaction_with_id("nospace-chain-options");
+            tx.process_uri("/?q=attack", "GET", "HTTP/1.1");
+            tx.process_request_headers();
+            tx.process_request_body(b"");
+
+            assert_eq!(
+                tx.interruption()
+                    .map(|interruption| (interruption.rule_id, interruption.status)),
+                Some((200, 403)),
+                "the rule after the malformed {malformed} starter must load and fire"
+            );
+        }
+    }
+
+    #[test]
     fn secmarker_ends_a_chain_dropped_for_an_ignored_compile_error() {
         let mut parser = Parser::new();
         parser
