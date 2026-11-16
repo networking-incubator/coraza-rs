@@ -761,6 +761,16 @@ impl Parser {
             if self.dropping_chain
                 && let Some(has_chain) = super::rule_compiler::directive_chain_status(&directive)
             {
+                if !self.skip_failed {
+                    // Go fails the whole configuration here: a rule that is a link of a
+                    // chain dropped for an ignored compilation error cannot load once
+                    // rule-error skipping is off, and silently consuming it would drop a
+                    // rule the operator never agreed to skip.
+                    self.dropping_chain = false;
+                    return Err(
+                        self.error("rule is a link of a chain dropped for an ignored compilation error".to_owned())
+                    );
+                }
                 self.skipped
                     .push(self.error("skipped because parsing failed while a rule chain was open".to_owned()));
                 self.dropping_chain = has_chain;
@@ -3748,6 +3758,45 @@ SecWebAppId production
                 "the rule after the malformed {swallowed} starter is a link of the dropped chain, as in Go"
             );
         }
+    }
+
+    #[test]
+    fn a_link_of_a_dropped_chain_errors_once_skipping_is_off() {
+        // Go fails the whole configuration when a rule that is a link of a chain
+        // dropped for an ignored compilation error arrives after
+        // `SecIgnoreRuleCompilationErrors Off`: consuming it silently would drop a
+        // rule the operator never agreed to skip.
+        let mut parser = Parser::new();
+        let error = parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecIgnoreRuleCompilationErrors On\n\
+                 SecRule REQUEST_URI @beginsWith /partner/ \"id:130,phase:1,pass,nolog,chain\"\n\
+                 SecIgnoreRuleCompilationErrors Off\n\
+                 SecRule REQUEST_URI \"@beginsWith /partner/\" \"ctl:ruleEngine=Off\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:200,phase:2,deny,status:403\"",
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rule is a link of a chain dropped for an ignored compilation error"),
+            "unexpected error: {error}"
+        );
+        // The pending chain state is cleared, so a reused parser starts fresh.
+        parser
+            .from_string("SecRule ARGS \"@contains attack\" \"id:300,phase:2,deny,status:403\"")
+            .unwrap();
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("off-mid-drop-reuse");
+        tx.process_uri("/?q=attack", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((300, 403))
+        );
     }
 
     #[test]
