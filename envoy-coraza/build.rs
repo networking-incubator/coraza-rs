@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Generates the rule-data table embedded by the `embed-crs` feature.
+//! Generates the files `src/policy.rs` embeds.
 //!
-//! The table maps `crs/`-prefixed names to the bytes of the fetched CRS tree,
-//! so an existing policy's `Include rules/*.conf` cannot pick up CRS files. It
-//! is only generated when the feature is on, and only from a tree whose version
-//! marker and file count match the tracked pin and the tree itself.
+//! Every build derives the built-in `@recommended-conf` from
+//! `coraza/coraza.conf-recommended`, the repository's only copy of Go Coraza's
+//! recommended configuration: the derived file is that one with the directives
+//! the Wasm filter cannot honour commented out.
+//!
+//! The `embed-crs` feature also generates the rule-data table. The table maps
+//! `crs/`-prefixed names to the bytes of the fetched CRS tree, so an existing
+//! policy's `Include rules/*.conf` cannot pick up CRS files. It is only
+//! generated from a tree whose version marker and file count match the tracked
+//! pin and the tree itself.
 
 use std::{
     collections::BTreeSet,
@@ -44,6 +50,42 @@ const MARKER: &str = ".version";
 const MAX_MARKER_BYTES: u64 = 256;
 /// Most pin bytes read; the pin is two short fields.
 const MAX_PIN_BYTES: u64 = 256;
+/// The engine's recommended configuration, relative to this crate: the single
+/// source of the built-in `@recommended-conf`.
+const RECOMMENDED_SOURCE: &str = "../coraza/coraza.conf-recommended";
+/// The derived file, under `OUT_DIR`, that `src/policy.rs` embeds.
+const RECOMMENDED_OUTPUT: &str = "recommended.conf";
+/// The directives of [`RECOMMENDED_SOURCE`] the Wasm filter cannot honour, each
+/// with the reason the derived file gives, one note line per reason line.
+const WASM_DISABLED_DIRECTIVES: [(&str, &str); 2] = [
+    (
+        "SecRequestBodyInMemoryLimit",
+        "the filter has no filesystem, keeps the whole request\n\
+         body in memory, and refuses an in-memory limit below SecRequestBodyLimit.",
+    ),
+    ("SecDataDir", "the filter has no filesystem."),
+];
+/// The start of the note above each directive the derivation comments out.
+const DISABLED_NOTE: &str = "# Disabled for WASM: ";
+/// The derived file's header, up to its list of disabled directives.
+const RECOMMENDED_HEADER: &str = "\
+# envoy-coraza built-in baseline, loaded with `Include @recommended-conf`.
+#
+# Derived at build time by envoy-coraza/build.rs from
+# coraza/coraza.conf-recommended, the verbatim copy of Go Coraza's
+# coraza.conf-recommended (Copyright 2022 Juan Pablo Tosso and the OWASP Coraza
+# contributors, Apache-2.0). Every line below is upstream's, except that these
+# directives, which the Wasm filter cannot honour, are commented out under a
+# \"Disabled for WASM\" note:
+#
+";
+/// The rest of the derived file's header, after its list of disabled directives.
+const RECOMMENDED_HEADER_END: &str = "\
+#
+# The file starts in DetectionOnly, like upstream. Set SecRuleEngine On after
+# the Include for the rules below to block.
+
+";
 
 /// The setup error for a tree that is missing, partial, or from another release.
 fn stale_tree(root: &Path) -> Box<dyn std::error::Error> {
@@ -204,11 +246,83 @@ fn collect(
     Ok(())
 }
 
+/// Derives the built-in `@recommended-conf` from the engine's recommended
+/// configuration: a comment header, then `source` line for line, with each
+/// directive in [`WASM_DISABLED_DIRECTIVES`] commented out under a note.
+///
+/// Fails when a disabled directive is missing, so the header never lists one
+/// the file does not set. Also fails when one continues onto the next line: the
+/// parser drops a comment before joining lines, so that next line would load
+/// as a directive of its own.
+fn derive_recommended_conf(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = String::from(RECOMMENDED_HEADER);
+    for (name, _) in WASM_DISABLED_DIRECTIVES {
+        writeln!(&mut out, "# - {name}")?;
+    }
+    out.push_str(RECOMMENDED_HEADER_END);
+    let mut disabled = BTreeSet::new();
+    for line in source.split_inclusive('\n') {
+        // Directive names are case-insensitive, and the parser trims every line.
+        let first = line.split_whitespace().next().unwrap_or_default();
+        let Some(&(name, reason)) = WASM_DISABLED_DIRECTIVES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(first))
+        else {
+            out.push_str(line);
+            continue;
+        };
+        if line.trim_end().ends_with('\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{RECOMMENDED_SOURCE}: {name} continues onto the next line, which a leading `#` does not disable"
+                ),
+            )
+            .into());
+        }
+        for (index, text) in reason.lines().enumerate() {
+            let prefix = if index == 0 { DISABLED_NOTE } else { "# " };
+            writeln!(&mut out, "{prefix}{text}")?;
+        }
+        out.push('#');
+        out.push_str(line);
+        disabled.insert(name);
+    }
+    if let Some((name, _)) = WASM_DISABLED_DIRECTIVES
+        .iter()
+        .find(|(name, _)| !disabled.contains(name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{RECOMMENDED_SOURCE} no longer sets {name}; update WASM_DISABLED_DIRECTIVES in envoy-coraza/build.rs"
+            ),
+        )
+        .into());
+    }
+    Ok(out)
+}
+
+/// Writes the built-in `@recommended-conf`, derived from [`RECOMMENDED_SOURCE`],
+/// to `output_dir`.
+fn write_recommended_conf(manifest: &Path, output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed={RECOMMENDED_SOURCE}");
+    let path = manifest.join(RECOMMENDED_SOURCE);
+    let source = fs::read_to_string(&path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    fs::write(output_dir.join(RECOMMENDED_OUTPUT), derive_recommended_conf(&source)?)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = PathBuf::from(
+        env::var_os("OUT_DIR").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OUT_DIR is not set"))?,
+    );
+    write_recommended_conf(manifest, &output_dir)?;
     if env::var_os("CARGO_FEATURE_EMBED_CRS").is_none() {
         return Ok(());
     }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let (pinned_version, pinned_sha256) = pinned_release(manifest)?;
     let root = manifest.join(CRS_DIR);
     println!("cargo:rerun-if-changed={}", root.display());
@@ -268,8 +382,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out.push_str("];\n");
     writeln!(&mut out, "/// The CRS release whose files this build embedded.\npub(crate) static EMBEDDED_CRS_VERSION: &str = {version:?};")?;
 
-    let output_dir =
-        env::var_os("OUT_DIR").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OUT_DIR is not set"))?;
-    fs::write(Path::new(&output_dir).join("embedded_crs.rs"), out)?;
+    fs::write(output_dir.join("embedded_crs.rs"), out)?;
     Ok(())
 }

@@ -11,5 +11,6 @@ Copyright 2009 The Go Authors. All rights reserved.
 `coraza.conf-recommended` is a verbatim copy of the file of the same name from
 Go Coraza v3.8.1 (`github.com/corazawaf/coraza/v3`), Copyright 2022 Juan Pablo
 Tosso and the OWASP Coraza contributors, licensed under the Apache License,
-Version 2.0, the license of this crate. `envoy-coraza/recommended.conf` is the
-same file without its `SecRequestBodyInMemoryLimit` and `SecDataDir` directives.
+Version 2.0, the license of this crate. envoy-coraza's `build.rs` derives its
+built-in `@recommended-conf` from this file, with its
+`SecRequestBodyInMemoryLimit` and `SecDataDir` directives commented out.
