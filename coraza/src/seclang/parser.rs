@@ -767,7 +767,13 @@ impl Parser {
                 continue;
             }
 
+            let ends_dropped_chain = self.dropping_chain
+                && directive
+                    .split_once(' ')
+                    .map_or_else(|| directive.as_ref(), |(name, _)| name)
+                    .eq_ignore_ascii_case("secmarker");
             match self.evaluate_line(&directive) {
+                Ok(()) if ends_dropped_chain => self.dropping_chain = false,
                 // A budget failure is not a directive the embedder may skip: continuing
                 // would compile every remaining rule before rejecting it, or accept a
                 // truncated include set. Only `SecRule` is skippable, as Go's
@@ -3628,6 +3634,57 @@ SecWebAppId production
         assert_eq!(
             parser.skipped().iter().map(|error| error.line).collect::<Vec<_>>(),
             [1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn ignore_errors_drops_links_of_a_malformed_chain_starter() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecIgnoreRuleCompilationErrors On\n\
+                 SecRule REQUEST_URI @beginsWith /partner/ \"id:130,phase:1,pass,nolog,chain\"\n\
+                     SecRule REQUEST_URI \"@beginsWith /partner/\" \"ctl:ruleEngine=Off\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:200,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("malformed-chain-starter");
+        tx.process_uri("/partner/orders?q=attack", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((200, 403))
+        );
+    }
+
+    #[test]
+    fn secmarker_ends_a_chain_dropped_for_an_ignored_compile_error() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecIgnoreRuleCompilationErrors On\n\
+                 SecRule REQUEST_URI \"@noSuchOperator /partner/\" \
+                     \"id:130,phase:1,pass,nolog,chain\"\n\
+                 SecMarker END\n\
+                 SecRule ARGS \"@contains attack\" \"id:200,phase:2,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("marker-ends-dropped-chain");
+        tx.process_uri("/partner/orders?q=attack", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((200, 403))
         );
     }
 

@@ -407,7 +407,17 @@ pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
     let line = line.trim_start();
     let (directive, options) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let actions = if directive.eq_ignore_ascii_case("SecRule") {
-        RuleArguments::parse(options).map_or("", |args| args.actions)
+        if let Ok(args) = RuleArguments::parse(options) {
+            args.actions
+        } else {
+            let options = options.trim_start();
+            if let Some(actions) = trailing_quoted(options).filter(|actions| !actions.is_empty()) {
+                actions
+            } else {
+                let options = options.trim_end_matches(' ');
+                options.rsplit_once(' ').map_or(options, |(_, token)| token)
+            }
+        }
     } else if directive.eq_ignore_ascii_case("SecAction") {
         remove_matching_quotes(options.trim())
     } else {
@@ -415,6 +425,31 @@ pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
     };
 
     Some(parse_actions(actions).is_ok_and(|actions| actions.iter().any(|action| action.key == "chain")))
+}
+
+/// The contents of the last double-quoted string in `data`; escaped quotes are skipped.
+fn trailing_quoted(data: &str) -> Option<&str> {
+    let data = data.trim_end_matches(' ');
+    let end = data.len().checked_sub(1)?;
+    if data.as_bytes().get(end) != Some(&b'"') {
+        return None;
+    }
+
+    for start in (0..end).rev() {
+        if data.as_bytes().get(start) != Some(&b'"') {
+            continue;
+        }
+        let mut preceding = start;
+        let mut backslashes = 0_usize;
+        while preceding > 0 && data.as_bytes().get(preceding.saturating_sub(1)) == Some(&b'\\') {
+            preceding = preceding.saturating_sub(1);
+            backslashes = backslashes.saturating_add(1);
+        }
+        if backslashes.is_multiple_of(2) {
+            return data.get(start.saturating_add(1)..end);
+        }
+    }
+    None
 }
 
 /// `"..."`, in which a backslash escapes the character after it; returns what's between
@@ -477,6 +512,14 @@ mod tests {
         assert_eq!(
             message("ARGS \"@rx\" id:1"),
             "invalid actions for rule with operator: \"ARGS \\\"@rx\\\" id:1\""
+        );
+    }
+
+    #[test]
+    fn malformed_rule_chain_detection_falls_back_to_the_last_token() {
+        assert_eq!(
+            directive_chain_status("SecRule REQUEST_URI @beginsWith /partner/ id:130,phase:1,pass,nolog,chain"),
+            Some(true)
         );
     }
 
