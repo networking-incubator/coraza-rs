@@ -406,17 +406,21 @@ impl<'a> RuleArguments<'a> {
 pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
     let line = line.trim_start();
     let (directive, options) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    // Go's `evaluateLine` strips wrapping quotes from a directive's options before
+    // dispatching it (internal/seclang/parser.go:177-179), so options wholly wrapped
+    // in quotes are not a quoted action list.
+    let options = strip_wrapping_quotes(options);
     let actions = if directive.eq_ignore_ascii_case("SecRule") {
         if let Ok(args) = RuleArguments::parse(options) {
             args.actions
         } else {
-            let options = options.trim_start();
+            // Go's fallback reads the last token without trimming leading spaces
+            // (internal/seclang/rule_parser.go:659-662), so extra spaces before the
+            // options still leave a last token to inspect.
             if let Some(actions) = trailing_quoted(options).filter(|actions| !actions.is_empty()) {
                 actions
             } else {
                 let options = options.trim_end_matches(' ');
-                // Go leaves the action list empty when the options have no space
-                // (`LastIndexByte(' ') < 0`): the whole string is not a last token.
                 options.rsplit_once(' ').map_or("", |(_, token)| token)
             }
         }
@@ -427,6 +431,17 @@ pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
     };
 
     Some(parse_actions(actions).is_ok_and(|actions| actions.iter().any(|action| action.key == "chain")))
+}
+
+/// Go's `evaluateLine` strips wrapping quotes from a directive's options before
+/// dispatching it: options at least three bytes long that start and end with a
+/// double quote lose every wrapping quote.
+fn strip_wrapping_quotes(options: &str) -> &str {
+    if options.len() >= 3 && options.starts_with('"') && options.ends_with('"') {
+        options.trim_matches('"')
+    } else {
+        options
+    }
 }
 
 /// The contents of the last double-quoted string in `data`; escaped quotes are skipped.
