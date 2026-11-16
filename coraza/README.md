@@ -5,6 +5,47 @@ provides SecLang parsing, request and response phase processing, and audit
 logging. It is not the upstream Go implementation. The `exec`, `initcol`, and
 `expirevar` action effects are not implemented.
 
+## Recommended configuration
+
+[`coraza.conf-recommended`](coraza.conf-recommended) is a verbatim copy of the
+recommended engine configuration that the pinned Go Coraza release ships
+(Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors,
+Apache-2.0). `cargo xtask go-fixtures-check` compares it with that release byte
+for byte, and `cargo xtask go-fixtures-refresh` updates it with the other Go
+fixtures. The text is also available as `coraza::seclang::RECOMMENDED_CONF`:
+
+```rust
+use coraza::{
+    Waf,
+    seclang::{Parser, RECOMMENDED_CONF},
+};
+
+fn waf() -> Result<Waf, Box<dyn std::error::Error>> {
+    let mut parser = Parser::new();
+    parser.from_string(RECOMMENDED_CONF)?;
+    parser.from_string("SecRuleEngine On")?;
+    Ok(parser.into_waf()?)
+}
+```
+
+Load it before any rule set, the OWASP CRS included, then turn blocking on: like
+upstream, it starts in `DetectionOnly`. Its rules are the fail-closed baseline for
+the engine's error flags. The CRS reads none of these flags, so without the
+baseline a body the engine could not parse is neither inspected nor blocked:
+
+- 200002 denies a request whose body processor failed (`REQBODY_ERROR`).
+- 200003 denies a multipart body that failed strict validation
+  (`MULTIPART_STRICT_ERROR`).
+- 200004 and 200005 deny a request whose arguments were dropped at
+  `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`).
+- 200009 denies a request target that does not parse (`URI_PARSE_ERROR`).
+- 200000, 200001 and 200006 select the XML and JSON body processors, which the
+  engine does not pick from the content type on its own.
+
+The file sets `SecRequestBodyInMemoryLimit` and `SecDataDir`, which need a
+filesystem. The envoy-coraza filter embeds a copy without those two directives
+as `@recommended-conf`.
+
 ## Extension seams
 
 | Seam | Registration/API | Contract |

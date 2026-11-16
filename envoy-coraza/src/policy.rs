@@ -39,10 +39,8 @@ use coraza::{
     Waf,
 };
 
-#[cfg(feature = "embed-crs")]
-use crate::config::{add_rule_data, normalize_rule_data_name, RULE_DATA_LIMITS};
 use crate::{
-    config::{display_name, Config},
+    config::{add_rule_data, display_name, normalize_rule_data_name, Config, RULE_DATA_LIMITS},
     observability::{self, Diagnostics},
 };
 
@@ -53,16 +51,29 @@ pub(crate) mod embedded_crs {
     include!(concat!(env!("OUT_DIR"), "/embedded_crs.rs"));
 }
 
-/// Adds the embedded CRS files that the configuration does not override.
+/// The name `Include` resolves to the built-in recommended baseline, in every build.
+///
+/// It is coraza-proxy-wasm's name for the same file. With no `.conf` suffix, a
+/// wildcard include such as `Include **/*.conf` cannot pick it up by accident.
+const RECOMMENDED_CONF_NAME: &str = "@recommended-conf";
+
+/// Go Coraza's `coraza.conf-recommended` without the directives that need a
+/// filesystem; see the file's header.
+const RECOMMENDED_CONF: &[u8] = include_bytes!("../recommended.conf");
+
+/// Adds the built-in files that the configuration does not override: the
+/// recommended baseline in every build and, with `embed-crs`, the CRS tree.
 ///
 /// Every file goes through the same name and size checks as a configured
-/// `rule_data` entry, so the embedded set cannot exceed the documented bounds.
-#[cfg(feature = "embed-crs")]
-fn embedded_rule_data(mut rule_data: BTreeMap<String, Vec<u8>>) -> Result<BTreeMap<String, Vec<u8>>, CompileError> {
+/// `rule_data` entry, so the built-in set cannot exceed the documented bounds.
+fn builtin_rule_data(mut rule_data: BTreeMap<String, Vec<u8>>) -> Result<BTreeMap<String, Vec<u8>>, CompileError> {
     let mut total = rule_data.values().map(Vec::len).sum();
     let mut configured: std::collections::BTreeSet<String> =
         rule_data.keys().map(|name| normalize_rule_data_name(name)).collect();
-    for &(name, bytes) in embedded_crs::EMBEDDED_CRS {
+    let builtins = std::iter::once((RECOMMENDED_CONF_NAME, RECOMMENDED_CONF));
+    #[cfg(feature = "embed-crs")]
+    let builtins = builtins.chain(embedded_crs::EMBEDDED_CRS.iter().copied());
+    for (name, bytes) in builtins {
         // A configured entry wins even when it is spelled with `./` or `//`.
         let normalized = normalize_rule_data_name(name);
         if configured.contains(&normalized) {
@@ -496,8 +507,7 @@ impl Generation {
             enable_filter_state_logs,
             rule_data,
         } = config;
-        #[cfg(feature = "embed-crs")]
-        let rule_data = embedded_rule_data(rule_data)?;
+        let rule_data = builtin_rule_data(rule_data)?;
         let diagnostics = Arc::new(Diagnostics::default());
         let mut warnings = Vec::new();
         if directives_map.is_empty() {
@@ -878,6 +888,201 @@ mod tests {
         );
     }
 
+    /// A multipart content type with the boundary the fixtures use.
+    const MULTIPART: Option<&str> = Some("multipart/form-data; boundary=b");
+
+    /// A part with an empty header block, then a SQL injection in the next field.
+    const EMPTY_HEADER_PART_THEN_SQLI: &[u8] = b"--b\r\n\r\nx\r\n--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--b--\r\n";
+
+    /// A generation whose default policy loads the built-in baseline, turns blocking on
+    /// and then adds `extra` directives.
+    fn recommended_generation(extra: &[&str]) -> Generation {
+        let mut directives = vec!["Include @recommended-conf", "SecRuleEngine On"];
+        directives.extend_from_slice(extra);
+        parse_generation(
+            &serde_json::json!({"directives_map": {"p": directives}, "default_directives": "p"}).to_string(),
+        )
+    }
+
+    /// The rule and status that interrupt one request through the default policy.
+    fn interruption(generation: &Generation, uri: &str, content_type: Option<&str>, body: &[u8]) -> Option<(i32, u16)> {
+        let policy = generation.select("example.com").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri(uri, "POST", "HTTP/1.1");
+        transaction.add_request_header("Host", "example.com");
+        transaction.add_request_header("User-Agent", "curl/8.0");
+        transaction.add_request_header("Accept", "*/*");
+        transaction.add_request_header("Content-Length", body.len().to_string());
+        if let Some(content_type) = content_type {
+            transaction.add_request_header("Content-Type", content_type);
+        }
+        if let Some(interruption) = transaction.process_request_headers() {
+            return Some((interruption.rule_id, interruption.status));
+        }
+        transaction
+            .process_request_body(body)
+            .map(|interruption| (interruption.rule_id, interruption.status))
+    }
+
+    /// `count` `name=value` pairs joined by `&`.
+    fn arguments(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("a{index}=1"))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    #[test]
+    fn the_built_in_recommended_baseline_fails_closed() {
+        let generation = recommended_generation(&[]);
+        let many_get_arguments = format!("/?{}", arguments(1001));
+        let many_post_arguments = arguments(1001);
+        for (uri, content_type, body, expected) in [
+            // 200002 blocks a multipart, JSON or XML body that does not parse; JSON
+            // and XML are only parsed because 200001, 200006 and 200000 select them.
+            (
+                "/",
+                MULTIPART,
+                &b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue"[..],
+                Some((200_002, 400)),
+            ),
+            ("/", Some("application/json"), b"{\"a\":", Some((200_002, 400))),
+            ("/", Some("application/problem+json"), b"[1,", Some((200_002, 400))),
+            ("/", Some("text/xml"), b"<?xml version=\"1.1\"?><a/>", Some((200_002, 400))),
+            // 200003 blocks a body that parses but fails strict multipart validation.
+            (
+                "/",
+                MULTIPART,
+                b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nv\r\n--b--\r\n",
+                Some((200_003, 400)),
+            ),
+            // 200009 blocks a request target that does not parse.
+            ("http://example.com:bad/path", None, b"", Some((200_009, 400))),
+            // 200004 and 200005 block arguments dropped at SecArgumentsLimit.
+            (&many_get_arguments, None, b"", Some((200_004, 400))),
+            (
+                "/",
+                Some("application/x-www-form-urlencoded"),
+                many_post_arguments.as_bytes(),
+                Some((200_005, 400)),
+            ),
+            // Well-formed requests pass.
+            (
+                "/",
+                MULTIPART,
+                b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--b--\r\n",
+                None,
+            ),
+            ("/", Some("application/json"), b"{\"a\":1}", None),
+            ("/", Some("text/xml"), b"<a>1</a>", None),
+            ("/", Some("application/x-www-form-urlencoded"), b"a=1", None),
+        ] {
+            assert_eq!(
+                interruption(&generation, uri, content_type, body),
+                expected,
+                "{} {content_type:?} {}",
+                uri.get(..40).unwrap_or(uri),
+                String::from_utf8_lossy(body.get(..40).unwrap_or(body))
+            );
+        }
+    }
+
+    #[test]
+    fn the_baseline_does_not_block_an_empty_header_part_and_the_next_field_is_inspected() {
+        // A part without headers is valid multipart, so the baseline passes it and the
+        // rule after the baseline still sees the injection in the next field.
+        let generation =
+            recommended_generation(&["SecRule ARGS_POST \"@detectSQLi\" \"id:110,phase:2,deny,status:403\""]);
+        assert_eq!(
+            interruption(&generation, "/", MULTIPART, EMPTY_HEADER_PART_THEN_SQLI),
+            Some((110, 403))
+        );
+        assert_eq!(
+            interruption(
+                &recommended_generation(&[]),
+                "/",
+                MULTIPART,
+                EMPTY_HEADER_PART_THEN_SQLI
+            ),
+            None,
+            "the empty-header part is not a body error"
+        );
+    }
+
+    #[test]
+    fn the_built_in_baseline_starts_in_detection_only_and_warns() {
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": ["Include @recommended-conf"]}, "default_directives": "p"}"#);
+        assert!(
+            generation.warnings().any(|warning| warning.contains("DetectionOnly")),
+            "warnings were {:?}",
+            generation.warnings().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
+            None,
+            "DetectionOnly logs 200002 without blocking"
+        );
+    }
+
+    #[test]
+    fn configured_rule_data_wins_over_the_built_in_baseline() {
+        // The `./` spelling must still take precedence over `@recommended-conf`.
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {"p": ["Include @recommended-conf"]},
+                "default_directives": "p",
+                "rule_data": {"./@recommended-conf": "SecRule REQUEST_URI \"@contains attack\" \"id:7,phase:1,deny,status:403\""}
+            }"#,
+        );
+        assert_eq!(interruption(&generation, "/attack", None, b""), Some((7, 403)));
+        assert_eq!(
+            interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
+            None,
+            "the replacement has no body-processor or error rules"
+        );
+    }
+
+    /// The logical SecLang directives of `text`: continuation lines joined, blank
+    /// lines and comments dropped.
+    fn directives(text: &str) -> Vec<String> {
+        let mut directives = Vec::new();
+        let mut current = String::new();
+        for line in text.lines().map(str::trim) {
+            if current.is_empty() && (line.is_empty() || line.starts_with('#')) {
+                continue;
+            }
+            if let Some(continued) = line.strip_suffix('\\') {
+                current.push_str(continued);
+                continue;
+            }
+            current.push_str(line);
+            directives.push(std::mem::take(&mut current));
+        }
+        directives
+    }
+
+    #[test]
+    fn the_built_in_baseline_differs_from_upstream_only_in_filesystem_directives() {
+        // The engine copy is byte-identical to Go Coraza's file (`cargo xtask
+        // go-fixtures-check`). This host leaves out only the two directives that
+        // need a filesystem, so every rule and every other setting stays upstream's.
+        const FILESYSTEM_DIRECTIVES: [&str; 2] = ["SecRequestBodyInMemoryLimit 131072", "SecDataDir /tmp/"];
+        let upstream = directives(coraza::seclang::RECOMMENDED_CONF);
+        let host = directives(std::str::from_utf8(super::RECOMMENDED_CONF).unwrap());
+        for directive in FILESYSTEM_DIRECTIVES {
+            assert!(
+                upstream.iter().any(|upstream| upstream == directive),
+                "upstream no longer sets {directive:?}; review the built-in copy"
+            );
+        }
+        let expected: Vec<String> = upstream
+            .into_iter()
+            .filter(|directive| !FILESYSTEM_DIRECTIVES.contains(&directive.as_str()))
+            .collect();
+        assert_eq!(host, expected);
+    }
+
     #[cfg(feature = "embed-crs")]
     #[test]
     fn embedded_crs_compiles_and_blocks_a_sqli_request() {
@@ -980,9 +1185,79 @@ mod tests {
         assert!(error.contains("unknown directive"), "message was {error:?}");
     }
 
+    /// The README's CRS policy: the built-in baseline, blocking, then the embedded CRS.
+    #[cfg(feature = "embed-crs")]
+    const DOCUMENTED_CRS_POLICY: &str = r#"{
+        "directives_map": {
+            "crs": [
+                "Include @recommended-conf",
+                "SecRuleEngine On",
+                "Include crs/crs-setup.conf",
+                "Include crs/rules/*.conf"
+            ]
+        },
+        "default_directives": "crs"
+    }"#;
+
     #[cfg(feature = "embed-crs")]
     #[test]
-    fn a_full_rule_data_set_leaves_no_room_for_the_embedded_files() {
+    fn the_documented_crs_policy_blocks_the_empty_header_multipart_bypass() {
+        let generation = parse_generation(DOCUMENTED_CRS_POLICY);
+        assert_eq!(
+            interruption(&generation, "/login", MULTIPART, EMPTY_HEADER_PART_THEN_SQLI),
+            Some((949_110, 403)),
+            "CRS inspects the field after the empty-header part"
+        );
+        assert_eq!(
+            interruption(
+                &generation,
+                "/login",
+                MULTIPART,
+                b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--"
+            ),
+            Some((200_002, 400)),
+            "a body the parser cannot finish is blocked by the baseline"
+        );
+        assert_eq!(
+            interruption(
+                &generation,
+                "/login",
+                MULTIPART,
+                b"--b\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nAlice\r\n--b--\r\n"
+            ),
+            None,
+            "a benign form passes"
+        );
+    }
+
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn embedded_crs_without_the_baseline_inspects_the_field_after_an_empty_header_part() {
+        // The CRS policy documented before the baseline has no rule on the error flags.
+        // Before the multipart fix, the parser stopped at the empty-header part and this
+        // request was allowed.
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {
+                    "crs": [
+                        "SecRuleEngine On",
+                        "SecRequestBodyAccess On",
+                        "SecRequestBodyLimit 13107200",
+                        "Include crs/crs-setup.conf",
+                        "Include crs/rules/*.conf"
+                    ]
+                },
+                "default_directives": "crs"
+            }"#,
+        );
+        assert_eq!(
+            interruption(&generation, "/login", MULTIPART, EMPTY_HEADER_PART_THEN_SQLI),
+            Some((949_110, 403))
+        );
+    }
+
+    #[test]
+    fn a_full_rule_data_set_leaves_no_room_for_the_built_in_files() {
         let mut rule_data = std::collections::BTreeMap::new();
         for index in 0..1024 {
             rule_data.insert(format!("f{index}.conf"), b"SecRuleEngine On\n".to_vec());
@@ -993,9 +1268,12 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
+        // The baseline is built into every build and is added first.
         assert!(
-            error.contains("rule data bound") && error.contains("already holds 1024 files"),
-            "the embedded files use the same file cap as configured rule_data: {error:?}"
+            error.contains("rule data bound")
+                && error.contains("@recommended-conf")
+                && error.contains("already holds 1024 files"),
+            "the built-in files use the same file cap as configured rule_data: {error:?}"
         );
     }
 

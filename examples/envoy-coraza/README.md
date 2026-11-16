@@ -13,11 +13,18 @@ standard library to send request trailers, so curl does not need optional
 
 The runner builds both Envoy Wasm artifacts, validates the HCM configuration,
 starts Envoy and the backend, then removes its containers, image, and temporary
-files. Set `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs` to build the
+files. Both configurations have a `recommended.local` policy that loads the
+built-in `@recommended-conf` baseline before a `@detectSQLi` rule; the runner
+checks that a SQL injection in the field after a multipart part with an empty
+header block is denied by that rule, and that a multipart body without its
+final delimiter is denied by baseline rule 200002 before it reaches the backend.
+Set `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs` to build the
 embedded-CRS artifact; that run uses `envoy-crs.yaml` — the same fixture
-configuration plus a `crs.local` policy that includes `crs/crs-setup.conf`
-and `crs/rules/*.conf`, usable as a CRS demo config — then checks that a SQL
-injection request is denied by CRS rule 949110. The filter config sets
+configuration plus a `crs.local` policy that includes `@recommended-conf`,
+`crs/crs-setup.conf` and `crs/rules/*.conf`, usable as a CRS demo config — then
+checks that SQL injection requests, including the empty-header multipart case,
+are denied by CRS rule 949110 and that the unterminated multipart body is denied
+by rule 200002. The filter config sets
 `allow_on_headers_stop_iteration: true`; this HCM profile also requires
 `proxy_100_continue: false` because request headers stay paused while phase 1
 runs.
