@@ -200,11 +200,29 @@ fn crs_body() -> Vec<u8> {
         if !body.is_empty() {
             body.push('&');
         }
-        body.push_str(key);
+        body.push_str(&form_encode(key));
         body.push('=');
-        body.push_str(value);
+        body.push_str(&form_encode(value));
     }
     body.into_bytes()
+}
+
+/// Percent-encode the characters that change urlencoded structure — `%` (escape
+/// prefix), `&` and `=` (delimiters) and `+` (decodes to space) — so each pair
+/// parses back to its original value. Everything else, including spaces and
+/// `;`/`#`/`@`, passes through unchanged in both engines.
+fn form_encode(component: &str) -> String {
+    let mut out = String::with_capacity(component.len());
+    for byte in component.bytes() {
+        match byte {
+            b'%' => out.push_str("%25"),
+            b'&' => out.push_str("%26"),
+            b'+' => out.push_str("%2B"),
+            b'=' => out.push_str("%3D"),
+            _ => out.push(char::from(byte)),
+        }
+    }
+    out
 }
 
 /// Compiles a SecLang document into a Waf.
