@@ -415,7 +415,9 @@ pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
                 actions
             } else {
                 let options = options.trim_end_matches(' ');
-                options.rsplit_once(' ').map_or(options, |(_, token)| token)
+                // Go leaves the action list empty when the options have no space
+                // (`LastIndexByte(' ') < 0`): the whole string is not a last token.
+                options.rsplit_once(' ').map_or("", |(_, token)| token)
             }
         }
     } else if directive.eq_ignore_ascii_case("SecAction") {
