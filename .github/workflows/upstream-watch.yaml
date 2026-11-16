@@ -1,0 +1,402 @@
+# Watches corazawaf/coraza for a stable release newer than the Go Coraza pin.
+#
+# github.com/corazawaf/coraza/v3 is pinned in benchmarks/coraza/go, which is
+# compared with upstream, and in coraza/tests/go_profiles/exporter, which
+# `cargo xtask go-fixtures-check` verifies the vendored fixtures against. When
+# upstream has a newer release, this workflow bumps both modules, runs the
+# fixture check and opens a pull request that reports the result. It never
+# refreshes the fixtures itself.
+#
+# Only the pull-request job can write, and it runs no repository code: it gets
+# the updated go.mod and go.sum files from the read-only bump job as an
+# artifact and commits them through the GitHub API, so GitHub signs the commit.
+# Branches named chore/bump-go-coraza-* belong to this workflow, and a version
+# whose branch already has a pull request, open or closed, is skipped. Pull
+# requests are opened only from main, which needs "Allow GitHub Actions to
+# create and approve pull requests" in the repository's Actions settings.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays at 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  UPSTREAM_REPO: corazawaf/coraza
+  GO_MODULE: github.com/corazawaf/coraza/v3
+  # The first module holds the pin compared with upstream; a bump updates every
+  # listed module whose pin is older than the new release.
+  GO_MODULE_DIRS: benchmarks/coraza/go coraza/tests/go_profiles/exporter
+  BRANCH_PREFIX: chore/bump-go-coraza-
+  PR_LABEL: upstream-sync
+
+jobs:
+  check:
+    name: Check for a new release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # find an existing pull request for the new version
+    outputs:
+      bump: ${{ steps.existing.outputs.bump }}
+      branch: ${{ steps.existing.outputs.branch }}
+      current: ${{ steps.release.outputs.current }}
+      version: ${{ steps.release.outputs.version }}
+      modules: ${{ steps.release.outputs.modules }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare the pin with the latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Prints the GO_MODULE version that the go.mod file $1 requires.
+          pinned_version() {
+            sed -e 's|//.*||' "$1" | awk -v module="$GO_MODULE" '
+              $1 == "require" && $2 == "(" { block = 1; next }
+              block && $1 == ")" { block = 0; next }
+              $1 == "require" && $2 == module { print $3; exit }
+              block && $1 == module { print $2; exit }'
+          }
+
+          # Succeeds when module version $1 precedes release $2 (vX.Y.Z). A
+          # pre-release or pseudo-version vX.Y.Z-... precedes vX.Y.Z itself.
+          older_than() {
+            local base=${1%%-*}
+            if [ "$base" = "$2" ]; then
+              [ "$1" != "$base" ]
+            else
+              printf '%s\n' "$base" "$2" | sort -V -C
+            fi
+          }
+
+          read -ra dirs <<< "$GO_MODULE_DIRS"
+          pin_file="${dirs[0]}/go.mod"
+          current=$(pinned_version "$pin_file")
+          if [[ ! "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
+            echo "::error file=${pin_file}::cannot read the ${GO_MODULE} version from ${pin_file}"
+            exit 1
+          fi
+          major=${current%%.*}
+          echo "${pin_file} pins ${GO_MODULE} ${current}"
+
+          # Upstream published some old betas and release candidates as full
+          # releases, so filter on the tag format as well as on the flags.
+          if ! tags=$(gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+              --jq '.[] | select((.draft or .prerelease) | not) | .tag_name'); then
+            echo "::error::cannot list the releases of ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          stable=$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<< "$tags" | sort -V || true)
+          latest=$(grep -E "^${major}\." <<< "$stable" | tail -n 1 || true)
+          newest=$(tail -n 1 <<< "$stable")
+          if [ -z "$latest" ]; then
+            echo "::error::${UPSTREAM_REPO} has no stable ${major}.x release"
+            exit 1
+          fi
+          echo "The latest ${major}.x release of ${UPSTREAM_REPO} is ${latest}"
+          if [ "$newest" != "$latest" ]; then
+            echo "::warning::${UPSTREAM_REPO} released ${newest}; a new major version changes the module path, so update to it by hand"
+          fi
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+          echo "version=${latest}" >> "$GITHUB_OUTPUT"
+
+          if ! older_than "$current" "$latest"; then
+            echo "::notice::Go Coraza is up to date: ${pin_file} pins ${current} and the latest ${major}.x release is ${latest}"
+            # shellcheck disable=SC2016 # The backticks are Markdown code spans.
+            printf '### Go Coraza is up to date\n\n`%s` pins `%s`; the latest %s.x release of %s is `%s`.\n' \
+              "$pin_file" "$current" "$major" "$UPSTREAM_REPO" "$latest" >> "$GITHUB_STEP_SUMMARY"
+            echo "newer=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          modules=()
+          for dir in "${dirs[@]}"; do
+            pin=$(pinned_version "${dir}/go.mod")
+            if [ -z "$pin" ]; then
+              echo "::error file=${dir}/go.mod::${dir}/go.mod does not require ${GO_MODULE}"
+              exit 1
+            elif older_than "$pin" "$latest"; then
+              echo "${dir}: ${pin} -> ${latest}"
+              modules+=("$dir")
+            else
+              echo "::warning file=${dir}/go.mod::${dir} pins ${pin}, which is not older than ${latest}; leaving it unchanged"
+            fi
+          done
+          # shellcheck disable=SC2016 # The backticks are Markdown code spans.
+          printf '### Go Coraza %s is available\n\n`%s` pins `%s`. Modules to update: %s.\n' \
+            "$latest" "$pin_file" "$current" "${modules[*]}" >> "$GITHUB_STEP_SUMMARY"
+          echo "modules=${modules[*]}" >> "$GITHUB_OUTPUT"
+          echo "newer=true" >> "$GITHUB_OUTPUT"
+
+      - name: Skip a version that already has a pull request
+        id: existing
+        if: steps.release.outputs.newer == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="${BRANCH_PREFIX}${VERSION}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          if ! pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=all&head=${GITHUB_REPOSITORY_OWNER}:${branch}" \
+              --jq 'first(.[]) | "#\(.number) (\(if .merged_at then "merged" else .state end)) \(.html_url)"'); then
+            echo "::error::cannot list the pull requests from ${branch}"
+            exit 1
+          fi
+          if [ -n "$pr" ]; then
+            echo "::notice::Skipping Go Coraza ${VERSION}: ${branch} already has pull request ${pr}"
+            # shellcheck disable=SC2016 # The backticks are Markdown code spans.
+            printf '### Skipped Go Coraza %s\n\n`%s` already has pull request %s. To retry, reopen it or bump the pin by hand.\n' \
+              "$VERSION" "$branch" "$pr" >> "$GITHUB_STEP_SUMMARY"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Go Coraza ${VERSION} is available and ${branch} has no pull request"
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  bump:
+    name: Bump the pin and check the fixtures
+    needs: check
+    if: needs.check.outputs.bump == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      fixtures: ${{ steps.fixtures.outputs.result }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      MODULES: ${{ needs.check.outputs.modules }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: benchmarks/coraza/go/go.mod
+          cache: false
+
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-suffix: upstream-watch
+
+      - name: Update the Go modules
+        run: |
+          set -euo pipefail
+          # setup-go exports GOTOOLCHAIN=local. Let go fetch the toolchain that
+          # a module or the new release requires instead of failing.
+          export GOTOOLCHAIN=auto GOWORK=off
+          read -ra dirs <<< "$MODULES"
+          for dir in "${dirs[@]}"; do
+            echo "::group::${dir}"
+            (
+              cd "$dir"
+              go get "${GO_MODULE}@${VERSION}"
+              go mod tidy
+              go mod download "${GO_MODULE}@${VERSION}"
+              resolved=$(go list -m -f '{{.Version}}' "$GO_MODULE")
+              if [ "$resolved" != "$VERSION" ]; then
+                echo "::error file=${dir}/go.mod::${dir} resolves ${GO_MODULE} to ${resolved}, not ${VERSION}"
+                exit 1
+              fi
+            )
+            echo "::endgroup::"
+            mkdir -p "$RUNNER_TEMP/upstream-watch/files/${dir}"
+            cp "${dir}/go.mod" "${dir}/go.sum" "$RUNNER_TEMP/upstream-watch/files/${dir}/"
+          done
+          git diff --stat -- "${dirs[@]}"
+
+      - name: Build xtask
+        run: cargo build --locked --package xtask
+
+      - name: Check the vendored Go fixtures
+        id: fixtures
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/upstream-watch/fixtures-check.log"
+          if cargo --quiet --locked xtask go-fixtures-check --require-go > "$log" 2>&1; then
+            result=passed
+          else
+            result=failed
+            echo "::warning::go-fixtures-check failed: the vendored fixtures need a manual refresh for Go Coraza ${VERSION}"
+          fi
+          cat "$log"
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+          printf '### Go Coraza %s: go-fixtures-check %s\n\n~~~text\n%s\n~~~\n' \
+            "$VERSION" "$result" "$(cat "$log")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the update
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-watch
+          path: ${{ runner.temp }}/upstream-watch/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  pull-request:
+    name: Open the pull request
+    needs: [check, bump]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the branch and commit the update to it
+      pull-requests: write # create the label, then open and label the pull request
+    env:
+      BRANCH: ${{ needs.check.outputs.branch }}
+      CURRENT: ${{ needs.check.outputs.current }}
+      VERSION: ${{ needs.check.outputs.version }}
+      MODULES: ${{ needs.check.outputs.modules }}
+      FIXTURES: ${{ needs.bump.outputs.fixtures }}
+    steps:
+      - name: Download the update
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch
+          path: ${{ runner.temp }}/upstream-watch
+
+      - name: Create the label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          labels=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/labels?per_page=100" --jq '.[].name')
+          if grep -qxF "$PR_LABEL" <<< "$labels"; then
+            echo "Label ${PR_LABEL} exists"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/labels" -f name="$PR_LABEL" -f color=0e8a16 \
+              -f description="Automated update to a new upstream release" --silent
+            echo "Created label ${PR_LABEL}"
+          fi
+
+      - name: Commit the update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          read -ra dirs <<< "$MODULES"
+
+          # Commit only the go.mod and go.sum files of the modules that the
+          # check job selected, whatever else the artifact holds.
+          additions='[]'
+          for dir in "${dirs[@]}"; do
+            for name in go.mod go.sum; do
+              additions=$(jq --arg path "${dir}/${name}" \
+                --rawfile contents "$RUNNER_TEMP/upstream-watch/files/${dir}/${name}" \
+                '. + [{path: $path, contents: ($contents | @base64)}]' <<< "$additions")
+            done
+          done
+
+          # Start the branch at the commit the bump job updated. A branch that
+          # an earlier run left without a pull request is reset.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" --silent 2> /dev/null; then
+            echo "::notice::Resetting ${BRANCH}, which an earlier run left without a pull request"
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="$GITHUB_SHA" -F force=true --silent
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" -f sha="$GITHUB_SHA" --silent
+          fi
+
+          {
+            printf 'Update %s from %s to %s with go get\nand go mod tidy in:\n\n' "$GO_MODULE" "$CURRENT" "$VERSION"
+            printf -- '- %s\n' "${dirs[@]}"
+            printf '\nRelease notes: %s/%s/releases/tag/%s\n\n' "$GITHUB_SERVER_URL" "$UPSTREAM_REPO" "$VERSION"
+            echo "Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          } > "$RUNNER_TEMP/commit-body.txt"
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg branch "$BRANCH" --arg head "$GITHUB_SHA" \
+            --arg headline "deps: bump Go Coraza to ${VERSION}" \
+            --rawfile body "$RUNNER_TEMP/commit-body.txt" --argjson additions "$additions" '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                expectedHeadOid: $head,
+                message: {headline: $headline, body: $body},
+                fileChanges: {additions: $additions}
+              }}
+            }' > "$RUNNER_TEMP/commit-request.json"
+          oid=$(gh api graphql --method POST --input "$RUNNER_TEMP/commit-request.json" \
+            --jq '.data.createCommitOnBranch.commit.oid')
+          if [ -z "$oid" ] || [ "$oid" = null ]; then
+            echo "::error::createCommitOnBranch returned no commit for ${BRANCH}"
+            exit 1
+          fi
+          echo "Committed ${oid} to ${BRANCH}"
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          read -ra dirs <<< "$MODULES"
+          log="$RUNNER_TEMP/upstream-watch/fixtures-check.log"
+          body="$RUNNER_TEMP/pr-body.md"
+          # shellcheck disable=SC2016 # The backticks are Markdown code spans.
+          {
+            printf 'Bumps the Go Coraza pin, `%s`, from `%s` to `%s`.\n\n' "$GO_MODULE" "$CURRENT" "$VERSION"
+            printf -- '- Release notes: %s/%s/releases/tag/%s\n' "$GITHUB_SERVER_URL" "$UPSTREAM_REPO" "$VERSION"
+            if [[ "$CURRENT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              printf -- '- Upstream changes: %s/%s/compare/%s...%s\n' \
+                "$GITHUB_SERVER_URL" "$UPSTREAM_REPO" "$CURRENT" "$VERSION"
+            fi
+            printf '\nUpdated with `go get %s@%s && go mod tidy` in:\n\n' "$GO_MODULE" "$VERSION"
+            printf -- '- `%s`\n' "${dirs[@]}"
+            printf '\n## `cargo xtask go-fixtures-check --require-go`: %s\n\n' "$FIXTURES"
+            if [ "$FIXTURES" = passed ]; then
+              printf 'The vendored Go Coraza fixtures match `%s`.\n' "$VERSION"
+            else
+              printf 'The vendored Go Coraza fixtures do not match `%s`, and this workflow does not refresh them. ' "$VERSION"
+              printf 'On this branch, run `cargo xtask go-fixtures-refresh`, review the diff, including '
+              printf '`coraza/coraza.conf-recommended` and the fixture inventory constants, and push the result. '
+              printf 'See the [CI guide](%s/%s/blob/main/docs/ci.md#coraza-harness).\n' \
+                "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY"
+            fi
+            printf '\n~~~text\n'
+            if [ "$(stat -c %s "$log")" -gt 50000 ]; then
+              head -c 50000 "$log"
+              printf '\n[output truncated; the workflow run log has all of it]\n'
+            else
+              cat "$log"
+            fi
+            printf '~~~\n\n---\n\n'
+            printf 'Opened by the [upstream watch workflow](%s/%s/actions/runs/%s). ' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'Pull requests opened with `GITHUB_TOKEN` do not start CI: close and reopen this pull request, '
+            printf 'or push a commit to it, to run the checks.\n'
+          } > "$body"
+
+          jq -n --arg title "deps: bump Go Coraza to ${VERSION}" --arg head "$BRANCH" --rawfile body "$body" \
+            '{title: $title, head: $head, base: "main", body: $body}' > "$RUNNER_TEMP/pr-request.json"
+          if ! pr=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" --input "$RUNNER_TEMP/pr-request.json" \
+              --jq '"\(.number) \(.html_url)"' 2> "$RUNNER_TEMP/pr-error.txt"); then
+            cat "$RUNNER_TEMP/pr-error.txt" >&2
+            if grep -q 'not permitted to create or approve pull requests' "$RUNNER_TEMP/pr-error.txt"; then
+              echo "::error::enable \"Allow GitHub Actions to create and approve pull requests\" in Settings > Actions > General, then re-run this workflow"
+            else
+              echo "::error::cannot open a pull request from ${BRANCH}"
+            fi
+            exit 1
+          fi
+          read -r number url <<< "$pr"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${number}/labels" \
+            -f "labels[]=${PR_LABEL}" --silent
+          echo "::notice::Opened ${url} for Go Coraza ${VERSION} (go-fixtures-check ${FIXTURES})"
+          printf '### Opened %s\n\nGo Coraza %s, go-fixtures-check %s.\n' \
+            "$url" "$VERSION" "$FIXTURES" >> "$GITHUB_STEP_SUMMARY"

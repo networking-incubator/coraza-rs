@@ -164,6 +164,34 @@ by the fixture regeneration command.
 
 - Audits GitHub Actions workflow and action security.
 
+### `Upstream watch`
+
+- Runs every Monday at 06:00 UTC and on `workflow_dispatch`. It compares the
+  `github.com/corazawaf/coraza/v3` version pinned in
+  `benchmarks/coraza/go/go.mod` with the newest stable release of
+  `corazawaf/coraza` in the same major version. If upstream is newer, it runs
+  `go get` and `go mod tidy` in that module and in
+  `coraza/tests/go_profiles/exporter`, whose pin is the one
+  `cargo xtask go-fixtures-check` verifies, then runs
+  `cargo xtask go-fixtures-check --require-go` and opens a pull request from
+  `chore/bump-go-coraza-<version>`, labelled `upstream-sync`, that reports the
+  result.
+- The workflow never refreshes the fixtures. If the check fails, run
+  `cargo xtask go-fixtures-refresh` on the pull request branch, review the diff
+  as described under [`Coraza harness`](#coraza-harness), and push the result.
+- A version is skipped when its branch already has a pull request, open or
+  closed. A new upstream major version changes the module path, so it is only
+  reported as a warning.
+- Pull requests are opened only by runs on `main`; a dispatch from another
+  branch stops after the fixture check. The job that writes runs no repository
+  code: it receives the updated `go.mod` and `go.sum` files from the read-only
+  job as an artifact and commits them through the GitHub API, so GitHub signs
+  the commit.
+- Opening the pull request needs "Allow GitHub Actions to create and approve
+  pull requests" in the repository's Actions settings. CI does not start on a
+  pull request opened with `GITHUB_TOKEN`; close and reopen it, or push a
+  commit to it, to run the checks.
+
 ## Run checks locally
 
 ```console
