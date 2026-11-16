@@ -31,6 +31,10 @@
 //!   [`Incomplete::UnsupportedContentEncoding`] rather than decompressed; Envoy is expected to have decoded it first.
 //! - **Binary file parts are not semantically parsed.** A multipart part that both carries a filename and declares an
 //!   image, audio, video or octet-stream type gets raw-body scanning only.
+//! - **A part with an empty header block hides the type of the part after it.** RFC 2046 allows a part without header
+//!   fields, but multer reads part headers up to the first CRLFCRLF: the next delimiter and part headers become header
+//!   bytes, and that part's body is scanned as the nameless part's value, so a JSON or URL-encoded part there is not
+//!   decoded. The nameless part is reported as [`Incomplete::MalformedBody`].
 //!
 //! Every limit above produces an [`Incomplete`] reason except the first,
 //! whose shape is simply not recognised. Whether an incomplete message is
@@ -1174,7 +1178,10 @@ impl<'de> Visitor<'de> for JsonKeyVisitor<'_> {
 /// Inspection tests for decoded and bounded HTTP inputs.
 mod tests {
     use super::Inspection;
-    use crate::{config::Config, inspect::Incomplete};
+    use crate::{
+        config::{Config, Mode},
+        inspect::Incomplete,
+    };
 
     /// Builds byte-valued HTTP headers for scanner tests.
     fn headers(entries: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
@@ -1922,6 +1929,47 @@ mod tests {
         scan_body(&mut too_many, body, &format);
 
         assert_eq!(too_many.incomplete(), Some(Incomplete::FieldLimit));
+    }
+
+    /// Fails closed on a part with an empty header block.
+    ///
+    /// RFC 2046 allows a part without header fields, but multer reads a part's
+    /// headers up to the first CRLFCRLF. An empty header block therefore swallows
+    /// the next delimiter and part headers, and that part's body is read as the
+    /// nameless part's body without its declared type: the coraza engine had the
+    /// same parser gap. A plain payload is still found; an escaped one is only
+    /// covered by the incomplete verdict, which a blocking direction rejects under
+    /// the default policy.
+    #[test]
+    fn multipart_empty_header_part_is_incomplete_so_block_mode_rejects_it() {
+        let config = Config::default();
+        assert!(config.rejects_incomplete(Mode::Block));
+        let format = Inspection::new(&config).body_format(b"multipart/form-data; boundary=BOUNDARY");
+
+        let plain = b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--BOUNDARY--\r\n";
+        let mut inspection = Inspection::new(&config);
+        scan_body(&mut inspection, plain, &format);
+        assert!(
+            inspection.has_sqli(),
+            "a plain payload after the empty-header part is found"
+        );
+        assert_eq!(inspection.incomplete(), Some(Incomplete::MalformedBody));
+
+        let mut escaped = b"--BOUNDARY\r\n\r\nx\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"q\"\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        escaped.extend_from_slice(br#"{"q":"1\u0020UNION\u0020SELECT\u0020a"}"#);
+        escaped.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+        let mut inspection = Inspection::new(&config);
+        scan_body(&mut inspection, &escaped, &format);
+        assert!(
+            !inspection.has_sqli(),
+            "multer merges the JSON part into the nameless one; if a multer update parses it, \
+             update this test and the documented detection limits"
+        );
+        assert_eq!(
+            inspection.incomplete(),
+            Some(Incomplete::MalformedBody),
+            "the merged body is still reported incomplete, so a blocking direction rejects it"
+        );
     }
 
     /// Keeps parsing the parts that follow an oversized one.
