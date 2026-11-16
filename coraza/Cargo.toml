@@ -79,6 +79,10 @@ required-features = ["async-server"]
 name = "coraza_workload"
 harness = false
 
+[[bench]]
+name = "micro"
+harness = false
+
 # Publish the feature-gated operators in the docs build, which otherwise shows
 # only the default build.
 [package.metadata.docs.rs]
