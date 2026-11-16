@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Refresh and verify the vendored Go Coraza acceptance fixtures.
+//! Refresh and verify the vendored Go Coraza acceptance fixtures and recommended configuration.
 
 #![allow(clippy::missing_docs_in_private_items, reason = "internal xtask implementation")]
 
@@ -33,6 +33,10 @@ const OPERATORS_DIR: &str = "coraza/tests/go_operators";
 const PROFILES_DATA_DIR: &str = "coraza/tests/go_profiles/data";
 const PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles.json";
 const MULTIPHASE_PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles-multiphase.json";
+/// Go Coraza's recommended configuration, vendored verbatim under this name.
+const RECOMMENDED_CONF: &str = "coraza.conf-recommended";
+/// The directory that holds the vendored recommended configuration.
+const RECOMMENDED_CONF_DIR: &str = "coraza";
 const OPERATOR_JSON_FILES: usize = 29;
 const OPERATOR_CASES: usize = 3934;
 const PROFILE_COUNT: usize = 49;
@@ -171,6 +175,10 @@ fn refresh(root: &Path, source: &Source) -> Result<(), String> {
     copy_files(&operator_files, &operators_dir)?;
     copy_files(&operator_data_files, &operator_data_dir)?;
     copy_files(&profile_data_files, &profiles_data_dir)?;
+    copy_files(
+        &[source.module.join(RECOMMENDED_CONF)],
+        &root.join(RECOMMENDED_CONF_DIR),
+    )?;
     remove_stale(&operators_dir, &operator_files, "json")?;
     remove_stale(&operator_data_dir, &operator_data_files, "dat")?;
     remove_stale(&profiles_data_dir, &profile_data_files, "dat")?;
@@ -180,7 +188,7 @@ fn refresh(root: &Path, source: &Source) -> Result<(), String> {
     verify_inventory(root, &operator_files, &source.version)?;
 
     println!(
-        "Refreshed Go Coraza {} fixtures: {} operator files, {} default profiles and {} multiphase profiles; run the harnesses to review parity.",
+        "Refreshed Go Coraza {} fixtures: {} operator files, {} default profiles, {} multiphase profiles and {RECOMMENDED_CONF}; run the harnesses to review parity.",
         source.version,
         operator_files.len(),
         PROFILE_COUNT,
@@ -212,6 +220,12 @@ fn check(root: &Path, source: &Source, provenance: bool) -> Result<(), String> {
         "dat",
         &mut drifted,
     )?;
+    compare_file(
+        root,
+        &source.module.join(RECOMMENDED_CONF),
+        &root.join(RECOMMENDED_CONF_DIR).join(RECOMMENDED_CONF),
+        &mut drifted,
+    )?;
 
     let operator_files = files_with_extension(&root.join(OPERATORS_DIR), "json")?;
     if let Err(error) = verify_inventory(root, &operator_files, &source.version) {
@@ -229,7 +243,7 @@ fn check(root: &Path, source: &Source, provenance: bool) -> Result<(), String> {
         check_provenance(root, &root.join(MULTIPHASE_PROFILES_FILE), true)?;
     }
     println!(
-        "Verified Go Coraza {} fixtures: {} operator files, {} default profiles and {} multiphase profiles.",
+        "Verified Go Coraza {} fixtures: {} operator files, {} default profiles, {} multiphase profiles and {RECOMMENDED_CONF}.",
         source.version, OPERATOR_JSON_FILES, PROFILE_COUNT, MULTIPHASE_PROFILE_COUNT
     );
     Ok(())
@@ -259,6 +273,20 @@ fn compare_trees(
         if source_bytes != destination_bytes {
             drifted.push(format!("{}: modified", relative(root, &destination_path)));
         }
+    }
+    Ok(())
+}
+
+/// Records `destination` as missing or modified unless it holds `source`'s bytes.
+fn compare_file(root: &Path, source: &Path, destination: &Path, drifted: &mut Vec<String>) -> Result<(), String> {
+    let source_bytes = fs::read(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    if !destination.is_file() {
+        drifted.push(format!("{}: missing", relative(root, destination)));
+        return Ok(());
+    }
+    let destination_bytes = fs::read(destination).map_err(|error| format!("{}: {error}", destination.display()))?;
+    if source_bytes != destination_bytes {
+        drifted.push(format!("{}: modified", relative(root, destination)));
     }
     Ok(())
 }

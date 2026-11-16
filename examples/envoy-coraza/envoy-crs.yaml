@@ -95,23 +95,24 @@ static_resources:
                                     "SecResponseBodyAccess Off",
                                     "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:105,phase:4,deny,status:502\""
                                   ],
-                                  "crs": [
+                                  "recommended": [
+                                    "Include @recommended-conf",
                                     "SecRuleEngine On",
-                                    "SecAuditEngine RelevantOnly",
+                                    "SecRule ARGS_POST \"@detectSQLi\" \"id:110,phase:2,deny,status:403\""
+                                  ],
+                                  "crs": [
+                                    "Include @recommended-conf",
+                                    "SecRuleEngine On",
                                     "SecAuditLogFormat JSON",
-                                    "SecRequestBodyAccess On",
-                                    "SecRequestBodyLimit 13107200",
-                                    "SecResponseBodyAccess On",
                                     "SecResponseBodyLimit 1048576",
                                     "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
-                                    "Include crs/rules/*.conf",
-                                    "SecRule REQUEST_HEADERS:Content-Type \"@rx ^application/json(?:\\s*;.*)?$\" \"id:999100,phase:1,pass,nolog,t:none,t:lowercase,ctl:requestBodyProcessor=JSON\""
+                                    "Include crs/rules/*.conf"
                                   ]
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "crs.local": "crs"}
+                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "recommended.local": "recommended", "crs.local": "crs"}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

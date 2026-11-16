@@ -18,8 +18,13 @@ This repository uses GitHub Actions to block risky changes early.
   feature, and runs `make test-envoy-wasm-crs`. It also runs the Envoy lifecycle
   harness against the feature-on artifact via
   `ENVOY_CORAZA_MAKE_TARGET=build-envoy-wasm-crs`; that run adds a `crs.local`
-  policy that includes the embedded tree and asserts a SQL injection request is
-  denied by CRS rule 949110.
+  policy that includes the built-in `@recommended-conf` baseline and the
+  embedded tree, and asserts that SQL injection requests, including one in the
+  field after a multipart part with an empty header block, are denied by CRS
+  rule 949110 and that an unterminated multipart body is denied by baseline rule
+  200002. The default `envoy-wasm` run and this one both check the same
+  multipart cases against a `recommended.local` policy that loads the baseline
+  without the CRS.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
@@ -102,13 +107,17 @@ where downloaded tool integrity is enforced.
   `cargo xtask go-fixtures-refresh`, and review the diff, including the
   `FIXTURE_*` count constants in `coraza/tests/go_operators.rs` and
   `coraza/tests/go_profiles_replay.rs`. This writes both `profiles.json` and
-  `profiles-multiphase.json`; the command needs the pinned module in
-  the Go module cache (`go mod download`). `cargo xtask go-fixtures-check`
-  compares the checked-in operator and profile data bytes with that module and
-  validates the operator and profile inventories against the `OPERATOR_*` and
-  `PROFILE_*` constants: `make test` runs it in lenient mode (it skips without
-  Go), and `make go-harness-check` runs it after its Go tests with
-  `--require-go` so a missing toolchain or a drifted fixture fails there.
+  `profiles-multiphase.json`, and copies the module's `coraza.conf-recommended`
+  to `coraza/coraza.conf-recommended`. Apply any change in that file to
+  `envoy-coraza/recommended.conf` as well: an envoy-coraza test fails until the
+  two copies differ only in the directives that need a filesystem. The command
+  needs the pinned module in the Go module cache (`go mod download`).
+  `cargo xtask go-fixtures-check` compares the checked-in operator and profile
+  data bytes and the recommended configuration with that module and validates
+  the operator and profile inventories against the `OPERATOR_*` and `PROFILE_*`
+  constants: `make test` runs it in lenient mode (it skips without Go), and
+  `make go-harness-check` runs it after its Go tests with `--require-go` so a
+  missing toolchain or a drifted fixture fails there.
 - `cargo xtask go-fixtures-check --provenance` also regenerates
   both profile JSON documents with the matching default and multiphase tags and
   byte-compares them, so a same-inventory edit to rules or expected results

@@ -188,9 +188,8 @@ spec:
                     {
                       "directives_map": {
                         "crs": [
+                          "Include @recommended-conf",
                           "SecRuleEngine On",
-                          "SecRequestBodyAccess On",
-                          "SecRequestBodyLimit 13107200",
                           "Include crs/crs-setup.conf",
                           "Include crs/rules/*.conf"
                         ]

@@ -42,8 +42,9 @@
 //! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`.
 //! * `rule_data` is this connector's additive map of file name to file bytes for the file-based operators and
 //!   `Include`. Names are bounded like the engine's in-memory rule data source: see [`RULE_DATA_LIMITS`]. A non-string
-//!   value is ignored, but its name is still validated. A build with the `embed-crs` feature seeds the fetched CRS tree
-//!   under `crs/`, through the same checks; a configured entry with an embedded file's normalized name wins.
+//!   value is ignored, but its name is still validated. Every build seeds the recommended baseline as
+//!   `@recommended-conf`, and a build with the `embed-crs` feature also seeds the fetched CRS tree under `crs/`,
+//!   through the same checks; a configured entry with a built-in file's normalized name wins.
 //! * `config_gzip_b64` replaces the plain document with that document gzip-compressed and base64-encoded, for a control
 //!   plane that will not carry the plain JSON. Inside that wrapper it is the only accepted top-level key: any other
 //!   key, known or unknown, rejects the document. Its value must be one line of standard padded base64, and the

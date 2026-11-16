@@ -5,6 +5,54 @@ policy generations and enforces them on request and response phases; the
 standalone Envoy harness in [`examples/envoy-coraza`](../examples/envoy-coraza)
 exercises the lifecycle checks.
 
+## Recommended baseline (`@recommended-conf`)
+
+Every build, with or without the CRS, embeds Go Coraza's recommended engine
+configuration as the built-in file `@recommended-conf`, under the name
+coraza-proxy-wasm uses. Load it first in every policy:
+
+```json
+{
+  "directives_map": {
+    "main": [
+      "Include @recommended-conf",
+      "SecRuleEngine On",
+      "SecRule ARGS \"@detectSQLi\" \"id:1000,phase:2,deny,status:403\""
+    ]
+  },
+  "default_directives": "main"
+}
+```
+
+Its rules turn the engine's error flags into blocks. A rule set alone does not:
+the CRS reads none of these flags, so without the baseline a body the engine
+could not parse is neither inspected nor blocked.
+
+| Rule | Effect |
+| --- | --- |
+| 200000, 200001, 200006 | Select the XML and JSON body processors for XML, `application/json` and `+json` content types; without them those bodies are not parsed into `ARGS_POST`. |
+| 200002 | Denies with 400 when the request body processor fails (`REQBODY_ERROR`). |
+| 200003 | Denies with 400 when a multipart body fails strict validation (`MULTIPART_STRICT_ERROR`). |
+| 200004, 200005 | Deny with 400 when arguments were dropped at `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`). |
+| 200009 | Denies with 400 when the request target does not parse (`URI_PARSE_ERROR`). |
+
+The file is [`recommended.conf`](recommended.conf). It is the engine copy,
+[`coraza/coraza.conf-recommended`](../coraza/coraza.conf-recommended), which
+`cargo xtask go-fixtures-check` keeps byte-identical to the pinned Go Coraza
+release, without its `SecRequestBodyInMemoryLimit` and `SecDataDir`: this filter
+has no filesystem and keeps the whole request body in memory. A test fails if the
+two copies differ in anything else. Like upstream, the file also starts the
+engine in `DetectionOnly`, so put `SecRuleEngine On` after the `Include`; the
+filter logs a configure-time warning for a policy left in `DetectionOnly`. It
+also enables request and response body access with upstream's limits and
+`RelevantOnly` audit logging. Override any of those with directives after the
+`Include`.
+
+The `Include` must name the file exactly: it has no `.conf` suffix, so wildcard
+patterns such as `Include **/*.conf` do not select it. A configured `rule_data`
+entry named `@recommended-conf` replaces the built-in file. The file uses one of
+the 1024 `rule_data` file slots and about 12 KiB of the 8 MiB total budget.
+
 ## Embedding the OWASP Core Rule Set
 
 `make build-envoy-wasm-crs` downloads the CRS release pinned in the tracked
@@ -43,15 +91,15 @@ unreviewed content.
 The embedded files live in their own `crs/` namespace, so a policy that already
 includes `rules/*.conf` cannot pick up the CRS by accident. A wildcard-first
 pattern such as `Include **/*.conf` intentionally does match the embedded `crs/`
-namespace. The policy includes the CRS files by name:
+namespace. The policy includes the recommended baseline first, as the CRS
+setup file requires, and then the CRS files by name:
 
 ```json
 {
   "directives_map": {
     "crs": [
+      "Include @recommended-conf",
       "SecRuleEngine On",
-      "SecRequestBodyAccess On",
-      "SecRequestBodyLimit 13107200",
       "Include crs/crs-setup.conf",
       "Include crs/rules/*.conf"
     ]
@@ -59,6 +107,10 @@ namespace. The policy includes the CRS files by name:
   "default_directives": "crs"
 }
 ```
+
+The baseline already sets `SecRequestBodyAccess On` and
+`SecRequestBodyLimit 13107200`. Without it, a request body the engine cannot
+parse reaches the backend uninspected.
 
 A configured `rule_data` entry whose normalized name matches an embedded file
 overrides that file. Without the `embed-crs` feature the same directives work,

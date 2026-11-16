@@ -94,11 +94,16 @@ static_resources:
                                     "SecRuleEngine On",
                                     "SecResponseBodyAccess Off",
                                     "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:105,phase:4,deny,status:502\""
+                                  ],
+                                  "recommended": [
+                                    "Include @recommended-conf",
+                                    "SecRuleEngine On",
+                                    "SecRule ARGS_POST \"@detectSQLi\" \"id:110,phase:2,deny,status:403\""
                                   ]
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off"}
+                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "recommended.local": "recommended"}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

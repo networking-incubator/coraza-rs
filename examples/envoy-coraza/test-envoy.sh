@@ -185,6 +185,23 @@ require_log() {
     fail "Envoy logs did not contain: $expected"
 }
 
+# Waits for the request to `path` to log rule `rule_id`. Rule logs reach stderr as
+# each rule matches, unlike the access log, which Envoy flushes on a timer.
+require_rule_log() {
+    local path=$1
+    local rule_id=$2
+    for _attempt in {1..50}; do
+        # No --quiet: an early exit would SIGPIPE the first grep and, under pipefail,
+        # fail the pipeline whenever more lines for the path follow the match.
+        if envoy_logs | grep --fixed-strings "[uri \"$path\"]" | grep --fixed-strings "[id \"$rule_id\"]" >/dev/null; then
+            return
+        fi
+        sleep 0.1
+    done
+    envoy_logs >"$temp_dir/envoy.log"
+    fail "rule $rule_id did not log for $path"
+}
+
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 if [[ $target_dir != /* ]]; then
     target_dir="$repo_root/$target_dir"
@@ -380,6 +397,14 @@ if grep --quiet --fixed-strings 'LEAK-MARKER' "$temp_dir/response"; then
     fail 'phase-4 denial with body access off leaked upstream response body bytes'
 fi
 
+# A part with an empty header block, then a SQL injection in the next field: the
+# multipart parser used to stop at the empty part, so no rule saw the injection.
+printf '%b' "--X\r\n\r\nx\r\n--X\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--X--\r\n" \
+    >"$temp_dir/empty-header-sqli"
+# A multipart body without its final delimiter, which the engine cannot parse.
+printf '%b' '--X\r\nContent-Disposition: form-data; name="q"\r\n\r\nunterminated' \
+    >"$temp_dir/unterminated-multipart"
+
 if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     before=$(backend_count /crs-sqli)
     status=$(request "$temp_dir/response" --header 'Host: crs.local' \
@@ -405,6 +430,26 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     check_status 403 "$status" 'embedded CRS mixed-case JSON SQLi denial'
     [[ $(backend_count /crs-json-sqli-case) == "$before" ]] \
         || fail 'embedded CRS sent a denied mixed-case JSON request to the backend'
+
+    # The crs policy loads @recommended-conf first: CRS inspects the field after an
+    # empty-header part, and a body the engine cannot parse is denied by 200002.
+    before=$(backend_count /crs-empty-header)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --header 'content-type: multipart/form-data; boundary=X' \
+        --data-binary "@$temp_dir/empty-header-sqli" http://127.0.0.1:10001/crs-empty-header)
+    check_status 403 "$status" 'embedded CRS SQLi after an empty-header multipart part'
+    require_rule_log /crs-empty-header 949110
+    [[ $(backend_count /crs-empty-header) == "$before" ]] \
+        || fail 'embedded CRS sent the field after an empty-header part to the backend'
+
+    before=$(backend_count /crs-unterminated)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --header 'content-type: multipart/form-data; boundary=X' \
+        --data-binary "@$temp_dir/unterminated-multipart" http://127.0.0.1:10001/crs-unterminated)
+    check_status 400 "$status" 'embedded CRS policy denies an unparseable multipart body'
+    require_rule_log /crs-unterminated 200002
+    [[ $(backend_count /crs-unterminated) == "$before" ]] \
+        || fail 'embedded CRS policy sent an unparseable multipart body to the backend'
 fi
 
 # A field-only multipart body must not need a temporary upload directory. This used
@@ -418,6 +463,31 @@ check_status 200 "$status" 'field-only multipart'
 if envoy_logs | grep --quiet --fixed-strings 'not supported by WASI yet'; then
     fail 'field-only multipart aborted in the WASI temporary-directory path'
 fi
+
+# Every build embeds @recommended-conf, which the recommended.local policy loads
+# before its own SQLi rule.
+before=$(backend_count /recommended-empty-header)
+status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
+    --header 'content-type: multipart/form-data; boundary=X' \
+    --data-binary "@$temp_dir/empty-header-sqli" http://127.0.0.1:10001/recommended-empty-header)
+check_status 403 "$status" 'SQLi after an empty-header multipart part'
+require_rule_log /recommended-empty-header 110
+[[ $(backend_count /recommended-empty-header) == "$before" ]] \
+    || fail 'the field after an empty-header multipart part reached the backend'
+
+before=$(backend_count /recommended-unterminated)
+status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
+    --header 'content-type: multipart/form-data; boundary=X' \
+    --data-binary "@$temp_dir/unterminated-multipart" http://127.0.0.1:10001/recommended-unterminated)
+check_status 400 "$status" 'recommended baseline denies an unparseable multipart body'
+require_rule_log /recommended-unterminated 200002
+[[ $(backend_count /recommended-unterminated) == "$before" ]] \
+    || fail 'an unparseable multipart body reached the backend'
+
+status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
+    --header 'content-type: multipart/form-data; boundary=X' \
+    --data-binary "@$temp_dir/multipart-field" http://127.0.0.1:10001/recommended-benign)
+check_status 200 "$status" 'recommended baseline passes a well-formed multipart body'
 
 envoy_logs >"$temp_dir/envoy.log"
 grep --quiet --fixed-strings 'test blocked' "$temp_dir/envoy.log" \
