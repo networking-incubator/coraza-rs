@@ -52,8 +52,9 @@ impl CompiledRx {
     /// Compile a pattern, enabling multiline and dotall behavior.
     fn new(pattern: &str) -> Result<Self, regex::Error> {
         if spells_non_utf8_bytes(pattern) {
-            let pattern = unbrace_byte_escapes(pattern);
-            regex::bytes::RegexBuilder::new(&format!("(?sm){pattern}"))
+            // Byte-path Latin-1 folding under `(?i)` is not implemented.
+            let pattern = unbrace_byte_escapes(&ascii_perl_classes(pattern));
+            regex::bytes::RegexBuilder::new(&pattern)
                 .unicode(false)
                 .build()
                 .map(Self::Bytes)
@@ -132,6 +133,8 @@ fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
             if let Some(escaped) = rest.get(length..).and_then(|tail| tail.chars().next()) {
                 let escaped_length = escaped.len_utf8();
                 match escaped {
+                    '<' => result.push_str(r"\x3c"),
+                    '>' => result.push_str(r"\x3e"),
                     'b' | 'B' => {
                         result.push_str("(?-u:\\");
                         result.push(escaped);
@@ -151,7 +154,7 @@ fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
                         result.push(escaped);
                     },
                 }
-                changed |= matches!(escaped, 'b' | 'B' | 'w' | 'W' | 'd' | 'D' | 's' | 'S');
+                changed |= matches!(escaped, '<' | '>' | 'b' | 'B' | 'w' | 'W' | 'd' | 'D' | 's' | 'S');
                 offset += length + escaped_length;
                 continue;
             }
@@ -261,6 +264,8 @@ fn rewrite_class(class: &str) -> Option<String> {
                 continue;
             };
             let replacement = match escaped {
+                '<' => Some(r"\x3c"),
+                '>' => Some(r"\x3e"),
                 'w' => Some("[0-9A-Za-z_]"),
                 'W' => Some("[^0-9A-Za-z_]"),
                 'd' => Some("[0-9]"),
@@ -733,9 +738,33 @@ mod tests {
         let tx = Transaction::new("operator-test");
         let mut out = Outputs::default();
         assert!(rx(r"\xff").unwrap().evaluate(&tx, b"\xff", &mut out));
-        assert!(rx(r"\xff.*end").unwrap().evaluate(&tx, b"\xff\nend", &mut out));
+        // Go's binaryregexp compiles the byte pattern raw, so dot does not cross a newline.
+        assert!(!rx(r"\xff.*end").unwrap().evaluate(&tx, b"\xff\nend", &mut out));
         assert!(!rx(r"\xff").unwrap().evaluate(&tx, "\u{00ff}".as_bytes(), &mut out));
         assert!(rx(r"\\xff").unwrap().evaluate(&tx, br"\xff", &mut out));
+    }
+
+    #[test]
+    fn escaped_angle_brackets_are_literals_like_go() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        assert!(matches(r"\<\?php", b"<?php system('id');"));
+        assert!(matches(r"=\>", b"x=>y"));
+        assert!(!matches(r"\<script", b"script"));
+        assert!(matches(r"\<script", b"<script"));
+        assert!(matches(r"[\<\>]", b"<"));
+        assert!(matches(r"[\<\>]", b">"));
+    }
+
+    #[test]
+    fn byte_regexes_use_go_classes_and_default_flags() {
+        let tx = Transaction::new("operator-test");
+        let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
+
+        assert!(matches(r"\xff\S", b"\xff\x0b"), "Go's \\S includes vertical tab");
+        assert!(!matches(r"\xff.b", b"\xff\nb"));
+        assert!(matches(r"\xff[a&&b]", b"\xff&"));
     }
 
     #[test]
