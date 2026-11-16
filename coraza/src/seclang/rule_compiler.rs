@@ -80,7 +80,7 @@ pub(crate) fn compile_sec_rule_in(
         .map_err(|error| CompileError::new(format!("failed to parse variables '{vars}': {error}")))?;
 
     // Parse operator
-    let rule_operator = parse_operator_in(operator, context)
+    let rule_operator = parse_operator_in(operator.as_ref(), context)
         .map_err(|error| CompileError::new(format!("failed to parse operator '{operator}': {error}")))?;
 
     // Parse actions (none if empty)
@@ -359,8 +359,8 @@ fn remove_matching_quotes(input: &str) -> &str {
 struct RuleArguments<'a> {
     /// Variables to inspect, before the operator and its argument.
     variables: &'a str,
-    /// Between the quotes, escapes kept
-    operator: &'a str,
+    /// Between the quotes, with escaped double quotes unescaped.
+    operator: Cow<'a, str>,
     /// Between the quotes; empty without actions
     actions: &'a str,
 }
@@ -387,6 +387,11 @@ impl<'a> RuleArguments<'a> {
                 .strip_prefix('"')
                 .and_then(|rest| rest.strip_suffix('"'))
                 .ok_or_else(|| invalid("actions"))?,
+        };
+        let operator = if operator.contains("\\\"") {
+            Cow::Owned(operator.replace("\\\"", "\""))
+        } else {
+            Cow::Borrowed(operator)
         };
 
         Ok(Self {
@@ -425,8 +430,8 @@ mod tests {
     use super::*;
 
     /// `(variables, operator, actions)` of `data`.
-    fn split(data: &str) -> CompileResult<(&str, &str, &str)> {
-        RuleArguments::parse(data).map(|args| (args.variables, args.operator, args.actions))
+    fn split(data: &str) -> CompileResult<(&str, String, &str)> {
+        RuleArguments::parse(data).map(|args| (args.variables, args.operator.into_owned(), args.actions))
     }
 
     #[test]
@@ -447,16 +452,16 @@ mod tests {
     fn test_split_rule_arguments() {
         assert_eq!(
             split("ARGS \"@rx attack\" \"id:1,deny\""),
-            Ok(("ARGS", "@rx attack", "id:1,deny"))
+            Ok(("ARGS", "@rx attack".to_owned(), "id:1,deny"))
         );
-        assert_eq!(split("ARGS \"@rx attack\""), Ok(("ARGS", "@rx attack", "")));
+        assert_eq!(split("ARGS \"@rx attack\""), Ok(("ARGS", "@rx attack".to_owned(), "")));
         assert_eq!(
             split("ARGS \"@rx \\\"quoted\\\"\" \"id:1\""),
-            Ok(("ARGS", "@rx \\\"quoted\\\"", "id:1"))
+            Ok(("ARGS", "@rx \"quoted\"".to_owned(), "id:1"))
         );
         assert_eq!(
             split("ARGS|REQUEST_HEADERS  \t\"@rx attack\"\t\"id:1\""),
-            Ok(("ARGS|REQUEST_HEADERS", "@rx attack", "id:1"))
+            Ok(("ARGS|REQUEST_HEADERS", "@rx attack".to_owned(), "id:1"))
         );
     }
 
