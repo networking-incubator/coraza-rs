@@ -48,10 +48,12 @@ also enables request and response body access with upstream's limits and
 `RelevantOnly` audit logging. Override any of those with directives after the
 `Include`.
 
-The `Include` must name the file exactly: it has no `.conf` suffix, so wildcard
-patterns such as `Include **/*.conf` do not select it. A configured `rule_data`
-entry named `@recommended-conf` replaces the built-in file. The file uses one of
-the 1024 `rule_data` file slots and about 12 KiB of the 8 MiB total budget.
+The `Include` must name the file exactly: no wildcard pattern selects it, not
+even a bare `Include *`, so a wildcard after `SecRuleEngine On` cannot load its
+`SecRuleEngine DetectionOnly`. A configured `rule_data` entry named
+`@recommended-conf` replaces the built-in file, and wildcards match that entry
+like any other configured file. The file uses one of the 1024 `rule_data` file
+slots and about 12 KiB of the 8 MiB total budget.
 
 ## Embedding the OWASP Core Rule Set
 

@@ -53,8 +53,9 @@ pub(crate) mod embedded_crs {
 
 /// The name `Include` resolves to the built-in recommended baseline, in every build.
 ///
-/// It is coraza-proxy-wasm's name for the same file. With no `.conf` suffix, a
-/// wildcard include such as `Include **/*.conf` cannot pick it up by accident.
+/// It is coraza-proxy-wasm's name for the same file. Like every built-in `@` file,
+/// it loads only through an `Include` that names it: no wildcard selects it, not
+/// even a bare `Include *` (see [`CountingRuleData::glob`]).
 const RECOMMENDED_CONF_NAME: &str = "@recommended-conf";
 
 /// Go Coraza's `coraza.conf-recommended` without the directives that need a
@@ -66,10 +67,13 @@ const RECOMMENDED_CONF: &[u8] = include_bytes!("../recommended.conf");
 ///
 /// Every file goes through the same name and size checks as a configured
 /// `rule_data` entry, so the built-in set cannot exceed the documented bounds.
-fn builtin_rule_data(mut rule_data: BTreeMap<String, Vec<u8>>) -> Result<BTreeMap<String, Vec<u8>>, CompileError> {
+/// Returns the names of the added `@` files, which globs must leave out; a
+/// configured entry that replaces one is not built in and globs list it as before.
+fn builtin_rule_data(rule_data: &mut BTreeMap<String, Vec<u8>>) -> Result<Vec<String>, CompileError> {
     let mut total = rule_data.values().map(Vec::len).sum();
     let mut configured: std::collections::BTreeSet<String> =
         rule_data.keys().map(|name| normalize_rule_data_name(name)).collect();
+    let mut unlisted = Vec::new();
     let builtins = std::iter::once((RECOMMENDED_CONF_NAME, RECOMMENDED_CONF));
     #[cfg(feature = "embed-crs")]
     let builtins = builtins.chain(embedded_crs::EMBEDDED_CRS.iter().copied());
@@ -79,14 +83,15 @@ fn builtin_rule_data(mut rule_data: BTreeMap<String, Vec<u8>>) -> Result<BTreeMa
         if configured.contains(&normalized) {
             continue;
         }
-        add_rule_data(&mut rule_data, &mut total, name, bytes, RULE_DATA_LIMITS).map_err(|error| {
-            CompileError::Limit {
-                limit: format!("rule data bound: {error}"),
-            }
+        add_rule_data(rule_data, &mut total, name, bytes, RULE_DATA_LIMITS).map_err(|error| CompileError::Limit {
+            limit: format!("rule data bound: {error}"),
         })?;
+        if normalized.starts_with('@') {
+            unlisted.push(normalized.clone());
+        }
         configured.insert(normalized);
     }
-    Ok(rule_data)
+    Ok(unlisted)
 }
 
 /// Most policies one generation may hold.
@@ -149,11 +154,13 @@ const COMPILE_LIMITS: CompileLimits = CompileLimits {
 ///
 /// It delegates storage to [`Memory`] and stops the generation once more than
 /// its budget has been read, so repeated `Include`s cannot multiply the work a
-/// small configuration asks for.
+/// small configuration asks for. Its globs leave out the built-in `@` files.
 #[derive(Debug)]
 struct CountingRuleData {
     /// The storage every policy reads.
     memory: Memory,
+    /// Built-in `@` names that globs leave out: only an `Include` that names one reads it.
+    unlisted: Vec<String>,
     /// Bytes read so far in this generation.
     read: AtomicUsize,
     /// Most bytes one generation may read.
@@ -161,10 +168,11 @@ struct CountingRuleData {
 }
 
 impl CountingRuleData {
-    /// Wraps `memory` with a per-generation read budget.
-    fn new(memory: Memory, budget: usize) -> Self {
+    /// Wraps `memory` with a per-generation read budget; globs never return `unlisted`.
+    fn new(memory: Memory, unlisted: Vec<String>, budget: usize) -> Self {
         Self {
             memory,
+            unlisted,
             read: AtomicUsize::new(0),
             budget,
         }
@@ -190,8 +198,16 @@ impl RuleData for CountingRuleData {
         Ok(bytes)
     }
 
+    /// Expands `pattern` without the built-in `@` files.
+    ///
+    /// `@recommended-conf` starts the engine in `DetectionOnly`, so a wildcard that
+    /// matched it, such as `Include *` after `SecRuleEngine On`, would load the
+    /// policy with only a warning and stop it blocking. coraza-proxy-wasm resolves
+    /// its `@` names only by exact name too: its directory listing omits them.
     fn glob(&self, pattern: &str) -> io::Result<Vec<std::path::PathBuf>> {
-        self.memory.glob(pattern)
+        let mut paths = self.memory.glob(pattern)?;
+        paths.retain(|path| !self.unlisted.iter().any(|name| path.as_path() == Path::new(name)));
+        Ok(paths)
     }
 
     fn as_file_system(&self) -> Option<&FileSystem> {
@@ -505,9 +521,9 @@ impl Generation {
             default_directives,
             per_authority_directives,
             enable_filter_state_logs,
-            rule_data,
+            mut rule_data,
         } = config;
-        let rule_data = builtin_rule_data(rule_data)?;
+        let unlisted = builtin_rule_data(&mut rule_data)?;
         let diagnostics = Arc::new(Diagnostics::default());
         let mut warnings = Vec::new();
         if directives_map.is_empty() {
@@ -521,6 +537,7 @@ impl Generation {
         }
         let source: Arc<dyn RuleData> = Arc::new(CountingRuleData::new(
             Memory::new(rule_data),
+            unlisted,
             limits.rule_data_read_bytes,
         ));
         let compiler = PolicyCompiler {
@@ -679,9 +696,14 @@ fn check_limits(config: &Config, limits: CompileLimits) -> Result<(), CompileErr
 )]
 /// Generation compilation and selection tests.
 mod tests {
+    use std::path::PathBuf;
+
+    use coraza::rule_data::{Memory, RuleData as _};
+
     use super::{
-        check_limits, truncate_message, CompileError, CompileLimits, Generation, COMPILE_LIMITS, MAX_POLICIES,
-        MAX_REQUEST_BODY_LIMIT, MAX_RESPONSE_BODY_LIMIT, MAX_RULES_PER_GENERATION, MAX_RULES_PER_POLICY,
+        builtin_rule_data, check_limits, truncate_message, CompileError, CompileLimits, CountingRuleData, Generation,
+        COMPILE_LIMITS, MAX_POLICIES, MAX_REQUEST_BODY_LIMIT, MAX_RESPONSE_BODY_LIMIT, MAX_RULES_PER_GENERATION,
+        MAX_RULES_PER_POLICY,
     };
     use crate::config::Config;
 
@@ -1169,6 +1191,77 @@ mod tests {
                 "without the feature there is no CRS to match: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_bare_wildcard_include_keeps_an_enforced_policy_blocking() {
+        // `*` matches every root-level name, and the built-in baseline has one. Its
+        // `SecRuleEngine DetectionOnly` would override the `SecRuleEngine On` before the
+        // `Include`, so the policy would load with only a warning and stop blocking.
+        let config = |directives: &[&str]| {
+            serde_json::json!({
+                "directives_map": {"p": directives},
+                "default_directives": "p",
+                "rule_data": {
+                    "rules.conf": "SecRule REQUEST_URI \"@contains attack\" \"id:7,phase:1,deny,status:403\""
+                }
+            })
+            .to_string()
+        };
+        #[cfg(not(feature = "embed-crs"))]
+        {
+            let generation = parse_generation(&config(&["SecRuleEngine On", "Include *"]));
+            assert_eq!(
+                generation.select("example.com").unwrap().waf.config().rule_engine,
+                super::RuleEngineStatus::On,
+                "the wildcard must not load the baseline's DetectionOnly"
+            );
+            assert!(
+                !generation.warnings().any(|warning| warning.contains("DetectionOnly")),
+                "warnings were {:?}",
+                generation.warnings().collect::<Vec<_>>()
+            );
+            assert_eq!(interruption(&generation, "/attack", None, b""), Some((7, 403)));
+
+            // Naming the baseline still loads it, and the wildcard after it does not load
+            // it again, which would also fail on its duplicate rule ids.
+            let generation = parse_generation(&config(&["Include @recommended-conf", "SecRuleEngine On", "Include *"]));
+            assert_eq!(interruption(&generation, "/attack", None, b""), Some((7, 403)));
+            assert_eq!(
+                interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
+                Some((200_002, 400)),
+                "the named baseline blocks a body that does not parse"
+            );
+        }
+        #[cfg(feature = "embed-crs")]
+        {
+            // `*` also matches the embedded `crs/` directory, which an `Include` cannot
+            // read, so this build rejects the policy instead of loading it.
+            let error = compile_error(&config(&["SecRuleEngine On", "Include *"]));
+            assert!(error.contains("failed to read file 'crs'"), "message was {error:?}");
+        }
+    }
+
+    #[test]
+    fn globs_leave_out_the_built_in_baseline_but_its_exact_name_reads() {
+        // The source a generation reads when the configuration holds one file, `name`.
+        let source = |name: &str| {
+            let mut rule_data = std::collections::BTreeMap::from([(name.to_owned(), b"SecRuleEngine On".to_vec())]);
+            let unlisted = builtin_rule_data(&mut rule_data).unwrap();
+            CountingRuleData::new(Memory::new(rule_data), unlisted, COMPILE_LIMITS.rule_data_read_bytes)
+        };
+        let baseline = PathBuf::from("@recommended-conf");
+
+        let built_in = source("rules.conf");
+        for pattern in ["*", "**/*", "@*", "*conf"] {
+            let matches = built_in.glob(pattern).unwrap();
+            assert!(!matches.contains(&baseline), "{pattern} matched {matches:?}");
+        }
+        assert!(built_in.glob("*").unwrap().contains(&PathBuf::from("rules.conf")));
+        assert_eq!(built_in.read(&baseline).unwrap(), super::RECOMMENDED_CONF);
+
+        // A configured replacement is not built in, so globs list it like any other entry.
+        assert_eq!(source("@recommended-conf").glob("@*").unwrap(), [baseline]);
     }
 
     #[cfg(feature = "embed-crs")]
