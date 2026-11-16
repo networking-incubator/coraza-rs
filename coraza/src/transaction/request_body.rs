@@ -1855,6 +1855,50 @@ mod multipart_tests {
         assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(403));
     }
 
+    /// The field after an empty-header part, which a rule must still inspect.
+    const SQLI_FIELD: &[u8] = b"1' UNION SELECT password FROM users--";
+
+    /// Rules that deny a SQL injection in any multipart field.
+    const SQLI_RULES: &str = "SecRequestBodyAccess On\n\
+                              SecRule ARGS_POST \"@detectSQLi\" \"id:1,phase:2,deny,status:403\"";
+
+    #[test]
+    fn an_empty_header_part_does_not_hide_the_fields_after_it() {
+        // RFC 2046 allows a part with no header fields. Go Coraza publishes it as the
+        // nameless field `ARGS_POST[""]` and inspects every part after it. Rejecting
+        // it as malformed used to stop parsing there, so `q` was never inspected and
+        // a policy without a rule on the error flags let the injection through.
+        let body = b"--b\r\n\r\nx\r\n--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--b--\r\n";
+        let tx = process_with_rules(body, SQLI_RULES);
+
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.args_post.first(b""), Some(&b"x"[..]));
+        assert_eq!(tx.args_post.first(b"q"), Some(SQLI_FIELD));
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((1, 403))
+        );
+    }
+
+    #[test]
+    fn an_empty_header_part_in_lf_mode_does_not_hide_the_fields_after_it() {
+        // The same shape with bare LF line endings, as the mutation campaign sent it.
+        let body = b"--b\n\nMARK1 headerless\n--b\nContent-Disposition: form-data; name=\"q\"\n\n1' UNION SELECT password FROM users--\n--b--\n";
+        let tx = process_with_rules(body, SQLI_RULES);
+
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.args_post.first(b""), Some(&b"MARK1 headerless"[..]));
+        assert_eq!(tx.args_post.first(b"q"), Some(SQLI_FIELD));
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((1, 403))
+        );
+    }
+
     #[test]
     fn upload_directory_follows_the_platform() {
         #[cfg(target_os = "wasi")]

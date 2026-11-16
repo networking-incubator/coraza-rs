@@ -946,6 +946,17 @@ fn unquote(value: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Returns a tuple of (`position`, `separator_length`), or `None` if not found.
 fn find_header_end(data: &[u8]) -> Option<(usize, usize)> {
+    // A part whose first line is blank has an empty header block. RFC 2046 lets a body
+    // part carry no header fields, and Go's `textproto.ReadMIMEHeader` returns an empty
+    // header for it, so `NextPart` publishes the part and keeps reading. That blank
+    // line is the whole separator: the part data starts right after it. Without this
+    // case the part was rejected as malformed and every later part went uninspected.
+    if data.starts_with(b"\r\n") {
+        return Some((0, 2));
+    }
+    if data.starts_with(b"\n") {
+        return Some((0, 1));
+    }
     // The first blank physical line ends the headers, so scan left to right: searching
     // for `\r\n\r\n` first would pick a later one inside a body whose headers ended
     // with a bare `\n\n` and start the part data past the real separator.
@@ -1440,6 +1451,104 @@ DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
         assert_eq!(find_header_end(b"X: y\r\n\nATTACK"), Some((4, 3)));
         assert_eq!(find_header_end(b"X: y\n\r\nATTACK"), Some((4, 3)));
         assert_eq!(find_header_end(b"X: y\r\n"), None);
+        // A leading blank line is an empty header block, as Go's `ReadMIMEHeader`
+        // reads it, and that one line is the whole separator: a second blank line
+        // after it is part data, not more of the separator.
+        assert_eq!(find_header_end(b"\r\nATTACK"), Some((0, 2)));
+        assert_eq!(find_header_end(b"\nATTACK"), Some((0, 1)));
+        assert_eq!(find_header_end(b"\r\n\r\nATTACK"), Some((0, 2)));
+        assert_eq!(find_header_end(b"\n\r\nATTACK"), Some((0, 1)));
+        assert_eq!(find_header_end(b"\r\n"), Some((0, 2)));
+        assert_eq!(find_header_end(b"\r"), None);
+        assert_eq!(find_header_end(b""), None);
+    }
+
+    #[test]
+    fn a_part_with_an_empty_header_block_does_not_stop_parsing() {
+        // RFC 2046 allows a body part without header fields. Go's `NextPart` returns
+        // it with an empty header and reads on, so the field after it must still be
+        // parsed: dropping it hid the SQL injection in `q` from every rule.
+        let body = b"--XyZ\r\n\
+\r\n\
+x\r\n\
+--XyZ\r\n\
+Content-Disposition: form-data; name=\"q\"\r\n\
+\r\n\
+1' UNION SELECT password FROM users--\r\n\
+--XyZ--\r\n";
+
+        let parts = MultipartParser::new("XyZ", body).parse_ok().unwrap();
+
+        assert_eq!(parts.len(), 2);
+        let empty = parts.first().unwrap();
+        assert!(empty.headers.is_empty());
+        assert!(empty.name.is_empty());
+        assert_eq!(empty.data, b"x");
+        let field = parts.get(1).unwrap();
+        assert_eq!(field.name, b"q");
+        assert_eq!(field.data, b"1' UNION SELECT password FROM users--");
+    }
+
+    #[test]
+    fn an_empty_header_block_in_lf_mode_keeps_its_content_as_data() {
+        // The LF-mode shape used to end the header block at the later `\n\r\n`, so
+        // the content line was silently dropped with the headers. Go reads the
+        // leading blank line as the empty header block, so the line is part data and
+        // the CR before the delimiter stays in it.
+        let body = b"--XyZ\n\nMARK1 headers\n\r\n--XyZ--";
+
+        let parts = MultipartParser::new("XyZ", body).parse_ok().unwrap();
+
+        assert_eq!(parts.len(), 1);
+        let part = parts.first().unwrap();
+        assert!(part.headers.is_empty());
+        assert!(part.name.is_empty());
+        assert_eq!(part.data, b"MARK1 headers\n\r");
+    }
+
+    #[test]
+    fn an_empty_header_block_is_not_followed_by_headers() {
+        // Header-looking lines after the empty header block are part data, as in Go:
+        // only the first blank line ends a part's headers.
+        let body = b"--b\r\n\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b--\r\n";
+
+        let parts = MultipartParser::new("b", body).parse_ok().unwrap();
+
+        assert_eq!(parts.len(), 1);
+        let part = parts.first().unwrap();
+        assert!(part.headers.is_empty());
+        assert!(part.name.is_empty());
+        assert_eq!(part.data, b"Content-Disposition: form-data; name=\"a\"\r\n\r\nv");
+    }
+
+    #[test]
+    fn an_empty_header_block_with_an_empty_body_is_one_empty_part() {
+        // The blank line is the header terminator, and the line ending before the
+        // closing delimiter is the same one, as in Go's `scanUntilBoundary` with no
+        // bytes read yet.
+        let parts = MultipartParser::new("b", b"--b\r\n\r\n--b--\r\n").parse_ok().unwrap();
+
+        assert_eq!(parts.len(), 1);
+        let part = parts.first().unwrap();
+        assert!(part.headers.is_empty());
+        assert!(part.data.is_empty());
+    }
+
+    #[test]
+    fn a_cut_empty_header_part_is_kept() {
+        // A body limit that cuts a part after its empty header block keeps the part
+        // read so far, as Go's processor publishes the field before it stops.
+        let (parts, error) = MultipartParser::new("b", b"--b\r\n\r\npartial").truncated(true).parse();
+        assert!(error.is_none());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"partial");
+
+        // Without the limit the same body is incomplete: the part is still kept, and
+        // the missing final boundary is reported after it.
+        let (parts, error) = MultipartParser::new("b", b"--b\r\n\r\npartial").parse();
+        assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.first().unwrap().data, b"partial");
     }
 
     #[test]
