@@ -2041,14 +2041,38 @@ mod tests {
             }),
         );
         parser
-            .from_string("SecRule ARGS:q \"@equals yes\" \"id:1,phase:1,pass\"")
+            .from_string(r#"SecRule ARGS:q "@equals a\"b" "id:1,phase:1,pass""#)
             .unwrap();
         let waf = parser.compile().unwrap();
         let mut tx = waf.new_transaction_with_id("custom-operator");
-        tx.add_get_argument("q", "yes");
+        tx.add_get_argument("q", "a\"b");
         tx.process_request_headers();
 
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 1));
+    }
+
+    #[test]
+    fn escaped_quotes_in_operator_arguments_match_literal_quotes() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                r#"SecRule ARGS:q "@contains a\"b" "id:1,phase:1,pass"
+SecRule ARGS:q "@streq \"q\"" "id:2,phase:1,pass"
+SecRule ARGS:q "@rx \"q\"" "id:3,phase:1,pass""#,
+            )
+            .unwrap();
+        let waf = parser.compile().unwrap();
+
+        let mut contains = waf.new_transaction_with_id("operator-contains-escaped-quote");
+        contains.add_get_argument("q", "a\"b");
+        contains.process_request_headers();
+        assert!(contains.matched_rules().iter().any(|matched| matched.rule.id == 1));
+
+        let mut quoted = waf.new_transaction_with_id("operator-streq-rx-escaped-quotes");
+        quoted.add_get_argument("q", "\"q\"");
+        quoted.process_request_headers();
+        assert!(quoted.matched_rules().iter().any(|matched| matched.rule.id == 2));
+        assert!(quoted.matched_rules().iter().any(|matched| matched.rule.id == 3));
     }
 
     #[test]
