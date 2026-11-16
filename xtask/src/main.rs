@@ -26,6 +26,7 @@
 
 mod conformance;
 mod corpus;
+mod envoy_contract;
 mod go_fixtures;
 mod lint_license;
 mod tables;
@@ -67,6 +68,12 @@ enum Command {
     ConformanceCheck,
     /// Regenerate the conformance capability manifest from source and overrides.
     ConformanceRefresh,
+    /// Verify the pinned Envoy Coraza contract manifest and fixture hashes.
+    EnvoyContractCheck,
+    /// Record one host's normalized outcomes for the Envoy Coraza contract.
+    EnvoyContractRecord(envoy_contract::RecordArgs),
+    /// Compare recorded Envoy Coraza outcomes and write mismatch cases.
+    EnvoyContractCompare(envoy_contract::CompareArgs),
 }
 
 // -----------------------------------------------------------------------------
@@ -86,5 +93,8 @@ fn main() {
         Command::TablesRefresh(args) => tables::refresh_or_exit(&args),
         Command::ConformanceCheck => conformance::check_or_exit(),
         Command::ConformanceRefresh => conformance::refresh_or_exit(),
+        Command::EnvoyContractCheck => envoy_contract::check_or_exit(),
+        Command::EnvoyContractRecord(args) => envoy_contract::record_or_exit(&args),
+        Command::EnvoyContractCompare(args) => envoy_contract::compare_or_exit(&args),
     }
 }

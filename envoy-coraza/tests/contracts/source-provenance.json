@@ -1,0 +1,712 @@
+{
+  "schema_version": 1,
+  "description": "Exact per-file content digests for the rules embedded at the pinned connector commits. License is populated only when declared in that file; a pinned connector tree is not treated as proof of each asset's original source or license.",
+  "references": {
+    "upstream": {
+      "source_commit": "b1770f5b0be397bd4ddc2c976ab6548a7a1eeb7f",
+      "source_kind": "clean_git_checkout",
+      "embedded_source": "wasmplugin/fs.go: //go:embed rules",
+      "embedded_root": "wasmplugin/rules",
+      "embedded_rules_tree_sha256": "d1722cae3744e9b9de88ec8602c8ea467e149cace66d14ec1ef6cd69b56a1aa6",
+      "crs_root": "wasmplugin/rules/crs",
+      "crs_version": "4.14.0",
+      "crs_version_evidence": "wasmplugin/rules/crs-setup.conf.example:2",
+      "crs_tree_sha256": "bb3ad6265806b1a49c7b8f88bf4f3fce14b6504222e1387ae7229be625f3a8a9",
+      "tree_hash_method": "SHA-256 over each tree's sorted, LF-terminated UTF-8 records '<file SHA-256>  <path relative to that tree root>\\n'; file hashes cover exact bytes",
+      "explicit_license_file_count": 28,
+      "unverified_license_file_count": 22,
+      "unverified_license_files": [
+        "coraza-demo.conf",
+        "coraza.conf-recommended.conf",
+        "crs/iis-errors.data",
+        "crs/java-classes.data",
+        "crs/java-errors.data",
+        "crs/lfi-os-files.data",
+        "crs/php-config-directives.data",
+        "crs/php-errors-pl2.data",
+        "crs/php-errors.data",
+        "crs/php-function-names-933150.data",
+        "crs/php-function-names-933151.data",
+        "crs/php-variables.data",
+        "crs/restricted-files.data",
+        "crs/restricted-upload.data",
+        "crs/scanners-user-agents.data",
+        "crs/sql-errors.data",
+        "crs/ssrf.data",
+        "crs/unix-shell.data",
+        "crs/web-shells-asp.data",
+        "crs/web-shells-php.data",
+        "crs/windows-powershell-commands.data",
+        "ftw-config.conf"
+      ],
+      "files": [
+        {
+          "path": "coraza-demo.conf",
+          "sha256": "fdca7a042c14691a725ea062fbc57b5bec40cd582f0eca4cb48bdaea09828961",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "coraza.conf-recommended.conf",
+          "sha256": "526c0fe91e67c3ac0d845916bdbf660c610d2a107f0f28cdbd77153f2e3a128b",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf.example",
+          "sha256": "8ceb41dca9bd22109093f2ffda5afb67172d26950b62124525f8f7bac7a06830",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-901-INITIALIZATION.conf",
+          "sha256": "7d35b35a050cebd95fb407c4f8d795f6a76e6e57ea60a432cad7cad3b044e5bc",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-905-COMMON-EXCEPTIONS.conf",
+          "sha256": "2e9a7f06588d034ba8fc211c100827dda0bef3230b69861687a276aa067ac1d7",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-911-METHOD-ENFORCEMENT.conf",
+          "sha256": "162ddfa877018ded556f4b6f5331d2450ecc86107bfa60212cab4b95a319327f",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-913-SCANNER-DETECTION.conf",
+          "sha256": "9baf006a478a63393e0f69a0960673697fede9dd6cd217a66410bea4d2600f8a",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+          "sha256": "44863653f0022d8fef30a000f6fd3859bf8bf91a537f48bd8933543857032ceb",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-921-PROTOCOL-ATTACK.conf",
+          "sha256": "30f2f5309824c574638d8090b41090e1681322768a7676c17b662caa836cc714",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-922-MULTIPART-ATTACK.conf",
+          "sha256": "c68c83d501f7c248cb56caec8a071b488d33020ed1004088aa4b9bf6ab2eeb0d",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-930-APPLICATION-ATTACK-LFI.conf",
+          "sha256": "738acad595d7d06180f787ffc8676b03aa633be607dc6c68910ae88ee3a15f8a",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-931-APPLICATION-ATTACK-RFI.conf",
+          "sha256": "7757cbe630935995bcf2eb2fa8051a90a03ac52436380085b22df46f624b973c",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-932-APPLICATION-ATTACK-RCE.conf",
+          "sha256": "d44649c92fcd9d466fd108ca76fb02dafe17759d61e7c244643aeaf349e58a96",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-933-APPLICATION-ATTACK-PHP.conf",
+          "sha256": "a46436ee7f1701ddfaca8edd54d493f0cd917a03db8daeab867ad3cd9c86e6e7",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf",
+          "sha256": "28f931818009165bf8ab83f9a709ae6507cb5162fb691f68aca02d3a946d7500",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-941-APPLICATION-ATTACK-XSS.conf",
+          "sha256": "6d3f51c791e1257e15c491155f9c31c752cf56f8f5aa88e7d1e0591397804c18",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+          "sha256": "261c4c5061a62aeb8de70b2e19aa99924c00e82a57e0efad725493bf3534b5fb",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
+          "sha256": "b2a93788ce6c9847c5181a391a060cc80dc522f3736c38356e54dee490528024",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+          "sha256": "b8a8a8f81e9de8615ba02642e038b96b34e00385e3da6f6f32c2d844c1d55697",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-949-BLOCKING-EVALUATION.conf",
+          "sha256": "ccec26a8dabf764ef6ef279066ab9abe90a84a3565f6f728e9a30bc395d02f86",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-950-DATA-LEAKAGES.conf",
+          "sha256": "6ec1ecaa70e1f145913ac87f55c3e0236f5f3f719abc69949c6861d45dccc8a1",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-951-DATA-LEAKAGES-SQL.conf",
+          "sha256": "ae90d0a9acc6305ec4902347a0ff7b55efba64e813f4378571f0a5183d0868b8",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-952-DATA-LEAKAGES-JAVA.conf",
+          "sha256": "c423215ca0c5109ff010ea225a6107752485b9628d0e2205c0c8d67d2713ace1",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-953-DATA-LEAKAGES-PHP.conf",
+          "sha256": "dfe87e4475b2bf22055c7f1297dbaf13dd45681ce0ed00055fb1ee1fe4421d1e",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-954-DATA-LEAKAGES-IIS.conf",
+          "sha256": "31e125e9c0e420b52730d6de3ecc1c8a58906409a3f61048c06cb0924d9b3b6a",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-955-WEB-SHELLS.conf",
+          "sha256": "faa782c5f096ce0db35fafd634837418d9e31fde90dbfc9bd2b1b2d5f95a1054",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-959-BLOCKING-EVALUATION.conf",
+          "sha256": "a1b6b4ab83e51adcf594813006555fd15de9da270c73bde46ff6394ab4e0d294",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-980-CORRELATION.conf",
+          "sha256": "c42dab15648e54dad2b74a0ea1eb447faa9a373960ed8b86a77033a7aa10a540",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf.example",
+          "sha256": "f68451a88a8622d4e67e0d68fa67907ed947635f10e407ae3a052b6259b02254",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/iis-errors.data",
+          "sha256": "b14193bd4f3306da296dfde284d3d536f3bd7de38c5635ad2379289ee18b48b2",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/java-classes.data",
+          "sha256": "ce783ea2e42458cbfcadc081c449a6e109626b51cd459f0a4f35b02d690cf92e",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/java-errors.data",
+          "sha256": "ddc0c0f6f7f9ed4be844b725f73bda72c6a12712a0a7e1e15f5343f429611160",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/lfi-os-files.data",
+          "sha256": "5cee71d022c069a2ae814f599e28e790355329f691d171934753725bd7473e4b",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-config-directives.data",
+          "sha256": "9b5be859008a518f5a08b0cff82f4e1b93268dc8462d1250f93a29437a43eae3",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-errors-pl2.data",
+          "sha256": "defb3e272a8375639d99a774a9287a94c1456502237eaa2e6df8329e302561d5",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-errors.data",
+          "sha256": "25c07f3cdffcf0b03a907386e602e00108a67e823fd79d86eee87a57d245b9cf",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-function-names-933150.data",
+          "sha256": "c90dd0a33f4132fcdc3f8e99de0d41724e19d9dd49f548f7cc3a105a8cbaf414",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-function-names-933151.data",
+          "sha256": "2c70102d395aba50f1b2adf7af5bcc305e151bca49206a91e9f3dd9c123dbfcc",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-variables.data",
+          "sha256": "07ffd3c28d5d79e18e3844352fc3dd122af7e0037dbfebe6ed4dad403e9a95de",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/restricted-files.data",
+          "sha256": "4846e823ddd393fd6ff987e2b88ce0d1bceb22149d4710cbbe5b86e17c081dc1",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/restricted-upload.data",
+          "sha256": "54dae2c6cd72c7e08e37186a594a8c25d00cffd29043ee6669434c51e2a0d89f",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/scanners-user-agents.data",
+          "sha256": "d92d09898d00f77c62c72b09973d99199de29cd0c4a9b2607f5ac1cd2745950e",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/sql-errors.data",
+          "sha256": "68af3089af7b33d0fd59ced7d33952b17541d2a78037cfe86b2964097f4bb3e0",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/ssrf.data",
+          "sha256": "eaad498a8ed2b74080af81835fe0106f9998bbe55dea144451a847b3cd1515cd",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/unix-shell.data",
+          "sha256": "7d13359472971951807b8432b11aa108770b6a8e8acbd3199e347a2a5ffc68d3",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/web-shells-asp.data",
+          "sha256": "4ebbd5ab8fe4d10f18dd69b56e9e935eb861c1bf327893532221578feaa5c0cc",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/web-shells-php.data",
+          "sha256": "9e67cf50981651658292031edd32fb0a8c2c761de8778a02f8539d6dd61d1341",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/windows-powershell-commands.data",
+          "sha256": "5055ffeb4ce22869dee0f611045991e64365e980bba68649f4468aea86476d93",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs-setup.conf.example",
+          "sha256": "489aa0e719dd8cefdb2e84f933fb75dee6af4469e5bf7071921ce09bcf4babcd",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "ftw-config.conf",
+          "sha256": "b65331d973b3a7c98bcc07bb8c2f9c35a856a45d06adf942639947330aaedfe2",
+          "license": null,
+          "license_evidence": null
+        }
+      ]
+    },
+    "pr20": {
+      "source_commit": "266b6ed6a471e26e5c6862a46beb974eb1a0fa52",
+      "source_kind": "git_archive",
+      "embedded_source": "wasmplugin/fs.go: //go:embed rules",
+      "embedded_root": "wasmplugin/rules",
+      "embedded_rules_tree_sha256": "e7142c1f8e2c6ae5b28a6b6123c3cf8a558ab5e55bd4d6bb2bd25608e60fe124",
+      "crs_root": "wasmplugin/rules/crs",
+      "crs_version": "4.28.0",
+      "crs_version_evidence": "wasmplugin/rules/crs-setup.conf.example:2",
+      "crs_tree_sha256": "1538b8e9d3dc35bd862c29bb3865f67d21c9c86792a3507ad7a0996c64dd9d4d",
+      "tree_hash_method": "SHA-256 over each tree's sorted, LF-terminated UTF-8 records '<file SHA-256>  <path relative to that tree root>\\n'; file hashes cover exact bytes",
+      "explicit_license_file_count": 30,
+      "unverified_license_file_count": 24,
+      "unverified_license_files": [
+        "coraza-demo.conf",
+        "coraza.conf-recommended.conf",
+        "crs/ai-critical-artifacts.data",
+        "crs/asp-dotnet-errors.data",
+        "crs/iis-errors.data",
+        "crs/java-classes.data",
+        "crs/lfi-os-files.data",
+        "crs/php-errors.data",
+        "crs/php-function-names-933150.data",
+        "crs/php-variables.data",
+        "crs/restricted-files.data",
+        "crs/restricted-upload.data",
+        "crs/ruby-errors.data",
+        "crs/scanners-user-agents.data",
+        "crs/sql-errors.data",
+        "crs/ssrf-no-scheme.data",
+        "crs/ssrf.data",
+        "crs/unix-shell-aliases.data",
+        "crs/unix-shell-builtins.data",
+        "crs/unix-shell.data",
+        "crs/web-shells-asp.data",
+        "crs/web-shells-php.data",
+        "crs/windows-powershell-commands.data",
+        "ftw-config.conf"
+      ],
+      "files": [
+        {
+          "path": "coraza-demo.conf",
+          "sha256": "fdca7a042c14691a725ea062fbc57b5bec40cd582f0eca4cb48bdaea09828961",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "coraza.conf-recommended.conf",
+          "sha256": "6730502be30f130ff0323dd00d06792ec41608a16eaa43789db9859b0942fdd1",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf.example",
+          "sha256": "aa9bda1ffc6b483166858fa26749a04e7d8193969b21a89757c47e3050acd0cb",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-901-INITIALIZATION.conf",
+          "sha256": "236fbbfa18b98ae8f664fe88b61bc2840e54292fe627ada88ba2560cfbaed1c1",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-905-COMMON-EXCEPTIONS.conf",
+          "sha256": "f36dc5945ec3b63425bfce5f61e6fb09aeef5975a09f0f7d7789d35ebdde6ee5",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-911-METHOD-ENFORCEMENT.conf",
+          "sha256": "2e5c1d06cac67f381e3b2f332261b1e57320e805b3d2d3265979c14f707ac3c7",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-913-SCANNER-DETECTION.conf",
+          "sha256": "b04686fdc995f2836eccd5234a2f17eead8ff7335fac04aaf36968d97b133c08",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+          "sha256": "2c13aed521f75d5d3c1eaef7f568e4f11347f18a02f54c1e713d3cc95accc050",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-921-PROTOCOL-ATTACK.conf",
+          "sha256": "ebe40108e81cf2f57518e14556d66c5d8ec39302ed15ee1cda3ce3e136ccaba5",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-922-MULTIPART-ATTACK.conf",
+          "sha256": "dae833cebfe2a1c62079fdfd688ab5254cf3d54fb916978a7b6229e7bdeb92b7",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-930-APPLICATION-ATTACK-LFI.conf",
+          "sha256": "e88ac0377110a5b093c9c0f63737e5447b849c7d899cfc6f8570b48540ebdd2b",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-931-APPLICATION-ATTACK-RFI.conf",
+          "sha256": "4d355f335e25d49d91689558fdf341e4fb968f812bc50108eab55ad6bd45b30b",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-932-APPLICATION-ATTACK-RCE.conf",
+          "sha256": "94258f7fc1bc4bb2572914b49ff8d9fdb66a68cd9d7f567af18fe161a4b0223c",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-933-APPLICATION-ATTACK-PHP.conf",
+          "sha256": "d7801ce419c52a62979cfef0b70ca332d84da53f102d5a80c43fd295f4351da2",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf",
+          "sha256": "238b2cee4a3744efcf6bc4b8cca24f784fa6ed018a84c3c527adba37d2b49e18",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-941-APPLICATION-ATTACK-XSS.conf",
+          "sha256": "f094e4fdc99d79209dd5781836a1005663bc216805762a78a95e8de14abdea10",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+          "sha256": "db756f71e8270280c5ae74d09c11250fad8c118f6a905c6a6794d5643d27cd00",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf",
+          "sha256": "6548548eb36b6c25f3f3a66231a066bc5bb3dc9663bd9a4c243f6a7441c35fed",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-944-APPLICATION-ATTACK-JAVA.conf",
+          "sha256": "fbb5574633407315b7803346386d21c86403c00f4096df0e0bcc052c83ddb28e",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-949-BLOCKING-EVALUATION.conf",
+          "sha256": "abcf9ed99509a81667bf4b401f5892f468b69b6ab1d18542c9d51d5357114eea",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/REQUEST-999-COMMON-EXCEPTIONS-AFTER.conf",
+          "sha256": "906e6d33983eeea1d5da7e75f46c2ab489506c5d161685772aac584ad322d331",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-950-DATA-LEAKAGES.conf",
+          "sha256": "23c9055ee66abacb682a910ebe9d16dcccdb2e76ba0f735f1cf8879178cada6d",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-951-DATA-LEAKAGES-SQL.conf",
+          "sha256": "172320ac9927a341150a65566014c0dc96136f23d834db4d0a79273f1612ce66",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-952-DATA-LEAKAGES-JAVA.conf",
+          "sha256": "054504a30807e97e6e36ec635c0402eb85681f43ab07ff7af83f60b47406aa8e",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-953-DATA-LEAKAGES-PHP.conf",
+          "sha256": "823cb195799f90b34df18823535fdd7a4bb99c2cff66c22de26af4f846a7c47c",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-954-DATA-LEAKAGES-IIS.conf",
+          "sha256": "3b1dd5bdd944307ff4a34c8063092981c0392741181013338f3f0773aaaf18f0",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-955-WEB-SHELLS.conf",
+          "sha256": "572438003b42aeba8dbe740d193087bd0637c8f2b6fee3f80cafaec24cbaf08c",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-956-DATA-LEAKAGES-RUBY.conf",
+          "sha256": "c47d433e4523088f2d66c591df6f9a9b2958e041c2e406c668c208173fa14686",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-959-BLOCKING-EVALUATION.conf",
+          "sha256": "b2f4270922d64cf778e32a8bc5e4683c187d78591bc7db47fa8d9ed95ee32649",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-980-CORRELATION.conf",
+          "sha256": "5fa8fa7fe1047dbe33fcb5246c4f8e079ea337bd0fbe0929c933da4d2e5c3ada",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf.example",
+          "sha256": "e4f725b7669a591492b38a79c2f727479f56235af27c50fc0c13dd9eeac38e6e",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "crs/ai-critical-artifacts.data",
+          "sha256": "9352bbfff2c5dd86311dfbefaf76a71597402a2eba9cad33bc736b3d2560311a",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/asp-dotnet-errors.data",
+          "sha256": "a3bb53002692e86fdb06e7045b64bc8f7c74972f824106f566ec48bd528884aa",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/iis-errors.data",
+          "sha256": "3eac5008e5dee373d0b876e92405af04cc4ce0f73625e7510499f708b516aa40",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/java-classes.data",
+          "sha256": "e939e4af2b219a695f84d905cae484698718beabc0efdbe4236ae1d8dc9e2ca3",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/lfi-os-files.data",
+          "sha256": "84669b74e47faba9f67e1187a5c5f53469722e6025e7482d4eecb918365ab67e",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-errors.data",
+          "sha256": "0d73be62fc08bd613738f4b90f59430fca4fe7ad0a58df182ae4f7ee3b3ac925",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-function-names-933150.data",
+          "sha256": "ba322a02f1d9150c7f5b57a04a6986fcf4b21bde7322255c2790e610b09a59c1",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/php-variables.data",
+          "sha256": "07ffd3c28d5d79e18e3844352fc3dd122af7e0037dbfebe6ed4dad403e9a95de",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/restricted-files.data",
+          "sha256": "ec748c0cb8dc63661d873498d4d39c03fc90a61b09a5418065de30f25b9e4fa0",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/restricted-upload.data",
+          "sha256": "ae69b132c08eb819a7369803bd5d48be709f95f9772710422383f81d273bd1a6",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/ruby-errors.data",
+          "sha256": "caf826022886052069d54946b3f8f6608b5672225db203a448589bd2bfc195a1",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/scanners-user-agents.data",
+          "sha256": "efdb35b4df7c076ebe5324c81b42e3579766c4f36356241cc483d7971a319ab5",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/sql-errors.data",
+          "sha256": "ba9f3f7070f4c2c6c2d6165da06566f18aee19756c510ccde99aeff57fd5ca1a",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/ssrf-no-scheme.data",
+          "sha256": "753805c3b3284a28c2d834c9ce32aab8f3d24257e66c2d64b3308bd8f4aacbd4",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/ssrf.data",
+          "sha256": "6305d2a07d3b7997112358a38986fe30c55faa11f9002c3479a687a718bfc66a",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/unix-shell-aliases.data",
+          "sha256": "7860d692ba74be8465972e1c348d06b9ba41f61243406cfc7fed82db6fc26bee",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/unix-shell-builtins.data",
+          "sha256": "7c7b600b457b06940a440095cf594f0e28de1891020de9840fc9ea7cf1e00e57",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/unix-shell.data",
+          "sha256": "30b49ed5e34d7ef2f5afc74f8ca21baec6a3b44a8c6d15082d2ff1bc6d456fa1",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/web-shells-asp.data",
+          "sha256": "4ebbd5ab8fe4d10f18dd69b56e9e935eb861c1bf327893532221578feaa5c0cc",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/web-shells-php.data",
+          "sha256": "9e67cf50981651658292031edd32fb0a8c2c761de8778a02f8539d6dd61d1341",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs/windows-powershell-commands.data",
+          "sha256": "5055ffeb4ce22869dee0f611045991e64365e980bba68649f4468aea86476d93",
+          "license": null,
+          "license_evidence": null
+        },
+        {
+          "path": "crs-setup.conf.example",
+          "sha256": "2cfdcc437420bd337c2f76d2b1a6a01790888d9632063f3ec3ebfc212bce807d",
+          "license": "Apache-2.0",
+          "license_evidence": "file content explicitly names Apache Software License version 2"
+        },
+        {
+          "path": "ftw-config.conf",
+          "sha256": "bc57d0ec12e92bd26f28cbdeb6fd9fd1ec4a17c7475ac47fa0a625950eee7877",
+          "license": null,
+          "license_evidence": null
+        }
+      ]
+    }
+  }
+}
