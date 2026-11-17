@@ -204,11 +204,10 @@ impl CompiledAction {
         }
 
         match self.name.as_str() {
-            "deny" => {
+            "deny" | "drop" => {
                 let status = if rule.status == 0 { 403 } else { rule.status };
-                tx.interrupt(rule.id, "deny", status, "");
+                tx.interrupt(rule.id, self.name.as_str(), status, "");
             },
-            "drop" => tx.interrupt(rule.id, "drop", rule.status, ""),
             "redirect" => {
                 let data = Macro::new(&self.argument).map_or_else(|_| self.argument.clone(), |value| value.expand(tx));
                 // Go's `redirect.go` only honors a status a client can redirect with;
@@ -955,6 +954,28 @@ mod tests {
                 tx.interruption().map(|interruption| interruption.status),
                 Some(expected),
                 "configured status {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_defaults_to_forbidden_status_and_keeps_an_explicit_status() {
+        for (action, expected) in [("drop", 403), ("drop,status:418", 418)] {
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRule REQUEST_URI \"@streq /drop\" \"phase:1,id:2,{action}\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction();
+            tx.process_uri("/drop", "GET", "HTTP/1.1");
+            tx.process_request_headers();
+
+            assert_eq!(
+                tx.interruption().map(|interruption| interruption.status),
+                Some(expected),
+                "{action}"
             );
         }
     }
