@@ -59,6 +59,11 @@ impl RuleOperator {
             outcome => outcome,
         }
     }
+
+    /// Whether an uninspected result from this operator must interrupt the transaction.
+    pub(crate) fn fails_closed_on_not_inspected(&self) -> bool {
+        self.operator.fails_closed_on_not_inspected()
+    }
 }
 
 #[cfg(test)]

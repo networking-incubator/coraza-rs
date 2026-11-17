@@ -356,6 +356,10 @@ impl Rule {
                     let outcome = operator.evaluate_outcome(tx, &candidate, &mut outputs);
                     tx.store_operator_outputs(&mut outputs);
                     Self::log_operator_outcome(tx, id, value.variable, outcome);
+                    if outcome == OperatorOutcome::NotInspected && operator.fails_closed_on_not_inspected() {
+                        tx.interrupt(id, "deny", 500, "host operator refused to inspect input");
+                        return Vec::new();
+                    }
                     match outcome {
                         OperatorOutcome::Matched => {
                             let mut matched = MatchData::new(value.variable, value.key.clone(), candidate);
@@ -373,7 +377,8 @@ impl Rule {
                             matched_values.push(matched);
                         },
                         // An embedder operator can report no verdict for a value; the
-                        // rule treats it as a miss. Built-in detectors scan every input.
+                        // rule treats it as a miss. Refused host-operator inspections
+                        // are interrupted above instead.
                         OperatorOutcome::NotMatched | OperatorOutcome::NotInspected => {},
                     }
                 }

@@ -26,7 +26,8 @@
 //! nor normalised, so an IPv6 value yields a name a blocklist does not publish.
 //! The lookup is bounded by Go's 500ms deadline and a resolver failure is no
 //! match, as in Go, where `LookupHost` returns an error and the rule does not
-//! match.
+//! match. Refusal at the in-flight cap is reported as uninspected and fails
+//! closed in the rule engine.
 //!
 //! Divergences from Go:
 //!
@@ -39,19 +40,20 @@
 //!   and reports no match when the TXT lookup fails. This port has no DNS dependency, so it performs the A/AAAA lookup
 //!   only: the TXT message and its capture are absent, and a name whose TXT lookup fails matches here where Go reports
 //!   no match.
-//! - A deadline, the in-flight cap or a spawn failure reports [`OperatorOutcome::NotMatched`], as Go returns `false`
-//!   from `Evaluate` on its timeout. A negated `!@rbl` therefore matches on failure, exactly as in Go.
+//! - A deadline or spawn failure reports [`OperatorOutcome::NotMatched`], as Go returns `false` from `Evaluate` on its
+//!   timeout. An in-flight refusal instead reports [`OperatorOutcome::NotInspected`], which the rule engine turns into
+//!   a 500 interruption so a negated `!@rbl` cannot pass the value through.
 //!
 //! Resource bounds: the system resolver cannot be cancelled, so each lookup
 //! runs on its own thread with [`LOOKUP_STACK`] of stack and the operator gives
 //! up after [`LOOKUP_TIMEOUT`], abandoning that thread until the resolver
-//! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process; above
-//! that, and when a thread cannot be spawned, the operator reports
-//! [`OperatorOutcome::NotMatched`] instead of queueing or panicking. A resolver
-//! failure is an answer that the value is not listed, so it is also a plain
-//! miss. No operational failure from this operator raises the detector
-//! inspection signal.
+//! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process. A
+//! saturated cap reports [`OperatorOutcome::NotInspected`] and the rule engine
+//! interrupts with status 500; a thread-spawn failure or resolver failure stays
+//! a plain miss, as in Go.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     net::ToSocketAddrs as _,
     sync::{
@@ -88,6 +90,20 @@ static LIMITER: Limiter = Limiter {
     in_flight: AtomicUsize::new(0),
 };
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The in-flight cap for the calling thread.
+fn in_flight_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_CAP.with(Cell::get) {
+        return cap;
+    }
+    MAX_IN_FLIGHT
+}
+
 /// Counts lookups in flight against [`MAX_IN_FLIGHT`].
 struct Limiter {
     /// Slots currently held.
@@ -103,7 +119,7 @@ struct InFlight<'a> {
 impl Limiter {
     /// Reserve a slot, or report `None` when the cap is already reached.
     fn acquire(&self) -> Option<InFlight<'_>> {
-        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= in_flight_cap() {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -159,12 +175,13 @@ impl Operator for Rbl {
         // Go's `LookupHost` returns every A and AAAA record and errors when the
         // name has none; `ToSocketAddrs` is the same getaddrinfo lookup, and a
         // resolver error is "not listed" in Go's rule, so it is no match here.
-        verdict(bounded(LOOKUP_TIMEOUT, move || {
-            match (name.as_str(), 0).to_socket_addrs() {
-                Ok(mut addresses) => addresses.next().is_some(),
-                Err(_) => false,
-            }
-        }))
+        match bounded(LOOKUP_TIMEOUT, move || match (name.as_str(), 0).to_socket_addrs() {
+            Ok(mut addresses) => addresses.next().is_some(),
+            Err(_) => false,
+        }) {
+            Ok(listed) => verdict(listed),
+            Err(BoundedError::InFlightLimit) => OperatorOutcome::NotInspected,
+        }
     }
 }
 
@@ -189,13 +206,23 @@ pub fn rbl(service: &str) -> Result<Rbl, String> {
     Rbl::new(service)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedError {
+    InFlightLimit,
+}
+
 /// Run `work` on a worker thread and give up after `timeout`.
 ///
-/// Returns `None` when the lookup never completed: the deadline expired, the
-/// in-flight cap was reached, or the thread could not be spawned. An abandoned
+/// Returns `Err` when the in-flight cap is saturated and `Ok(None)` when a
+/// started lookup times out or the worker thread cannot be spawned. An abandoned
 /// lookup keeps its in-flight slot until the resolver returns.
-fn bounded<T: Send + 'static>(timeout: Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let slot = LIMITER.acquire()?;
+fn bounded<T: Send + 'static>(
+    timeout: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<Option<T>, BoundedError> {
+    let Some(slot) = LIMITER.acquire() else {
+        return Err(BoundedError::InFlightLimit);
+    };
     let (sender, receiver) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("coraza-rbl".to_owned())
@@ -207,9 +234,9 @@ fn bounded<T: Send + 'static>(timeout: Duration, work: impl FnOnce() -> T + Send
         });
     if spawned.is_err() {
         // The builder dropped the closure, and its slot with it.
-        return None;
+        return Ok(None);
     }
-    receiver.recv_timeout(timeout).ok()
+    Ok(receiver.recv_timeout(timeout).ok())
 }
 
 #[cfg(test)]
@@ -291,18 +318,51 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 true
             }),
-            None
+            Ok(None)
         );
-        assert_eq!(bounded(Duration::from_secs(1), || false), Some(false));
+        assert_eq!(bounded(Duration::from_secs(1), || false), Ok(Some(false)));
     }
 
     #[test]
     fn a_lookup_without_an_answer_is_no_match() {
-        // The deadline, the in-flight cap and a spawn failure all reach the
-        // operator as `None`, and Go returns false for each of them.
+        // A deadline and spawn failure are ordinary misses, as in Go.
         assert_eq!(verdict(None), OperatorOutcome::NotMatched);
         assert_eq!(verdict(Some(true)), OperatorOutcome::Matched);
         assert_eq!(verdict(Some(false)), OperatorOutcome::NotMatched);
+    }
+
+    #[test]
+    fn a_cap_refusal_is_distinct_from_a_lookup_failure() {
+        use super::{BoundedError, TEST_CAP};
+
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let result = bounded(Duration::from_secs(1), || true);
+        TEST_CAP.with(|cap| cap.set(None));
+
+        assert_eq!(result, Err(BoundedError::InFlightLimit));
+    }
+
+    #[test]
+    fn an_exhausted_in_flight_cap_fails_closed() {
+        use super::TEST_CAP;
+
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"!@rbl example.invalid\" \"id:964,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("rbl-cap");
+        tx.add_get_argument("q", b"192.0.2.1");
+
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let interruption = tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+
+        assert_eq!(
+            interruption.map(|value| value.status),
+            Some(500),
+            "refusing an uninspected value must interrupt instead of reporting a clean miss"
+        );
     }
 
     #[test]
@@ -368,7 +428,7 @@ mod tests {
     #[test]
     fn a_bounded_call_returns_as_soon_as_the_work_ends() {
         let started = Instant::now();
-        assert_eq!(bounded(Duration::from_secs(5), || true), Some(true));
+        assert_eq!(bounded(Duration::from_secs(5), || true), Ok(Some(true)));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a quick lookup must not wait for the deadline"

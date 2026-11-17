@@ -75,11 +75,10 @@ pub enum OperatorOutcome {
     NotMatched,
     /// The operator could not inspect the input, so it has no verdict.
     ///
-    /// Rules treat this as not matched. A built-in operator never reports it: the
-    /// detector operators scan every input, and a host operator (`inspectFile`, `rbl`,
-    /// `validateSchema`) reports [`OperatorOutcome::NotMatched`] when it cannot run,
-    /// because Go returns `false` for every operational error. The value is kept for
-    /// embedder-supplied operators that need three-valued logic.
+    /// Rules normally treat this as not matched. A refused `inspectFile` or `rbl`
+    /// run uses it to trigger the engine's fail-closed interruption; other built-in
+    /// host-operator errors remain non-matches to preserve Go behavior. It is also
+    /// available to embedder-supplied operators that need three-valued logic.
     NotInspected,
 }
 
@@ -400,6 +399,17 @@ impl OperatorEnum {
                 ValidateSchema::with_rule_data(context.base_dir, argument, context.rule_data).map(Self::ValidateSchema)
             },
             _ => Err(format!("unknown operator: {name}")),
+        }
+    }
+
+    /// Whether this host operator must fail closed when it cannot inspect a value.
+    pub(crate) fn fails_closed_on_not_inspected(&self) -> bool {
+        match self {
+            #[cfg(feature = "inspect-file")]
+            Self::InspectFile(_) => true,
+            #[cfg(feature = "rbl")]
+            Self::Rbl(_) => true,
+            _ => false,
         }
     }
 
