@@ -1,9 +1,70 @@
 {
+  "differential": {
+    "schema": 1,
+    "oracle": {
+      "repository": "https://github.com/corazawaf/libinjection-go",
+      "version": "v0.3.6",
+      "module_sum": "h1:cXqACFY1anDzC9W127WguanVYvzvvcdQJI0BmErixdk=",
+      "go_toolchain_flavors": [
+        {
+          "version": "go1.27.x",
+          "minimum_patch": 1,
+          "go_experiment": ""
+        },
+        {
+          "version": "go1.27.x-X:nodwarf5",
+          "minimum_patch": 1,
+          "go_experiment": "nodwarf5"
+        }
+      ],
+      "goos": "linux",
+      "goarch": "amd64",
+      "driver": "tools/parity/oracle_driver_test.go",
+      "transport": "tab-separated case id and hex input; binary outputs are hex fields"
+    },
+    "c_reference": {
+      "repository": "https://github.com/libinjection/libinjection",
+      "commit": "1b9f5f077fc10754e7e4b6498cdaa8fbee53d707",
+      "driver": "tests/c_oracle_driver.c",
+      "results": "SQLi verdict and fingerprint; XSS verdict",
+      "reviewed_xss_differences": 20
+    },
+    "tables": {
+      "sql_keyword_entries": 9359,
+      "sql_fingerprint_entries": 8367,
+      "sql_dispatch_bytes": 256,
+      "sql_dispatch_sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e",
+      "xss_tables": {
+        "tags": 20,
+        "events": 432,
+        "attributes": 20
+      },
+      "xss_table_sha256": {
+        "tags": "7c67dd16500749855f3752ea228ed62ce3d8bb68b5f7ef4b8d466975593419fe",
+        "events": "745e347f29e0052ad0431d9149f721c30e6d3b1e68abdebca17db62a8febd9c1",
+        "attributes": "f6182c0a6a197aa07bdabb8fa969941a6a4e35eebbfec2282a39fac47b9c52bc"
+      }
+    },
+    "source_sha256": {
+      "sqli_data.go": "196959c0e8c24c06ba604c3b9d926814fc3b3a28702db2a7ef920a0542d58c54",
+      "sqli_parse.go": "8442fa562228890a3f1acbfbcfe8ad76d8d2b840be3b2cce776f2ce683972785",
+      "sqli_token.go": "466f90c777cae2fa7ee48b88fc4c79eb48aa03d0904f6023a4480181196a3134",
+      "sqli.go": "a1e5bd2887a6f04e8262d58fe7add7144023c787e03ec4b466df984f25e41bac",
+      "xss_decls.go": "5c39d0d1b96efe075c30c108c602e31e50a3d8c565342206144012bd9f5b759c",
+      "xss_helpers.go": "d9b1e66d21d0d316a51cd1e547eef4352f99ed74f89fc5190f8d10d0753ea8a9",
+      "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
+      "xss.go": "768f919a0f0dd54cb9777fee388c539632b16f1ccec8701529c4d476d96e4aaf",
+      "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023",
+      "data/sqli_keywords.txt": "52b43232f68b154ab4f90edb548069c19a4c44afd0e90e55b555aa2fbfb11f93"
+    },
+    "exceptions": [],
+    "expected_oracle_errors": []
+  },
   "fixtures": {
     "families": {
       "folding": 119,
       "html5": 68,
-      "sqli": 55,
+      "sqli": 60,
       "tokens": 249,
       "xss": 7
     },
@@ -1199,6 +1260,16 @@
         "size": 142
       },
       {
+        "name": "test-sqli-052.txt",
+        "sha256": "2006dbe59d6916510a332ea5fe4dd5408722aac08da092242236a56acdae0b8a",
+        "size": 123
+      },
+      {
+        "name": "test-sqli-053.txt",
+        "sha256": "970c4ab9f6a4676d255e5b1a9967a3cb492accbae156a569c911f463c73ec01a",
+        "size": 117
+      },
+      {
         "name": "test-sqli-1e-001.txt",
         "sha256": "1e271badedc6183cd033ec198ea842a24902f456ce20a69a497e7f53f339483f",
         "size": 96
@@ -1217,6 +1288,21 @@
         "name": "test-sqli-1e-004.txt",
         "sha256": "0b28749bdf7442765c7db1adac5ccc18077326090eba2c7ba561c0cf35369d13",
         "size": 103
+      },
+      {
+        "name": "test-sqli-nulbyte-001.txt",
+        "sha256": "e11e3921cd587267d09a2f03b56a63a70b3b84435d962306c27acb0b59d34f1a",
+        "size": 119
+      },
+      {
+        "name": "test-sqli-nulbyte-002.txt",
+        "sha256": "ea9369d911261272a1b1f5874a38c68381b8edca96a94334f6a613024726fc9d",
+        "size": 117
+      },
+      {
+        "name": "test-sqli-nulbyte-003.txt",
+        "sha256": "0801ca63220bd196216e1ae56e31021154e13bf5924968dabb726fbf7930b5d6",
+        "size": 101
       },
       {
         "name": "test-tokens-061.txt",
@@ -2499,78 +2585,17 @@
         "size": 66
       }
     ],
-    "total": 498
+    "total": 503
   },
   "oracle": {
-    "go_version": "go version go1.27.1 linux/amd64",
-    "module_sum": "h1:IYJ0i4VxE2/ypgknP6JXxob1mNB83n2JXWpxnAzP/Co=",
-    "version": "v0.3.6-0.20261012170915-24322d8dcacc"
+    "go_version": "go version go1.27.4-X:nodwarf5 linux/amd64",
+    "module_sum": "h1:cXqACFY1anDzC9W127WguanVYvzvvcdQJI0BmErixdk=",
+    "version": "v0.3.6"
   },
   "schema": 2,
   "source": {
-    "module_sum": "h1:IYJ0i4VxE2/ypgknP6JXxob1mNB83n2JXWpxnAzP/Co=",
+    "module_sum": "h1:cXqACFY1anDzC9W127WguanVYvzvvcdQJI0BmErixdk=",
     "repository": "https://github.com/corazawaf/libinjection-go",
-    "version": "v0.3.6-0.20261012170915-24322d8dcacc"
-  },
-  "differential": {
-    "schema": 1,
-    "oracle": {
-      "repository": "https://github.com/corazawaf/libinjection-go",
-      "version": "v0.3.6-0.20261012170915-24322d8dcacc",
-      "module_sum": "h1:IYJ0i4VxE2/ypgknP6JXxob1mNB83n2JXWpxnAzP/Co=",
-      "go_toolchain_flavors": [
-        {
-          "version": "go1.27.x",
-          "minimum_patch": 1,
-          "go_experiment": ""
-        },
-        {
-          "version": "go1.27.x-X:nodwarf5",
-          "minimum_patch": 1,
-          "go_experiment": "nodwarf5"
-        }
-      ],
-      "goos": "linux",
-      "goarch": "amd64",
-      "driver": "tools/parity/oracle_driver_test.go",
-      "transport": "tab-separated case id and hex input; binary outputs are hex fields"
-    },
-    "c_reference": {
-      "repository": "https://github.com/libinjection/libinjection",
-      "commit": "533a165ebc1f7c36ecbe3e5583990ea0db81f554",
-      "driver": "tests/c_oracle_driver.c",
-      "results": "SQLi verdict and fingerprint; XSS verdict",
-      "reviewed_xss_differences": 20
-    },
-    "tables": {
-      "sql_keyword_entries": 9352,
-      "sql_fingerprint_entries": 8367,
-      "sql_dispatch_bytes": 256,
-      "sql_dispatch_sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e",
-      "xss_tables": {
-        "tags": 20,
-        "events": 432,
-        "attributes": 20
-      },
-      "xss_table_sha256": {
-        "tags": "7c67dd16500749855f3752ea228ed62ce3d8bb68b5f7ef4b8d466975593419fe",
-        "events": "745e347f29e0052ad0431d9149f721c30e6d3b1e68abdebca17db62a8febd9c1",
-        "attributes": "f6182c0a6a197aa07bdabb8fa969941a6a4e35eebbfec2282a39fac47b9c52bc"
-      }
-    },
-    "source_sha256": {
-      "sqli_data.go": "058d0a34084153f2cacbf27ea6b05a460276e871c818c39d22ae75339e6fbd46",
-      "sqli_parse.go": "8442fa562228890a3f1acbfbcfe8ad76d8d2b840be3b2cce776f2ce683972785",
-      "sqli_token.go": "466f90c777cae2fa7ee48b88fc4c79eb48aa03d0904f6023a4480181196a3134",
-      "sqli.go": "a1e5bd2887a6f04e8262d58fe7add7144023c787e03ec4b466df984f25e41bac",
-      "xss_decls.go": "5c39d0d1b96efe075c30c108c602e31e50a3d8c565342206144012bd9f5b759c",
-      "xss_helpers.go": "d9b1e66d21d0d316a51cd1e547eef4352f99ed74f89fc5190f8d10d0753ea8a9",
-      "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
-      "xss.go": "768f919a0f0dd54cb9777fee388c539632b16f1ccec8701529c4d476d96e4aaf",
-      "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023",
-      "data/sqli_keywords.txt": "1914890e6eb9166066ad587db18b7c2309830a0612533fbf97744ca260079bfd"
-    },
-    "exceptions": [],
-    "expected_oracle_errors": []
+    "version": "v0.3.6"
   }
 }

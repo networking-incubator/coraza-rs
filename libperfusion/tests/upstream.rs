@@ -150,7 +150,7 @@ fn count_samples(prefix: &str, detect: impl Fn(&[u8]) -> bool) -> (usize, usize)
     (flagged, samples.len() - flagged)
 }
 
-// The SQLi detection count matches upstream at d88a8f8. The false-positive
+// The SQLi detection count matches upstream at 1b9f5f0. The false-positive
 // and XSS counts do not, because the local table and whitelist changes are
 // deliberate deviations; every differing sample is listed in the parity
 // ledger, `tests/parity/mismatch-ledger.md`.
@@ -177,12 +177,14 @@ fn sqli_false_positive_samples() {
 #[test]
 #[ignore = "upstream sample comparison; requires upstream data files via LIBINJECTION_DIR"]
 fn xss_samples() {
-    // Upstream C flags 81,397 of these 81,417 and the pinned Go main flags
-    // 81,388. The local `MATH` tag row closes four of the nine C-only
-    // detections -- the `<math><a xlink:href=...>` samples listed in the
-    // parity ledger -- so libperfusion flags 81,392.
+    // Upstream C flags 81,400 of these 81,420 and the pinned Go main flags
+    // 81,391. The pinned C revision carries the 0xFF h5_skip_white fix, so
+    // the three data/xss-github-92.txt samples are flagged by every
+    // implementation. The local `MATH` tag row closes four of the nine
+    // C-only detections -- the `<math><a xlink:href=...>` samples listed in
+    // the parity ledger -- so libperfusion flags 81,395.
     let (flagged, missed) = count_samples("xss", libperfusion::xss);
-    assert_eq!((flagged, missed), (81_392, 25));
+    assert_eq!((flagged, missed), (81_395, 25));
 }
 
 /// The checks of `src/test_error_handling.c` that carry over: the port has

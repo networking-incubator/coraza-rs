@@ -1,5 +1,5 @@
-# Extracted from libinjection C v4.0.0-8-gd88a8f8 (d88a8f86d617ac8dcb9169c9f34637aaac71ac76)
-# Total entries: 9352
+# Extracted from libinjection C v4.0.1-3-g1b9f5f0 (1b9f5f077fc10754e7e4b6498cdaa8fbee53d707)
+# Total entries: 9359
 # Format: KEY<TAB>VALUE_BYTE
 !!	o
 !<	o
@@ -9320,6 +9320,7 @@ _BIG5	t
 _BINARY	t
 _CP1250	t
 _CP1251	t
+_CP1256	t
 _CP1257	t
 _CP850	t
 _CP852	t
@@ -9328,6 +9329,7 @@ _CP932	t
 _DEC8	t
 _EUCJPMS	t
 _EUCKR	t
+_GB18030	t
 _GB2312	t
 _GBK	t
 _GEOSTD8	t
@@ -9346,9 +9348,14 @@ _MACROMAN	t
 _SJIS	t
 _SWE7	t
 _TIS620	t
+_UCS2	t
 _UJIS	t
-_USC2	t
+_UTF16	t
+_UTF16LE	t
+_UTF32	t
 _UTF8	t
+_UTF8MB3	t
+_UTF8MB4	t
 |/	o
 |=	o
 ||	&

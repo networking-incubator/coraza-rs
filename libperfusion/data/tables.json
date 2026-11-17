@@ -16,13 +16,13 @@
   },
   "schema": 1,
   "source": {
-    "commit": "d88a8f86d617ac8dcb9169c9f34637aaac71ac76",
+    "commit": "1b9f5f077fc10754e7e4b6498cdaa8fbee53d707",
     "repository": "https://github.com/libinjection/libinjection",
-    "version": "v4.0.0-8-gd88a8f8"
+    "version": "v4.0.1-3-g1b9f5f0"
   },
   "sql": {
-    "entries": 9352,
-    "sha256": "d9f0395d3e9b90c70c59f45d6be0408ef493bd854933b276e44614cb9d6b56bd"
+    "entries": 9359,
+    "sha256": "e1d28ceb1c72aef694e0971ad873e18ce5156e6b1688d01f21b9164f3c463bfe"
   },
   "xss": {
     "attributes": 20,

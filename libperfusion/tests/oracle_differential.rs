@@ -216,14 +216,14 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         "libperfusion public parity mismatches:\n{}",
         result.mismatches.join("\n\n")
     );
-    assert_eq!(cases.len(), 864, "pinned differential case inventory changed");
-    assert_eq!(result.comparisons, 17_280, "defined oracle field coverage changed");
+    assert_eq!(cases.len(), 869, "pinned differential case inventory changed");
+    assert_eq!(result.comparisons, 17_380, "defined oracle field coverage changed");
     assert_eq!(
         result.oracle_errors, 0,
         "pinned Go module must complete every result field"
     );
     assert_eq!(
-        result.accepted_exceptions, 6,
+        result.accepted_exceptions, 4,
         "libperfusion deviations must stay reviewed"
     );
 }
@@ -582,20 +582,9 @@ fn reviewed_perfusion_deviation(
     input: &[u8],
     field_index: usize,
 ) -> Option<(&'static str, &'static str, bool)> {
-    if id == "sql-nul-after-hex-prefix" && input == b"1 or 0x\0\x31=1-- " {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "31263163:4", false)),
-            _ => None,
-        };
-    }
-    if id == "sql-nul-after-hex-prefix-hash" && input == b"'=0X\0#" {
-        return match field_index {
-            2 => Some(("0", "1", true)),
-            3 => Some((":0", "736f3163:4", false)),
-            _ => None,
-        };
-    }
+    // The pinned Go module's strchr NUL semantics (upstream #140) match the
+    // C parser this port retains, so the two former `sql-nul-*` deviations
+    // no longer differ; they were removed rather than kept as dead entries.
     // `<math>` is in the local XSS tag supplement, so these four flag where
     // Go main allows. The pinned C reference agrees with libperfusion on all
     // four; see `tests/parity/mismatch-ledger.md`.
