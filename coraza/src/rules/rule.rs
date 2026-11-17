@@ -262,6 +262,9 @@ impl Rule {
 
             let mut chain_level = chain_level;
             for link in &self.chain {
+                if tx.rule_engine() == crate::types::RuleEngineStatus::Off {
+                    return Vec::new();
+                }
                 chain_level += 1;
                 let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
                 if link_matches.is_empty() {
