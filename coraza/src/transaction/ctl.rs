@@ -322,6 +322,48 @@ mod tests {
     }
 
     #[test]
+    fn rule_engine_off_stops_the_phase_before_a_later_on() {
+        let rules = "SecAction \"id:80,phase:1,pass,ctl:ruleEngine=Off\"\n\
+                     SecAction \"id:81,phase:1,pass,ctl:ruleEngine=On\"\n\
+                     SecRule ARGS:q \"@streq attack\" \"id:82,phase:1,deny\"";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut transaction = waf.new_transaction_with_id("ctl-rule-engine-off");
+        transaction.add_get_argument("q", "attack");
+
+        assert!(transaction.process_request_headers().is_none());
+        assert_eq!(transaction.rule_engine(), crate::types::RuleEngineStatus::Off);
+        assert_eq!(
+            transaction
+                .matched_rules()
+                .iter()
+                .map(|matched| matched.rule.id)
+                .collect::<Vec<_>>(),
+            [80]
+        );
+    }
+
+    #[test]
+    fn rule_engine_off_aborts_a_chain_before_its_next_link() {
+        let rules = "SecRule ARGS:trigger \"@streq go\" \"id:90,phase:1,chain,deny\"\n\
+                     SecRule ARGS:off \"@streq go\" \"ctl:ruleEngine=Off,chain\"\n\
+                     SecRule ARGS:final \"@streq go\" \"\"\n\
+                     SecAction \"id:91,phase:1,deny,ctl:ruleEngine=On\"";
+        let mut parser = crate::seclang::Parser::new();
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut transaction = waf.new_transaction_with_id("ctl-rule-engine-off-chain");
+        transaction.add_get_argument("trigger", "go");
+        transaction.add_get_argument("off", "go");
+        transaction.add_get_argument("final", "go");
+
+        assert!(transaction.process_request_headers().is_none());
+        assert_eq!(transaction.rule_engine(), crate::types::RuleEngineStatus::Off);
+        assert!(transaction.matched_rules().is_empty());
+    }
+
+    #[test]
     fn lowercase_regex_target_removes_matching_keys() {
         let rules = "SecAction \"id:80,phase:1,ctl:ruleRemoveTargetById=81;ARGS:/^user$/,pass\"\n\
                      SecRule ARGS \"@contains bad\" \"id:81,phase:1,deny\"";

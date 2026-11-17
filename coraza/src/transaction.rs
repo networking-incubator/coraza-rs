@@ -1307,7 +1307,10 @@ impl Transaction {
         let rules = Arc::clone(&self.rules);
 
         for rule in rules.iter() {
-            if (phase != RulePhase::Logging && self.interruption.is_some()) || self.is_allowed(phase) {
+            if self.rule_engine == RuleEngineStatus::Off
+                || (phase != RulePhase::Logging && self.interruption.is_some())
+                || self.is_allowed(phase)
+            {
                 break;
             }
             if !rule.should_evaluate_in_phase(phase, self.config.multiphase_evaluation) {
