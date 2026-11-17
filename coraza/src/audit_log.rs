@@ -192,7 +192,7 @@ pub struct AuditRequest {
     pub protocol: String,
     /// `REQUEST_URI`.
     pub uri: String,
-    /// Empty, as in Go Coraza, which never sets it
+    /// `REQUEST_PROTOCOL`, e.g. `HTTP/1.1`.
     pub http_version: String,
     /// The headers by lowercase name, with part `B`
     pub headers: Option<BTreeMap<String, Vec<String>>>,
@@ -900,8 +900,7 @@ impl AuditLog {
     /// 1.2.0), as Go Coraza fills it in, without the fields that are zero or empty, as
     /// its protobuf types leave them out.
     ///
-    /// Its severity is the transaction's highest: Go Coraza always writes `emergency`, as
-    /// it never sets the highest severity of its entries.
+    /// Its severity is the highest explicit rule severity, omitted when none is set.
     #[expect(
         clippy::too_many_lines,
         reason = "all OCSF event fields are mapped in one serializer"
@@ -939,11 +938,11 @@ impl AuditLog {
         let logged_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_micros());
-        // As Go's ParseRuleSeverity reads it, falling back to its zero value
+        // As Go's ParseRuleSeverity reads it; an unset value is omitted.
         let severity = tx
             .highest_severity
             .parse::<crate::types::RuleSeverity>()
-            .map_or("emergency", |severity| severity.as_str());
+            .map_or("", |severity| severity.as_str());
         let response = tx.response.clone().unwrap_or_default();
 
         let mut observables = Vec::new();

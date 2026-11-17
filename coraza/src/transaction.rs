@@ -1166,6 +1166,12 @@ impl Transaction {
         let elapsed = self.started.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let at = LocalTime::from_unix(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
         let has = |part| self.audit_log_parts.contains(&part);
+        let highest_severity = self.highest_severity.get().into_owned();
+        let highest_severity = if highest_severity == "255" {
+            String::new()
+        } else {
+            highest_severity
+        };
         let mut transaction = AuditTransaction {
             timestamp: format!(
                 "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -1182,6 +1188,7 @@ impl Transaction {
                 method: self.request_method.get().into_owned(),
                 protocol: self.request_protocol.get().into_owned(),
                 uri: self.request_uri.get().into_owned(),
+                http_version: self.request_protocol.get().into_owned(),
                 length: i32::try_from(request_body.map_or(0, <[u8]>::len)).unwrap_or(i32::MAX),
                 args: self
                     .args
@@ -1190,7 +1197,7 @@ impl Transaction {
                     .collect(),
                 ..AuditRequest::default()
             },
-            highest_severity: self.highest_severity.get().into_owned(),
+            highest_severity,
             is_interrupted: self.interruption.is_some(),
             ..AuditTransaction::default()
         };
@@ -5182,6 +5189,60 @@ v\r\n\
 
         assert!(tx.process_request_headers().is_none());
         assert_eq!(tx.process_request_body(b"").unwrap().rule_id, 22);
+    }
+
+    #[test]
+    fn audit_records_include_request_protocol_and_only_explicit_highest_severity() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRule REQUEST_URI \"@streq /matched\" \"id:80,phase:1,pass,severity:CRITICAL\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let mut unmatched = waf.new_transaction_with_id("audit-severity-unset");
+        unmatched.process_uri("/other", "GET", "HTTP/2.0");
+        assert!(unmatched.process_request_headers().is_none());
+        let unset = unmatched.audit_log();
+        assert_eq!(unset.transaction.request.http_version, "HTTP/2.0");
+        assert!(unset.transaction.highest_severity.is_empty());
+        let unset_json: serde_json::Value =
+            serde_json::from_str(&unset.format(crate::types::AuditLogFormat::Json)).unwrap();
+        assert_eq!(
+            unset_json
+                .pointer("/transaction/request/http_version")
+                .and_then(serde_json::Value::as_str),
+            Some("HTTP/2.0")
+        );
+        assert_eq!(
+            unset_json
+                .pointer("/transaction/highest_severity")
+                .and_then(serde_json::Value::as_str),
+            Some("")
+        );
+        let unset_ocsf: serde_json::Value =
+            serde_json::from_str(&unset.format(crate::types::AuditLogFormat::Ocsf)).unwrap();
+        assert!(unset_ocsf.get("severity").is_none());
+
+        let mut matched = waf.new_transaction_with_id("audit-severity-set");
+        matched.process_uri("/matched", "GET", "HTTP/1.1");
+        assert!(matched.process_request_headers().is_none());
+        let set = matched.audit_log();
+        assert_eq!(set.transaction.request.http_version, "HTTP/1.1");
+        assert_eq!(set.transaction.highest_severity, "2");
+        let set_json: serde_json::Value =
+            serde_json::from_str(&set.format(crate::types::AuditLogFormat::Json)).unwrap();
+        assert_eq!(
+            set_json
+                .pointer("/transaction/highest_severity")
+                .and_then(serde_json::Value::as_str),
+            Some("2")
+        );
+        let set_ocsf: serde_json::Value =
+            serde_json::from_str(&set.format(crate::types::AuditLogFormat::Ocsf)).unwrap();
+        assert_eq!(
+            set_ocsf.get("severity").and_then(serde_json::Value::as_str),
+            Some("critical")
+        );
     }
 
     #[test]
