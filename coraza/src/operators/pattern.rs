@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, MatchKind};
 
 use super::{Datasets, Macro, MacroError, Operator, Outputs, simple::contains_bytes};
 use crate::{
@@ -472,7 +472,11 @@ impl Operator for Pm {
             // Go keeps empty phrases from `strings.Split`: an empty phrase
             // matches every input.
             let dict: Vec<&str> = patterns.split(' ').collect();
-            match AhoCorasick::builder().ascii_case_insensitive(true).build(&dict) {
+            match AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .ascii_case_insensitive(true)
+                .build(&dict)
+            {
                 Ok(matcher) => {
                     expanded = matcher;
                     &expanded
@@ -505,7 +509,11 @@ pub fn pm(patterns: &str) -> Result<Pm, MacroError> {
     } else {
         let patterns = patterns.to_lowercase();
         let dict: Vec<&str> = patterns.split(' ').collect();
-        AhoCorasick::builder().ascii_case_insensitive(true).build(&dict).ok()
+        AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
+            .ascii_case_insensitive(true)
+            .build(&dict)
+            .ok()
     };
     Ok(Pm {
         macro_param,
@@ -535,6 +543,7 @@ impl Phrases {
     /// Returns an error if the phrase set cannot be compiled.
     fn new(patterns: Vec<Vec<u8>>) -> Result<Self, String> {
         let matcher = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
             .ascii_case_insensitive(true)
             .build(patterns)
             .map_err(|error| format!("failed to build matcher: {error}"))?;
@@ -922,6 +931,31 @@ mod tests {
             out.take_captures().collect::<Vec<_>>(),
             [(0, b"ADMIN".to_vec()), (1, b"guest".to_vec())]
         );
+    }
+
+    #[test]
+    fn phrase_operators_capture_the_longest_overlapping_phrase() {
+        // Go's LeftmostLongest result is `abc`, even though `ab` is the first pattern.
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("phrases", b"ab abc");
+
+        let directory = tempfile::tempdir().unwrap();
+        let phrase_file = directory.path().join("phrases.data");
+        std::fs::write(&phrase_file, b"ab\nabc\n").unwrap();
+        let file_operator = super::pm_from_file(&phrase_file).unwrap();
+        let datasets = super::Datasets::from([("phrases".to_owned(), vec!["ab".to_owned(), "abc".to_owned()])]);
+        let dataset_operator = super::pm_from_dataset("phrases", &datasets).unwrap();
+
+        let assert_longest = |operator: &dyn super::Operator| {
+            let mut out = Outputs::new(true);
+            assert!(operator.evaluate(&tx, b"abc", &mut out));
+            assert_eq!(out.take_captures().collect::<Vec<_>>(), [(0, b"abc".to_vec())]);
+        };
+
+        assert_longest(&pm("ab abc").unwrap());
+        assert_longest(&pm("%{TX.phrases}").unwrap());
+        assert_longest(&file_operator);
+        assert_longest(&dataset_operator);
     }
 
     #[test]
