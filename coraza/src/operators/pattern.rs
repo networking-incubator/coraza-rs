@@ -104,7 +104,7 @@ impl CompiledRx {
 /// Go defines `\b`, `\B`, `\w`, `\W`, `\d`, `\D`, `\s` and `\S` in terms of
 /// ASCII. Escaped literals such as `\\w` and `\b` inside a character class
 /// (a backspace there) are left alone.
-fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
+pub(super) fn ascii_perl_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
     let mut result = String::with_capacity(pattern.len());
     let mut changed = false;
     let mut offset = 0;
@@ -714,7 +714,8 @@ pub fn rest_path(template: &str) -> Result<RestPath, String> {
     let segment =
         regex::Regex::new(r"\{([^}]+)\}").map_err(|error| format!("invalid path segment matcher: {error}"))?;
     let pattern = segment.replace_all(template, "(?P<$1>[^?/]+)");
-    regex::Regex::new(&pattern)
+    let pattern = ascii_perl_classes(&pattern);
+    regex::Regex::new(pattern.as_ref())
         .map(|regex| RestPath { regex })
         .map_err(|error| format!("invalid @restpath template {template:?}: {error}"))
 }
@@ -1009,5 +1010,14 @@ mod tests {
     #[test]
     fn restpath_rejects_invalid_segment_names() {
         assert!(rest_path("/users/{user-id}").is_err());
+    }
+
+    #[test]
+    fn restpath_perl_classes_are_ascii_only_like_go() {
+        let tx = Transaction::new("operator-test");
+        let operator = rest_path(r"/users/\w+").unwrap();
+
+        assert!(operator.evaluate(&tx, b"/users/Alice_9", &mut Outputs::default()));
+        assert!(!operator.evaluate(&tx, "/users/é".as_bytes(), &mut Outputs::default()));
     }
 }
