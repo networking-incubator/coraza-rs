@@ -206,8 +206,10 @@ pub fn rbl(service: &str) -> Result<Rbl, String> {
     Rbl::new(service)
 }
 
+/// Why a bounded lookup gave up before producing a verdict.
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedError {
+    /// The in-flight limiter refused the run: too many lookups were still executing.
     InFlightLimit,
 }
 

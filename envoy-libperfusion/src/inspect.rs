@@ -52,7 +52,7 @@ use crate::config::Config;
 
 /// shortcut: stops at four layers; raise the bound if a supported app decodes more.
 const MAX_PERCENT_DECODE_LAYERS: usize = 4;
-/// Bytes per detector window: the largest input libperfusion accepts whole.
+/// Bytes per detector window: the scan budget per window this filter imposes.
 ///
 /// Scanning in byte windows rather than token windows keeps every detector
 /// call library-equivalent: a window is a contiguous byte range, so a leading
@@ -233,8 +233,8 @@ fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
 
 /// Reports whether any window of `bytes` reads as XSS.
 ///
-/// `xss_with_limit` skips libperfusion's own input-length guard, so bounding
-/// the scan here is what keeps a large body from being scanned unbounded.
+/// `xss_with_limit` is the bounded form of the library scan: the caller's
+/// window bound is what keeps a large body from being scanned unbounded.
 /// The CSS-value check runs alongside the HTML contexts because the filter
 /// sees a field value without the template around it, which is exactly the
 /// form a value reflected into a `style="..."` attribute arrives in.
@@ -1331,7 +1331,7 @@ mod tests {
     /// The window scanner must never be less sensitive than the library it wraps.
     ///
     /// Holding this property is what keeps the filter's verdict equivalent to
-    /// `libperfusion::sqli()` for every input the library accepts whole.
+    /// a whole-input `libperfusion::sqli` scan of the same window budget.
     #[test]
     fn window_scan_is_never_weaker_than_whole_input_sqli() {
         let mut corpus: Vec<&[u8]> = vec![
