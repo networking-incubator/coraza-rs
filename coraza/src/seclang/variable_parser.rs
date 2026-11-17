@@ -104,7 +104,7 @@ impl VariableList {
                         variables.push(spec.clone());
                     }
                 },
-                Element::Exclude(variable, Some(key)) => {
+                Element::Exclude(variable, key) => {
                     for spec in variables.iter_mut().filter(|spec| {
                         spec.variable() == *variable
                             || (multiphase
@@ -120,12 +120,18 @@ impl VariableList {
                                 ))
                     }) {
                         match key {
-                            VariableKey::String(key) => spec.add_exception_string(key),
-                            VariableKey::Regex(key) => spec.add_exception_regex(key.clone()),
+                            Some(VariableKey::String(key)) => spec.add_exception_string(key),
+                            Some(VariableKey::Regex(key)) => spec.add_exception_regex(key.clone()),
+                            // Go's keyless negation after a selector of the same variable
+                            // appends an empty-key exception, which filters every key
+                            // (`internal/corazawaf/transaction.go:684-698`): `ARGS|!ARGS`
+                            // selects nothing, in count mode too. Before any selector of
+                            // that variable it attaches to nothing, so `!ARGS|ARGS` still
+                            // selects.
+                            None => spec.add_exception_string(""),
                         }
                     }
                 },
-                Element::Exclude(_, None) => {},
             }
         }
     }
@@ -767,7 +773,12 @@ mod tests {
     }
 
     #[test]
-    fn keyless_negated_variables_are_noop_selectors() {
+    fn keyless_negated_variables_match_go_selector_semantics() {
+        // Go appends an empty-key exception for a keyless negation, which filters every
+        // key of an already-added selector of the same variable
+        // (`internal/corazawaf/transaction.go:684-698`), in count mode too. Before any
+        // selector of that variable the exception attaches to nothing, so `!ARGS|ARGS`
+        // still selects, and a different variable's selector is unaffected.
         let mut parser = crate::seclang::Parser::new();
         parser
             .from_string("SecRuleEngine On\nSecRule !ARGS \"@rx x\" \"id:1,phase:1,deny\"")
@@ -782,12 +793,48 @@ mod tests {
         let mut parser = crate::seclang::Parser::new();
         parser
             .from_string("SecRuleEngine On\nSecRule ARGS|!ARGS \"@rx x\" \"id:2,phase:1,deny\"")
-            .expect("positive selector survives keyless negation");
-        let waf = parser.into_waf().expect("positive selector builds a WAF");
-        let mut tx = waf.new_transaction_with_id("positive-with-keyless-negation");
+            .expect("keyless negation after a selector compiles");
+        let waf = parser.into_waf().expect("keyless negation builds a WAF");
+        let mut tx = waf.new_transaction_with_id("selector-then-keyless-negation");
         tx.add_get_argument("q", "x");
 
-        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(2));
+        // The empty-key exception filters every key: the rule selects nothing.
+        assert!(tx.process_request_headers().is_none());
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine On\nSecRule !ARGS|ARGS \"@rx x\" \"id:3,phase:1,deny\"")
+            .expect("keyless negation before a selector compiles");
+        let waf = parser.into_waf().expect("keyless negation builds a WAF");
+        let mut tx = waf.new_transaction_with_id("keyless-negation-then-selector");
+        tx.add_get_argument("q", "x");
+
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(3));
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine On\nSecRule ARGS_GET|!ARGS \"@rx x\" \"id:4,phase:1,deny\"")
+            .expect("keyless negation of another variable compiles");
+        let waf = parser.into_waf().expect("keyless negation builds a WAF");
+        let mut tx = waf.new_transaction_with_id("other-variable-keyless-negation");
+        tx.add_get_argument("q", "x");
+
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(4));
+    }
+
+    #[test]
+    fn keyless_negated_variables_filter_count_mode_like_go() {
+        // Go's count mode applies the same empty-key exception: `&ARGS|!ARGS` counts 0.
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine On\nSecRule &ARGS|!ARGS \"@eq 0\" \"id:5,phase:1,deny\"")
+            .expect("count with keyless negation compiles");
+        let waf = parser.into_waf().expect("count with keyless negation builds a WAF");
+        let mut tx = waf.new_transaction_with_id("count-keyless-negation");
+        tx.add_get_argument("q", "x");
+        tx.add_get_argument("z", "x");
+
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(5));
     }
 
     #[test]
