@@ -63,8 +63,12 @@ pub(crate) struct CheckArgs {
 struct Source {
     version: String,
     module: PathBuf,
-    /// The commit the pinned module was resolved to, from its `.info` file.
-    commit: String,
+    /// The commit the pinned module resolves to, when known: the `.info`
+    /// `Origin.Hash`, or the revision encoded in a pseudo-version when the cache
+    /// was populated without origin metadata. `None` when neither is available
+    /// (a tagged version fetched through a proxy); the fixture check compares by
+    /// prefix and skips when this is `None`.
+    commit: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +122,7 @@ fn resolve(root: &Path) -> Result<Source, String> {
             module.display()
         ));
     }
-    let commit = module_commit(&cache, &version)?;
+    let commit = module_commit(&cache, &version)?.or_else(|| pseudo_version_revision(&version));
     Ok(Source {
         version,
         module,
@@ -128,9 +132,9 @@ fn resolve(root: &Path) -> Result<Source, String> {
 
 /// The commit the cached module was fetched from, as recorded by the Go module
 /// download cache in `cache/download/<module>/@v/<version>.info`
-/// (`Origin.Hash`). The fixture documents record the same value, so a mismatch
-/// means the export predates a pin bump.
-fn module_commit(cache: &Path, version: &str) -> Result<String, String> {
+/// (`Origin.Hash`). A cache populated from a proxy response may legally omit
+/// `Origin`, so a missing hash is `None`, not an error.
+fn module_commit(cache: &Path, version: &str) -> Result<Option<String>, String> {
     let info_path = cache
         .join("cache/download")
         .join(MODULE)
@@ -138,12 +142,21 @@ fn module_commit(cache: &Path, version: &str) -> Result<String, String> {
         .join(format!("{version}.info"));
     let info = fs::read_to_string(&info_path).map_err(|error| format!("{}: {error}", info_path.display()))?;
     let value: Value = serde_json::from_str(&info).map_err(|error| format!("{}: {error}", info_path.display()))?;
-    value
+    Ok(value
         .get("Origin")
         .and_then(|origin| origin.get("Hash"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{}: no Origin.Hash in module info", info_path.display()))
+        .map(str::to_owned))
+}
+
+/// The revision a pseudo-version was resolved to: the 12-hex-character suffix
+/// of `vX.Y.Z-0.<timestamp>-<revision>`. Tagged versions encode no revision.
+fn pseudo_version_revision(version: &str) -> Option<String> {
+    let (base, revision) = version.rsplit_once('-')?;
+    if !base.contains('-') || revision.len() != 12 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(revision.to_owned())
 }
 
 fn pinned_version(root: &Path) -> Result<String, String> {
@@ -396,11 +409,15 @@ fn verify_profile_inventory(
             "{label} was exported from a different Go Coraza version; rerun `cargo xtask go-fixtures-refresh`"
         ));
     }
-    if source_json.get("commit").and_then(Value::as_str) != Some(source.commit.as_str()) {
+    if let Some(expected) = source.commit.as_deref()
+        && !source_json
+            .get("commit")
+            .and_then(Value::as_str)
+            .is_some_and(|recorded| recorded.starts_with(expected))
+    {
         return Err(format!(
-            "{label} records commit {}, but the pinned module's .info says {}; rerun `cargo xtask go-fixtures-refresh`",
+            "{label} records commit {}, but the pinned module resolves to {expected}; rerun `cargo xtask go-fixtures-refresh`",
             source_json.get("commit").and_then(Value::as_str).unwrap_or("<missing>"),
-            source.commit,
         ));
     }
     if source_json.get("build_tags").and_then(Value::as_str) != Some(inventory.build_tag) {
