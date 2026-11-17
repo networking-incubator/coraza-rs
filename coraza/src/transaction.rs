@@ -1416,7 +1416,7 @@ impl Transaction {
         if !collection.eq_ignore_ascii_case("TX") {
             return;
         }
-        let (key, value) = assignment.split_once('=').unwrap_or((assignment, ""));
+        let (key, value) = assignment.split_once('=').unwrap_or((assignment, "1"));
         let Ok(key) = Macro::new(key) else {
             return;
         };
@@ -4984,6 +4984,25 @@ v\r\n\
         tx.process_request_headers();
 
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("score")).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn setvar_without_a_value_sets_the_flag_to_one() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:16,phase:1,setvar:TX.flag,pass\"\n\
+                 SecRule TX:flag \"@streq 1\" \"id:17,phase:1,deny\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("setvar-flag");
+
+        assert_eq!(
+            tx.process_request_headers().map(|interruption| interruption.rule_id),
+            Some(17)
+        );
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("flag")).as_deref(), Some("1"));
     }
 
     #[test]
