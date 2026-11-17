@@ -111,6 +111,7 @@ go-harness-check:
 	if [ -n "$$files" ]; then printf '%s\n' "$$files"; exit 1; fi
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go vet ./...
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go test ./...
+	cd coraza/tests/go_profiles/exporter && GOWORK=off GOTOOLCHAIN=local go mod download
 	cargo xtask go-fixtures-check --require-go
 	cd benchmarks/coraza/go && GOWORK=off GOTOOLCHAIN=local go run ./cmd/checkresolve
 
