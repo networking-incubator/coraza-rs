@@ -183,7 +183,16 @@ impl Rule {
             [DebugField::RuleId(self.metadata.id), DebugField::Phase(phase.as_int())]
         });
         let mut collective_matched_values = Vec::new();
-        let matched_values = self.matches_chain(tx, self.metadata.id, phase, true, 0, &mut collective_matched_values);
+        let mut inspection_refused = false;
+        let matched_values = self.matches_chain(
+            tx,
+            self.metadata.id,
+            phase,
+            true,
+            0,
+            &mut collective_matched_values,
+            &mut inspection_refused,
+        );
         if matched_values.is_empty() {
             tx.debug_log(DebugLevel::Debug, "Rule evaluation finished without a match", || {
                 [DebugField::RuleId(self.metadata.id)]
@@ -216,12 +225,14 @@ impl Rule {
             }
         }
 
-        for action in &self.actions {
-            if action.action_type() != ActionType::Nondisruptive {
-                tx.debug_log(DebugLevel::Debug, "Evaluating action", || {
-                    [DebugField::RuleId(self.metadata.id), DebugField::Text(&action.name)]
-                });
-                action.evaluate(&self.metadata, tx);
+        if !inspection_refused {
+            for action in &self.actions {
+                if action.action_type() != ActionType::Nondisruptive {
+                    tx.debug_log(DebugLevel::Debug, "Evaluating action", || {
+                        [DebugField::RuleId(self.metadata.id), DebugField::Text(&action.name)]
+                    });
+                    action.evaluate(&self.metadata, tx);
+                }
             }
         }
         tx.debug_log(DebugLevel::Debug, "Finished rule evaluation", || {
@@ -242,6 +253,7 @@ impl Rule {
         top_level: bool,
         chain_level: usize,
         collective_matched_values: &mut Vec<MatchData>,
+        inspection_refused: &mut bool,
     ) -> Vec<MatchData> {
         if !top_level {
             Self::log_chain_evaluation(tx, "Evaluating chain link", id, self.metadata.id, chain_level);
@@ -253,9 +265,16 @@ impl Rule {
             if tx.multiphase_evaluation() && top_level && self.metadata.has_chain && phase < self.chain_min_phase {
                 return Vec::new();
             }
-            let mut matched_values =
-                self.match_values(tx, id, phase, top_level, chain_level, collective_matched_values);
-            if matched_values.is_empty() {
+            let mut matched_values = self.match_values(
+                tx,
+                id,
+                phase,
+                top_level,
+                chain_level,
+                collective_matched_values,
+                inspection_refused,
+            );
+            if matched_values.is_empty() || *inspection_refused {
                 return matched_values;
             }
             let own_matches = matched_values.len();
@@ -266,7 +285,19 @@ impl Rule {
                     return Vec::new();
                 }
                 chain_level += 1;
-                let link_matches = link.matches_chain(tx, id, phase, false, chain_level, collective_matched_values);
+                let link_matches = link.matches_chain(
+                    tx,
+                    id,
+                    phase,
+                    false,
+                    chain_level,
+                    collective_matched_values,
+                    inspection_refused,
+                );
+                if *inspection_refused {
+                    matched_values.extend(link_matches);
+                    return matched_values;
+                }
                 if link_matches.is_empty() {
                     return Vec::new();
                 }
@@ -315,6 +346,7 @@ impl Rule {
         top_level: bool,
         chain_level: usize,
         collective_matched_values: &mut Vec<MatchData>,
+        inspection_refused: &mut bool,
     ) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand(tx));
         let log_data = self.metadata.log_data.as_ref().map(|value| value.expand(tx));
@@ -358,7 +390,8 @@ impl Rule {
                     Self::log_operator_outcome(tx, id, value.variable, outcome);
                     if outcome == OperatorOutcome::NotInspected && operator.fails_closed_on_not_inspected() {
                         tx.interrupt(id, "deny", 500, "host operator refused to inspect input");
-                        return Vec::new();
+                        *inspection_refused = true;
+                        return matched_values;
                     }
                     match outcome {
                         OperatorOutcome::Matched => {

@@ -120,6 +120,20 @@ struct Limiter {
 thread_local! {
     // Per-thread override of [`MAX_IN_FLIGHT`].
     static TEST_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    // Number of test inspections to allow before refusing one.
+    static TEST_ALLOW_BEFORE_REFUSAL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_refuses_inspection() -> bool {
+    TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| match remaining.get() {
+        Some(0) => true,
+        Some(count) => {
+            remaining.set(Some(count.saturating_sub(1)));
+            false
+        },
+        None => false,
+    })
 }
 
 /// The in-flight cap for the calling thread.
@@ -197,6 +211,10 @@ impl Operator for InspectFile {
     }
 
     fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], _out: &mut Outputs) -> OperatorOutcome {
+        #[cfg(test)]
+        if test_refuses_inspection() {
+            return OperatorOutcome::NotInspected;
+        }
         verdict(run(&self.path, input))
     }
 }
@@ -1142,6 +1160,62 @@ mod tests {
             tx.would_be_interruption().is_some(),
             "the refusal must be visible as a would-be interruption"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_later_value_keeps_prior_matches_and_stops_the_rule() {
+        use super::TEST_ALLOW_BEFORE_REFUSAL;
+        use crate::{seclang::Parser, types::RuleVariable};
+
+        if !sh_available() {
+            return skip("/bin/sh");
+        }
+
+        for (engine, transaction_id) in [
+            ("On", "inspect-file-refusal-after-match"),
+            ("DetectionOnly", "inspect-file-refusal-after-match-detection-only"),
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine {engine}\n\
+                     SecRule ARGS:q|ARGS:r \"@inspectFile /bin/echo\" \"id:966,phase:1,chain,deny,status:403\"\n\
+                     SecRule ARGS:chain \"@streq yes\" \"setvar:tx.chain=1\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id(transaction_id);
+            tx.add_get_argument("q", b"first");
+            tx.add_get_argument("r", b"second");
+            tx.add_get_argument("chain", b"yes");
+
+            TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(Some(1)));
+            let interruption = tx.process_request_headers();
+            TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(None));
+
+            let matched = tx
+                .matched_rules()
+                .iter()
+                .find(|matched| matched.rule.id == 966)
+                .unwrap();
+            assert_eq!(matched.matches.len(), 1);
+            assert_eq!(
+                matched.matches.first().map(|matched| matched.value.as_slice()),
+                Some(b"first".as_slice())
+            );
+            assert!(
+                tx.get_variable(RuleVariable::TX, Some("chain")).is_none(),
+                "a refusal must stop chain-link evaluation"
+            );
+
+            if engine == "On" {
+                assert_eq!(interruption.map(|value| value.status), Some(500));
+            } else {
+                assert!(interruption.is_none());
+                assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(500));
+            }
+        }
     }
 
     #[test]
