@@ -489,9 +489,21 @@ impl Operator for Pm {
             return matcher.is_match(input);
         }
         let mut matched = false;
-        for (index, found) in matcher.find_iter(input).take(10).enumerate() {
-            out.capture(index, input.get(found.range()).unwrap_or_default());
+        // Go restarts matching after each match's start (its `Find` loop advances
+        // one byte past it), so overlapping phrases after a match are still
+        // captured: `@pm abc bcd` on `xabcyzabcde` captures abc, abc, bcd.
+        // `find_iter` is non-overlapping, so search from `start + 1` in a loop.
+        let mut offset = 0;
+        for index in 0..10 {
+            let Some(rest) = input.get(offset..) else { break };
+            let Some(found) = matcher.find_iter(rest).next() else {
+                break;
+            };
+            let start = offset + found.start();
+            let end = offset + found.end();
+            out.capture(index, input.get(start..end).unwrap_or_default());
             matched = true;
+            offset = start + 1;
         }
         matched
     }
@@ -556,9 +568,21 @@ impl Phrases {
             return self.matcher.is_match(input);
         }
         let mut matched = false;
-        for (index, found) in self.matcher.find_iter(input).take(10).enumerate() {
-            out.capture(index, input.get(found.range()).unwrap_or_default());
+        // Go restarts matching after each match's start (its `Find` loop advances
+        // one byte past it), so overlapping phrases after a match are still
+        // captured: `@pm abc bcd` on `xabcyzabcde` captures abc, abc, bcd.
+        // `find_iter` is non-overlapping, so search from `start + 1` in a loop.
+        let mut offset = 0;
+        for index in 0..10 {
+            let Some(rest) = input.get(offset..) else { break };
+            let Some(found) = self.matcher.find_iter(rest).next() else {
+                break;
+            };
+            let start = offset + found.start();
+            let end = offset + found.end();
+            out.capture(index, input.get(start..end).unwrap_or_default());
             matched = true;
+            offset = start + 1;
         }
         matched
     }
@@ -956,6 +980,67 @@ mod tests {
         assert_longest(&pm("%{TX.phrases}").unwrap());
         assert_longest(&file_operator);
         assert_longest(&dataset_operator);
+    }
+
+    #[test]
+    fn phrase_operators_capture_overlapping_phrases_like_go() {
+        // Go restarts matching after each match's start, so overlapping phrases after
+        // a match are still captured, including a suffix phrase that starts inside a
+        // match ending at the end of input: `@pm abc bcd` on `xabcyzabcde` captures
+        // abc, abc, bcd, and `@pm abc bc` on `abc` captures abc, bc.
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("phrases", b"abc bcd");
+
+        let directory = tempfile::tempdir().unwrap();
+        let phrase_file = directory.path().join("phrases.data");
+        std::fs::write(&phrase_file, b"abc\nbcd\n").unwrap();
+        let file_operator = super::pm_from_file(&phrase_file).unwrap();
+        let datasets = super::Datasets::from([("phrases".to_owned(), vec!["abc".to_owned(), "bcd".to_owned()])]);
+        let dataset_operator = super::pm_from_dataset("phrases", &datasets).unwrap();
+
+        let assert_overlap = |operator: &dyn super::Operator| {
+            let mut out = Outputs::new(true);
+            assert!(operator.evaluate(&tx, b"xabcyzabcde", &mut out));
+            assert_eq!(
+                out.take_captures().collect::<Vec<_>>(),
+                [(0, b"abc".to_vec()), (1, b"abc".to_vec()), (2, b"bcd".to_vec())]
+            );
+            // With only `abc` and `bcd` as phrases, a lone `abc` captures once.
+            let mut out = Outputs::new(true);
+            assert!(operator.evaluate(&tx, b"abc", &mut out));
+            assert_eq!(out.take_captures().collect::<Vec<_>>(), [(0, b"abc".to_vec())]);
+        };
+
+        assert_overlap(&pm("abc bcd").unwrap());
+        assert_overlap(&pm("%{TX.phrases}").unwrap());
+        assert_overlap(&file_operator);
+        assert_overlap(&dataset_operator);
+    }
+
+    #[test]
+    fn phrase_operators_capture_phrases_overlapping_the_end_of_input() {
+        // A match ending exactly at the end of input must not stop the capture
+        // loop: the suffix phrase starting inside it is still captured, as in
+        // Go (`@pm abc bc` on `abc` captures abc then bc).
+        let tx = Transaction::new("operator-test");
+        let operator = pm("abc bc").unwrap();
+        let mut out = Outputs::new(true);
+        assert!(operator.evaluate(&tx, b"abc", &mut out));
+        assert_eq!(
+            out.take_captures().collect::<Vec<_>>(),
+            [(0, b"abc".to_vec()), (1, b"bc".to_vec())]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let phrase_file = directory.path().join("phrases.data");
+        std::fs::write(&phrase_file, b"abc\nbc\n").unwrap();
+        let file_operator = super::pm_from_file(&phrase_file).unwrap();
+        let mut out = Outputs::new(true);
+        assert!(file_operator.evaluate(&tx, b"abc", &mut out));
+        assert_eq!(
+            out.take_captures().collect::<Vec<_>>(),
+            [(0, b"abc".to_vec()), (1, b"bc".to_vec())]
+        );
     }
 
     #[test]

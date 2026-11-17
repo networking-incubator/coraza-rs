@@ -570,7 +570,11 @@ fn kill_and_reap(child: &mut Child) {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "inspectFile tests use fixed scripts they create")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "inspectFile tests use fixed scripts they create"
+)]
 mod tests {
     use std::io::Read as _;
     #[cfg(unix)]
@@ -1076,6 +1080,67 @@ mod tests {
             interruption.map(|value| value.status),
             Some(500),
             "refusing an uninspected value must interrupt instead of reporting a clean miss"
+        );
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn an_exhausted_in_flight_cap_fails_closed_for_a_plain_rule() {
+        use super::TEST_CAP;
+        use crate::seclang::Parser;
+
+        // A non-negated rule is refused the same way: the interruption is the
+        // engine's fail-closed 500, not the rule's own disruptive action.
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"@inspectFile /bin/sh\" \"id:964,phase:1,deny,status:403\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inspect-file-cap-plain");
+        tx.add_get_argument("q", b"value");
+
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let interruption = tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+
+        let Some(interruption) = interruption else {
+            panic!("a refused inspection must interrupt")
+        };
+        assert_eq!(
+            interruption.status, 500,
+            "the refusal uses the engine's fail-closed status"
+        );
+        assert_eq!(
+            interruption.action, "deny",
+            "the refusal uses the engine's fail-closed action"
+        );
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn an_exhausted_in_flight_cap_records_a_would_be_interruption_under_detection_only() {
+        use super::TEST_CAP;
+        use crate::seclang::Parser;
+
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine DetectionOnly\n\
+                 SecRule ARGS:q \"@inspectFile /bin/sh\" \"id:965,phase:1,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inspect-file-cap-detection-only");
+        tx.add_get_argument("q", b"value");
+
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let interruption = tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+
+        assert!(interruption.is_none(), "DetectionOnly records without blocking");
+        assert!(
+            tx.would_be_interruption().is_some(),
+            "the refusal must be visible as a would-be interruption"
         );
     }
 

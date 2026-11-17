@@ -137,9 +137,8 @@ pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
 ///
 /// Equivalent to `xss(&input[..max_bytes.min(input.len())])`.
 ///
-/// Note this deliberately skips the [`MAX_INPUT_LEN`] guard that [`xss()`]
-/// applies, so passing `input.len()` scans the whole input however large it
-/// is. Callers that need a bound must impose their own.
+/// [`xss()`] scans the whole input however large it is; this function is the
+/// bounded form for callers that impose their own scan budget.
 #[must_use]
 pub fn xss_with_limit(input: &[u8], max_bytes: usize) -> bool {
     xss::detect(input.get(..max_bytes.min(input.len())).unwrap_or_default())
