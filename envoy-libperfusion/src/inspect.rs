@@ -227,7 +227,7 @@ fn scan_overlapping_windows(bytes: &[u8], detect: impl Fn(&[u8]) -> bool) -> boo
 /// payload that follows it.
 fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
     scan_overlapping_windows(bytes, |window| {
-        libperfusion::sqli(window).is_some() || has_sqli_from_token_restart(window)
+        libperfusion::sqli_with_limit(window, window.len()).is_some() || has_sqli_from_token_restart(window)
     })
 }
 
@@ -332,7 +332,7 @@ fn restart_detects(window: &[u8], start: usize, stride: usize) -> bool {
         .min(window.len());
     window
         .get(start..end)
-        .is_some_and(|tail| libperfusion::sqli(tail).is_some())
+        .is_some_and(|tail| libperfusion::sqli_with_limit(tail, tail.len()).is_some())
 }
 
 /// Builds the tokenizer used to locate restart offsets.

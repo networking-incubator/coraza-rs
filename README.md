@@ -76,13 +76,10 @@ The top-level functions provide the common detection paths:
 | `xss_in_context(input: &[u8], context: HtmlContext)` | `bool`, checking one caller-selected HTML context. |
 | `xss_with_limit(input: &[u8], max_bytes: usize)` | XSS detection over at most the first `max_bytes` bytes. |
 
-The public constant `MAX_INPUT_LEN` is 65,536. The default-cap functions
-(`sqli`, `sqli_with_dialect`, `xss`, `xss_with_context`, and `xss_in_context`)
-reject inputs longer than
-`MAX_INPUT_LEN` without scanning them, returning the same `None` or `false`
-used for a miss. Check the input length separately if your policy requires
-full inspection. The `_with_limit` functions instead scan a prefix of the
-requested length; a miss says nothing about bytes beyond that prefix.
+The public constant `MAX_INPUT_LEN` is a suggested 65,536-byte bound for
+callers that need to limit scan work; the default detection functions scan the
+complete input. The `_with_limit` functions scan only a prefix of the requested
+length; a miss says nothing about bytes beyond that prefix.
 
 ### Parser and tokenizer APIs
 

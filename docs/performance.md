@@ -474,12 +474,13 @@ at HEAD `90ac00e898e6b6528141a8fd7221926a97fe087a`, including the uncommitted
 Envoy adapter change to call `sqli_with_limit` and `xss_with_limit` over the
 complete admitted slice.
 
-The default libperfusion `sqli` and `xss` APIs reject inputs longer than
-65,536 bytes without scanning. The adapter now passes the bounded body slice's
-full length to the caller-bounded APIs, so content after that boundary is
-inspected. The larger scan cost below is the intended coverage for oversized
-inputs; the capped API does not provide a valid performance baseline for those
-inputs because it skips them.
+At the measured revision, libperfusion's default `sqli` and `xss` APIs rejected
+inputs longer than 65,536 bytes without scanning. The adapter instead passed
+the bounded body slice's full length to the caller-bounded APIs, so content
+after that boundary was inspected. The larger scan cost below is the intended
+coverage for oversized inputs; the capped API did not provide a valid
+performance baseline for those inputs because it skipped them. The current
+default APIs scan the complete input.
 
 ### Corpus API comparison
 

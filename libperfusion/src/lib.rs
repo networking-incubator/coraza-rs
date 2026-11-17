@@ -78,13 +78,10 @@ pub mod internals {
     }
 }
 
-/// Maximum input length accepted by the convenience detection functions.
+/// Suggested input bound for callers that want to limit per-call scan work.
 ///
-/// [`sqli()`], [`sqli_with_dialect()`], [`xss()`], [`xss_with_context()`] and
-/// [`xss_in_context()`] reject inputs longer than 65 536 bytes without scanning,
-/// providing a defense-in-depth bound on per-request work. Callers that must
-/// inspect any length, as Coraza's operators do, use [`sqli_with_limit()`] or
-/// [`xss_with_limit()`] with `input.len()`.
+/// The convenience detection functions scan the complete input regardless of
+/// length. Use [`sqli_with_limit()`] or [`xss_with_limit()`] to scan a prefix.
 pub const MAX_INPUT_LEN: usize = 65_536;
 
 /// Checks `input` for SQL injection.
@@ -93,26 +90,14 @@ pub const MAX_INPUT_LEN: usize = 65_536;
 /// double-quoted string. Returns the fingerprint of the first of these
 /// readings that matches a known SQL injection pattern, or `None` if the
 /// input looks benign.
-///
-/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
-/// scanning.
 #[must_use]
 pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
-    if input.len() > MAX_INPUT_LEN {
-        return None;
-    }
     sqli::detect(input)
 }
 
 /// Like [`sqli()`], but also returns which [`Dialect`] the match was found in.
-///
-/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
-/// scanning.
 #[must_use]
 pub fn sqli_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)> {
-    if input.len() > MAX_INPUT_LEN {
-        return None;
-    }
     sqli::detect_with_dialect(input)
 }
 
@@ -129,37 +114,22 @@ pub fn sqli_with_limit(input: &[u8], max_bytes: usize) -> Option<Fingerprint> {
 /// The input is tested as HTML, and as if it continued an attribute value,
 /// unquoted or quoted with `'`, `"` or a backtick. Returns `true` if any of
 /// these readings holds a tag, attribute or URL that can run script.
-///
-/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
-/// scanning.
 #[must_use]
 pub fn xss(input: &[u8]) -> bool {
-    if input.len() > MAX_INPUT_LEN {
-        return false;
-    }
     xss::detect(input)
 }
 
 /// Like [`xss()`], but also returns which [`HtmlContext`] the match was found in.
 ///
-/// Returns `None` if the input looks benign or exceeds [`MAX_INPUT_LEN`].
+/// Returns `None` if the input looks benign.
 #[must_use]
 pub fn xss_with_context(input: &[u8]) -> Option<HtmlContext> {
-    if input.len() > MAX_INPUT_LEN {
-        return None;
-    }
     xss::detect_with_context(input)
 }
 
 /// Checks `input` for cross-site scripting in one caller-selected HTML context.
-///
-/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
-/// scanning.
 #[must_use]
 pub fn xss_in_context(input: &[u8], context: HtmlContext) -> bool {
-    if input.len() > MAX_INPUT_LEN {
-        return false;
-    }
     xss::is_xss(input, context, None)
 }
 
@@ -182,13 +152,7 @@ pub fn xss_with_limit(input: &[u8], max_bytes: usize) -> bool {
 /// `<style>` block -- `background:url(javascript:alert(1))`,
 /// `width:expression(alert(1))` -- reaches them in the one form they cannot
 /// read. Use this when a field is known to land in CSS.
-///
-/// Inputs longer than [`MAX_INPUT_LEN`] (65 536 bytes) are rejected without
-/// scanning.
 #[must_use]
 pub fn xss_in_css_value(input: &[u8]) -> bool {
-    if input.len() > MAX_INPUT_LEN {
-        return false;
-    }
     xss::is_css_value_xss(input)
 }
