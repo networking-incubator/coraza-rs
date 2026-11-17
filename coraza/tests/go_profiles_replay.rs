@@ -47,23 +47,23 @@ const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/go_profiles/d
 /// Files the `operators_with_files` profile loads through `@pmFromFile`/`@ipMatchFromFile`.
 const DATA_FILES: [&str; 3] = ["netranges-01.dat", "netranges-02.dat", "pmFromFile-01.dat"];
 /// Go module release the fixture was exported from.
-const FIXTURE_VERSION: &str = "v3.8.1";
+const FIXTURE_VERSION: &str = "v3.8.2-0.20261114225743-1cfa4f955a19";
 /// Build tags of the exported profile set: the upstream default build.
 const FIXTURE_BUILD_TAGS: &str = "default";
 /// Profiles registered by the default build.
-const FIXTURE_PROFILES: usize = 49;
+const FIXTURE_PROFILES: usize = 50;
 /// Tests those profiles hold.
-const FIXTURE_TESTS: usize = 78;
+const FIXTURE_TESTS: usize = 80;
 /// Stages those profiles hold.
-const FIXTURE_STAGES: usize = 120;
+const FIXTURE_STAGES: usize = 128;
 /// Build tag of the multiphase profile set.
 const FIXTURE_MULTIPHASE_BUILD_TAGS: &str = "coraza.rule.multiphase_evaluation";
 /// Profiles registered by the multiphase build.
-const FIXTURE_MULTIPHASE_PROFILES: usize = 52;
+const FIXTURE_MULTIPHASE_PROFILES: usize = 55;
 /// Tests those profiles hold.
-const FIXTURE_MULTIPHASE_TESTS: usize = 81;
+const FIXTURE_MULTIPHASE_TESTS: usize = 85;
 /// Stages those profiles hold.
-const FIXTURE_MULTIPHASE_STAGES: usize = 123;
+const FIXTURE_MULTIPHASE_STAGES: usize = 134;
 
 /// Expected identity and inventory for one exported Go build profile.
 #[derive(Clone, Copy)]

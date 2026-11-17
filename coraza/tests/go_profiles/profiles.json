@@ -1,7 +1,7 @@
 {
   "source": {
     "module": "github.com/corazawaf/coraza/v3",
-    "version": "v3.8.1",
+    "version": "v3.8.2-0.20261114225743-1cfa4f955a19",
     "commit": "9f8521398d1ff023b958fad0b944cac265763866",
     "build_tags": "default",
     "exporter": "coraza/tests/go_profiles/exporter"
@@ -175,7 +175,7 @@
       "name": "allow.yaml",
       "author": "fzipi",
       "description": "Test if the allow action works",
-      "rules": "\nSecDebugLogLevel 5\nSecRequestBodyAccess On\nSecDefaultAction \"phase:1,log,pass\"\n\nSecRule REQUEST_URI \"/allow_me\" \"id:1,phase:1,allow,log,msg:'ALLOWED'\"\nSecRule REQUEST_URI \"/allow_me\" \"id:2,phase:1,deny,log,msg:'DENIED'\"\n\n# Rule 11 allows phase 1, so rule 12 and 13, being both phase 1, are not triggered. Rule 22 is then triggered in phase 2.\nSecRule REQUEST_URI \"/partial_allow\" \"id:11,phase:1,allow:phase,msg:'Allowed in this phase only'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:12,phase:1,deny,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:13,phase:1,deny,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:22,phase:2,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 31 allows all the request phases (1 and 2), therefore rules 32, 33 and 34 should not be triggered. Rule 42 is\n# expected to be triggered at phase 3.\nSecRule REQUEST_URI \"/request_allow\" \"id:31,phase:1,allow:request,log,msg:'Allowed at the request'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:32,phase:1,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:33,phase:2,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:34,phase:2,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:42,phase:3,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 45 allows only request phases (1 and 2), it should not impact on phase 3.\n# Therefore, rule 46 is expected to be triggered.\nSecRule REQUEST_URI \"/useless_request_allow\" \"id:45,phase:1,allow:request,log,msg:'Allowed at the request'\"\nSecRule REQUEST_URI \"/useless_request_allow\" \"id:46,phase:3,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 50 allows only the current phase (phase 1), it should not impact any other rule (being part of other phases).\n# Rule 61 is meant to allow only from phase 3 (so phase 3 and 4), rule 51, at phase 2 should deny the request\n# before reaching phase 3. Therefore rule 61 and 62 should not be triggered.\n# Suitable for testing that allow:phase is not propagated to other phases\nSecRule REQUEST_URI \"/allow_only_response\" \"id:50,phase:1,allow:phase,log, msg:'Allowed phase 1'\"\nSecRule REQUEST_BODY \"allow_only_response\" \"id:51,phase:2,deny,log,status:500,msg:'Denied request'\"\nSecRule REQUEST_URI \"/allow_only_response\" \"id:61,phase:3,allow,log,msg:'Allowed Response not triggered'\"\nSecRule REQUEST_URI \"/allow_only_response\" \"id:62,phase:4,deny,log,msg:'Deny response not triggered'\"\n\n# Rule 70 should deny the request at phase:2 before rule 71.\n# Suitable for testing multiphase evaluation combined with allow actions.\nSecRule REQUEST_BODY \"response_allow\" \"id:70,phase:2,deny,log,status:500,msg:'Denied request'\"\nSecRule REQUEST_URI \"/response_allow\" \"id:71,phase:3,allow,log,msg:'Allowed Response not triggered'\"\n",
+      "rules": "\nSecDebugLogLevel 5\nSecRequestBodyAccess On\nSecDefaultAction \"phase:1,log,pass\"\n\nSecRule REQUEST_URI \"/allow_me\" \"id:1,phase:1,allow,log,msg:'ALLOWED'\"\nSecRule REQUEST_URI \"/allow_me\" \"id:2,phase:1,deny,log,msg:'DENIED'\"\n# A plain allow skips the remaining request and response phases (rule 4), but the logging phase always runs (rule 3).\nSecRule REQUEST_URI \"/allow_me\" \"id:3,phase:5,pass,log,msg:'Logging phase still runs'\"\nSecRule REQUEST_URI \"/allow_me\" \"id:4,phase:3,pass,log,msg:'Response phase skipped'\"\n\n# Rule 11 allows phase 1, so rule 12 and 13, being both phase 1, are not triggered. Rule 22 is then triggered in phase 2.\nSecRule REQUEST_URI \"/partial_allow\" \"id:11,phase:1,allow:phase,msg:'Allowed in this phase only'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:12,phase:1,deny,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:13,phase:1,deny,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/partial_allow\" \"id:22,phase:2,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 31 allows all the request phases (1 and 2), therefore rules 32, 33 and 34 should not be triggered. Rule 42 is\n# expected to be triggered at phase 3.\nSecRule REQUEST_URI \"/request_allow\" \"id:31,phase:1,allow:request,log,msg:'Allowed at the request'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:32,phase:1,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:33,phase:2,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:34,phase:2,deny,log,msg:'NOT DENIED'\"\nSecRule REQUEST_URI \"/request_allow\" \"id:42,phase:3,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 45 allows only request phases (1 and 2), it should not impact on phase 3.\n# Therefore, rule 46 is expected to be triggered.\nSecRule REQUEST_URI \"/useless_request_allow\" \"id:45,phase:1,allow:request,log,msg:'Allowed at the request'\"\nSecRule REQUEST_URI \"/useless_request_allow\" \"id:46,phase:3,deny,log,status:500,msg:'DENIED'\"\n\n# Rule 50 allows only the current phase (phase 1), it should not impact any other rule (being part of other phases).\n# Rule 61 is meant to allow only from phase 3 (so phase 3 and 4), rule 51, at phase 2 should deny the request\n# before reaching phase 3. Therefore rule 61 and 62 should not be triggered.\n# Suitable for testing that allow:phase is not propagated to other phases\nSecRule REQUEST_URI \"/allow_only_response\" \"id:50,phase:1,allow:phase,log, msg:'Allowed phase 1'\"\nSecRule REQUEST_BODY \"allow_only_response\" \"id:51,phase:2,deny,log,status:500,msg:'Denied request'\"\nSecRule REQUEST_URI \"/allow_only_response\" \"id:61,phase:3,allow,log,msg:'Allowed Response not triggered'\"\nSecRule REQUEST_URI \"/allow_only_response\" \"id:62,phase:4,deny,log,msg:'Deny response not triggered'\"\n\n# Rule 70 should deny the request at phase:2 before rule 71.\n# Suitable for testing multiphase evaluation combined with allow actions.\nSecRule REQUEST_BODY \"response_allow\" \"id:70,phase:2,deny,log,status:500,msg:'Denied request'\"\nSecRule REQUEST_URI \"/response_allow\" \"id:71,phase:3,allow,log,msg:'Allowed Response not triggered'\"\n",
       "tests": [
         {
           "title": "allow action",
@@ -186,10 +186,12 @@
               },
               "output": {
                 "triggered_rules": [
-                  1
+                  1,
+                  3
                 ],
                 "non_triggered_rules": [
-                  2
+                  2,
+                  4
                 ]
               }
             },
@@ -568,6 +570,60 @@
       ]
     },
     {
+      "name": "chains_ignore_compilation_errors.yaml",
+      "author": "fzipi",
+      "description": "SecIgnoreRuleCompilationErrors drops a chain whole when one of its links fails to compile",
+      "rules": "\nSecRuleEngine On\nSecIgnoreRuleCompilationErrors On\n\nSecRule UNKNOWN_VARIABLE \"@unconditionalMatch\" \"id:100,phase:1,pass,nolog,chain\"\n    SecRule REQUEST_URI \"@beginsWith /partner/\" \"ctl:ruleEngine=Off\"\n\nSecRule REQUEST_URI \"@beginsWith /pay\" \"id:110,phase:2,deny,status:403,chain\"\n    SecRule ARGS:card \"@unknownOperator x\" \"chain\"\n        SecRule ARGS:card \"@rx .\" \"setvar:tx.chain_110_leak=1\"\nSecRule TX:chain_110_leak \"@eq 1\" \"id:150,phase:2,pass,log\"\n\nSecRule REQUEST_URI \"@beginsWith /pay\" \"id:120,phase:2,deny,status:403,chain\"\n    SecRule ARGS:card \"@unknownOperator x\"\n\n# Malformed: the operator is not quoted.\nSecRule REQUEST_URI @beginsWith /partner/ \"id:130,phase:1,pass,nolog,chain\"\n    SecRule REQUEST_URI \"@beginsWith /partner/\" \"ctl:ruleEngine=Off\"\n\n# Malformed: the actions are not quoted.\nSecRule REQUEST_URI \"@beginsWith /partner/\" id:160,phase:1,pass,nolog,chain\n    SecRule REQUEST_URI \"@beginsWith /partner/\" \"ctl:ruleEngine=Off\"\n\n# A marker ends a chain, even one left open by a faulty starter.\nSecRule UNKNOWN_VARIABLE \"@unconditionalMatch\" \"id:140,phase:1,pass,nolog,chain\"\nSecMarker END_140\n\nSecRule ARGS \"@contains attack\" \"id:200,phase:2,deny,status:403\"\n",
+      "tests": [
+        {
+          "title": "chains with a faulty link are dropped whole",
+          "stages": [
+            {
+              "input": {
+                "uri": "/partner/orders?q=attack"
+              },
+              "output": {
+                "triggered_rules": [
+                  200
+                ],
+                "non_triggered_rules": [
+                  100,
+                  110,
+                  120,
+                  130,
+                  140,
+                  150,
+                  160
+                ],
+                "interruption": {
+                  "rule_id": 200,
+                  "action": "deny",
+                  "status": 403
+                }
+              }
+            },
+            {
+              "input": {
+                "uri": "/pay?card=1"
+              },
+              "output": {
+                "non_triggered_rules": [
+                  100,
+                  110,
+                  120,
+                  130,
+                  140,
+                  150,
+                  160,
+                  200
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "crs.yaml",
       "author": "jptosso",
       "description": "This is a mix of many tests used to make fixes for CRS",
@@ -603,7 +659,7 @@
       "name": "ctl.yaml",
       "author": "jptosso",
       "description": "Test if the ctl action works",
-      "rules": "\nSecDebugLogLevel 9\nSecRequestBodyAccess On\nSecAction \"id:1, phase:1, ctl:ruleRemoveByTag=test, \\\n\tctl:ruleRemoveById=444, \\\n\tctl:ruleRemoveByMsg=test, \\\n\tctl:ruleRemoveTargetById=5;ARGS_GET:id, \\\n\tctl:ruleRemoveTargetByTag=test-tag;ARGS_GET:id, \\\n\tctl:ruleRemoveTargetByMsg=sometest;ARGS_GET:id, \\\n\tctl:forceRequestBodyVariable=On, \\\n\tlog\"\nSecAction \"id: 2, phase: 1, log, tag:test\"\nSecAction \"id: 3, phase: 1, log, msg:'test'\"\n\n# this rule should match\nSecRule ARGS_GET \"1234\" \"id: 4, phase: 1, log\"\n# this rule shouldn't match because of the CTL\nSecRule ARGS_GET \"1234\" \"id: 5, phase: 1, log\"\n\n#shouldnt match\nSecRule ARGS_GET \"1234\" \"id: 6, phase: 1, log, tag:test-tag\"\nSecRule ARGS_GET \"1234\" \"id: 7, phase: 1, log, msg:'sometest'\"\n\n# should match\nSecRule REQBODY_PROCESSOR \"URLENCODED\" \"id:100,log,phase:2\"\nSecRule REQUEST_BODY \"pizza\" \"id:103,log,phase:2\"\nSecRule ARGS_POST:pineapple \"pizza\" \"id:105,log,phase:2\"\n\nSecAction \"id:444,phase:2,log\"\n\n# ruleRemoveTargetById whole collection test: removes all ARGS_GET from rule 201\nSecAction \"id:200,phase:1,ctl:ruleRemoveTargetById=201;ARGS_GET,log\"\nSecRule ARGS_GET \"@rx .\" \"id:201, phase:1, log\"\n\n# ruleRemoveTargetById regex key test (GET):\n# Rule 300 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from rule 301.\n# Matching args (json.0.desc, json.1.desc) must NOT trigger rule 301.\nSecRule REQUEST_URI \"@beginsWith /api/jobs\" \"id:300,phase:1,pass,log,ctl:ruleRemoveTargetById=301;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:301,phase:1,log\"\n\n# ruleRemoveTargetById regex key test (cookies):\n# Rule 370 removes REQUEST_COOKIES matching /^__utm/ from rule 371. A cookie whose\n# name trims to \"\" must still reach rule 371.\nSecRule REQUEST_URI \"@beginsWith /api/cookie-test\" \"id:370,phase:1,pass,log,ctl:ruleRemoveTargetById=371;REQUEST_COOKIES:/^__utm/\"\nSecRule REQUEST_COOKIES \"@rx attack\" \"id:371,phase:1,log\"\n\n# ruleRemoveTargetById regex key test (POST JSON body):\n# Rule 310 activates JSON body processor for application/json requests.\n# Rule 311 removes ARGS_POST matching /^json\\.\\d+\\.desc$/ from rule 312 when URI starts with /api/jsonjobs.\n# JSON body [{\"desc\":\"attack\"},{\"desc\":\"attack\"}] → ARGS_POST: json.0.desc=attack, json.1.desc=attack.\n# Rule 312 would normally match \"attack\" in ARGS_POST but must be suppressed by rule 311's CTL.\nSecRule REQUEST_HEADERS:content-type \"@beginsWith application/json\" \"id:310,phase:1,pass,log,ctl:requestBodyProcessor=JSON\"\nSecRule REQUEST_URI \"@beginsWith /api/jsonjobs\" \"id:311,phase:1,pass,log,ctl:ruleRemoveTargetById=312;ARGS_POST:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_POST \"@rx attack\" \"id:312,phase:2,log\"\n\n# ruleRemoveTargetByTag regex key test:\n# Rule 320 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from all rules tagged OWASP_CRS.\n# Rule 321 is tagged OWASP_CRS and would normally match the attack args but must be suppressed.\nSecRule REQUEST_URI \"@beginsWith /api/tag-test\" \"id:320,phase:1,pass,log,ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:321,phase:1,log,tag:OWASP_CRS\"\n\n# ruleRemoveTargetByMsg regex key test:\n# Rule 330 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from all rules with msg:'web shell detection'.\n# Rule 331 has msg:'web shell detection' and would normally match the attack args but must be suppressed.\nSecRule REQUEST_URI \"@beginsWith /api/msg-test\" \"id:330,phase:1,pass,log,ctl:ruleRemoveTargetByMsg=web shell detection;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:331,phase:1,log,msg:'web shell detection'\"\n\n# ruleRemoveTargetById chain child test:\n# Rule 340 removes ARGS_GET:json.content from rule 341. Rule 341 is a chain whose\n# CHILD inspects ARGS_GET. The exclusion must propagate to the chain child or the\n# request will be blocked by the child despite the ctl removal (issue #1610).\nSecRule REQUEST_URI \"@beginsWith /api/chain-id\" \"id:340,phase:1,pass,log,ctl:ruleRemoveTargetById=341;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:341,phase:1,log,chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n\n# ruleRemoveTargetByTag chain child test (mirrors the CRS WordPress plugin case):\n# Rule 350 removes ARGS_GET:json.content from all rules tagged OWASP_CRS. Rule 351\n# is a chain tagged OWASP_CRS whose CHILD inspects ARGS_GET.\nSecRule REQUEST_URI \"@beginsWith /api/chain-tag\" \"id:350,phase:1,pass,log,ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:351,phase:1,log,tag:OWASP_CRS,chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n\n# ruleRemoveTargetByMsg chain child test:\n# Rule 360 removes ARGS_GET:json.content from all rules with msg:'argument too long'.\n# Rule 361 is a chain whose PARENT has that msg and whose CHILD inspects ARGS_GET.\nSecRule REQUEST_URI \"@beginsWith /api/chain-msg\" \"id:360,phase:1,pass,log,ctl:ruleRemoveTargetByMsg=argument too long;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:361,phase:1,log,msg:'argument too long',chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n",
+      "rules": "\nSecDebugLogLevel 9\nSecRequestBodyAccess On\nSecAction \"id:1, phase:1, ctl:ruleRemoveByTag=test, \\\n\tctl:ruleRemoveById=444, \\\n\tctl:ruleRemoveByMsg=test, \\\n\tctl:ruleRemoveTargetById=5;ARGS_GET:id, \\\n\tctl:ruleRemoveTargetByTag=test-tag;ARGS_GET:id, \\\n\tctl:ruleRemoveTargetByMsg=sometest;ARGS_GET:id, \\\n\tctl:forceRequestBodyVariable=On, \\\n\tlog\"\nSecAction \"id: 2, phase: 1, log, tag:test\"\nSecAction \"id: 3, phase: 1, log, msg:'test'\"\n\n# this rule should match\nSecRule ARGS_GET \"1234\" \"id: 4, phase: 1, log\"\n# this rule shouldn't match because of the CTL\nSecRule ARGS_GET \"1234\" \"id: 5, phase: 1, log\"\n\n#shouldnt match\nSecRule ARGS_GET \"1234\" \"id: 6, phase: 1, log, tag:test-tag\"\nSecRule ARGS_GET \"1234\" \"id: 7, phase: 1, log, msg:'sometest'\"\n\n# should match\nSecRule REQBODY_PROCESSOR \"URLENCODED\" \"id:100,log,phase:2\"\nSecRule REQUEST_BODY \"pizza\" \"id:103,log,phase:2\"\nSecRule ARGS_POST:pineapple \"pizza\" \"id:105,log,phase:2\"\n\nSecAction \"id:444,phase:2,log\"\n\n# ruleRemoveTargetById whole collection test: removes all ARGS_GET from rule 201\nSecAction \"id:200,phase:1,ctl:ruleRemoveTargetById=201;ARGS_GET,log\"\nSecRule ARGS_GET \"@rx .\" \"id:201, phase:1, log\"\n\n# ruleRemoveTargetById regex key test (GET):\n# Rule 300 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from rule 301.\n# Matching args (json.0.desc, json.1.desc) must NOT trigger rule 301.\nSecRule REQUEST_URI \"@beginsWith /api/jobs\" \"id:300,phase:1,pass,log,ctl:ruleRemoveTargetById=301;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:301,phase:1,log\"\n\n# ruleRemoveTargetById regex key test (cookies):\n# Rule 370 removes REQUEST_COOKIES matching /^__utm/ from rule 371. A cookie whose\n# name trims to \"\" must still reach rule 371.\nSecRule REQUEST_URI \"@beginsWith /api/cookie-test\" \"id:370,phase:1,pass,log,ctl:ruleRemoveTargetById=371;REQUEST_COOKIES:/^__utm/\"\nSecRule REQUEST_COOKIES \"@rx attack\" \"id:371,phase:1,log\"\n\n# ruleRemoveTargetById regex key test (POST JSON body):\n# Rule 310 activates JSON body processor for application/json requests.\n# Rule 311 removes ARGS_POST matching /^json\\.\\d+\\.desc$/ from rule 312 when URI starts with /api/jsonjobs.\n# JSON body [{\"desc\":\"attack\"},{\"desc\":\"attack\"}] → ARGS_POST: json.0.desc=attack, json.1.desc=attack.\n# Rule 312 would normally match \"attack\" in ARGS_POST but must be suppressed by rule 311's CTL.\nSecRule REQUEST_HEADERS:content-type \"@beginsWith application/json\" \"id:310,phase:1,pass,log,ctl:requestBodyProcessor=JSON\"\nSecRule REQUEST_URI \"@beginsWith /api/jsonjobs\" \"id:311,phase:1,pass,log,ctl:ruleRemoveTargetById=312;ARGS_POST:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_POST \"@rx attack\" \"id:312,phase:2,log\"\n\n# ruleRemoveTargetByTag regex key test:\n# Rule 320 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from all rules tagged OWASP_CRS.\n# Rule 321 is tagged OWASP_CRS and would normally match the attack args but must be suppressed.\nSecRule REQUEST_URI \"@beginsWith /api/tag-test\" \"id:320,phase:1,pass,log,ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:321,phase:1,log,tag:OWASP_CRS\"\n\n# ruleRemoveTargetByMsg regex key test:\n# Rule 330 removes ARGS_GET matching /^json\\.\\d+\\.desc$/ from all rules with msg:'web shell detection'.\n# Rule 331 has msg:'web shell detection' and would normally match the attack args but must be suppressed.\nSecRule REQUEST_URI \"@beginsWith /api/msg-test\" \"id:330,phase:1,pass,log,ctl:ruleRemoveTargetByMsg=web shell detection;ARGS_GET:/^json\\.\\d+\\.desc$/\"\nSecRule ARGS_GET \"@rx attack\" \"id:331,phase:1,log,msg:'web shell detection'\"\n\n# ruleRemoveTargetById chain child test:\n# Rule 340 removes ARGS_GET:json.content from rule 341. Rule 341 is a chain whose\n# CHILD inspects ARGS_GET. The exclusion must propagate to the chain child or the\n# request will be blocked by the child despite the ctl removal (issue #1610).\nSecRule REQUEST_URI \"@beginsWith /api/chain-id\" \"id:340,phase:1,pass,log,ctl:ruleRemoveTargetById=341;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:341,phase:1,log,chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n\n# ruleRemoveTargetByTag chain child test (mirrors the CRS WordPress plugin case):\n# Rule 350 removes ARGS_GET:json.content from all rules tagged OWASP_CRS. Rule 351\n# is a chain tagged OWASP_CRS whose CHILD inspects ARGS_GET.\nSecRule REQUEST_URI \"@beginsWith /api/chain-tag\" \"id:350,phase:1,pass,log,ctl:ruleRemoveTargetByTag=OWASP_CRS;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:351,phase:1,log,tag:OWASP_CRS,chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n\n# ruleRemoveTargetByMsg chain child test:\n# Rule 360 removes ARGS_GET:json.content from all rules with msg:'argument too long'.\n# Rule 361 is a chain whose PARENT has that msg and whose CHILD inspects ARGS_GET.\nSecRule REQUEST_URI \"@beginsWith /api/chain-msg\" \"id:360,phase:1,pass,log,ctl:ruleRemoveTargetByMsg=argument too long;ARGS_GET:json.content\"\nSecRule REQUEST_METHOD \"@rx ^GET$\" \"id:361,phase:1,log,msg:'argument too long',chain\"\n    SecRule ARGS_GET \"@rx attack\" \"\"\n\n# ruleEngine=Off is final (seclang-spec ADR-0034):\n# Rule 400 turns the engine off. Rules 402 and 403 come later in the same phase and\n# would switch it back On or to DetectionOnly; once Off has run they must not run,\n# and neither must rule 401 or the phase 2 rule 404.\nSecRule ARGS_GET:engine_off \"@streq 1\" \"id:400,phase:1,pass,log,ctl:ruleEngine=Off\"\nSecRule REQUEST_URI \"@beginsWith /engine-test\" \"id:401,phase:1,pass,log\"\nSecRule ARGS_GET:mode \"@streq on\" \"id:402,phase:1,pass,log,ctl:ruleEngine=On\"\nSecRule ARGS_GET:mode \"@streq detect\" \"id:403,phase:1,pass,log,ctl:ruleEngine=DetectionOnly\"\n# Chains, as in ModSecurity v2: Off set by the last link still matches the chain (410).\n# Off set by an earlier link stops the chain, which does not match, so the next link\n# cannot set the engine back On (411). Either way rule 412 must not run.\nSecRule ARGS_GET:chain_last_off \"@streq 1\" \"id:410,phase:1,pass,log,chain\"\n    SecRule REQUEST_URI \"@beginsWith /engine-test\" \"ctl:ruleEngine=Off\"\nSecRule ARGS_GET:chain_off \"@streq 1\" \"id:411,phase:1,pass,log,ctl:ruleEngine=Off,chain\"\n    SecRule ARGS_GET:mode \"@streq on\" \"ctl:ruleEngine=On\"\nSecRule REQUEST_URI \"@beginsWith /engine-test\" \"id:412,phase:1,pass,log\"\n# Last, so that multiphase evaluation also runs it after the rules above.\nSecRule REQUEST_URI \"@beginsWith /engine-test\" \"id:404,phase:2,deny,status:403,log\"\n# Off set in the logging phase stops the rest of that phase too.\nSecRule ARGS_GET:log_off \"@streq 1\" \"id:420,phase:5,pass,log,ctl:ruleEngine=Off\"\nSecRule REQUEST_URI \"@beginsWith /engine-log\" \"id:421,phase:5,pass,log\"\n",
       "tests": [
         {
           "title": "actions",
@@ -858,6 +914,111 @@
               }
             }
           ]
+        },
+        {
+          "title": "ruleEngine=Off is final for the transaction",
+          "stages": [
+            {
+              "input": {
+                "uri": "/engine-test?engine_off=1\u0026mode=on",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  400
+                ],
+                "non_triggered_rules": [
+                  401,
+                  402,
+                  404
+                ]
+              }
+            },
+            {
+              "input": {
+                "uri": "/engine-test?engine_off=1\u0026mode=detect",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  400
+                ],
+                "non_triggered_rules": [
+                  401,
+                  403,
+                  404
+                ]
+              }
+            },
+            {
+              "input": {
+                "uri": "/engine-test?mode=on",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  401,
+                  402,
+                  404
+                ],
+                "non_triggered_rules": [
+                  400
+                ],
+                "interruption": {
+                  "rule_id": 404,
+                  "action": "deny",
+                  "status": 403
+                }
+              }
+            },
+            {
+              "input": {
+                "uri": "/engine-test?chain_off=1\u0026mode=on",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  401,
+                  402
+                ],
+                "non_triggered_rules": [
+                  411,
+                  412,
+                  404
+                ]
+              }
+            },
+            {
+              "input": {
+                "uri": "/engine-test?chain_last_off=1",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  401,
+                  410
+                ],
+                "non_triggered_rules": [
+                  412,
+                  404
+                ]
+              }
+            },
+            {
+              "input": {
+                "uri": "/engine-log?log_off=1",
+                "method": "GET"
+              },
+              "output": {
+                "triggered_rules": [
+                  420
+                ],
+                "non_triggered_rules": [
+                  421
+                ]
+              }
+            }
+          ]
         }
       ]
     },
@@ -952,7 +1113,7 @@
       "name": "disruptive_actions.yaml",
       "author": "sts",
       "description": "Test if disruptive actions trigger an interruption",
-      "rules": "\nSecRule REQUEST_URI \"/redirect1$\" \"phase:1,id:1,log,status:302,redirect:https://www.example.com\"\n# deny action defaults to status 403\nSecRule REQUEST_URI \"/deny1$\" \"phase:1,id:2,log,deny\"\nSecRule REQUEST_URI \"/drop1$\" \"phase:1,id:3,log,drop\"\n\nSecRule REQUEST_URI \"/redirect2$\" \"phase:2,id:21,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny2$\" \"phase:2,id:22,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop2$\" \"phase:2,id:23,log,drop\"\n\nSecRule REQUEST_URI \"/redirect3$\" \"phase:3,id:31,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny3$\" \"phase:3,id:32,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop3$\" \"phase:3,id:33,log,drop\"\n\nSecRule REQUEST_URI \"/redirect4$\" \"phase:4,id:41,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny4$\" \"phase:4,id:42,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop4$\" \"phase:4,id:43,log,drop\"\n\nSecRule REQUEST_URI \"/redirect5$\" \"phase:5,id:51,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny5$\" \"phase:5,id:52,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop5$\" \"phase:5,id:53,log,drop\"\n\nSecRule REQUEST_URI \"/redirect6$\" \"phase:2,id:61,log,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/redirect7$\" \"phase:2,id:62,log,status:307,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/redirect8$\" \"phase:2,id:63,log,status:401,redirect:https://www.example.com\"\n\n\n# Rule 103 is missing the phase, therefore phase:2 is implicitly applied with its related default actions\n# So we will expect a deny with 501 response for the blocking action.\nSecDefaultAction \"phase:2,deny,status:501,log\"\nSecRule REQUEST_URI \"/default/block\" \"id:103,block,logdata:'WOOOP_BLOCKED_BY_CORAZA_TEST'\"\n",
+      "rules": "\nSecRule REQUEST_URI \"/redirect1$\" \"phase:1,id:1,log,status:302,redirect:https://www.example.com\"\n# deny and drop actions default to status 403\nSecRule REQUEST_URI \"/deny1$\" \"phase:1,id:2,log,deny\"\nSecRule REQUEST_URI \"/drop1$\" \"phase:1,id:3,log,drop\"\n\nSecRule REQUEST_URI \"/redirect2$\" \"phase:2,id:21,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny2$\" \"phase:2,id:22,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop2$\" \"phase:2,id:23,log,status:500,drop\"\n\nSecRule REQUEST_URI \"/redirect3$\" \"phase:3,id:31,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny3$\" \"phase:3,id:32,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop3$\" \"phase:3,id:33,log,drop\"\n\nSecRule REQUEST_URI \"/redirect4$\" \"phase:4,id:41,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny4$\" \"phase:4,id:42,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop4$\" \"phase:4,id:43,log,drop\"\n\nSecRule REQUEST_URI \"/redirect5$\" \"phase:5,id:51,log,status:302,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/deny5$\" \"phase:5,id:52,log,status:500,deny\"\nSecRule REQUEST_URI \"/drop5$\" \"phase:5,id:53,log,drop\"\n\nSecRule REQUEST_URI \"/redirect6$\" \"phase:2,id:61,log,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/redirect7$\" \"phase:2,id:62,log,status:307,redirect:https://www.example.com\"\nSecRule REQUEST_URI \"/redirect8$\" \"phase:2,id:63,log,status:401,redirect:https://www.example.com\"\n\n\n# Rule 103 is missing the phase, therefore phase:2 is implicitly applied with its related default actions\n# So we will expect a deny with 501 response for the blocking action.\nSecDefaultAction \"phase:2,deny,status:501,log\"\nSecRule REQUEST_URI \"/default/block\" \"id:103,block,logdata:'WOOOP_BLOCKED_BY_CORAZA_TEST'\"\n",
       "tests": [
         {
           "title": "disruptive_actions",
@@ -998,7 +1159,8 @@
                 ],
                 "interruption": {
                   "rule_id": 3,
-                  "action": "drop"
+                  "action": "drop",
+                  "status": 403
                 }
               }
             },
@@ -1107,7 +1269,8 @@
                 ],
                 "interruption": {
                   "rule_id": 23,
-                  "action": "drop"
+                  "action": "drop",
+                  "status": 500
                 }
               }
             },
@@ -1152,7 +1315,8 @@
                 ],
                 "interruption": {
                   "rule_id": 33,
-                  "action": "drop"
+                  "action": "drop",
+                  "status": 403
                 }
               }
             },
@@ -1197,7 +1361,8 @@
                 ],
                 "interruption": {
                   "rule_id": 43,
-                  "action": "drop"
+                  "action": "drop",
+                  "status": 403
                 }
               }
             },
@@ -1242,7 +1407,8 @@
                 ],
                 "interruption": {
                   "rule_id": 53,
-                  "action": "drop"
+                  "action": "drop",
+                  "status": 403
                 }
               }
             },
@@ -1404,7 +1570,7 @@
       "name": "macroexpansion.yaml",
       "author": "jptosso",
       "description": "Test if the macro expansions work",
-      "rules": "\nSecAction \"id:1,pass,setvar:'tx.inbound_anomaly_score_threshold=5',setvar:'tx.blocking_paranoia_level=1'\"\n\nSecRule TX:inbound_anomaly_score_threshold \"@eq 5\" \"id:100,log,pass\"\n\nSecRule TX:inbound_anomaly_score_threshold \"@eq %{tx.inbound_anomaly_ScorE_threshold}\" \"id:150,log,pass\"\n\nSecRule TX:blocking_paranoia_level \"@eq 1\" \"id:200,log,pass\"\n\nSecRule TX:executing_paranoia_level \"@lt %{tx.blocking_paranoia_level}\" \"id:901500,phase:1,log\"\n",
+      "rules": "\nSecAction \"id:1,pass,setvar:'tx.inbound_anomaly_score_threshold=5',setvar:'tx.blocking_paranoia_level=1'\"\n\nSecRule TX:inbound_anomaly_score_threshold \"@eq 5\" \"id:100,log,pass\"\n\nSecRule TX:inbound_anomaly_score_threshold \"@eq %{tx.inbound_anomaly_ScorE_threshold}\" \"id:150,log,pass\"\n\nSecRule TX:blocking_paranoia_level \"@eq 1\" \"id:200,log,pass\"\n\nSecRule TX:executing_paranoia_level \"@lt %{tx.blocking_paranoia_level}\" \"id:901500,phase:1,log\"\n\nSecAction \"id:300,pass,setvar:'tx.joined=a%{tx.unset}b'\"\nSecRule TX:joined \"@streq ab\" \"id:301,log,pass\"\nSecAction \"id:302,phase:1,pass,log,msg:'json=%{JSON.a}'\"\n",
       "tests": [
         {
           "title": "macroexpansions",
@@ -1415,11 +1581,14 @@
                 "triggered_rules": [
                   100,
                   150,
-                  200
+                  200,
+                  301,
+                  302
                 ],
                 "non_triggered_rules": [
                   901500
-                ]
+                ],
+                "log_contains": "[msg \"json=\"]"
               }
             }
           ]
@@ -2379,7 +2548,7 @@
       "name": "setvar.yaml",
       "author": "jptosso",
       "description": "Test if the setvar action work",
-      "rules": "\nSecRule ARGS_NAMES \"@rx .\" \\\n\t\"id:921170,\\\n\tnolog,\\\n\tsetvar:'TX.paramcounter_%{MATCHED_VAR_NAME}=+1'\"\n\nSecRule TX:/paramcounter_.*/ \"@eq 2\" \"id:920271,log\"\n",
+      "rules": "\nSecRule ARGS_NAMES \"@rx .\" \\\n\t\"id:921170,\\\n\tnolog,\\\n\tsetvar:'TX.paramcounter_%{MATCHED_VAR_NAME}=+1'\"\n\nSecRule TX:/paramcounter_.*/ \"@eq 2\" \"id:920271,log\"\n\nSecAction \"id:1,nolog,setvar:TX.flag\"\nSecRule TX:flag \"@streq 1\" \"id:2,log\"\nSecAction \"id:3,nolog,setvar:!TX.flag\"\nSecRule \u0026TX:flag \"@eq 0\" \"id:4,log\"\nSecRule TX:flag \"@unconditionalMatch\" \"id:5,log\"\nSecAction \"id:6,nolog,setvar:'TX.empty='\"\nSecRule TX:empty \"@rx ^$\" \"id:7,log\"\nSecRule TX:empty \"@rx .\" \"id:8,log\"\nSecAction \"id:9,nolog,setvar:'TX.%{tx.unset}=empty_key_marker'\"\nSecRule TX \"@streq empty_key_marker\" \"id:10,log\"\n",
       "tests": [
         {
           "title": "setvar",
@@ -2390,7 +2559,15 @@
               },
               "output": {
                 "triggered_rules": [
-                  920271
+                  920271,
+                  2,
+                  4,
+                  7
+                ],
+                "non_triggered_rules": [
+                  5,
+                  8,
+                  10
                 ]
               }
             }
