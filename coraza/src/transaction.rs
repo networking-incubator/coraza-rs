@@ -1443,17 +1443,31 @@ impl Transaction {
             .strip_prefix('+')
             .map(|number| (true, number))
             .or_else(|| value.strip_prefix('-').map(|number| (false, number)));
-        if let Some((add, number)) = arithmetic
-            && let Ok(number) = number.parse::<i64>()
-        {
-            let current = self
-                .get_variable(RuleVariable::TX, Some(&key))
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(0);
+        if let Some((add, number)) = arithmetic {
+            // Go's evaluateTxCollection (internal/actions/setvar.go:158-190): an empty
+            // operand is 0; an unparsable operand is a raw-value write unless it starts
+            // with `tx.`, which writes nothing; an unparsable current value writes
+            // nothing; an unset or empty current value is 0.
+            let operand = match number.parse::<i64>() {
+                Ok(number) => number,
+                Err(_) if number.is_empty() => 0,
+                Err(_) if number.starts_with("tx.") => return,
+                Err(_) => {
+                    self.set_tx_variable(&key, value);
+                    return;
+                },
+            };
+            let current = match self.get_variable(RuleVariable::TX, Some(&key)) {
+                Some(current) if !current.is_empty() => match current.parse::<i64>() {
+                    Ok(current) => current,
+                    Err(_) => return,
+                },
+                _ => 0,
+            };
             let result = if add {
-                current.saturating_add(number)
+                current.saturating_add(operand)
             } else {
-                current.saturating_sub(number)
+                current.saturating_sub(operand)
             };
             self.set_tx_variable(&key, result.to_string());
             return;
@@ -5053,6 +5067,45 @@ v\r\n\
         tx.process_request_headers();
 
         assert!(tx.get_variable(RuleVariable::TX, Some("tx.missing")).is_none());
+    }
+
+    #[test]
+    fn setvar_arithmetic_matches_go_evaluate_tx_collection() {
+        // Go's evaluateTxCollection (internal/actions/setvar.go:158-190): an empty
+        // operand is 0, an unparsable `tx.`-prefixed operand writes nothing, any other
+        // unparsable operand writes the raw value, and an unparsable current value
+        // writes nothing.
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:20,phase:1,pass,setvar:TX.a=+%{TX.missing}\"\n\
+                 SecAction \"id:21,phase:1,pass,setvar:TX.b=5,setvar:TX.b=+%{TX.missing}\"\n\
+                 SecAction \"id:22,phase:1,pass,setvar:TX.c=+tx.foo\"\n\
+                 SecAction \"id:23,phase:1,pass,setvar:TX.d=+literal\"\n\
+                 SecAction \"id:24,phase:1,pass,setvar:TX.e=notanumber,setvar:TX.e=+1\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("setvar-arithmetic");
+
+        tx.process_request_headers();
+
+        // An empty operand is 0.
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("a")).as_deref(), Some("0"));
+        // An existing value plus an empty operand keeps the value.
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("b")).as_deref(), Some("5"));
+        // An unparsable `tx.`-prefixed operand writes nothing.
+        assert!(tx.get_variable(RuleVariable::TX, Some("c")).is_none());
+        // Any other unparsable operand writes the raw value.
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("d")).as_deref(),
+            Some("+literal")
+        );
+        // An unparsable current value writes nothing.
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("e")).as_deref(),
+            Some("notanumber")
+        );
     }
 
     #[test]
