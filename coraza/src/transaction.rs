@@ -1644,6 +1644,9 @@ impl Transaction {
     /// Connectors that already split cookies may keep using [`Transaction::add_request_cookie`];
     /// both paths accumulate values.
     pub fn add_request_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        if key.is_empty() {
+            return;
+        }
         let value = value.as_ref();
         let first_content_type =
             key.eq_ignore_ascii_case("content-type") && self.request_headers.first("content-type").is_none();
@@ -1687,6 +1690,9 @@ impl Transaction {
 
     /// Store a response header value as supplied by the connector.
     pub fn add_response_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        if key.is_empty() {
+            return;
+        }
         let value = value.as_ref();
         let content_type = key.eq_ignore_ascii_case("content-type");
         self.response_headers.add(key, value);
@@ -2989,6 +2995,29 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
             tx.get_variable(RuleVariable::RequestBodyLength, None).as_deref(),
             Some("0")
         );
+    }
+
+    #[test]
+    fn empty_header_names_are_dropped_from_request_and_response_rules() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecRule REQUEST_HEADERS \"@streq ATTACK\" \"id:80,phase:1,pass\"\n\
+                 SecRule RESPONSE_HEADERS \"@streq ATTACK\" \"id:81,phase:3,pass\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("empty-header-name");
+        tx.add_request_header("", b"ATTACK");
+
+        assert!(tx.get_variable(RuleVariable::RequestHeaders, Some("")).is_none());
+        assert!(tx.process_request_headers().is_none());
+
+        tx.add_response_header("", b"ATTACK");
+        assert!(tx.get_variable(RuleVariable::ResponseHeaders, Some("")).is_none());
+        assert!(tx.process_response_headers(200, "HTTP/1.1").is_none());
+        assert!(tx.matched_rules().is_empty());
     }
 
     #[test]
