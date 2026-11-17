@@ -38,10 +38,12 @@ tables retain their source revision in their headers and are checked with
 
 `data/sqli_keywords.txt` and `data/xss_tables.txt` are generated from the
 pinned C revision and are rewritten wholesale by `cargo xtask tables-refresh`.
-Rows this project adds go in `data/sqli_keywords_local.txt` and
-`data/xss_tables_local.txt` instead, so a refresh cannot drop them; `build.rs`
-merges each supplement into the matching upstream table at compile time and
-rejects a row that duplicates or contradicts an upstream one.
+Local fingerprint additions and XSS rows live in
+`data/sqli_keywords_local.txt` and `data/xss_tables_local.txt`. Optional
+dialect identifiers live in `data/sqli_keywords_strict.txt` and are included
+only when the `strict-sql-lookup` Cargo feature is enabled. Those identifiers
+can improve function-call detection but can reclassify UNION column names, so
+the default builtin lookup preserves upstream denylist coverage.
 
 Run the usual checks from the repository root. The parity target needs Go
 1.27.1 and `LIBINJECTION_DIR` set to the C revision in the parity manifest.

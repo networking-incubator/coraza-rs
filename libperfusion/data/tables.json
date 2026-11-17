@@ -1,9 +1,14 @@
 {
   "local": {
     "sql": {
-      "entries": 28,
+      "entries": 8,
       "file": "sqli_keywords_local.txt",
-      "sha256": "c11990fd3513c122d21e6b1b5a4926a31daaf87858cc0d1b28ba48e998f80333"
+      "sha256": "a656980f971eb1b1a13bcd4df8c1a53f35949060199f8ee4efe3ae07a3f1a9de"
+    },
+    "strict_sql": {
+      "entries": 20,
+      "file": "sqli_keywords_strict.txt",
+      "sha256": "8968ba3be692a385cf107f4027eb3f0dd6a3b04c8623c2a7d09f8277eb73236f"
     },
     "xss": {
       "attributes": 12,

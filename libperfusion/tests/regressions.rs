@@ -133,9 +133,6 @@ fn sqli_detects_short_stacked_statements() {
         b"1;SHUTDOWN",
         b"1;SHUTDOWN--",
         b"1;USE master",
-        b"1; ATTACH DATABASE '/tmp/x' AS x",
-        b"1; VACUUM INTO '/tmp/x'",
-        b"1; COPY t FROM PROGRAM 'id'",
     ] {
         assert!(
             libperfusion::sqli(payload).is_some(),
@@ -145,6 +142,7 @@ fn sqli_detects_short_stacked_statements() {
     }
 }
 
+#[cfg(feature = "strict-sql-lookup")]
 #[test]
 fn sqli_classifies_modern_dialect_functions() {
     // A callable absent from the table becomes a Bareword, which moves the
@@ -164,6 +162,33 @@ fn sqli_classifies_modern_dialect_functions() {
             String::from_utf8_lossy(payload)
         );
     }
+}
+
+#[cfg(not(feature = "strict-sql-lookup"))]
+#[test]
+fn sqli_builtin_keeps_union_column_barewords() {
+    for input in [
+        b"-2 union select 1,2 copy,version() from x".as_slice(),
+        b"-2 UNION SELECT 1,2VACUUM,version(),4 FROM t",
+        b"-1JSON_TABLE union select 1,2,3",
+        b"1LO_IMPORT union all select 1,null,null",
+    ] {
+        assert!(
+            libperfusion::sqli(input).is_some(),
+            "union column list not detected: {:?}",
+            input.escape_ascii()
+        );
+    }
+    assert!(libperfusion::sqli(b"-2 union select 1,2 zzz,version() from x").is_some());
+}
+
+#[cfg(feature = "strict-sql-lookup")]
+#[test]
+fn strict_sql_lookup_preserves_dialect_gains() {
+    assert!(libperfusion::sqli(b"1 AND JSON_EXTRACT(a,b)=1--").is_some());
+    assert!(libperfusion::sqli(b"1; ATTACH DATABASE '/tmp/x' AS x").is_some());
+    assert!(libperfusion::sqli(b"1; VACUUM INTO '/tmp/x'").is_some());
+    assert!(libperfusion::sqli(b"1; COPY t FROM PROGRAM 'id'").is_some());
 }
 
 #[test]
@@ -207,7 +232,7 @@ fn sqli_keeps_qualified_oracle_package_calls() {
 
 #[test]
 fn sqli_added_keywords_do_not_flag_ordinary_prose() {
-    // The additions above are only safe if they leave English text alone.
+    // The optional dialect identifiers must leave English text alone.
     for text in [
         b"please copy the program to the new window".as_slice(),
         b"I will attach the file and detach the drive",
