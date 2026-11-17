@@ -63,6 +63,8 @@ pub(crate) struct CheckArgs {
 struct Source {
     version: String,
     module: PathBuf,
+    /// The commit the pinned module was resolved to, from its `.info` file.
+    commit: String,
 }
 
 #[derive(Clone, Copy)]
@@ -108,14 +110,40 @@ fn workspace_root() -> PathBuf {
 
 fn resolve(root: &Path) -> Result<Source, String> {
     let version = pinned_version(root)?;
-    let module = go_mod_cache()?.join(format!("{MODULE}@{version}"));
+    let cache = go_mod_cache()?;
+    let module = cache.join(format!("{MODULE}@{version}"));
     if !module.is_dir() {
         return Err(format!(
             "pinned module directory {} is missing; run `go mod download {MODULE}@{version}` in {EXPORTER_DIR}",
             module.display()
         ));
     }
-    Ok(Source { version, module })
+    let commit = module_commit(&cache, &version)?;
+    Ok(Source {
+        version,
+        module,
+        commit,
+    })
+}
+
+/// The commit the cached module was fetched from, as recorded by the Go module
+/// download cache in `cache/download/<module>/@v/<version>.info`
+/// (`Origin.Hash`). The fixture documents record the same value, so a mismatch
+/// means the export predates a pin bump.
+fn module_commit(cache: &Path, version: &str) -> Result<String, String> {
+    let info_path = cache
+        .join("cache/download")
+        .join(MODULE)
+        .join("@v")
+        .join(format!("{version}.info"));
+    let info = fs::read_to_string(&info_path).map_err(|error| format!("{}: {error}", info_path.display()))?;
+    let value: Value = serde_json::from_str(&info).map_err(|error| format!("{}: {error}", info_path.display()))?;
+    value
+        .get("Origin")
+        .and_then(|origin| origin.get("Hash"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{}: no Origin.Hash in module info", info_path.display()))
 }
 
 fn pinned_version(root: &Path) -> Result<String, String> {
@@ -185,7 +213,7 @@ fn refresh(root: &Path, source: &Source) -> Result<(), String> {
 
     run_exporter(root, &root.join(PROFILES_FILE), false)?;
     run_exporter(root, &root.join(MULTIPHASE_PROFILES_FILE), true)?;
-    verify_inventory(root, &operator_files, &source.version)?;
+    verify_inventory(root, &operator_files, source)?;
 
     println!(
         "Refreshed Go Coraza {} fixtures: {} operator files, {} default profiles, {} multiphase profiles and {RECOMMENDED_CONF}; run the harnesses to review parity.",
@@ -228,7 +256,7 @@ fn check(root: &Path, source: &Source, provenance: bool) -> Result<(), String> {
     )?;
 
     let operator_files = files_with_extension(&root.join(OPERATORS_DIR), "json")?;
-    if let Err(error) = verify_inventory(root, &operator_files, &source.version) {
+    if let Err(error) = verify_inventory(root, &operator_files, source) {
         drifted.push(error);
     }
 
@@ -308,7 +336,7 @@ fn check_provenance(root: &Path, pinned: &Path, multiphase: bool) -> Result<(), 
     ))
 }
 
-fn verify_inventory(root: &Path, operator_files: &[PathBuf], version: &str) -> Result<(), String> {
+fn verify_inventory(root: &Path, operator_files: &[PathBuf], source: &Source) -> Result<(), String> {
     let mut cases = 0;
     for path in operator_files {
         let entries = read_json(path)?;
@@ -327,7 +355,8 @@ fn verify_inventory(root: &Path, operator_files: &[PathBuf], version: &str) -> R
     verify_profile_inventory(
         root,
         &root.join(PROFILES_FILE),
-        version,
+        &source.version,
+        source,
         ProfileInventory {
             build_tag: DEFAULT_BUILD_TAG,
             profiles: PROFILE_COUNT,
@@ -338,7 +367,8 @@ fn verify_inventory(root: &Path, operator_files: &[PathBuf], version: &str) -> R
     verify_profile_inventory(
         root,
         &root.join(MULTIPHASE_PROFILES_FILE),
-        version,
+        &source.version,
+        source,
         ProfileInventory {
             build_tag: MULTIPHASE_BUILD_TAG,
             profiles: MULTIPHASE_PROFILE_COUNT,
@@ -353,19 +383,27 @@ fn verify_profile_inventory(
     root: &Path,
     path: &Path,
     version: &str,
+    source: &Source,
     inventory: ProfileInventory,
 ) -> Result<(), String> {
     let label = relative(root, path);
     let document = read_json(path)?;
-    let source = document
+    let source_json = document
         .get("source")
         .ok_or_else(|| format!("{label}: missing source"))?;
-    if source.get("version").and_then(Value::as_str) != Some(version) {
+    if source_json.get("version").and_then(Value::as_str) != Some(version) {
         return Err(format!(
             "{label} was exported from a different Go Coraza version; rerun `cargo xtask go-fixtures-refresh`"
         ));
     }
-    if source.get("build_tags").and_then(Value::as_str) != Some(inventory.build_tag) {
+    if source_json.get("commit").and_then(Value::as_str) != Some(source.commit.as_str()) {
+        return Err(format!(
+            "{label} records commit {}, but the pinned module's .info says {}; rerun `cargo xtask go-fixtures-refresh`",
+            source_json.get("commit").and_then(Value::as_str).unwrap_or("<missing>"),
+            source.commit,
+        ));
+    }
+    if source_json.get("build_tags").and_then(Value::as_str) != Some(inventory.build_tag) {
         return Err(format!(
             "{label} has the wrong Go build tags; rerun `cargo xtask go-fixtures-refresh`"
         ));

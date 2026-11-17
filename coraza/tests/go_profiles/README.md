@@ -10,8 +10,9 @@ fixtures that some profiles load through file-backed operators.
 
 ## Origin and attribution
 
-- Source: `github.com/corazawaf/coraza/v3`, module version `v3.8.1`,
-  commit `9f8521398d1ff023b958fad0b944cac265763866`, package `testing/engine`
+- Source: `github.com/corazawaf/coraza/v3`, module version
+  `v3.8.2-0.20261114225743-1cfa4f955a19` (Go `main`),
+  commit `1cfa4f955a19f86c687d93c0e7c3a9c97a71e547`, package `testing/engine`
   (profiles are registered through `profile.RegisterProfile` from `init` functions;
   upstream has no JSON/YAML loader or exporter).
 - The profiles and `testdata/*.dat` fixtures are Copyright 2022 Juan Pablo Tosso and
