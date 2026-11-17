@@ -104,7 +104,7 @@ impl VariableList {
                         variables.push(spec.clone());
                     }
                 },
-                Element::Exclude(variable, key) => {
+                Element::Exclude(variable, Some(key)) => {
                     for spec in variables.iter_mut().filter(|spec| {
                         spec.variable() == *variable
                             || (multiphase
@@ -125,6 +125,7 @@ impl VariableList {
                         }
                     }
                 },
+                Element::Exclude(_, None) => {},
             }
         }
     }
@@ -317,8 +318,8 @@ fn pattern<'i>(input: &mut &'i [u8]) -> winnow::Result<&'i [u8], EmptyError> {
 enum Element {
     /// Inspect the selected variable.
     Inspect(VariableSpec),
-    /// Exclude keys from matching earlier variables of the same kind.
-    Exclude(RuleVariable, VariableKey),
+    /// Exclude a key from matching earlier variables of the same kind, or do nothing if no key was written.
+    Exclude(RuleVariable, Option<VariableKey>),
 }
 
 /// Build a selector or exclusion from one parsed expression.
@@ -330,8 +331,6 @@ fn build_element(variable: &ParsedVariable) -> ParseResult<Element> {
         .transpose()?;
 
     if variable.markers.is_negation {
-        let key =
-            key.ok_or_else(|| CompileError::new(format!("a negated variable needs a key: !{}", variable.variable)))?;
         return Ok(Element::Exclude(variable.variable, key));
     }
 
@@ -768,6 +767,30 @@ mod tests {
     }
 
     #[test]
+    fn keyless_negated_variables_are_noop_selectors() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine On\nSecRule !ARGS \"@rx x\" \"id:1,phase:1,deny\"")
+            .expect("keyless negation compiles");
+        let waf = parser.into_waf().expect("keyless negation builds a WAF");
+        let mut tx = waf.new_transaction_with_id("keyless-negation");
+        tx.add_get_argument("q", "x");
+
+        assert!(tx.process_request_headers().is_none());
+        assert!(tx.matched_rules().is_empty());
+
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRuleEngine On\nSecRule ARGS|!ARGS \"@rx x\" \"id:2,phase:1,deny\"")
+            .expect("positive selector survives keyless negation");
+        let waf = parser.into_waf().expect("positive selector builds a WAF");
+        let mut tx = waf.new_transaction_with_id("positive-with-keyless-negation");
+        tx.add_get_argument("q", "x");
+
+        assert_eq!(tx.process_request_headers().map(|item| item.rule_id), Some(2));
+    }
+
+    #[test]
     fn request_xml_selector_selects_the_root_children() {
         let mut xml = Map::new(RuleVariable::RequestXML);
         xml.add("/*", b"superuser & guest");
@@ -828,7 +851,8 @@ mod tests {
             parse_variables("REQUEST_URI:/foo/").err(),
             parse_variables("REQUEST_URI:foo").err()
         );
-        assert!(parse_variables("ARGS|!ARGS").is_err());
+        // A keyless negation is accepted and excludes nothing.
+        assert_eq!(parsed("ARGS|!ARGS").len(), 1);
         assert!(parse_variables("ARGS:/[/").is_err());
         assert!(parse_variables("ARGS:/^id$").is_err());
         assert!(parse_variables("ARGS:/^id$/!ARGS:secret").is_err());
