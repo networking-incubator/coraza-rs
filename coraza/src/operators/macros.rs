@@ -94,15 +94,12 @@ impl Macro {
         })
     }
 
-    /// Expand references from `tx`. An unset variable keeps its original name text.
+    /// Expand references from `tx`. An unset variable expands to an empty string.
     pub fn expand(&self, tx: &Transaction) -> String {
         let mut result = String::with_capacity(self.original.len());
         for token in &self.tokens {
             match token.variable {
-                Some(variable) => result.push_str(
-                    &tx.get_variable(variable, token.key.as_deref())
-                        .unwrap_or_else(|| token.text.clone()),
-                ),
+                Some(variable) => result.push_str(&tx.get_variable(variable, token.key.as_deref()).unwrap_or_default()),
                 None => result.push_str(&token.text),
             }
         }
@@ -224,9 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn unset_variables_keep_the_original_name_text() {
+    fn unset_variables_expand_to_empty_text() {
         let tx = Transaction::new("macro-test");
-        assert_eq!(Macro::new("%{TX.missing}").unwrap().expand(&tx), "TX.missing");
+        assert_eq!(Macro::new("%{TX.missing}").unwrap().expand(&tx), "");
+        assert_eq!(
+            Macro::new("before%{TX.missing}after").unwrap().expand(&tx),
+            "beforeafter"
+        );
     }
 
     #[test]

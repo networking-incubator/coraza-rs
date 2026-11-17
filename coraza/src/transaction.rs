@@ -1421,6 +1421,9 @@ impl Transaction {
             return;
         };
         let key = key.expand(self).to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
         if remove {
             self.tx.remove(&key);
             return;
@@ -4981,6 +4984,20 @@ v\r\n\
         tx.process_request_headers();
 
         assert_eq!(tx.get_variable(RuleVariable::TX, Some("score")).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn setvar_skips_keys_that_expand_to_empty() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecAction \"id:15,phase:1,setvar:TX.%{TX.missing}=value,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("setvar-empty-key");
+
+        tx.process_request_headers();
+
+        assert!(tx.get_variable(RuleVariable::TX, Some("tx.missing")).is_none());
     }
 
     #[test]
