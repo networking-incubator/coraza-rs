@@ -27,17 +27,18 @@
 //!
 //! Divergences from Go:
 //!
-//! - A missed deadline, a spawn failure, a failed wait, or a read error reports [`OperatorOutcome::NotMatched`], as
-//!   Go's `Evaluate` returns `false` for every error. A negated `!@inspectFile` therefore matches on failure, exactly
-//!   as in Go.
+//! - A missed deadline, spawn failure, failed wait, or read error reports [`OperatorOutcome::NotMatched`], as Go's
+//!   `Evaluate` returns `false` for every error. A negated `!@inspectFile` therefore matches on those failures, as in
+//!   Go.
 //! - Output beyond [`OUTPUT_CAP`] keeps the collected prefix and applies Go's first-byte verdict to it: the reader
 //!   stops and the run is abandoned, so a program that writes a huge output cannot pin the caller. An over-cap run with
 //!   no output at all is a non-match, and the exit status is not consulted once the cap is passed: a program that
 //!   writes more than the cap and then exits non-zero still matches by its first byte here, where Go reads the whole
 //!   output and returns false on the failing status.
 //! - A non-zero exit status stays a non-match for a run that stays within [`OUTPUT_CAP`], as in Go.
-//! - The number of runs in flight in a process is capped at [`MAX_IN_FLIGHT`]; a run above that cap reports
-//!   [`OperatorOutcome::NotMatched`] rather than queueing.
+//! - The number of runs in flight in a process is capped at [`MAX_IN_FLIGHT`]. A refused run reports
+//!   [`OperatorOutcome::NotInspected`] and the rule engine interrupts with status 500 rather than treating the value as
+//!   clean.
 //! - On Unix both streams share one socket, so the combined output keeps the program's write order like Go's
 //!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr, so an
 //!   over-cap verdict can be decided from stderr there, where Go reads the combined first byte.
@@ -57,7 +58,9 @@
 //! detached instead: it holds one descriptor and never more than the cap, and it
 //! ends when the last write end closes. A killed program is reaped within a short
 //! grace; one stuck in uninterruptible sleep stays a zombie until the process exits
-//! rather than parking the caller past its deadline.
+//! rather than parking the caller past its deadline. A saturated in-flight cap is
+//! reported as an uninspected value, so the rule engine fails closed with a 500
+//! interruption.
 
 use std::{
     borrow::Cow,
@@ -221,6 +224,8 @@ enum Run {
     OverCap(Vec<u8>),
     /// The program could not be run at all.
     Failed,
+    /// The in-flight cap refused to run the program.
+    Refused,
 }
 
 /// The output one reader collected before end-of-file or the cap.
@@ -232,16 +237,15 @@ struct ReadOutput {
     over_cap: bool,
 }
 
-/// Map a run onto Go's first-byte verdict.
+/// Map a run onto its operator outcome.
 ///
-/// Go returns `false` on every operational error, so a failed run is a plain
-/// non-match: a negated rule then matches exactly as it does in Go. An over-cap
-/// run still has a first byte whenever it has output, and that byte is the whole
-/// verdict, so the collected prefix decides it.
+/// An in-flight refusal is distinct so the rule engine can fail closed. Other
+/// operational errors remain non-matches, as in Go.
 fn verdict(run: Run) -> OperatorOutcome {
     match run {
         Run::Completed(output) | Run::OverCap(output) if first_byte_is_verdict(&output) => OperatorOutcome::Matched,
         Run::Completed(_) | Run::OverCap(_) | Run::Failed => OperatorOutcome::NotMatched,
+        Run::Refused => OperatorOutcome::NotInspected,
     }
 }
 
@@ -298,7 +302,7 @@ fn run(path: &str, input: &[u8]) -> Run {
 /// Run `path` with the value as its argument, bounded by `timeout`.
 fn run_with_timeout(path: &str, input: &[u8], timeout: Duration) -> Run {
     let Some(_slot) = LIMITER.acquire() else {
-        return Run::Failed;
+        return Run::Refused;
     };
     let deadline = Instant::now() + timeout;
     let Some((mut child, readers)) = spawn_captured(path, &value_argument(input)) else {
@@ -640,7 +644,7 @@ mod tests {
     fn output_of(program: &str, input: &[u8]) -> Option<Vec<u8>> {
         match run_with_timeout(program, input, Duration::from_secs(5)) {
             Run::Completed(bytes) => Some(bytes),
-            Run::OverCap(_) | Run::Failed => None,
+            Run::OverCap(_) | Run::Failed | Run::Refused => None,
         }
     }
 
@@ -1028,7 +1032,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_exhausted_in_flight_cap_misses_without_spawning() {
+    fn an_exhausted_in_flight_cap_refuses_without_spawning() {
         use super::{TEST_CAP, run_with_timeout};
 
         if !sh_available() {
@@ -1043,8 +1047,36 @@ mod tests {
         let run = run_with_timeout("/bin/sh", path.as_bytes(), Duration::from_secs(5));
         TEST_CAP.with(|cap| cap.set(None));
 
-        assert!(matches!(run, Run::Failed), "a refused run is a plain miss");
+        assert!(
+            matches!(run, Run::Refused),
+            "a refused run is distinct from a failed run"
+        );
         assert!(!marker.exists(), "a refused run must not spawn the program");
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn an_exhausted_in_flight_cap_fails_closed() {
+        use super::TEST_CAP;
+        use crate::seclang::Parser;
+
+        let mut parser = Parser::new();
+        parser
+            .from_string("SecRule ARGS:q \"!@inspectFile /bin/sh\" \"id:963,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inspect-file-cap");
+        tx.add_get_argument("q", b"value");
+
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        let interruption = tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+
+        assert_eq!(
+            interruption.map(|value| value.status),
+            Some(500),
+            "refusing an uninspected value must interrupt instead of reporting a clean miss"
+        );
     }
 
     #[test]
