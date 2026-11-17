@@ -69,3 +69,26 @@ updates:
       actions-updates:
         patterns:
           - "*"
+
+  - package-ecosystem: "gomod"
+    directories:
+      - "/benchmarks/coraza/go"
+      - "/coraza/tests/go_profiles/exporter"
+    cooldown:
+      default-days: 7
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    allow:
+      - dependency-name: "github.com/corazawaf/coraza/v3"
+    groups:
+      go-coraza:
+        patterns:
+          - "github.com/corazawaf/coraza/v3"
+    labels:
+      - "dependencies"
+      - "go"
+      - "upstream-sync"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
