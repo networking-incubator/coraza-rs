@@ -33,8 +33,10 @@ use crate::{
 pub enum Attribute {
     /// Always banned.
     Black,
-    /// Its value is a URL-like object.
+    /// Its value is checked against the upstream URL prefixes.
     Url,
+    /// Its value must begin with a script-capable URL scheme including `:`.
+    UrlScheme,
     /// Its value contains CSS text that needs special handling.
     Style,
     /// Its value names another attribute.
@@ -77,16 +79,21 @@ static EVENT_SPANS: [(usize, usize); 26] = {
     spans
 };
 
-/// URL schemes that can run script. "JAVA" covers `java:` and `javascript:`.
-const BLACK_URL_SCHEMES: [&[u8]; 6] = [
-    b"DATA",
-    b"VIEW-SOURCE",
-    b"JAVA",
-    b"VBSCRIPT",
-    // Script-capable only in narrow circumstances, but cheap to cover: the
-    // scan is linear over six entries.
-    b"BLOB",
-    b"FILESYSTEM",
+/// Upstream URL prefixes plus local BLOB and FILESYSTEM schemes.
+///
+/// "JAVA" covers `java:` and `javascript:`; the two local schemes include
+/// their colon so a relative path such as `blobstore/x.png` does not match.
+const BLACK_URL_SCHEMES: [&[u8]; 6] = [b"DATA", b"VIEW-SOURCE", b"JAVA", b"VBSCRIPT", b"BLOB:", b"FILESYSTEM:"];
+
+/// Colon-required URL schemes for local attributes whose values are often prose.
+const BLACK_URL_SCHEMES_WITH_COLON: [&[u8]; 7] = [
+    b"DATA:",
+    b"VIEW-SOURCE:",
+    b"JAVA:",
+    b"JAVASCRIPT:",
+    b"VBSCRIPT:",
+    b"BLOB:",
+    b"FILESYSTEM:",
 ];
 
 const MAX_NORMALIZED_TOKEN_LEN: usize = 64;
@@ -408,10 +415,10 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
     })
 }
 
-/// The upper-case first letters of [`BLACK_URL_SCHEMES`], as an A-Z bitmap.
+/// The upper-case first letters used by either scheme list, as an A-Z bitmap.
 #[expect(
     clippy::indexing_slicing,
-    reason = "Const initializer: the loop bound guards BLACK_URL_SCHEMES[i]; every scheme is a \
+    reason = "Const initializer: each loop bound guards its scheme array; every scheme is a \
               non-empty upper-case ASCII literal, so [0] - b'A' is 0..=25. A scheme outside A-Z \
               fails to compile."
 )]
@@ -422,10 +429,23 @@ const SCHEME_FIRST_LETTERS: u32 = {
         letters |= 1 << (BLACK_URL_SCHEMES[i][0] - b'A');
         i += 1;
     }
+    i = 0;
+    while i < BLACK_URL_SCHEMES_WITH_COLON.len() {
+        letters |= 1 << (BLACK_URL_SCHEMES_WITH_COLON[i][0] - b'A');
+        i += 1;
+    }
     letters
 };
 
 fn is_black_url(url: &[u8]) -> bool {
+    is_black_url_with_schemes(url, &BLACK_URL_SCHEMES)
+}
+
+fn is_black_url_with_colon(url: &[u8]) -> bool {
+    is_black_url_with_schemes(url, &BLACK_URL_SCHEMES_WITH_COLON)
+}
+
+fn is_black_url_with_schemes(url: &[u8], schemes: &[&[u8]]) -> bool {
     // Skip whitespace, and high-bit bytes with it: they are not ASCII, Opera
     // sometimes takes UTF-8 whitespace, and EUC-JP ignores some of them.
     let start = url.iter().position(|&ch| ch > 32 && ch < 127).unwrap_or(url.len());
@@ -446,9 +466,7 @@ fn is_black_url(url: &[u8]) -> bool {
         },
     }
 
-    BLACK_URL_SCHEMES
-        .iter()
-        .any(|scheme| htmlencode_startswith(scheme, url))
+    schemes.iter().any(|scheme| htmlencode_startswith(scheme, url))
 }
 
 /// Check one context, also trying a NUL-as-space reading when the input has NULs.
@@ -506,6 +524,7 @@ fn is_xss_raw(input: &[u8], context: Context, data_start: Option<usize>, nul_as_
                     None => false,
                     Some(Attribute::Black | Attribute::Style) => true,
                     Some(Attribute::Url) => is_black_url(text),
+                    Some(Attribute::UrlScheme) => is_black_url_with_colon(text),
                     // An attribute name is given in a _value_.
                     Some(Attribute::Indirect) => black_attr(text) == Some(Attribute::Black),
                 };
@@ -597,6 +616,8 @@ mod tests {
         assert_eq!(black_attr(b"on\0click"), Some(Attribute::Black));
 
         assert_eq!(black_attr(b"href"), Some(Attribute::Url));
+        assert_eq!(black_attr(b"data"), Some(Attribute::UrlScheme));
+        assert_eq!(black_attr(b"srcset"), Some(Attribute::UrlScheme));
         assert_eq!(black_attr(b"style"), Some(Attribute::Style));
         assert_eq!(black_attr(b"attributeName"), Some(Attribute::Indirect));
         assert_eq!(black_attr(b"xmlns"), Some(Attribute::Black));
@@ -755,6 +776,12 @@ mod tests {
         assert!(is_black_url(b"&#106;ava\nscript:"));
         assert!(is_black_url(b"&#x144;ata:"));
         assert!(!is_black_url(b"https://example.com/java"));
+        assert!(!is_black_url(b"blobstore/1.png"));
+        assert!(is_black_url(b"blob:https://example.test/id"));
+        assert!(is_black_url_with_colon(b"data:text/html,alert(1)"));
+        assert!(is_black_url_with_colon(b"javascript:alert(1)"));
+        assert!(!is_black_url_with_colon(b"Data Engineer"));
+        assert!(!is_black_url_with_colon(b"java-logo.png"));
         assert!(!is_black_url(b""));
     }
 }

@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! Inputs that upstream libinjection misses, and this port detects.
+//! Regression inputs that must preserve their expected detection outcomes.
 
 #![expect(
     clippy::tests_outside_test_module,
@@ -257,6 +257,44 @@ fn xss_detects_url_bearing_attributes() {
             !libperfusion::xss(benign),
             "ordinary markup flagged: {:?}",
             String::from_utf8_lossy(benign)
+        );
+    }
+}
+
+#[test]
+fn local_url_attributes_require_a_scheme_colon() {
+    for benign in [
+        b"Profile=Data Engineer at ACME".as_slice(),
+        b"archive=database_2024.zip",
+        b"see src=blobstore/1.png",
+        b"notes ping=java",
+        b"manifest=data.json",
+    ] {
+        assert!(
+            !libperfusion::xss(benign),
+            "ordinary text flagged: {:?}",
+            String::from_utf8_lossy(benign)
+        );
+    }
+
+    for inherited in [b"to=Data team".as_slice(), b"style=bold"] {
+        assert!(
+            libperfusion::xss(inherited),
+            "an inherited control stopped matching: {:?}",
+            String::from_utf8_lossy(inherited)
+        );
+    }
+
+    for payload in [
+        br#"<object data="data:text/html,alert(1)">"#.as_slice(),
+        br#"<a ping="javascript:alert(1)">"#,
+        br#"<a ping="blob:https://example.test/id">"#,
+        br#"<a cite="filesystem:http://example.test/temp/x">"#,
+    ] {
+        assert!(
+            libperfusion::xss(payload),
+            "colon-terminated URL scheme not detected: {:?}",
+            String::from_utf8_lossy(payload)
         );
     }
 }

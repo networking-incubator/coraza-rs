@@ -552,7 +552,7 @@ fn parse_xss_rows(source: &str) -> Result<Vec<Vec<String>>, String> {
             [kind, name, attr]
                 if kind == "attr"
                     && !name.is_empty()
-                    && ["Black", "Url", "Style", "Indirect"].contains(&attr.as_str()) => {},
+                    && ["Black", "Url", "UrlScheme", "Style", "Indirect"].contains(&attr.as_str()) => {},
             _ => return Err(format!("invalid XSS table row {line:?}")),
         }
         rows.push(fields);
@@ -774,8 +774,8 @@ mod tests {
 
     #[test]
     fn local_supplements_may_hold_only_some_row_kinds() {
-        let rows = parse_xss_rows("# comment\nattr\tSRCDOC\tBlack\ntag\tMATH\n").unwrap();
-        assert_eq!(xss_counts(&rows), (0, 1, 1));
+        let rows = parse_xss_rows("# comment\nattr\tSRCDOC\tBlack\nattr\tDATA\tUrlScheme\ntag\tMATH\n").unwrap();
+        assert_eq!(xss_counts(&rows), (0, 2, 1));
         // The upstream table must still carry every kind.
         assert!(parse_xss_data("attr\tSRCDOC\tBlack\n").is_err());
         let section = local_section(&[("VACUUM".to_owned(), b'T')], &rows);

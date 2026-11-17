@@ -116,7 +116,7 @@ these shapes; each is covered by a test in `tests/regressions.rs`.
 | `--` comment whitelist narrowed | suppresses any comment token longer than two bytes | allowed through when the comment body is entirely whitespace and ends the input | ANSI SQL and MySQL both require whitespace after `--`, so `admin'-- ` is the more canonical terminator and the whitelist was inverted relative to exploitability |
 | 8 stacked-statement fingerprints added | `01;ES`, `01;T`, `0S;ES`, `0S;T`, `01;TN`, `0S;TN`, `01;TC`, `0S;TC` absent | present | Length-4 coverage is thin upstream, so `1;WAITFOR DELAY '0:0:5'` passed while `1;WAITFOR DELAY '0:0:5',` was caught |
 | 20 dialect identifiers added | absent | present | A callable missing from the table is classified `Bareword`, which moves the fingerprint off the denylist; see `data/sqli_keywords_local.txt` |
-| 12 URL-bearing attributes and the `MATH` tag added | absent | present | `SRCSET`, `PING`, `CITE`, and the rest carry a URL that upstream never inspects, and no black tag backstops them; see `data/xss_tables_local.txt` |
+| 12 URL-bearing attributes and the `MATH` tag added | absent | present | Local attributes inspect colon-terminated schemes to avoid prose false positives; upstream does not inspect these URL-bearing attributes. See `data/xss_tables_local.txt` |
 
 ### Measured effect on the pinned upstream sample data
 

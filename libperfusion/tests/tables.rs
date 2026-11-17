@@ -144,6 +144,7 @@ fn local_supplements_are_merged_into_the_generated_tables() {
                 let attribute = match row[2].as_str() {
                     "Black" => Attribute::Black,
                     "Url" => Attribute::Url,
+                    "UrlScheme" => Attribute::UrlScheme,
                     "Style" => Attribute::Style,
                     "Indirect" => Attribute::Indirect,
                     other => panic!("unknown attribute type {other}"),
