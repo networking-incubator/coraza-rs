@@ -131,10 +131,11 @@ fn xss_context_benign_is_none() {
 }
 
 #[test]
-fn sqli_rejects_oversized_input() {
+fn sqli_defaults_scan_oversized_input() {
     let mut attack = b"1' OR '1'='1".to_vec();
     attack.resize(MAX_INPUT_LEN + 1, b' ');
-    assert!(libperfusion::sqli(&attack).is_none());
+    assert!(libperfusion::sqli(&attack).is_some());
+    assert!(libperfusion::sqli_with_dialect(&attack).is_some());
 }
 
 #[test]
@@ -145,10 +146,16 @@ fn sqli_accepts_max_size_input() {
 }
 
 #[test]
-fn xss_rejects_oversized_input() {
+fn xss_defaults_scan_oversized_input() {
     let mut attack = b"<script>alert(1)</script>".to_vec();
     attack.resize(MAX_INPUT_LEN + 1, b' ');
-    assert!(!libperfusion::xss(&attack));
+    assert!(libperfusion::xss(&attack));
+    assert!(libperfusion::xss_with_context(&attack).is_some());
+    assert!(libperfusion::xss_in_context(&attack, HtmlContext::Data));
+
+    let mut css = b"width:expression(alert(1))".to_vec();
+    css.resize(MAX_INPUT_LEN + 1, b' ');
+    assert!(libperfusion::xss_in_css_value(&css));
 }
 
 #[test]

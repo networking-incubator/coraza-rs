@@ -18,9 +18,9 @@ use libfuzzer_sys::fuzz_target;
 
 mod support;
 
-/// Upper bound on generated inputs.  Pass `-max_len=262144` to the fuzzer to
-/// match.  This is 4× [`libperfusion::MAX_INPUT_LEN`] so the rejection path
-/// is exercised with a variety of overlarge payloads.
+/// Upper bound on generated inputs. Pass `-max_len=262144` to the fuzzer to
+/// match. This is 4× [`libperfusion::MAX_INPUT_LEN`] to exercise complete
+/// scans beyond the suggested caller bound.
 const MAX_LEN: usize = 262_144;
 
 fuzz_target!(|data: &[u8]| {
