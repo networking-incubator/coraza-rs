@@ -20,6 +20,7 @@
 
 //! Validation and utility operators for encoding, byte ranges, and national IDs.
 
+use super::pattern::ascii_perl_classes;
 use crate::{
     operators::{Operator, Outputs},
     transaction::Transaction,
@@ -333,8 +334,9 @@ pub fn validate_nid(argument: &str) -> Result<ValidateNid, String> {
         "us" => NidKind::Us,
         _ => return Err(invalid()),
     };
-    let regex =
-        regex::Regex::new(pattern).map_err(|error| format!("invalid @validateNid argument {argument:?}: {error}"))?;
+    let pattern = ascii_perl_classes(pattern);
+    let regex = regex::Regex::new(pattern.as_ref())
+        .map_err(|error| format!("invalid @validateNid argument {argument:?}: {error}"))?;
     Ok(ValidateNid { kind, regex })
 }
 
@@ -383,7 +385,7 @@ fn is_ssn(nid: &str) -> bool {
             .fold(0_u32, |number, digit| number * 10 + *digit)
     };
     let (area, group, serial) = (number(0..3), number(3..5), number(5..9));
-    if area == 0 || group == 0 || serial == 0 || area >= 740 || area == 666 {
+    if area == 0 || group == 0 || serial == 0 || area >= 900 || area == 666 {
         return false;
     }
     let all_equal = digits.windows(2).all(|pair| pair.first() == pair.get(1));
@@ -468,5 +470,17 @@ mod tests {
         assert!(!ssn.evaluate(&tx, b"000-12-3456", &mut Outputs::default()));
         assert!(!ssn.evaluate(&tx, b"123-45-6789", &mut Outputs::default()));
         assert!(validate_nid("xx [0-9]+").is_err());
+    }
+
+    #[test]
+    fn validate_nid_uses_ascii_perl_classes_and_accepts_randomized_ssn_areas() {
+        let tx = Transaction::new("operator-test");
+        let ssn = validate_nid(r"us \b\d{3}-\d{2}-\d{4}\b").unwrap();
+
+        assert!(ssn.evaluate(&tx, "é234-56-7891é".as_bytes(), &mut Outputs::default()));
+        for area in [b"740-12-3456".as_slice(), b"899-12-3456"] {
+            assert!(ssn.evaluate(&tx, area, &mut Outputs::default()));
+        }
+        assert!(!ssn.evaluate(&tx, b"900-12-3456", &mut Outputs::default()));
     }
 }
