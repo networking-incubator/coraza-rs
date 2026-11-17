@@ -758,7 +758,18 @@ impl Parser {
                 Err(_) => return Err(self.error("backticks left open".to_owned())),
             };
 
+            // The dispatcher recognizes a directive name by the first space only and
+            // requires an argument for rule directives. A line that would not dispatch
+            // (tab-separated name, bare `SecAction`) must fall through and fail as Go
+            // does instead of being consumed as a dropped link.
+            let (rule_name, rule_options) = directive
+                .as_ref()
+                .split_once(' ')
+                .unwrap_or_else(|| (directive.as_ref(), ""));
+            let dispatches_as_rule = !rule_options.is_empty()
+                && (rule_name.eq_ignore_ascii_case("secrule") || rule_name.eq_ignore_ascii_case("secaction"));
             if self.dropping_chain
+                && dispatches_as_rule
                 && let Some(has_chain) = super::rule_compiler::directive_chain_status(&directive)
             {
                 if !self.skip_failed {
@@ -3797,6 +3808,63 @@ SecWebAppId production
                 .map(|interruption| (interruption.rule_id, interruption.status)),
             Some((300, 403))
         );
+    }
+
+    #[test]
+    fn a_secaction_with_quoted_content_behind_spaces_does_not_invent_a_chain() {
+        // Go's MaybeRemoveQuotes strips one quote pair without trimming whitespace,
+        // so `SecAction " 'chain' "` keeps its single-quoted content quoted and does
+        // not declare a chain: the next rule loads and fires. Trimming before the
+        // unquote re-exposed the content and swallowed that rule.
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecIgnoreRuleCompilationErrors On\n\
+                 SecRule ARGS \"@missing x\" \"id:130,phase:1,pass,chain\"\n\
+                 SecAction \" 'chain' \"\n\
+                 SecRule ARGS \"@contains attack\" \"id:200,phase:1,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.compile().unwrap();
+        let mut tx = waf.new_transaction_with_id("secaction-double-unquote");
+        tx.process_uri("/?q=attack", "GET", "HTTP/1.1");
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+
+        assert_eq!(
+            tx.interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((200, 403))
+        );
+    }
+
+    #[test]
+    fn non_dispatching_directives_are_not_consumed_as_dropped_links() {
+        // A bare `SecAction` and a tab-separated `SecRule` fail directive dispatch
+        // ("requires an argument" / unknown directive) in Go and in the normal Rust
+        // path; the dropped-chain shortcut must not swallow them instead.
+        for (line, expected) in [
+            ("SecAction", "requires an argument"),
+            (
+                "SecRule\tARGS \"@contains attack\" \"id:200,phase:1,deny,status:403\"",
+                "unknown directive",
+            ),
+        ] {
+            let mut parser = Parser::new();
+            let error = parser
+                .from_string(&format!(
+                    "SecRuleEngine On\n\
+                     SecIgnoreRuleCompilationErrors On\n\
+                     SecRule ARGS \"@missing x\" \"id:130,phase:1,pass,chain\"\n\
+                     {line}",
+                ))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "line {line:?}: unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
