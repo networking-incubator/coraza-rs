@@ -156,6 +156,7 @@ fn xss_tables(texts: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
         let kind = match kind {
             "Black" => "Black",
             "Url" => "Url",
+            "UrlScheme" => "UrlScheme",
             "Style" => "Style",
             "Indirect" => "Indirect",
             _ => {

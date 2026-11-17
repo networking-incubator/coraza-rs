@@ -54,6 +54,7 @@ GO_KIND_TO_RUST = {
     "attributeTypeAttrIndirect": "Indirect",
 }
 RUST_XSS_KIND = {"Black": "Deny", "Url": "Url", "Style": "Style", "Indirect": "Indirect"}
+LOCAL_RUST_XSS_KINDS = {*RUST_XSS_KIND, "UrlScheme"}
 
 
 def sha256(data: bytes) -> str:
@@ -320,7 +321,7 @@ def parse_local_xss_rows() -> list[tuple[str, str]]:
         match fields:
             case ["event" | "tag", name] if name:
                 rows.append((fields[0], name))
-            case ["attr", name, kind] if name and kind in RUST_XSS_KIND:
+            case ["attr", name, kind] if name and kind in LOCAL_RUST_XSS_KINDS:
                 rows.append(("attr", name))
             case _:
                 fail(f"invalid local XSS table row at {path}:{line_number}: {line!r}")
