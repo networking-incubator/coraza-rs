@@ -32,9 +32,10 @@ import (
 	"github.com/corazawaf/coraza/v3/testing/profile"
 )
 
-// sourceCommit is the commit of tag v3.8.1 in github.com/corazawaf/coraza, as recorded
-// by the Go module cache's .info file and `git ls-remote`.
-const sourceCommit = "9f8521398d1ff023b958fad0b944cac265763866"
+// sourceCommit is the commit the exporter's go.mod pins
+// (github.com/corazawaf/coraza/v3), as recorded by the Go module cache's
+// .info file and `git ls-remote`.
+const sourceCommit = "1cfa4f955a19f86c687d93c0e7c3a9c97a71e547"
 
 type document struct {
 	Source   source       `json:"source"`

@@ -2,7 +2,7 @@
   "source": {
     "module": "github.com/corazawaf/coraza/v3",
     "version": "v3.8.2-0.20261114225743-1cfa4f955a19",
-    "commit": "9f8521398d1ff023b958fad0b944cac265763866",
+    "commit": "1cfa4f955a19f86c687d93c0e7c3a9c97a71e547",
     "build_tags": "coraza.rule.multiphase_evaluation",
     "exporter": "coraza/tests/go_profiles/exporter"
   },
