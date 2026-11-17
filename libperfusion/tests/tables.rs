@@ -88,7 +88,9 @@ fn data_rows(name: &str) -> Vec<Vec<String>> {
 #[test]
 fn local_supplements_are_merged_into_the_generated_tables() {
     let sql_local = data_rows("sqli_keywords_local.txt");
+    let strict_sql_local = data_rows("sqli_keywords_strict.txt");
     assert!(!sql_local.is_empty(), "no local SQL rows to merge");
+    assert!(!strict_sql_local.is_empty(), "no strict SQL rows to merge");
     for row in &sql_local {
         let (key, value) = (row[0].as_str(), row[1].as_str());
         let found = SQL_KEYWORDS
@@ -96,6 +98,16 @@ fn local_supplements_are_merged_into_the_generated_tables() {
             .find(|&&(word, _)| word == key)
             .unwrap_or_else(|| panic!("local SQL row {key} is missing from the generated table"));
         assert_eq!(String::from_utf8(vec![found.1.as_byte()]).unwrap(), value, "{key}");
+    }
+    for row in &strict_sql_local {
+        let key = row[0].as_str();
+        let found = SQL_KEYWORDS.iter().find(|&&(word, _)| word == key);
+        if cfg!(feature = "strict-sql-lookup") {
+            let found = found.unwrap_or_else(|| panic!("strict SQL row {key} is missing from the generated table"));
+            assert_eq!(String::from_utf8(vec![found.1.as_byte()]).unwrap(), row[1], "{key}");
+        } else {
+            assert!(found.is_none(), "strict SQL row {key} leaked into the default table");
+        }
     }
     for row in data_rows("sqli_keywords.txt") {
         assert!(
@@ -110,16 +122,16 @@ fn local_supplements_are_merged_into_the_generated_tables() {
         "the merged SQL table is not sorted or has duplicates"
     );
 
-    // Exactly the two files merged, nothing else. `data_rows` reads them
-    // under the same whitespace rule `build.rs` applies, so a build script
-    // that drifted from it -- keeping a leading space in a key, or taking an
-    // indented `#` line for a row -- shows up here as a table that is not
-    // what the files say.
+    // The default table merges the upstream and local rows; the opt-in
+    // feature also includes the strict dialect identifiers.
     let mut expected: Vec<(String, String)> = data_rows("sqli_keywords.txt")
         .into_iter()
         .chain(sql_local.clone())
         .map(|row| (row[0].clone(), row[1].clone()))
         .collect();
+    if cfg!(feature = "strict-sql-lookup") {
+        expected.extend(strict_sql_local.iter().map(|row| (row[0].clone(), row[1].clone())));
+    }
     expected.sort();
     let generated: Vec<(String, String)> = SQL_KEYWORDS
         .iter()

@@ -27,6 +27,9 @@ memchr = { version = "2.7", default-features = false, features = ["std"] }
 
 [features]
 internals = []
+# Enable local dialect identifiers that improve some function-call detections
+# but can weaken upstream UNION-column fingerprints.
+strict-sql-lookup = []
 
 [dev-dependencies]
 libperfusion = { path = ".", features = ["internals"] }

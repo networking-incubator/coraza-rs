@@ -51,6 +51,9 @@ impl<T: SqlLookup + ?Sized> SqlLookup for &T {
 }
 
 /// The keyword, operator, and fingerprint tables shipped with libperfusion.
+///
+/// The `strict-sql-lookup` Cargo feature adds local dialect identifiers that
+/// improve some detections but can reclassify upstream `UNION` column names.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BuiltinSqlLookup;
 

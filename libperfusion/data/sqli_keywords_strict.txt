@@ -1,0 +1,26 @@
+# Optional dialect identifiers for the strict-sql-lookup Cargo feature.
+#
+# These local rows improve some dialect-specific function and statement
+# detections but can reclassify UNION column names away from upstream's
+# denylisted fingerprints. The default builtin lookup intentionally omits them.
+# Format: KEY<TAB>VALUE_BYTE
+ATTACH	T
+COPY	T
+DETACH	T
+GTID_SUBSET	f
+GTID_SUBTRACT	f
+JSONB_EXTRACT_PATH	f
+JSON_AGG	f
+JSON_EXTRACT	f
+JSON_QUERY	f
+JSON_TABLE	f
+JSON_VALUE	f
+LO_EXPORT	f
+LO_IMPORT	f
+OPENJSON	f
+STRING_SPLIT	f
+SYSTEM_TIME	k
+TABLESAMPLE	k
+UNPIVOT	k
+VACUUM	T
+WAIT_FOR_EXECUTED_GTID_SET	f
