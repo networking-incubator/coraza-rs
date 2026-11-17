@@ -425,7 +425,11 @@ pub(super) fn directive_chain_status(line: &str) -> Option<bool> {
             }
         }
     } else if directive.eq_ignore_ascii_case("SecAction") {
-        remove_matching_quotes(options.trim())
+        // Go's MaybeRemoveQuotes strips one quote pair without trimming whitespace
+        // (internal/strings/strings.go:63), so quoted content behind intervening
+        // spaces stays quoted and is not an action list. Trimming here re-exposed
+        // it after the wrapping-quote strip and invented a `chain` action.
+        remove_matching_quotes(options)
     } else {
         return None;
     };
