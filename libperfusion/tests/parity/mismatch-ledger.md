@@ -1,64 +1,59 @@
 # Differential behavior and mismatch ledger
 
-The selected oracle is `libinjection-go` main at commit
-`24322d8dcaccb6ce078151937741fb4f7e462a55`, pinned as
-`v0.3.6-0.20261012170915-24322d8dcacc` in `xtask/tools/go.mod` with checksum
-`h1:IYJ0i4VxE2/ypgknP6JXxob1mNB83n2JXWpxnAzP/Co=`. The direct suite covers
-864 corpus and binary cases across SQL/XSS public results, SQL token and fold
+The selected oracle is `libinjection-go` v0.3.6 (release commit
+`355a9b39be7f692a976372cb34b675f45ec07188`), pinned as `v0.3.6` in
+`xtask/tools/go.mod` with checksum
+`h1:cXqACFY1anDzC9W127WguanVYvzvvcdQJI0BmErixdk=`. The direct suite covers
+869 corpus and binary cases across SQL/XSS public results, SQL token and fold
 streams, and five HTML contexts. The generated suite covers 770 deterministic
 byte and grammar inputs.
 
-The direct suite compares 17,280 defined fields. All 864 cases complete
-without oracle errors; 858 match all three public fields. Six exact cases
+The direct suite compares 17,380 defined fields. All 869 cases complete
+without oracle errors; 865 match all three public fields. Four exact cases
 carry reviewed public-result differences. Parser stream differences are
 reported as diagnostics and do not relax the public-result gate.
+
+The pinned Go module carries upstream libinjection-go #140 (C-strchr NUL
+semantics in the SQLi span helpers), which closed the two former
+`sql-nul-*` public-result deviations and the fifteen former SQL token-stream
+diagnostics. It also carries #141 (MySQL charset introducers), matching the
+pinned C revision's keyword table.
 
 ## Reviewed direct differences
 
 | Case | Input | Pinned Go main | libperfusion | Reason |
 | --- | --- | --- | --- | --- |
-| `sql-nul-after-hex-prefix` | `31206f7220307800313d312d2d20` (`1 or 0x<NUL>1=1-- `) | SQLi miss | SQLi hit, `1&1c` | Retains the C parser's bounded numeric-span behavior. |
-| `sql-nul-after-hex-prefix-hash` | `273d30580023` (`'=0X<NUL>#`) | SQLi miss | SQLi hit, `so1c` | Retains the C parser's NUL-containing hexadecimal-number behavior. |
 | `xss-soaj1664ashar-pastebin-u6FY1xDA.txt:78` | `74) <math><a xlink:href="//jsfiddle.net/t846h/">click` | XSS miss | XSS hit | Local `MATH` tag row; the pinned C reference also flags it. |
 | `xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102` | `97) <math><a xlink:href="//jsfiddle.net/t846h/">click` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:693` | `<math><a xlink:href="//XXXxenotixXXX:3555/xss_serve_payloads/bmpz.bmp">KCF` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:694` | `<math><a xlink:href="//XXXxenotixXXX:3555/xss_serve_payloads/kcf.js">KCF` | XSS miss | XSS hit | As above. |
 
 Each exception is keyed by both case ID and exact bytes in
-`tests/oracle_differential.rs`. The test requires exactly six reviewed
+`tests/oracle_differential.rs`. The test requires exactly four reviewed
 exception cases, so unrelated differences fail.
 
-The generated suite has eight reviewed SQLi verdict differences. The first is
-`raw-0265`, input
-`3d2f5932200a273d63300a3058002358592d62255c603e592060202025612a`: Go reports
-a miss; libperfusion reports a hit with fingerprint `son1o`. The other seven
--- `raw-0043`, `raw-0060`, `raw-0075`, `raw-0227`, `raw-0292`, `raw-0365` and
-`raw-0373` -- are the narrowed `#` comment whitelist described below: each
+The generated suite has seven reviewed SQLi verdict differences:
+`raw-0043`, `raw-0060`, `raw-0075`, `raw-0227`, `raw-0292`, `raw-0365` and
+`raw-0373` -- the narrowed `#` comment whitelist described below: each
 minimizes to `"#` or `'#` and yields the `sc` fingerprint Go suppresses. All
-eight are pinned by case ID and exact bytes in
+seven are pinned by case ID and exact bytes in
 `tests/generated_differential.rs`; other verdict differences fail.
 
 ## Parser diagnostics
 
-- For benign `0x<NUL>1` (`30780031`), Go emits a word and number while
-  libperfusion emits one number token. Both public verdicts are benign.
-- For benign `@<NUL>name` (`40006e616d65`), Go emits one variable token while
-  libperfusion separates an empty variable token from `name`. Both public
-  verdicts are benign.
-- For `1 or 0x<NUL>1=1-- ` and `'=0X<NUL>#`, Go and libperfusion differ in
-  numeric token boundaries. Their public verdict differences are listed above.
 - For `<%a%b%><script>alert(1)</script>`, public XSS results match while the
   HTML token streams differ.
 
-These account for 16 diagnostic stream fields: 15 SQL token/fold fields and
-one HTML field. The direct inventory also covers SQL fold-collapse cases,
-namespace lookalikes, SVG/XSL name boundaries, and `xlink=1`; none are
-additional exceptions.
+This accounts for one diagnostic stream field. The former fifteen SQL
+token/fold diagnostics around NUL-containing numeric spans were closed by the
+pinned Go module's #140 fix. The direct inventory also covers SQL
+fold-collapse cases, namespace lookalikes, SVG/XSL name boundaries, and
+`xlink=1`; none are additional exceptions.
 
 ## Pinned C reference
 
-The C check uses commit `533a165ebc1f7c36ecbe3e5583990ea0db81f554`, pinned in
-`tests/parity/manifest.json`. Across 864 inputs, SQLi verdicts and fingerprints
+The C check uses commit `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`, pinned in
+`tests/parity/manifest.json`. Across 869 inputs, SQLi verdicts and fingerprints
 match exactly. Twenty XSS verdict differences are reviewed:
 
 - **C misses; libperfusion detects:** `xss-event-name-nul`,
@@ -84,15 +79,16 @@ match exactly. Twenty XSS verdict differences are reviewed:
   case ID and exact bytes, as `(C, libperfusion) = (true, true)` rows of
   `C_XSS_SAMPLE_VERDICTS`, so losing the detection again fails the gate.
 
-On all 81,417 XSS samples in the pinned C data, libperfusion flags 81,392
-and allows 25; Go main flags 81,388 and allows 29; C flags 81,397 and allows
-20. The four samples above are the whole difference between libperfusion and
-Go main, and five C-only detections remain.
+On all 81,420 XSS samples in the pinned C data (the revision carries the
+0xFF `h5_skip_white` fix and its three `data/xss-github-92.txt` samples),
+libperfusion flags 81,395 and allows 25; Go main flags 81,391 and allows 29;
+C flags 81,400 and allows 20. The four samples above are the whole difference
+between libperfusion and Go main, and five C-only detections remain.
 
 The optional C gate compares exact case IDs and bytes and requires exactly
 these twenty XSS differences; new SQL or XSS differences fail. The Go gate
 also checks all nine added sample inputs, including their XSS verdicts, and
-requires exactly six reviewed public-result exceptions.
+requires exactly four reviewed public-result exceptions.
 
 ## Corpus formatter regression
 
@@ -110,7 +106,8 @@ completes every result field in the checked-in baseline.
 ## Deliberate detection deviations from upstream
 
 The following changes make this port detect inputs upstream misses. They are
-deviations from `d88a8f8` by design, so the pinned oracle will disagree on
+deviations from the pinned upstream revision `1b9f5f0` by design, so the
+pinned oracle will disagree on
 these shapes; each is covered by a test in `tests/regressions.rs`.
 
 | Change | Upstream | libperfusion | Reason |
@@ -131,7 +128,7 @@ asserted in `tests/upstream.rs`.
 | --- | --- | --- | --- |
 | `sqli-*.txt` (85,802) | 85,785 flagged | 85,785 flagged | none |
 | `false_positives.txt` (423) | 21 flagged | 25 flagged | four more, all from the `#` whitelist |
-| `xss*.txt` (81,417) | 81,397 flagged | 81,392 flagged | four more than Go main, all from the `MATH` tag |
+| `xss*.txt` (81,420) | 81,400 flagged | 81,395 flagged | four more than Go main, all from the `MATH` tag |
 
 The four added false positives are the cost of the `#` change and are
 recorded here rather than argued away: `7" #2 CIRCULAR NEEDLE`,
@@ -193,9 +190,9 @@ and C oracles still describe upstream, so the optional
 
 ## Provenance
 
-Compatibility is selected against the pinned Go main commit using Go
-1.27.1/linux/amd64. The shipped tables were extracted from C revision
-`d88a8f86d617ac8dcb9169c9f34637aaac71ac76`, recorded in `data/tables.json`.
-The checked-in differential workflow runs both the pinned Go module and the C
-checkout at `533a165ebc1f7c36ecbe3e5583990ea0db81f554`, recorded in
-`tests/parity/manifest.json`, as CI oracles.
+Compatibility is selected against the pinned Go main commit using
+go1.27.4-X:nodwarf5/linux/amd64. The shipped tables were extracted from C
+revision `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`, recorded in
+`data/tables.json`. The checked-in differential workflow runs both the pinned
+Go module and the C checkout at `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`,
+recorded in `tests/parity/manifest.json`, as CI oracles.

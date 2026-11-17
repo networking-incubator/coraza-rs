@@ -34,7 +34,7 @@ GO_MODULE = "github.com/corazawaf/libinjection-go"
 GO_REPOSITORY = "https://github.com/corazawaf/libinjection-go"
 C_REFERENCE = {
     "repository": "https://github.com/libinjection/libinjection",
-    "commit": "533a165ebc1f7c36ecbe3e5583990ea0db81f554",
+    "commit": "1b9f5f077fc10754e7e4b6498cdaa8fbee53d707",
     "driver": "tests/c_oracle_driver.c",
     "results": "SQLi verdict and fingerprint; XSS verdict",
     # Was 24; the local MATH tag row closed four of them. See
@@ -42,8 +42,8 @@ C_REFERENCE = {
     "reviewed_xss_differences": 20,
 }
 GO_TOOLS = ROOT.parent / "xtask/tools"
-FAMILY_COUNTS = {"sqli": 55, "folding": 119, "tokens": 249, "html5": 68, "xss": 7}
-EXPECTED_KEYWORDS = 9_352
+FAMILY_COUNTS = {"sqli": 60, "folding": 119, "tokens": 249, "html5": 68, "xss": 7}
+EXPECTED_KEYWORDS = 9_359
 EXPECTED_FINGERPRINTS = 8_367
 EXPECTED_XSS = {"tags": 20, "events": 432, "attributes": 20}
 EXPECTED_ORACLE_ERRORS: list[dict[str, object]] = []
@@ -505,8 +505,8 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
     counts, files = fixture_inventory()
     if counts != FAMILY_COUNTS:
         fail(f"fixture family counts differ: expected {FAMILY_COUNTS}, found {counts}")
-    if len(files) != 498:
-        fail(f"expected 498 test fixtures, found {len(files)}")
+    if len(files) != 503:
+        fail(f"expected 503 test fixtures, found {len(files)}")
     # Runs on both paths: the upstream-versus-source comparison below stays
     # exact, and this is what keeps the local supplements from quietly
     # changing what those exact hashes describe.
@@ -596,7 +596,7 @@ def main() -> None:
     if current != recorded_differential:
         print("parity manifest mismatch; rerun with --update only after reviewing source/data changes", file=sys.stderr)
         raise SystemExit(1)
-    print("parity manifest verified: 498 fixtures and recorded source/table hashes")
+    print("parity manifest verified: 503 fixtures and recorded source/table hashes")
 
 
 if __name__ == "__main__":

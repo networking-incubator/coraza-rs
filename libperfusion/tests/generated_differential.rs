@@ -103,16 +103,14 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
         let expected = parse_result(case, response);
         let perfusion = perfusion_result(&case.input);
         perfusion_fingerprint_diagnostics += usize::from(expected.fingerprint != perfusion.fingerprint);
-        if is_reviewed_c_aligned_sql_improvement(case, &expected, &perfusion)
-            || is_reviewed_hash_comment_deviation(case, &expected, &perfusion)
-        {
+        if is_reviewed_hash_comment_deviation(case, &expected, &perfusion) {
             perfusion_exceptions += 1;
         } else if !results_match(&expected, &perfusion) {
             perfusion_failures.push((case.clone(), expected, perfusion));
         }
     }
 
-    assert_eq!(perfusion_exceptions, 8, "libperfusion Go exception inventory changed");
+    assert_eq!(perfusion_exceptions, 7, "libperfusion Go exception inventory changed");
 
     if perfusion_failures.is_empty() {
         eprintln!(
@@ -178,19 +176,10 @@ const HASH_COMMENT_SQL_DEVIATIONS: [(&str, &str); 7] = [
     ),
 ];
 
-fn is_reviewed_c_aligned_sql_improvement(case: &Case, expected: &PublicResult, actual: &PublicResult) -> bool {
-    case.id == "raw-0265"
-        && case.input
-            == [
-                0x3D, 0x2F, 0x59, 0x32, 0x20, 0x0A, 0x27, 0x3D, 0x63, 0x30, 0x0A, 0x30, 0x58, 0x00, 0x23, 0x58, 0x59,
-                0x2D, 0x62, 0x25, 0x5C, 0x60, 0x3E, 0x59, 0x20, 0x60, 0x20, 0x20, 0x25, 0x61, 0x2A,
-            ]
-        && !expected.sqli
-        && expected.xss == Some(false)
-        && actual.sqli
-        && actual.xss == Some(false)
-}
-
+/// The pinned Go module's strchr NUL semantics (upstream #140) now match the
+/// C parser this port retains, so the former `raw-0265` `0X<NUL>#` deviation
+/// agrees and was removed rather than kept as a dead entry.
+///
 /// The `'#`/`"#` fingerprint deviations listed in
 /// [`HASH_COMMENT_SQL_DEVIATIONS`], and only those.
 fn is_reviewed_hash_comment_deviation(case: &Case, expected: &PublicResult, actual: &PublicResult) -> bool {

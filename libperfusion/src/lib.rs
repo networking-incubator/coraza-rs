@@ -9,7 +9,7 @@
 //! cross-site scripting in user input by tokenizing it rather than matching
 //! regular expressions.
 //!
-//! The port follows libinjection 4.0.0 (`d88a8f8`) and aims to give the same
+//! The port follows libinjection 4.0.1 (`1b9f5f0`) and aims to give the same
 //! verdict as the C library on every input. It uses `std` for accelerated byte
 //! searches and does not allocate while detecting.
 //!

@@ -1,4 +1,4 @@
-# Extracted from libinjection C v4.0.0-8-gd88a8f8 (d88a8f86d617ac8dcb9169c9f34637aaac71ac76)
+# Extracted from libinjection C v4.0.1-3-g1b9f5f0 (1b9f5f077fc10754e7e4b6498cdaa8fbee53d707)
 # Format: event<TAB>NAME, attr<TAB>NAME<TAB>TYPE, tag<TAB>NAME
 event	ABORT
 event	ACCESSKEYNOTFOUND
