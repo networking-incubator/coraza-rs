@@ -176,19 +176,18 @@ pub fn ip_match_from_dataset(name: &str, datasets: &Datasets) -> Result<IpMatchF
 /// IP address matching operator (from file).
 ///
 /// Loads IP addresses and CIDR blocks from a file, then performs matching
-/// identical to `@ipMatch`. Each line in the file should contain one IP
-/// address or CIDR block. Empty lines and lines starting with `#` are ignored.
+/// identical to `@ipMatch`. Lines may contain comma-separated entries. Empty
+/// lines and lines starting with `#` are ignored.
 ///
 /// # File Format
 ///
 /// ```text
 /// # Internal networks
-/// 10.0.0.0/8
-/// 172.16.0.0/12
+/// 10.0.0.0/8, 172.16.0.0/12
 /// 192.168.0.0/16
 ///
 /// # Specific IPs
-/// 203.0.113.42
+/// 203.0.113.42, 203.0.113.43
 /// ```
 ///
 /// # Arguments
@@ -205,8 +204,8 @@ impl IpMatchFromFile {
     ///
     /// # Arguments
     ///
-    /// * `file_path` - Path to file containing IP addresses (one per line); a relative path is relative to the working
-    ///   directory
+    /// * `file_path` - Path to a file containing comma-separated IP addresses or CIDR blocks; relative paths use the
+    ///   working directory
     ///
     /// # Returns
     ///
@@ -215,7 +214,7 @@ impl IpMatchFromFile {
     ///
     /// # File Format
     ///
-    /// - One IP address or CIDR block per line
+    /// - Comma-separated IP addresses or CIDR blocks
     /// - Empty lines are ignored
     /// - Lines starting with `#` are treated as comments and ignored
     /// - Invalid IP addresses are silently skipped
@@ -237,7 +236,7 @@ impl IpMatchFromFile {
         let content = read_to_string(rule_data, file_path)
             .map_err(|error| format!("failed to read file {}: {error}", file_path.display()))?;
 
-        let mut subnets = Vec::new();
+        let mut networks = String::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -246,24 +245,15 @@ impl IpMatchFromFile {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
-            // Auto-add CIDR suffix if not present
-            let ip_with_cidr = if line.contains(':') && !line.contains('/') {
-                // IPv6 without CIDR - add /128
-                format!("{line}/128")
-            } else if line.contains('.') && !line.contains('/') {
-                // IPv4 without CIDR - add /32
-                format!("{line}/32")
-            } else {
-                line.to_owned()
-            };
-
-            if let Ok(net) = IpNet::from_str(&ip_with_cidr) {
-                subnets.push(canonical_net(net));
+            if !networks.is_empty() {
+                networks.push(',');
             }
+            networks.push_str(line);
         }
 
-        Ok(Self { subnets })
+        Ok(Self {
+            subnets: IpMatch::new(&networks).subnets,
+        })
     }
 }
 
@@ -283,8 +273,8 @@ impl Operator for IpMatchFromFile {
 ///
 /// # Arguments
 ///
-/// * `file_path` - Path to file containing IP addresses (one per line); a relative path is relative to the working
-///   directory
+/// * `file_path` - Path to a file containing comma-separated IP addresses or CIDR blocks; relative paths use the
+///   working directory
 ///
 /// # Errors
 ///
@@ -344,6 +334,38 @@ mod tests {
         );
 
         assert!(ip_match_from_file(dir.path().join("missing.dat")).is_err());
+    }
+
+    #[test]
+    fn matches_multiple_ip_entries_on_each_file_line() {
+        let tx = Transaction::new("operator-test");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ips.dat");
+        std::fs::write(
+            &path,
+            "# list\n\
+             192.0.2.1, 198.51.100.7\n\
+             203.0.113.0/24,10.0.0.1\n\
+             2001:db8::1 , 2001:db8::2\n",
+        )
+        .unwrap();
+        let operator = ip_match_from_file(&path).unwrap();
+
+        for ip in [
+            b"192.0.2.1".as_slice(),
+            b"198.51.100.7",
+            b"203.0.113.9",
+            b"10.0.0.1",
+            b"2001:db8::1",
+            b"2001:db8::2",
+        ] {
+            assert!(
+                operator.evaluate(&tx, ip, &mut Outputs::default()),
+                "{}",
+                String::from_utf8_lossy(ip)
+            );
+        }
+        assert!(!operator.evaluate(&tx, b"198.51.100.8", &mut Outputs::default()));
     }
 
     #[test]
