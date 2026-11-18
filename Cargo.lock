@@ -244,6 +244,7 @@ dependencies = [
  "jsonschema",
  "libperfusion",
  "md-5",
+ "memchr",
  "mime",
  "regex",
  "serde_json",
