@@ -29,7 +29,9 @@ use crate::{
 /// SQL injection detection operator.
 ///
 /// Detects SQL injection attempts using libinjection's `SQLi` detection algorithm.
-/// On an upstream-compatible miss, it retries with local dialect identifiers.
+/// It uses the default table, retries with the local dialect identifiers after
+/// a miss, and takes `ATTACH`, `COPY`, `DETACH` and `VACUUM` only as a
+/// statement after `;`.
 /// Returns true if SQL injection patterns are detected in the input. When a match
 /// is found, the SQL fingerprint (such as `s&sos`) is captured in field 0.
 ///

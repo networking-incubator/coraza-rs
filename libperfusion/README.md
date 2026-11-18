@@ -44,9 +44,12 @@ dialect identifiers live in `data/sqli_keywords_strict.txt` and are included
 only when the `strict-sql-lookup` Cargo feature is enabled. Those identifiers
 can improve function-call detection but can reclassify UNION column names, so
 the default builtin lookup preserves upstream denylist coverage.
-`sqli_with_strict_fallback()` retains the default lookup first and retries with
-those identifiers only when needed; Coraza's `@detectSQLi` and the
-`envoy-libperfusion` filter use this combined lookup.
+`sqli_with_strict_fallback()` uses the default lookup first and retries with
+the dialect identifiers only when needed. Of those, `ATTACH`, `COPY`, `DETACH`
+and `VACUUM` are ordinary English words: they count (as a `Tsql` statement)
+only directly after a `;`, in both passes, and never cause a retry on their
+own. Coraza's `@detectSQLi` and the `envoy-libperfusion` filter use this
+lookup.
 
 Run the usual checks from the repository root. The parity target needs Go
 1.27.1 and `LIBINJECTION_DIR` set to the C revision in the parity manifest.

@@ -34,6 +34,14 @@ pub trait SqlLookup {
 
     /// Whether `fingerprint` is in the detector's deny list.
     fn is_fingerprint(&self, fingerprint: &[u8]) -> bool;
+
+    /// Whether `word`, which this lookup read as a bareword, is a statement
+    /// word that the folder retypes [`Tsql`](TokenType::Tsql) when it directly
+    /// follows a `;`. No word is, by default.
+    #[inline]
+    fn is_statement_after_semicolon(&self, _word: &[u8]) -> bool {
+        false
+    }
 }
 
 impl<T: SqlLookup + ?Sized> SqlLookup for &T {
@@ -47,6 +55,10 @@ impl<T: SqlLookup + ?Sized> SqlLookup for &T {
 
     fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
         (**self).is_fingerprint(fingerprint)
+    }
+
+    fn is_statement_after_semicolon(&self, word: &[u8]) -> bool {
+        (**self).is_statement_after_semicolon(word)
     }
 }
 
@@ -69,7 +81,9 @@ impl SqlLookup for BuiltinSqlLookup {
 
 pub(crate) const BUILTIN_SQL_LOOKUP: BuiltinSqlLookup = BuiltinSqlLookup;
 
-/// The upstream-compatible lookup, tracking whether a strict-only word occurs.
+/// The upstream-compatible lookup, tracking whether a strict-only identifier
+/// occurs. The statement words (strict entries typed `Tsql`) read as plain
+/// barewords and are not tracked: they only count after a `;`.
 pub(crate) struct DefaultSqlLookup<'a> {
     pub(crate) saw_strict_word: &'a Cell<bool>,
 }
@@ -78,7 +92,9 @@ impl SqlLookup for DefaultSqlLookup<'_> {
     fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
         let (ty, strict) = lookup_entry(word)?;
         if strict {
-            self.saw_strict_word.set(true);
+            if ty != TokenType::Tsql {
+                self.saw_strict_word.set(true);
+            }
             return None;
         }
         Some(ty)
@@ -87,20 +103,38 @@ impl SqlLookup for DefaultSqlLookup<'_> {
     fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
         fingerprint_is_listed(self, fingerprint)
     }
+
+    fn is_statement_after_semicolon(&self, word: &[u8]) -> bool {
+        is_statement_word(word)
+    }
 }
 
-/// The default lookup with the local dialect identifiers overlaid.
+/// The default lookup with the local dialect identifiers overlaid, except for
+/// the statement words, which stay barewords.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StrictSqlLookup;
 
 impl SqlLookup for StrictSqlLookup {
     fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
-        lookup_entry(word).map(|(ty, _)| ty)
+        match lookup_entry(word)? {
+            (TokenType::Tsql, true) => None,
+            (ty, _) => Some(ty),
+        }
     }
 
     fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
         fingerprint_is_listed(self, fingerprint)
     }
+
+    fn is_statement_after_semicolon(&self, word: &[u8]) -> bool {
+        is_statement_word(word)
+    }
+}
+
+/// Whether `word` is a statement word: a strict-table entry typed `Tsql`
+/// (ATTACH, COPY, DETACH, VACUUM).
+fn is_statement_word(word: &[u8]) -> bool {
+    matches!(lookup_entry(word), Some((TokenType::Tsql, true)))
 }
 
 fn fingerprint_is_listed(lookup: &impl SqlLookup, fingerprint: &[u8]) -> bool {
@@ -310,23 +344,49 @@ mod tests {
         let strict = StrictSqlLookup;
 
         for &(word, ty) in &STRICT_SQL_KEYWORDS {
+            // The statement words stay barewords in both passes, and only
+            // identifiers count as a strict word that asks for a retry.
+            let statement = ty == TokenType::Tsql;
             assert_eq!(lookup_entry(word.as_bytes()), Some((ty, true)), "{word}");
-            assert_eq!(strict.lookup_word(word.as_bytes()), Some(ty), "{word}");
-            assert_eq!(
-                strict.lookup_word(word.to_ascii_lowercase().as_bytes()),
-                Some(ty),
-                "{word}"
-            );
+            for word in [word.to_owned(), word.to_ascii_lowercase()] {
+                assert_eq!(
+                    strict.lookup_word(word.as_bytes()),
+                    (!statement).then_some(ty),
+                    "{word}"
+                );
+                assert_eq!(
+                    strict.is_statement_after_semicolon(word.as_bytes()),
+                    statement,
+                    "{word}"
+                );
+                assert_eq!(
+                    default.is_statement_after_semicolon(word.as_bytes()),
+                    statement,
+                    "{word}"
+                );
+            }
             assert_eq!(default.lookup_word(word.as_bytes()), None, "{word}");
-            assert!(saw_strict_word.get(), "{word}");
+            assert_eq!(saw_strict_word.get(), !statement, "{word}");
             saw_strict_word.set(false);
-            // The builtin lookup knows the word only with the feature.
+            // The builtin lookup knows the word only with the feature, and
+            // never takes a word after a `;` for a statement.
             assert_eq!(
                 lookup_word(word.as_bytes()),
                 cfg!(feature = "strict-sql-lookup").then_some(ty),
                 "{word}"
             );
+            assert!(
+                !BuiltinSqlLookup.is_statement_after_semicolon(word.as_bytes()),
+                "{word}"
+            );
         }
+        assert_eq!(
+            STRICT_SQL_KEYWORDS
+                .iter()
+                .filter(|&&(_, ty)| ty == TokenType::Tsql)
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -342,6 +402,7 @@ mod tests {
             assert_eq!(lookup_entry(word.as_bytes()), Some((ty, false)), "{word}");
             assert_eq!(default.lookup_word(word.as_bytes()), Some(ty), "{word}");
             assert_eq!(StrictSqlLookup.lookup_word(word.as_bytes()), Some(ty), "{word}");
+            assert!(!default.is_statement_after_semicolon(word.as_bytes()), "{word}");
         }
         assert!(!saw_strict_word.get());
     }

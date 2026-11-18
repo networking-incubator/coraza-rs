@@ -214,6 +214,97 @@ fn sqli_strict_fallback_unions_default_and_dialect_detections() {
 }
 
 #[test]
+fn sqli_strict_fallback_reads_statement_words_after_semicolon() {
+    for payload in [
+        b"1; COPY x".as_slice(),
+        b"'; ATTACH x--",
+        b"1;/**/VACUUM x",
+        b"1; DETACH DATABASE '/tmp/x' AS x",
+        b"1; COPY t FROM PROGRAM 'id'",
+        b"1; COPY INTO '/tmp/x'",
+    ] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(payload).is_some(),
+            "statement after ';' missed: {:?}",
+            payload.escape_ascii().to_string()
+        );
+        // Plain `sqli()` is the lookup's own business: it has these words
+        // only with the feature.
+        assert_eq!(
+            libperfusion::sqli(payload).is_some(),
+            cfg!(feature = "strict-sql-lookup"),
+            "{:?}",
+            payload.escape_ascii().to_string()
+        );
+    }
+}
+
+#[test]
+fn sqli_strict_fallback_reads_statement_words_elsewhere_as_barewords() {
+    for line in [
+        b"please copy the report from the table".as_slice(),
+        b"see attach copy for details",
+        b"bring copy base select earth",
+        b"see the table; copy the report",
+        // A statement word is a statement only directly after a `;`.
+        b"1; if 1=1 ATTACH x",
+        // A quoted identifier is not one.
+        b"1;`copy` x",
+    ] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(line).is_none(),
+            "benign line detected: {:?}",
+            line.escape_ascii().to_string()
+        );
+    }
+
+    // The default lookup reads them as barewords: `sqli()` keeps its answers.
+    #[cfg(not(feature = "strict-sql-lookup"))]
+    for line in [
+        b"see attach copy for details".as_slice(),
+        b"bring copy base select earth",
+        b"1; if 1=1 ATTACH x",
+    ] {
+        assert!(libperfusion::sqli(line).is_none());
+    }
+    #[cfg(feature = "strict-sql-lookup")]
+    {
+        assert_eq!(libperfusion::sqli(b"see attach copy for details").unwrap(), "nTTnn");
+        assert_eq!(libperfusion::sqli(b"bring copy base select earth").unwrap(), "nTnEn");
+    }
+}
+
+#[test]
+fn sqli_strict_fallback_keeps_statement_words_as_union_columns() {
+    assert!(libperfusion::sqli_with_strict_fallback(b"1 union select copy from users").is_some());
+    // Under the feature, `sqli()` has `copy` as a statement and misses it.
+    assert_eq!(
+        libperfusion::sqli(b"1 union select copy from users").is_some(),
+        !cfg!(feature = "strict-sql-lookup")
+    );
+}
+
+#[test]
+fn sqli_strict_fallback_retries_with_dialect_identifiers() {
+    for payload in [
+        b"1 AND GTID_SUBSET(a,b)=1--".as_slice(),
+        b"1; SELECT GTID_SUBTRACT('/etc/passwd')",
+    ] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(payload).is_some(),
+            "identifier retry missed: {:?}",
+            payload.escape_ascii().to_string()
+        );
+        assert_eq!(
+            libperfusion::sqli(payload).is_some(),
+            cfg!(feature = "strict-sql-lookup"),
+            "{:?}",
+            payload.escape_ascii().to_string()
+        );
+    }
+}
+
+#[test]
 fn sqli_keeps_extended_stored_procedures_as_barewords() {
     // `XP_CMDSHELL` was added to the dialect table as a Function and that
     // *lost* detections: the listed `s&1Tn` and `s;Tns` fingerprints became

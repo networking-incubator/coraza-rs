@@ -69,7 +69,7 @@ The top-level functions provide the common detection paths:
 | Function | Result |
 | --- | --- |
 | `sqli(input: &[u8])` | `Option<Fingerprint>`; the fingerprint identifies a known SQLi pattern. |
-| `sqli_with_strict_fallback(input: &[u8])` | `Option<Fingerprint>`; retries with local dialect identifiers after a default-table miss. |
+| `sqli_with_strict_fallback(input: &[u8])` | `Option<Fingerprint>`; default table, then the local dialect identifiers on a retry after a miss; `ATTACH`, `COPY`, `DETACH` and `VACUUM` count only as a statement after `;`. |
 | `sqli_with_dialect(input: &[u8])` | `Option<(Fingerprint, Dialect)>`, including the matching SQL dialect. |
 | `sqli_with_limit(input: &[u8], max_bytes: usize)` | SQLi detection over at most the first `max_bytes` bytes. |
 | `xss(input: &[u8])` | `bool`, checking the supported HTML and attribute-value contexts. |
@@ -97,7 +97,8 @@ also exports:
   `check_fingerprint`, `tokens`, and `stats`. `SqlStatistics` exposes
   `tokens`, `folds`, `comment_ddx`, and `comment_hash` counters.
 - `SqlLookup` requires `lookup_word` and `is_fingerprint`; its default
-  `lookup_operator` delegates to `lookup_word`. Use `BuiltinSqlLookup` for the
+  `lookup_operator` delegates to `lookup_word`, and its default
+  `is_statement_after_semicolon` returns `false`. Use `BuiltinSqlLookup` for the
   bundled keyword, operator, and fingerprint tables.
 - `HtmlTokenizer::new(input, context)` creates an HTML token iterator.
   `HtmlToken` provides `kind` and the original input `text`; `HtmlContext`
