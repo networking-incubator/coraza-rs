@@ -76,7 +76,9 @@ adding them requires a shared-corpus fixture first.
   `libperfusion/tests/regressions.rs`.
 - Eight stacked-statement fingerprints added. Cases are pinned in
   `libperfusion/tests/regressions.rs`.
-- Twenty dialect identifiers added. Cases are pinned in
+- Dialect identifiers added to the `@detectSQLi` fallback: sixteen on a retry after a
+  default-table miss, and `ATTACH`, `COPY`, `DETACH` and `VACUUM` only as a statement
+  directly after `;`. Default `sqli()` is unchanged. Cases are pinned in
   `libperfusion/tests/regressions.rs`.
 - Twelve URL-bearing attributes and the `MATH` tag added. Cases are pinned in
   `libperfusion/tests/regressions.rs` and the two XSS corpus rows above.

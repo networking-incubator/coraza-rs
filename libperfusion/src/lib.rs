@@ -98,8 +98,12 @@ pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
 /// Checks `input` with the upstream-compatible lookup, then retries with local
 /// dialect identifiers if the first pass misses.
 ///
-/// This returns the union of the default and strict lookup detections without
-/// changing the behavior of [`sqli()`] or [`BuiltinSqlLookup`].
+/// The lookup is the default table, plus the dialect identifiers (such as
+/// `JSON_EXTRACT`) on a retry, plus `ATTACH`, `COPY`, `DETACH` and `VACUUM`
+/// only as a statement directly after a `;`. Elsewhere those four stay
+/// ordinary words, and seeing one never causes a retry. [`sqli()`] does not
+/// use this retry. Its lookup is unchanged, but it scans inputs of any length
+/// (see [`MAX_INPUT_LEN`]).
 #[must_use]
 pub fn sqli_with_strict_fallback(input: &[u8]) -> Option<Fingerprint> {
     sqli::detect_with_strict_fallback(input)

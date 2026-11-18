@@ -251,6 +251,15 @@ impl<L: SqlLookup> State<'_, L> {
                 // be a control flow statement: "; IF 1=1 ...".
                 self.tokens[left + 1].ty = T::Tsql;
                 continue;
+            } else if a.ty == T::Semicolon
+                && b.ty == T::Bareword
+                && b.str_open.is_none()
+                && self.lexer.lookup.is_statement_after_semicolon(b.value())
+            {
+                // A statement word (ATTACH, COPY, ...) is a bareword unless
+                // it starts a statement: "; COPY t FROM ...".
+                self.tokens[left + 1].ty = T::Tsql;
+                continue;
             } else if matches!(a.ty, T::Bareword | T::Variable)
                 && b.ty == T::LeftParens
                 && FUNCTION_LIKE_WORDS.iter().any(|word| a.is_word(word))

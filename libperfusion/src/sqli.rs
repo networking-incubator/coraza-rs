@@ -393,7 +393,9 @@ pub(crate) fn detect_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)
 }
 
 /// Try the upstream-compatible lookup first, then the strict dialect table on
-/// a miss when the default pass saw one of its identifiers.
+/// a miss when the default pass saw one of its identifiers. In both passes
+/// ATTACH, COPY, DETACH and VACUUM are barewords, except directly after a `;`
+/// (see `SqlLookup::is_statement_after_semicolon`); they never cause the retry.
 pub(crate) fn detect_with_strict_fallback(input: &[u8]) -> Option<Fingerprint> {
     if input.is_empty() {
         return None;
