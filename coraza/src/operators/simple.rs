@@ -274,7 +274,10 @@ pub fn ends_with(parameter: &str) -> Result<EndsWith, MacroError> {
 
 /// Whether `needle` occurs in `haystack`, including an empty `needle`.
 pub(super) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle)
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    needle.is_empty() || memchr::memmem::find(haystack, needle).is_some()
 }
 
 #[cfg(test)]
@@ -340,5 +343,21 @@ mod tests {
         assert!(matches(&ends_with("c").unwrap(), b"abc", &tx));
         assert!(!matches(&begins_with("b").unwrap(), b"abc", &tx));
         assert!(!matches(&ends_with("b").unwrap(), b"abc", &tx));
+    }
+}
+
+#[cfg(test)]
+mod contains_bytes_tests {
+    use super::contains_bytes;
+
+    #[test]
+    fn preserves_empty_binary_and_overlapping_match_semantics() {
+        assert!(contains_bytes(b"", b""));
+        assert!(contains_bytes(b"anything", b""));
+        assert!(!contains_bytes(b"", b"x"));
+        assert!(!contains_bytes(b"abc", b"abcd"));
+        assert!(contains_bytes(b"\xffa\0b\xfe", b"a\0b"));
+        assert!(!contains_bytes(b"\xffa\0b\xfe", b"a\0c"));
+        assert!(contains_bytes(b"aaaaab", b"aaab"));
     }
 }

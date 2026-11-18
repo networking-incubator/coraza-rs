@@ -23,6 +23,7 @@ ipnet = "2.9"
 jsonschema = { version = "0.61", default-features = false, optional = true }
 libperfusion = { version = "0.1.0", path = "../libperfusion" }
 md-5 = { version = "0.11", optional = true }
+memchr = { version = "2.7", default-features = false, features = ["std"] }
 mime = "0.3"
 regex = "1.10"
 serde_json = "1"

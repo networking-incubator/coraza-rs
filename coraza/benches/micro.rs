@@ -16,7 +16,7 @@
 //!
 //! `cargo bench -p coraza --bench micro [-- --iterations N --repetitions R --json FILE --crs DIR]`
 //!
-//! Three groups, one per performance-gate axis in `docs/open-findings.md` §4:
+//! Four groups covering isolated hot paths and full-CRS execution:
 //!
 //! - `transform`: [`TransformationChain::apply`] over a CRS-length chain
 //!   (`t:urlDecodeUni,t:htmlEntityDecode,t:jsDecode,t:cssDecode,t:removeNulls`), the prefix CRS shares across hundreds
@@ -25,6 +25,8 @@
 //!   measures transaction construction and body ingestion; `txn_streq` and `txn_rx` add one non-matching rule over
 //!   `ARGS`. The streq delta is the per-rule selection + materialisation cost that P-02 targets; the rx delta
 //!   additionally carries the UTF-8 validation pass that P-06 targets.
+//! - `contains`: direct `@contains %{ARGS.n}` on a request-backed 64 `KiB` near miss, plus `@within %{ARGS.pattern}`
+//!   over a 128 `KiB` inspected value and request-backed short parameter (P-08).
 //! - `crs`: a full phase-1+2 pass with the real CRS ruleset (aggregate gate for every per-rule multiplier). Skipped
 //!   with a message when the CRS checkout is absent: fetch it with `envoy-coraza/crs-fetch.sh` or pass `--crs DIR`.
 //!
@@ -42,8 +44,10 @@
 use std::{env, fs, hint::black_box, path::PathBuf, process::ExitCode, time::Instant};
 
 use coraza::{
-    TransformationChain, Waf,
+    RuleVariable, TransformationChain, Waf,
+    operators::{Operator as _, Outputs, contains, within},
     seclang::Parser,
+    transaction::Transaction,
     transformations::{Transformation, css_decode, html_entity_decode, js_decode, remove_nulls, url_decode_uni},
 };
 use serde_json::json;
@@ -323,6 +327,46 @@ fn bench_select(args: &Args, rows: &mut Vec<(&'static str, Timings)>) -> Result<
     Ok(())
 }
 
+/// Runs isolated P-08 near-match workloads with request-backed macro operands.
+fn bench_contains(args: &Args, rows: &mut Vec<(&'static str, Timings)>) -> Result<(), String> {
+    let mut tx = Transaction::new("micro-bench-contains");
+    let mut needle = vec![b'a'; 64 * 1024];
+    needle.push(b'b');
+    tx.add_get_argument("n", &needle);
+    tx.add_get_argument("pattern", b"needle");
+    let haystack = vec![b'a'; 128 * 1024];
+    let operator = contains("%{ARGS.n}").map_err(|error| format!("contains: {error}"))?;
+    let mut outputs = Outputs::default();
+    if operator.evaluate(&tx, &haystack, &mut outputs) {
+        return Err("contains near-match benchmark unexpectedly matched".to_owned());
+    }
+
+    rows.push((
+        "contains/args_macro_near_miss_128k",
+        // One timed call per sample keeps the quadratic pre-fix practical to measure.
+        time_repetitions(1, args.repetitions, || {
+            black_box(operator.evaluate(black_box(&tx), black_box(&haystack), &mut outputs));
+        }),
+    ));
+
+    let operator = within("%{ARGS.pattern}").map_err(|error| format!("within: {error}"))?;
+    if tx.get_variable(RuleVariable::Args, Some("pattern")).as_deref() != Some("needle") {
+        return Err("within macro parameter did not expand to the expected short string".to_owned());
+    }
+    let input = vec![b'a'; 128 * 1024];
+    if operator.evaluate(&tx, &input, &mut outputs) {
+        return Err("within short-parameter benchmark unexpectedly matched".to_owned());
+    }
+    rows.push((
+        "within/short_param_128k",
+        // One timed call per sample keeps the reversed-argument case cheap to measure.
+        time_repetitions(1, args.repetitions, || {
+            black_box(operator.evaluate(black_box(&tx), black_box(&input), &mut outputs));
+        }),
+    ));
+    Ok(())
+}
+
 /// Runs the `crs` group against the real CRS checkout.
 fn bench_crs(args: &Args, rows: &mut Vec<(&'static str, Timings)>) -> Result<(), String> {
     let crs = &args.crs;
@@ -357,6 +401,7 @@ fn run(args: &Args) -> Result<(), String> {
     let mut rows: Vec<(&'static str, Timings)> = Vec::new();
 
     bench_transform(args, &mut rows);
+    bench_contains(args, &mut rows)?;
     bench_select(args, &mut rows)?;
     bench_crs(args, &mut rows)?;
 
