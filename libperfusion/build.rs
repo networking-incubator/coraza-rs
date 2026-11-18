@@ -202,7 +202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rows = sql_rows(&text)?;
     let local_rows = sql_rows(&local_text)?;
-    let strict_sql_rows = sql_rows(&strict_sql_text)?;
+    let mut strict_sql_rows = sql_rows(&strict_sql_text)?;
+    strict_sql_rows.sort_by_key(|&(key, _)| key);
     // Reject collisions even when this build omits the opt-in rows.
     let mut all_rows = rows.clone();
     all_rows.extend(local_rows.iter().copied());
@@ -226,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rows.extend(local_rows);
     if env::var_os("CARGO_FEATURE_STRICT_SQL_LOOKUP").is_some() {
-        rows.extend(strict_sql_rows);
+        rows.extend(strict_sql_rows.iter().copied());
     }
     rows.sort_by_key(|&(key, _)| key);
 
@@ -239,6 +240,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows.len()
     );
     for (key, kind) in rows {
+        writeln!(&mut out, "    ({key:?}, T::{kind}),")?;
+    }
+    out.push_str("];\n\n#[rustfmt::skip]\n/// Optional dialect identifiers used by the strict fallback lookup.\n");
+    writeln!(
+        &mut out,
+        "pub(crate) static STRICT_SQL_KEYWORDS: [(&str, T); {}] = [",
+        strict_sql_rows.len()
+    )?;
+    for (key, kind) in strict_sql_rows {
         writeln!(&mut out, "    ({key:?}, T::{kind}),")?;
     }
     out.push_str("];\n");

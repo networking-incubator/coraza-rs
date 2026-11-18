@@ -11,10 +11,10 @@
         reason = "Private lookup tables and helpers implement the documented SQL lookup trait."
     )
 )]
-use core::cmp::Ordering;
+use core::{cell::Cell, cmp::Ordering};
 
 use super::{
-    keyword_table::SQL_KEYWORDS,
+    keyword_table::{SQL_KEYWORDS, STRICT_SQL_KEYWORDS},
     token::{TOKEN_SIZE, TokenType},
 };
 
@@ -63,19 +63,57 @@ impl SqlLookup for BuiltinSqlLookup {
     }
 
     fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
-        if fingerprint.is_empty() || fingerprint.len() > super::MAX_TOKENS {
-            return false;
-        }
-
-        let mut key = [b'0'; super::MAX_TOKENS + 1];
-        for (dst, src) in key[1..].iter_mut().zip(fingerprint) {
-            *dst = src.to_ascii_uppercase();
-        }
-        lookup_word(&key[..=fingerprint.len()]) == Some(TokenType::Fingerprint)
+        fingerprint_is_listed(self, fingerprint)
     }
 }
 
 pub(crate) const BUILTIN_SQL_LOOKUP: BuiltinSqlLookup = BuiltinSqlLookup;
+
+/// The upstream-compatible lookup, tracking whether a strict-only word occurs.
+pub(crate) struct DefaultSqlLookup<'a> {
+    pub(crate) saw_strict_word: &'a Cell<bool>,
+}
+
+impl SqlLookup for DefaultSqlLookup<'_> {
+    fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
+        let (ty, strict) = lookup_entry(word)?;
+        if strict {
+            self.saw_strict_word.set(true);
+            return None;
+        }
+        Some(ty)
+    }
+
+    fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
+        fingerprint_is_listed(self, fingerprint)
+    }
+}
+
+/// The default lookup with the local dialect identifiers overlaid.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StrictSqlLookup;
+
+impl SqlLookup for StrictSqlLookup {
+    fn lookup_word(&self, word: &[u8]) -> Option<TokenType> {
+        lookup_entry(word).map(|(ty, _)| ty)
+    }
+
+    fn is_fingerprint(&self, fingerprint: &[u8]) -> bool {
+        fingerprint_is_listed(self, fingerprint)
+    }
+}
+
+fn fingerprint_is_listed(lookup: &impl SqlLookup, fingerprint: &[u8]) -> bool {
+    if fingerprint.is_empty() || fingerprint.len() > super::MAX_TOKENS {
+        return false;
+    }
+
+    let mut key = [b'0'; super::MAX_TOKENS + 1];
+    for (dst, src) in key[1..].iter_mut().zip(fingerprint) {
+        *dst = src.to_ascii_uppercase();
+    }
+    lookup.lookup_word(&key[..=fingerprint.len()]) == Some(TokenType::Fingerprint)
+}
 
 /// Upstream's `cstrcasecmp`: compares the upper-case C string `a` with the
 /// arbitrary bytes `b`, upper-casing `b` on the fly.
@@ -126,23 +164,42 @@ const fn hash(key: &[u8]) -> usize {
     ((hash ^ (hash >> 15)) as usize) & (SLOT_COUNT - 1)
 }
 
-/// A hash table over [`SQL_KEYWORDS`]: each slot holds the index of a word,
-/// or [`EMPTY`]. A word sits in the first free slot from its hash on.
+/// A hash table over [`SQL_KEYWORDS`] and [`STRICT_SQL_KEYWORDS`]: each slot
+/// holds the index of a word, or [`EMPTY`]. An index past the end of
+/// [`SQL_KEYWORDS`] counts on into the strict identifiers. A word sits in the
+/// first free slot from its hash on.
+///
+/// The strict identifiers go in first. With the `strict-sql-lookup` feature
+/// they are in both tables, and a lookup must meet the strict entry first to
+/// know the word is one.
 static SLOTS: [u16; SLOT_COUNT] = {
-    assert!(SQL_KEYWORDS.len() < EMPTY as usize, "keyword indices must fit in u16");
+    let builtin = SQL_KEYWORDS.len();
+    let total = builtin + STRICT_SQL_KEYWORDS.len();
+    assert!(total < EMPTY as usize, "keyword indices must fit in u16");
     let mut slots = [EMPTY; SLOT_COUNT];
     let mut i = 0;
-    while i < SQL_KEYWORDS.len() {
-        let mut slot = hash(SQL_KEYWORDS[i].0.as_bytes());
+    while i < total {
+        // Strict identifiers first, then the builtin table.
+        let index = if i < STRICT_SQL_KEYWORDS.len() {
+            builtin + i
+        } else {
+            i - STRICT_SQL_KEYWORDS.len()
+        };
+        let word = if index < builtin {
+            SQL_KEYWORDS[index].0
+        } else {
+            STRICT_SQL_KEYWORDS[index - builtin].0
+        };
+        let mut slot = hash(word.as_bytes());
         while slots[slot] != EMPTY {
             slot = (slot + 1) & (SLOT_COUNT - 1);
         }
-        // The assertion above proves every table index fits in u16.
+        // The assertion above proves every index fits in u16.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "the table length is checked against u16::MAX above"
+            reason = "the combined table length is checked against u16::MAX above"
         )]
-        let index = i as u16;
+        let index = index as u16;
         slots[slot] = index;
         i += 1;
     }
@@ -169,11 +226,24 @@ static SLOTS: [u16; SLOT_COUNT] = {
 /// Upstream does a binary search over it (`bsearch_keyword_type`), which
 /// finds the same words: those `key` equals by [`cstrcasecmp`]. Done that
 /// way, the lookups were half of what detecting `SQLi` cost.
+///
+/// A strict-only identifier is a word only with the `strict-sql-lookup`
+/// feature; without it the builtin lookup does not know the word.
 pub(crate) fn lookup_word(key: &[u8]) -> Option<TokenType> {
-    if !key.is_ascii() {
-        return lookup_unicode_word(key);
+    match lookup_entry(key)? {
+        (ty, false) => Some(ty),
+        (ty, true) => cfg!(feature = "strict-sql-lookup").then_some(ty),
     }
-    lookup_ascii_word(key)
+}
+
+/// Looks `key` up among the builtin words and the strict-only identifiers
+/// in one probe, reporting whether the word found is a strict-only one.
+#[inline]
+fn lookup_entry(key: &[u8]) -> Option<(TokenType, bool)> {
+    if !key.is_ascii() {
+        return lookup_unicode_entry(key);
+    }
+    lookup_ascii_entry(key)
 }
 
 /// Looks up a valid UTF-8 word using Go's Unicode uppercase behavior for
@@ -181,7 +251,7 @@ pub(crate) fn lookup_word(key: &[u8]) -> Option<TokenType> {
 /// are ASCII; other Unicode uppercase results cannot match them.
 /// Keep conversion outlined: inlining it slows large ASCII miss scans.
 #[inline(never)]
-fn lookup_unicode_word(key: &[u8]) -> Option<TokenType> {
+fn lookup_unicode_entry(key: &[u8]) -> Option<(TokenType, bool)> {
     let word = core::str::from_utf8(key).ok()?;
     let mut upper = [0; TOKEN_SIZE];
     let mut len = 0;
@@ -194,19 +264,26 @@ fn lookup_unicode_word(key: &[u8]) -> Option<TokenType> {
         upper[len] = mapped as u8;
         len += 1;
     }
-    lookup_ascii_word(&upper[..len])
+    lookup_ascii_entry(&upper[..len])
 }
 
-fn lookup_ascii_word(key: &[u8]) -> Option<TokenType> {
+#[inline]
+fn lookup_ascii_entry(key: &[u8]) -> Option<(TokenType, bool)> {
     let mut slot = hash(key);
     loop {
         let index = SLOTS[slot];
         if index == EMPTY {
             return None;
         }
-        let (word, ty) = SQL_KEYWORDS[usize::from(index)];
+        let index = usize::from(index);
+        // The bounds check the builtin table needs anyway is what tells a
+        // strict identifier apart, so a builtin word costs what it always did.
+        let ((word, ty), strict) = match SQL_KEYWORDS.get(index) {
+            Some(&entry) => (entry, false),
+            None => (STRICT_SQL_KEYWORDS[index - SQL_KEYWORDS.len()], true),
+        };
         if cstrcasecmp(word.as_bytes(), key) == Ordering::Equal {
-            return Some(ty);
+            return Some((ty, strict));
         }
         slot = (slot + 1) & (SLOT_COUNT - 1);
     }
@@ -222,6 +299,51 @@ mod tests {
             assert_eq!(lookup_word(word.as_bytes()), Some(ty), "{word}");
             assert_eq!(lookup_word(word.to_ascii_lowercase().as_bytes()), Some(ty), "{word}");
         }
+    }
+
+    #[test]
+    fn strict_lookup_finds_its_entries_and_keeps_them_out_of_the_default_table() {
+        let saw_strict_word = Cell::new(false);
+        let default = DefaultSqlLookup {
+            saw_strict_word: &saw_strict_word,
+        };
+        let strict = StrictSqlLookup;
+
+        for &(word, ty) in &STRICT_SQL_KEYWORDS {
+            assert_eq!(lookup_entry(word.as_bytes()), Some((ty, true)), "{word}");
+            assert_eq!(strict.lookup_word(word.as_bytes()), Some(ty), "{word}");
+            assert_eq!(
+                strict.lookup_word(word.to_ascii_lowercase().as_bytes()),
+                Some(ty),
+                "{word}"
+            );
+            assert_eq!(default.lookup_word(word.as_bytes()), None, "{word}");
+            assert!(saw_strict_word.get(), "{word}");
+            saw_strict_word.set(false);
+            // The builtin lookup knows the word only with the feature.
+            assert_eq!(
+                lookup_word(word.as_bytes()),
+                cfg!(feature = "strict-sql-lookup").then_some(ty),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_words_are_never_reported_as_strict() {
+        let saw_strict_word = Cell::new(false);
+        let default = DefaultSqlLookup {
+            saw_strict_word: &saw_strict_word,
+        };
+        for &(word, ty) in &SQL_KEYWORDS {
+            if STRICT_SQL_KEYWORDS.iter().any(|&(strict, _)| strict == word) {
+                continue;
+            }
+            assert_eq!(lookup_entry(word.as_bytes()), Some((ty, false)), "{word}");
+            assert_eq!(default.lookup_word(word.as_bytes()), Some(ty), "{word}");
+            assert_eq!(StrictSqlLookup.lookup_word(word.as_bytes()), Some(ty), "{word}");
+        }
+        assert!(!saw_strict_word.get());
     }
 
     /// `cstrcasecmp` as upstream writes it, one byte at a time.

@@ -222,12 +222,14 @@ fn scan_overlapping_windows(bytes: &[u8], detect: impl Fn(&[u8]) -> bool) -> boo
 /// Reports whether any window of `bytes` reads as `SQLi`.
 ///
 /// Each window is first tested whole, which reproduces the verdict
-/// `libperfusion::sqli()` would give for that range, and then from a bounded
+/// `libperfusion::sqli_with_strict_fallback()` would give for that range (the
+/// upstream-compatible lookup, then the local dialect identifiers on a miss),
+/// and then from a bounded
 /// set of token-anchored restarts so a benign SQL prefix cannot mask a
 /// payload that follows it.
 fn has_sqli_in_overlapping_windows(bytes: &[u8]) -> bool {
     scan_overlapping_windows(bytes, |window| {
-        libperfusion::sqli_with_limit(window, window.len()).is_some() || has_sqli_from_token_restart(window)
+        libperfusion::sqli_with_strict_fallback(window).is_some() || has_sqli_from_token_restart(window)
     })
 }
 
@@ -332,7 +334,7 @@ fn restart_detects(window: &[u8], start: usize, stride: usize) -> bool {
         .min(window.len());
     window
         .get(start..end)
-        .is_some_and(|tail| libperfusion::sqli_with_limit(tail, tail.len()).is_some())
+        .is_some_and(|tail| libperfusion::sqli_with_strict_fallback(tail).is_some())
 }
 
 /// Builds the tokenizer used to locate restart offsets.
@@ -1326,6 +1328,29 @@ mod tests {
                 "multipart part starting with a delimiter must be detected: {text:?}"
             );
         }
+    }
+
+    /// The filter keeps both families of detection: the UNION column lists the
+    /// upstream-compatible lookup catches, and the dialect statements and
+    /// functions only the local identifiers catch.
+    #[test]
+    fn window_scan_detects_default_and_dialect_sqli() {
+        for case in [
+            b"-2 union select 1,2 copy,version() from x".as_slice(),
+            b"1; COPY t FROM PROGRAM 'id'",
+            b"1; SELECT LO_IMPORT('/etc/passwd')",
+            b"1; ATTACH DATABASE '/tmp/x' AS x",
+            b"1 AND JSON_EXTRACT(a,b)=1--",
+        ] {
+            assert!(
+                super::has_sqli_in_overlapping_windows(case),
+                "window scan missed {:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+        assert!(!super::has_sqli_in_overlapping_windows(
+            b"please copy the program to the new window"
+        ));
     }
 
     /// The window scanner must never be less sensitive than the library it wraps.

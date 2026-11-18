@@ -1180,15 +1180,14 @@ mod tests {
             parser
                 .from_string(&format!(
                     "SecRuleEngine {engine}\n\
-                     SecRule ARGS:q|ARGS:r \"@inspectFile /bin/echo\" \"id:966,phase:1,chain,deny,status:403\"\n\
-                     SecRule ARGS:chain \"@streq yes\" \"setvar:tx.chain=1\""
+                     SecRule ARGS:q|ARGS:r \"@inspectFile /bin/echo\" \
+                     \"id:966,phase:1,deny,status:403,msg:'scanner hit',setvar:tx.hits=+1\""
                 ))
                 .unwrap();
             let waf = parser.into_waf().unwrap();
             let mut tx = waf.new_transaction_with_id(transaction_id);
             tx.add_get_argument("q", b"first");
             tx.add_get_argument("r", b"second");
-            tx.add_get_argument("chain", b"yes");
 
             TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(Some(1)));
             let interruption = tx.process_request_headers();
@@ -1204,9 +1203,11 @@ mod tests {
                 matched.matches.first().map(|matched| matched.value.as_slice()),
                 Some(b"first".as_slice())
             );
-            assert!(
-                tx.get_variable(RuleVariable::TX, Some("chain")).is_none(),
-                "a refusal must stop chain-link evaluation"
+            assert_eq!(matched.message(), "scanner hit", "the kept match is a complete one");
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some("hits")).as_deref(),
+                Some("1"),
+                "the refused value must not run the rule's per-match actions"
             );
 
             if engine == "On" {
@@ -1214,6 +1215,69 @@ mod tests {
             } else {
                 assert!(interruption.is_none());
                 assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(500));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_inside_a_chain_is_not_recorded_as_a_match() {
+        use super::TEST_ALLOW_BEFORE_REFUSAL;
+        use crate::{seclang::Parser, types::RuleVariable};
+
+        if !sh_available() {
+            return skip("/bin/sh");
+        }
+
+        // The refusal can land on the first link after one of its values
+        // matched, or on a later link after the first one matched. Either way
+        // the chain never completed, so the rule did not match.
+        let refused_first_link = "SecRule ARGS:q|ARGS:r \"@inspectFile /bin/echo\" \
+             \"id:967,phase:1,chain,deny,status:403,msg:'upload is infected',severity:CRITICAL\"\n\
+             SecRule ARGS:chain \"@streq yes\" \"setvar:tx.chain=1\"";
+        let refused_later_link = "SecRule ARGS:chain \"@streq yes\" \
+             \"id:967,phase:1,chain,deny,status:403,msg:'upload is infected',severity:CRITICAL\"\n\
+             SecRule ARGS:q \"@inspectFile /bin/echo\" \"chain\"\n\
+             SecRule ARGS:chain \"@streq yes\" \"setvar:tx.chain=1\"";
+
+        for (rules, allowed) in [(refused_first_link, 1), (refused_later_link, 0)] {
+            for engine in ["On", "DetectionOnly"] {
+                let mut parser = Parser::new();
+                parser.from_string(&format!("SecRuleEngine {engine}\n{rules}")).unwrap();
+                let waf = parser.into_waf().unwrap();
+                let mut tx = waf.new_transaction_with_id("inspect-file-refusal-in-chain");
+                tx.add_get_argument("q", b"first");
+                tx.add_get_argument("r", b"second");
+                tx.add_get_argument("chain", b"yes");
+
+                TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(Some(allowed)));
+                let interruption = tx.process_request_headers();
+                TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(None));
+
+                assert!(
+                    tx.matched_rules().is_empty(),
+                    "an incomplete chain must not be recorded as a match ({engine})"
+                );
+                assert_eq!(
+                    tx.get_variable(RuleVariable::HighestSeverity, None).as_deref(),
+                    Some("255"),
+                    "an incomplete chain must not raise the highest severity ({engine})"
+                );
+                assert!(
+                    tx.get_variable(RuleVariable::TX, Some("chain")).is_none(),
+                    "a refusal must stop chain-link evaluation ({engine})"
+                );
+
+                if engine == "On" {
+                    let Some(interruption) = interruption else {
+                        panic!("a refused inspection must interrupt")
+                    };
+                    assert_eq!(interruption.status, 500);
+                    assert_eq!(interruption.rule_id, 967);
+                } else {
+                    assert!(interruption.is_none());
+                    assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(500));
+                }
             }
         }
     }

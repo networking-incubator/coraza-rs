@@ -29,6 +29,7 @@ use crate::{
 /// SQL injection detection operator.
 ///
 /// Detects SQL injection attempts using libinjection's `SQLi` detection algorithm.
+/// On an upstream-compatible miss, it retries with local dialect identifiers.
 /// Returns true if SQL injection patterns are detected in the input. When a match
 /// is found, the SQL fingerprint (such as `s&sos`) is captured in field 0.
 ///
@@ -48,7 +49,7 @@ impl Operator for DetectSQLi {
     }
 
     fn evaluate_outcome(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> OperatorOutcome {
-        let Some(fingerprint) = libperfusion::sqli_with_limit(input, input.len()) else {
+        let Some(fingerprint) = libperfusion::sqli_with_strict_fallback(input) else {
             return OperatorOutcome::NotMatched;
         };
         out.capture(0, fingerprint.as_bytes());

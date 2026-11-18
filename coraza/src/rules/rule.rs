@@ -193,7 +193,10 @@ impl Rule {
             &mut collective_matched_values,
             &mut inspection_refused,
         );
-        if matched_values.is_empty() {
+        // A refused inspection leaves a chain incomplete: the links matched so
+        // far are not a match of the rule, so nothing is recorded for it. A
+        // rule without a chain keeps the values it matched before the refusal.
+        if matched_values.is_empty() || (inspection_refused && !self.chain.is_empty()) {
             tx.debug_log(DebugLevel::Debug, "Rule evaluation finished without a match", || {
                 [DebugField::RuleId(self.metadata.id)]
             });
@@ -618,6 +621,27 @@ mod tests {
 
         assert!(tx.process_request_headers().is_none());
         assert!(tx.matched_rules().iter().any(|matched| matched.rule.id == 962));
+    }
+
+    #[test]
+    fn detect_sqli_keeps_default_and_strict_dialect_detections() {
+        let waf = build_waf("SecRule ARGS:q \"@detectSQLi\" \"id:967,phase:1,pass\"");
+        for (transaction_id, input) in [
+            (
+                "sqli-default-lookup",
+                b"-2 union select 1,2 copy,version() from x".as_slice(),
+            ),
+            ("sqli-strict-fallback", b"1 AND JSON_EXTRACT(a,b)=1--"),
+        ] {
+            let mut tx = waf.new_transaction_with_id(transaction_id);
+            tx.add_get_argument("q", input);
+
+            assert!(tx.process_request_headers().is_none());
+            assert!(
+                tx.matched_rules().iter().any(|matched| matched.rule.id == 967),
+                "@detectSQLi missed {transaction_id}"
+            );
+        }
     }
 
     #[test]
