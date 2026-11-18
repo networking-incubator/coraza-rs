@@ -31,7 +31,7 @@ use core::{cmp::Ordering, fmt};
 pub use api::{SqlState, SqlStatistics, SqlToken, SqlTokenizer};
 
 use self::{
-    keywords::{BUILTIN_SQL_LOOKUP, cstrcasecmp},
+    keywords::{BUILTIN_SQL_LOOKUP, DefaultSqlLookup, StrictSqlLookup, cstrcasecmp},
     lexer::Lexer,
     token::{Token, TokenType},
 };
@@ -390,6 +390,29 @@ pub(crate) fn detect_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)
     }
     let mut state = State::new(input, Quote::None, Dialect::Ansi);
     detect_state(&mut state)
+}
+
+/// Try the upstream-compatible lookup first, then the strict dialect table on
+/// a miss when the default pass saw one of its identifiers.
+pub(crate) fn detect_with_strict_fallback(input: &[u8]) -> Option<Fingerprint> {
+    if input.is_empty() {
+        return None;
+    }
+
+    let saw_strict_word = core::cell::Cell::new(false);
+    let lookup = DefaultSqlLookup {
+        saw_strict_word: &saw_strict_word,
+    };
+    let mut state = State::with_lookup(input, Quote::None, Dialect::Ansi, lookup);
+    if let Some((fingerprint, _)) = detect_state(&mut state) {
+        return Some(fingerprint);
+    }
+    if !saw_strict_word.get() {
+        return None;
+    }
+
+    let mut state = State::with_lookup(input, Quote::None, Dialect::Ansi, StrictSqlLookup);
+    detect_state(&mut state).map(|(fingerprint, _)| fingerprint)
 }
 
 pub(crate) fn detect_state<L: SqlLookup>(state: &mut State<'_, L>) -> Option<(Fingerprint, Dialect)> {

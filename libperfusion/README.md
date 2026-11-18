@@ -44,6 +44,9 @@ dialect identifiers live in `data/sqli_keywords_strict.txt` and are included
 only when the `strict-sql-lookup` Cargo feature is enabled. Those identifiers
 can improve function-call detection but can reclassify UNION column names, so
 the default builtin lookup preserves upstream denylist coverage.
+`sqli_with_strict_fallback()` retains the default lookup first and retries with
+those identifiers only when needed; Coraza's `@detectSQLi` and the
+`envoy-libperfusion` filter use this combined lookup.
 
 Run the usual checks from the repository root. The parity target needs Go
 1.27.1 and `LIBINJECTION_DIR` set to the C revision in the parity manifest.

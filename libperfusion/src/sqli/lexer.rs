@@ -129,6 +129,9 @@ impl Parser {
             reason = "The hidden internals feature reexports this parser for table tests."
         )
     )]
+    // Inlined by hand: with more than one lookup instantiated the compiler
+    // stops folding this per-byte dispatch into the scanner on its own.
+    #[inline(always)]
     pub const fn for_byte(ch: u8) -> Self {
         match ch {
             0..=32 | 127 | 0xA0 => Parser::White,
@@ -727,6 +730,7 @@ impl<'a, L: SqlLookup> Lexer<'a, L> {
     ///
     /// Folding has tokens written straight into its slots with this:
     /// handing them over by value is a good part of what tokenizing costs.
+    #[inline]
     pub(crate) fn next_into(&mut self, cur: &mut Token) -> bool {
         let s = self.s;
         *cur = Token::default();

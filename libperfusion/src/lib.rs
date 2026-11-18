@@ -95,6 +95,16 @@ pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
     sqli::detect(input)
 }
 
+/// Checks `input` with the upstream-compatible lookup, then retries with local
+/// dialect identifiers if the first pass misses.
+///
+/// This returns the union of the default and strict lookup detections without
+/// changing the behavior of [`sqli()`] or [`BuiltinSqlLookup`].
+#[must_use]
+pub fn sqli_with_strict_fallback(input: &[u8]) -> Option<Fingerprint> {
+    sqli::detect_with_strict_fallback(input)
+}
+
 /// Like [`sqli()`], but also returns which [`Dialect`] the match was found in.
 #[must_use]
 pub fn sqli_with_dialect(input: &[u8]) -> Option<(Fingerprint, Dialect)> {

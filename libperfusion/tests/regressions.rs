@@ -192,6 +192,28 @@ fn strict_sql_lookup_preserves_dialect_gains() {
 }
 
 #[test]
+fn sqli_strict_fallback_unions_default_and_dialect_detections() {
+    let dialect_only = [
+        b"1; COPY t FROM PROGRAM 'id'".as_slice(),
+        b"1; SELECT LO_IMPORT('/etc/passwd')",
+        b"1; ATTACH DATABASE '/tmp/x' AS x",
+        b"1 AND JSON_EXTRACT(a,b)=1--",
+        b"' OR WAIT_FOR_EXECUTED_GTID_SET(a)='",
+    ];
+
+    #[cfg(not(feature = "strict-sql-lookup"))]
+    assert!(libperfusion::sqli(dialect_only[3]).is_none());
+    for payload in dialect_only {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(payload).is_some(),
+            "strict fallback missed {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    assert!(libperfusion::sqli_with_strict_fallback(b"-2 union select 1,2 copy,version() from x").is_some());
+}
+
+#[test]
 fn sqli_keeps_extended_stored_procedures_as_barewords() {
     // `XP_CMDSHELL` was added to the dialect table as a Function and that
     // *lost* detections: the listed `s&1Tn` and `s;Tns` fingerprints became
