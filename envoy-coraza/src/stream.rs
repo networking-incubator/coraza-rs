@@ -1648,29 +1648,25 @@ fn request_metadata(headers: &[(String, Vec<u8>)]) -> Result<Option<RequestMetad
         None => property(vec!["request", "path"])?,
     };
     let protocol = property(vec!["request", "protocol"])?;
-    let has_host = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host"));
-    Ok(
-        request_line(method, uri, protocol).map(|(method, uri, protocol)| RequestMetadata {
-            method,
-            uri,
-            protocol,
-            has_host,
-        }),
-    )
-}
-
-/// Validates the request line fields, returning `None` when one is missing, not UTF-8 or empty.
-fn request_line(
-    method: Option<Vec<u8>>,
-    uri: Option<Vec<u8>>,
-    protocol: Option<Vec<u8>>,
-) -> Option<(String, Vec<u8>, String)> {
-    let method = str::from_utf8(&method?).ok()?.to_owned();
-    let protocol = str::from_utf8(&protocol?).ok()?.to_owned();
+    let Some(method) = method.and_then(|bytes| str::from_utf8(&bytes).ok().map(str::to_owned)) else {
+        return Ok(None);
+    };
+    let Some(protocol) = protocol.and_then(|bytes| str::from_utf8(&bytes).ok().map(str::to_owned)) else {
+        return Ok(None);
+    };
+    let Some(uri) = uri else {
+        return Ok(None);
+    };
     if method.is_empty() || protocol.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some((method, uri?, protocol))
+    let has_host = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    Ok(Some(RequestMetadata {
+        method,
+        uri,
+        protocol,
+        has_host,
+    }))
 }
 
 fn prepare_transaction(

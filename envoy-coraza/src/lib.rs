@@ -437,10 +437,8 @@ mod tests {
         );
     }
 
-    /// Configurations that would install a generation inspecting nothing.
-    const PASS_THROUGH_SHAPES: [&str; 11] = [
-        "",
-        "  \n\t",
+    /// Invalid documents that could otherwise be mistaken for empty policies.
+    const INVALID_CONFIG_SHAPES: [&str; 9] = [
         "{}",
         "[]",
         "null",
@@ -469,8 +467,8 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_through_shape_is_rejected_on_the_first_load() {
-        for input in PASS_THROUGH_SHAPES.iter().skip(2) {
+    fn invalid_configurations_are_rejected_on_the_first_load() {
+        for input in INVALID_CONFIG_SHAPES {
             let mut root = root();
             assert!(root.apply(input.as_bytes()).is_err(), "{input:?} is rejected");
             assert!(
@@ -499,9 +497,9 @@ mod tests {
         .expect("the enforcing configuration is valid");
         let enforcing = root.current_generation().expect("a generation is published");
 
-        for input in PASS_THROUGH_SHAPES
-            .iter()
-            .copied()
+        for input in ["", "  \n\t"]
+            .into_iter()
+            .chain(INVALID_CONFIG_SHAPES)
             .chain([blank_gzip.as_str(), empty_object_gzip.as_str()])
         {
             assert!(
@@ -527,8 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn on_configure_refuses_a_pass_through_shape_on_the_first_load() {
-        for input in PASS_THROUGH_SHAPES.iter().skip(2) {
+    fn on_configure_refuses_an_invalid_configuration_on_the_first_load() {
+        for input in INVALID_CONFIG_SHAPES {
             let mut root = root();
             assert!(!configure(&mut root, Some(input.as_bytes())), "{input:?}");
             assert!(root.current_generation().is_none(), "{input:?}");
