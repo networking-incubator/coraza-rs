@@ -25,7 +25,10 @@ use std::{
     ops::RangeInclusive,
 };
 
-use crate::{actions::RuleMetadata, rules::Rule};
+use crate::{
+    actions::RuleMetadata,
+    rules::{Rule, VariableSpec},
+};
 
 /// Callback invoked synchronously after a rule is inserted.
 pub(crate) type RuleObserver = dyn Fn(&RuleMetadata) + Send + Sync;
@@ -292,9 +295,12 @@ impl RuleGroup {
         self.rules.get(index)
     }
 
-    /// Returns one top-level rule mutably by its stable position.
-    pub(crate) fn rule_at_mut(&mut self, index: usize) -> Option<&mut Rule> {
-        self.rules.get_mut(index)
+    /// Returns the variables of one top-level rule by its position.
+    ///
+    /// Only the variables are exposed: a rule's id can change only through [`Self::replace_rule`],
+    /// which keeps the id index in step.
+    pub(crate) fn variables_at_mut(&mut self, index: usize) -> Option<&mut Vec<VariableSpec>> {
+        self.rules.get_mut(index).map(Rule::variables_mut)
     }
 
     /// Replace a top-level rule staged by a load-time update.
@@ -311,8 +317,9 @@ impl RuleGroup {
         }
     }
 
-    /// Rebuild the id index after an operation that can change metadata ids.
-    pub(crate) fn rebuild_id_index(&mut self) {
+    /// Rebuild the id index from the rules; the oracle the incremental updates must match.
+    #[cfg(test)]
+    fn rebuild_id_index(&mut self) {
         self.id_index.clear();
         for index in 0..self.rules.len() {
             let Some(id) = self.rules.get(index).map(|rule| rule.metadata().id()) else {
@@ -361,35 +368,71 @@ impl RuleGroup {
 
     /// Removes rules with ids in the inclusive range.
     pub(crate) fn delete_by_range(&mut self, start: i32, end: i32) {
-        self.rules.retain(|rule| !(start..=end).contains(&rule.metadata().id()));
-        self.recount();
+        self.remove_where(|rule| (start..=end).contains(&rule.metadata().id()));
     }
 
     /// Removes rules whose message equals `message`.
     pub(crate) fn delete_by_msg(&mut self, message: &str) {
-        self.rules.retain(|rule| rule.metadata().msg() != Some(message));
-        self.recount();
+        self.remove_where(|rule| rule.metadata().msg() == Some(message));
     }
 
     /// Removes rules tagged with `tag`.
     pub(crate) fn delete_by_tag(&mut self, tag: &str) {
-        self.rules
-            .retain(|rule| !rule.metadata().tags().iter().any(|item| item == tag));
-        self.recount();
+        self.remove_where(|rule| rule.metadata().tags().iter().any(|item| item == tag));
     }
 
-    /// Recompute the total after a bulk removal.
-    fn recount(&mut self) {
-        self.total = self.rules.iter().map(|rule| 1 + rule.chain.len()).sum();
-        self.rebuild_id_index();
+    /// Removes every top-level rule `matches` selects and keeps the id index and total in step.
+    ///
+    /// The index is shifted in place instead of rebuilt, so a directive that removes nothing
+    /// leaves it untouched and one that removes some pays no per-id allocation.
+    fn remove_where(&mut self, mut matches: impl FnMut(&Rule) -> bool) {
+        let mut removed = Vec::new();
+        let mut removed_ids = Vec::new();
+        let mut removed_total = 0_usize;
+        let mut position = 0_usize;
+        self.rules.retain(|rule| {
+            let index = position;
+            position += 1;
+            if matches(rule) {
+                removed.push(index);
+                removed_ids.push(rule.metadata().id());
+                removed_total = removed_total.saturating_add(1 + rule.chain.len());
+                false
+            } else {
+                true
+            }
+        });
+        let Some(&first_removed) = removed.first() else {
+            return;
+        };
+        self.total = self.total.saturating_sub(removed_total);
+        // Only the ids of removed rules lose positions; drop those and any id left empty.
+        removed_ids.sort_unstable();
+        removed_ids.dedup();
+        for id in removed_ids {
+            if let Some(positions) = self.id_index.get_mut(&id) {
+                positions.retain(|position| removed.binary_search(position).is_err());
+                if positions.is_empty() {
+                    self.id_index.remove(&id);
+                }
+            }
+        }
+        // `removed` is ascending, so the number of removed positions below a survivor is how far
+        // it moves down, and every id's list stays ascending.
+        for position in self.id_index.values_mut().flatten() {
+            if *position > first_removed {
+                let shift = removed.partition_point(|&index| index < *position);
+                *position = position.saturating_sub(shift);
+            }
+        }
     }
 
-    /// Updates rules tagged with `tag` and returns their count.
-    pub(crate) fn update_by_tag(&mut self, tag: &str, mut update: impl FnMut(&mut Rule)) -> usize {
+    /// Updates the variables of rules tagged with `tag` and returns their count.
+    pub(crate) fn update_by_tag(&mut self, tag: &str, mut update: impl FnMut(&mut Vec<VariableSpec>)) -> usize {
         let mut count = 0;
         for rule in &mut self.rules {
             if rule.metadata().tags().iter().any(|item| item == tag) {
-                update(rule);
+                update(rule.variables_mut());
                 count += 1;
             }
         }
@@ -604,6 +647,246 @@ mod tests {
         assert!(group.find_by_id(2).is_none());
         group.delete_by_range(3, 3);
         assert_eq!(group.count(), 0);
+    }
+
+    fn tagged(id: &str, action: &str, tag: &str, msg: &str) -> Rule {
+        let mut rule = rule(id, action);
+        if !tag.is_empty() {
+            rule.metadata_mut().tags.push(tag.to_owned());
+        }
+        if !msg.is_empty() {
+            rule.metadata_mut().msg = Some(crate::operators::Macro::new(msg).unwrap());
+        }
+        rule
+    }
+
+    fn marker(label: &str) -> Rule {
+        let mut rule = Rule::new();
+        rule.metadata_mut().sec_mark = Some(label.to_owned());
+        rule
+    }
+
+    fn live_total(group: &RuleGroup) -> usize {
+        group.rules().iter().map(|rule| 1 + rule.chain.len()).sum()
+    }
+
+    /// The incrementally maintained index and total must equal a fresh recomputation.
+    fn assert_consistent(group: &RuleGroup) {
+        let mut oracle = group.clone();
+        oracle.rebuild_id_index();
+        assert_eq!(group.id_index, oracle.id_index, "id index diverged from a full rebuild");
+        assert_eq!(group.total, live_total(group), "total diverged from the retained rules");
+    }
+
+    /// Ids 1, 2, 3, marker (id 0), 4, chain parent 5 with one member, 6, 7; odd ids tagged
+    /// `odd`, even ids `even`; the message is `m<id>`.
+    fn sample_group() -> RuleGroup {
+        let mut group = RuleGroup::new();
+        group.add(tagged("1", "", "odd", "m1"), false, None).unwrap();
+        group.add(tagged("2", "", "even", "m2"), false, None).unwrap();
+        group.add(tagged("3", "", "odd", "m3"), false, None).unwrap();
+        group.add(marker("MID"), false, None).unwrap();
+        group.add(tagged("4", "", "even", "m4"), false, None).unwrap();
+        group.add(tagged("5", "chain", "odd", "m5"), false, None).unwrap();
+        group.add(rule("", ""), false, None).unwrap();
+        group.add(tagged("6", "", "even", "m6"), false, None).unwrap();
+        group.add(tagged("7", "", "odd", "m7"), false, None).unwrap();
+        assert_consistent(&group);
+        group
+    }
+
+    /// `sample_group` with a second rule that carries id 2, as `replace_rule` can produce.
+    fn sample_group_with_duplicate_id() -> RuleGroup {
+        let mut group = sample_group();
+        group.replace_rule(6, tagged("2", "", "dup", "dup"));
+        assert_eq!(group.indices_by_id_range(2, 2), [1, 6]);
+        assert_consistent(&group);
+        group
+    }
+
+    fn ids(group: &RuleGroup) -> Vec<i32> {
+        group.iter().map(|rule| rule.metadata().id()).collect()
+    }
+
+    #[test]
+    fn range_removal_keeps_the_index_equal_to_a_rebuild() {
+        let ranges = [
+            (100, 200),
+            (5, 3),
+            (1, 1),
+            (7, 7),
+            (4, 4),
+            (0, 0),
+            (2, 3),
+            (1, 7),
+            (1, 2),
+            (6, 7),
+            (3, 6),
+        ];
+        for (start, end) in ranges {
+            for mut group in [sample_group(), sample_group_with_duplicate_id()] {
+                let before = ids(&group);
+                group.delete_by_range(start, end);
+                let expected: Vec<_> = before.into_iter().filter(|id| !(start..=end).contains(id)).collect();
+                assert_eq!(ids(&group), expected, "range {start}..={end}");
+                assert_consistent(&group);
+            }
+        }
+    }
+
+    #[test]
+    fn tag_removal_keeps_the_index_equal_to_a_rebuild() {
+        for tag in ["none", "odd", "even", "dup"] {
+            for mut group in [sample_group(), sample_group_with_duplicate_id()] {
+                group.delete_by_tag(tag);
+                assert!(
+                    group
+                        .iter()
+                        .all(|rule| !rule.metadata().tags().iter().any(|item| item == tag)),
+                    "tag {tag}"
+                );
+                assert_consistent(&group);
+            }
+        }
+    }
+
+    #[test]
+    fn message_removal_keeps_the_index_equal_to_a_rebuild() {
+        for message in ["none", "m1", "m7", "m4", "m5", "dup", "m2"] {
+            for mut group in [sample_group(), sample_group_with_duplicate_id()] {
+                group.delete_by_msg(message);
+                assert!(group.iter().all(|rule| rule.metadata().msg() != Some(message)));
+                assert_consistent(&group);
+            }
+        }
+    }
+
+    #[test]
+    fn removing_nothing_leaves_the_group_untouched() {
+        let mut group = sample_group_with_duplicate_id();
+        let (index, total, rules) = (group.id_index.clone(), group.total, ids(&group));
+        group.delete_by_range(100, 200);
+        group.delete_by_tag("none");
+        group.delete_by_msg("none");
+        assert_eq!(group.id_index, index);
+        assert_eq!(group.total, total);
+        assert_eq!(ids(&group), rules);
+    }
+
+    #[test]
+    fn removing_a_chain_parent_refunds_the_parent_and_its_members() {
+        let mut group = sample_group();
+        let total = group.total;
+        assert_eq!(group.rules()[5].chain.len(), 1);
+        group.delete_by_range(5, 5);
+        assert_eq!(group.total, total - 2);
+        assert_consistent(&group);
+
+        group.delete_by_range(1, 1);
+        assert_eq!(group.total, total - 3);
+        assert_consistent(&group);
+    }
+
+    #[test]
+    fn removing_the_markers_shifts_later_positions() {
+        let mut group = sample_group();
+        group.delete_by_range(0, 0);
+        assert_eq!(group.indices_by_id_range(4, 4), [3]);
+        assert_eq!(group.indices_by_id_range(7, 7), [6]);
+        assert_consistent(&group);
+    }
+
+    #[test]
+    fn removal_shifts_duplicate_id_positions_in_order() {
+        let mut group = sample_group_with_duplicate_id();
+        group.delete_by_range(1, 1);
+        group.delete_by_range(4, 4);
+        assert_eq!(group.indices_by_id_range(2, 2), [0, 4]);
+        group.delete_by_tag("dup");
+        assert_eq!(group.indices_by_id_range(2, 2), [0]);
+        assert_consistent(&group);
+    }
+
+    #[test]
+    fn removed_ids_can_be_added_again_but_surviving_ids_cannot() {
+        let mut group = sample_group();
+        group.delete_by_range(2, 3);
+        group.delete_by_tag("even");
+        group.delete_by_msg("m7");
+        assert_consistent(&group);
+
+        group.add(rule("2", ""), false, None).unwrap();
+        group.add(rule("7", ""), false, None).unwrap();
+        assert_consistent(&group);
+        assert_eq!(group.indices_by_id_range(2, 2), [group.count() - 2]);
+        for surviving in ["1", "5", "7"] {
+            assert!(
+                group
+                    .add(rule(surviving, ""), false, None)
+                    .unwrap_err()
+                    .contains(&format!("duplicated rule id {surviving}"))
+            );
+        }
+        assert_consistent(&group);
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn random_below(state: &mut u64, bound: usize) -> usize {
+        usize::try_from(next_random(state) % u64::try_from(bound).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn random_mutation_sequences_keep_the_index_and_total_consistent() {
+        const TAGS: [&str; 3] = ["", "a", "b"];
+        const MESSAGES: [&str; 3] = ["", "x", "y"];
+        for seed in [0x9E37_79B9_7F4A_7C15_u64, 0x1234_5678_9ABC_DEF1, 0xDEAD_BEEF_CAFE_F00D] {
+            let mut state = seed;
+            let mut group = RuleGroup::new();
+            for _ in 0..1500 {
+                match random_below(&mut state, 8) {
+                    0..=2 => {
+                        let id = random_below(&mut state, 14);
+                        let id = if id == 0 { String::new() } else { id.to_string() };
+                        let action = if random_below(&mut state, 4) == 0 { "chain" } else { "" };
+                        let tag = TAGS[random_below(&mut state, 3)];
+                        let msg = MESSAGES[random_below(&mut state, 3)];
+                        let new_rule = if random_below(&mut state, 10) == 0 {
+                            marker("M")
+                        } else {
+                            tagged(&id, action, tag, msg)
+                        };
+                        drop(group.add(new_rule, false, None));
+                    },
+                    3 => {
+                        let start = i32::try_from(random_below(&mut state, 15)).unwrap();
+                        let end = start + i32::try_from(random_below(&mut state, 4)).unwrap();
+                        group.delete_by_range(start, end);
+                    },
+                    4 => group.delete_by_tag(TAGS[random_below(&mut state, 3)]),
+                    5 => group.delete_by_msg(MESSAGES[random_below(&mut state, 3)]),
+                    6 => {
+                        let index = random_below(&mut state, group.count() + 1);
+                        if let Some(mut replacement) = group.rule_at(index).cloned() {
+                            let id = random_below(&mut state, 14);
+                            if id != 0 {
+                                replacement.metadata_mut().id = i32::try_from(id).unwrap();
+                            }
+                            group.replace_rule(index, replacement);
+                        }
+                    },
+                    _ => {
+                        group.discard_open_chain();
+                    },
+                }
+                assert_consistent(&group);
+            }
+        }
     }
 
     #[test]
