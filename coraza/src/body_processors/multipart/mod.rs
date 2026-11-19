@@ -25,6 +25,8 @@ mod parser;
 
 pub(crate) use parser::Part;
 
+use crate::body_processors::budget::MemoryBudget;
+
 /// Whether `name` is one MIME token, the shape Go's `textproto` canonicalizes. A name
 /// that holds a space is not a token, and Go keeps it as sent (go.dev/issue/34540).
 fn is_token_name(name: &str) -> bool {
@@ -65,6 +67,9 @@ pub(crate) struct ParseFailure {
     /// a body that is not multipart at all
     /// (`internal/bodyprocessors/multipart.go:22-34`, v3.8.1).
     pub(crate) strict: bool,
+    /// Whether the parser stopped in a body that is multipart, so that parts past the stop were not looked at.
+    /// A body that is not multipart has none.
+    pub(crate) parts_unread: bool,
 }
 
 /// Parse a multipart body using the boundary in its content type.
@@ -75,7 +80,16 @@ pub(crate) struct ParseFailure {
 ///
 /// `truncated` reports that `body` is only the prefix a `ProcessPartial` body limit
 /// retained, which Go's body processor inspects up to the last complete part.
-pub(crate) fn parse<'a>(content_type: &[u8], body: &'a [u8], truncated: bool) -> (Vec<Part<'a>>, Option<ParseFailure>) {
+///
+/// The parts it returns are charged to `memory`, and reading stops, as for any other parse failure, when
+/// they would take more than half of what it has left. The caller gives each part's
+/// [`Part::retained_bytes`] back as it drops the part.
+pub(crate) fn parse<'a>(
+    content_type: &[u8],
+    body: &'a [u8],
+    truncated: bool,
+    memory: &mut MemoryBudget,
+) -> (Vec<Part<'a>>, Option<ParseFailure>) {
     let content_type = match media_type::parse(content_type) {
         Ok(content_type) => content_type,
         Err(error) => {
@@ -84,6 +98,7 @@ pub(crate) fn parse<'a>(content_type: &[u8], body: &'a [u8], truncated: bool) ->
                 Some(ParseFailure {
                     message: error.to_owned(),
                     strict: true,
+                    parts_unread: true,
                 }),
             );
         },
@@ -97,18 +112,27 @@ pub(crate) fn parse<'a>(content_type: &[u8], body: &'a [u8], truncated: bool) ->
             Some(ParseFailure {
                 message: "not a multipart body".to_owned(),
                 strict: false,
+                parts_unread: false,
             }),
         );
     }
     // A missing boundary reaches `multipart.NewReader` as the empty string in Go, whose
     // first `NextPart` reports `multipart: boundary is empty`.
     let boundary = content_type.param(b"boundary").unwrap_or_default();
-    let (parts, error) = parser::MultipartParser::new(boundary, body)
+    // Reading may hold up to half of what the host can spare, which leaves the rest for publishing the first
+    // parts while the others are still held; the parts' charge is given back as they are published.
+    let reading = MemoryBudget::new(memory.remaining().map(|left| left / 2));
+    let parser = parser::MultipartParser::new(boundary, body)
         .truncated(truncated)
-        .parse();
+        .with_memory_budget(reading);
+    let (parts, error) = parser.parse();
+    if let (Some(before), Some(after)) = (reading.remaining(), parser.memory_left().remaining()) {
+        memory.charge(before.saturating_sub(after));
+    }
     let failure = error.map(|error| ParseFailure {
         message: error.go_message(),
-        strict: true,
+        strict: error.is_strict(),
+        parts_unread: true,
     });
     (parts, failure)
 }

@@ -43,7 +43,9 @@ pub use map::Map;
 #[cfg(test)]
 pub(crate) use map::keys_scanned;
 pub(crate) use map::{
-    FIRST_INSERT_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
+    ALLOCATION_OVERHEAD_BYTES, FIRST_INSERT_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT,
+    KEY_RETAINED_BYTES_PER_BYTE, VALUE_ENTRY_BYTES, allocation_bytes, index_capacity_for, index_table_bytes,
+    map_table_bytes,
 };
 pub use single::Single;
 

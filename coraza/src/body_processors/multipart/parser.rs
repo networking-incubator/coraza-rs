@@ -24,7 +24,13 @@
 //! This implementation follows the Go stdlib mime/multipart closely
 //! for maximum compatibility.
 
+use std::{cell::Cell, mem::size_of};
+
 use super::{is_token_name, media_type};
+use crate::{body_processors::budget::MemoryBudget, collection::ALLOCATION_OVERHEAD_BYTES};
+
+/// What a parse asks before it copies a header block: whether the host's memory budget has room for it.
+type Reserve<'r> = &'r dyn Fn(&[u8]) -> Result<(), ParseError>;
 
 /// An error from parsing a multipart body.
 #[derive(Debug)]
@@ -47,7 +53,13 @@ pub(super) enum ParseError {
     Parse(String),
     /// The body exceeds one of the parser's resource budgets.
     Limit(String),
+    /// Reading the next part would take the parser past the memory budget the host set. That is a capacity
+    /// event, not a violation of the multipart format, so it does not set the strict error.
+    Budget,
 }
+
+/// What the host's memory budget stopping the parser says.
+const BUDGET_MESSAGE: &str = "body memory budget exceeded";
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +72,7 @@ impl std::fmt::Display for ParseError {
             ParseError::MalformedHeaders(msg) => write!(f, "malformed headers: {msg}"),
             ParseError::Parse(msg) => write!(f, "parse error: {msg}"),
             ParseError::Limit(msg) => write!(f, "limit exceeded: {msg}"),
+            ParseError::Budget => write!(f, "limit exceeded: {BUDGET_MESSAGE}"),
         }
     }
 }
@@ -88,7 +101,14 @@ impl ParseError {
             },
             // Rust-only hardening budgets; the conformance ledger records the prefix.
             ParseError::Limit(message) => format!("malformed multipart: limit exceeded: {message}"),
+            ParseError::Budget => format!("malformed multipart: limit exceeded: {BUDGET_MESSAGE}"),
         }
+    }
+
+    /// Whether Go's reader would report this failure too, which sets `MULTIPART_STRICT_ERROR`: the host's memory
+    /// budget is not one of its errors.
+    pub(super) const fn is_strict(&self) -> bool {
+        !matches!(self, Self::Budget)
     }
 }
 
@@ -143,6 +163,44 @@ pub(crate) struct Part<'a> {
     pub(crate) data: &'a [u8],
 }
 
+impl Part<'_> {
+    /// Bytes of the slot the part takes in the vector it waits in, with the growth slack of that vector. The vector
+    /// keeps them until it is dropped, however many of its parts have been taken out.
+    pub(crate) const fn slot_bytes() -> usize {
+        size_of::<Self>().saturating_mul(2)
+    }
+
+    /// Bytes the part's own buffers hold beyond the body it borrows: its names, and each header's name and value
+    /// with the entry that holds them, all by the capacity the buffers keep, which a decoded name can leave well
+    /// above its length. They are freed when the part is dropped.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        /// One header: the entry in the part's list, and the allocation overhead of its name and value.
+        const HEADER_ENTRY_BYTES: usize = size_of::<(String, Vec<u8>)>() + 2 * ALLOCATION_OVERHEAD_BYTES;
+        let optional = |bytes: &Option<Vec<u8>>| bytes.as_ref().map_or(0, Vec::capacity);
+        let encoding = self.filename_encoding.as_ref().map_or(0, |encoding| {
+            encoding.charset.capacity().saturating_add(encoding.language.capacity())
+        });
+        self.headers
+            .iter()
+            .fold(0_usize, |total, (name, value)| {
+                total
+                    .saturating_add(HEADER_ENTRY_BYTES)
+                    .saturating_add(name.capacity())
+                    .saturating_add(value.capacity())
+            })
+            .saturating_add(self.name.capacity())
+            .saturating_add(optional(&self.filename))
+            .saturating_add(optional(&self.alt_filename))
+            .saturating_add(encoding)
+            .saturating_add(5 * ALLOCATION_OVERHEAD_BYTES)
+    }
+
+    /// Bytes this part holds while it waits in its vector: [`Part::slot_bytes`] and [`Part::owned_bytes`].
+    pub(crate) fn retained_bytes(&self) -> usize {
+        Self::slot_bytes().saturating_add(self.owned_bytes())
+    }
+}
+
 /// Maximum boundary length in bytes.
 ///
 /// RFC 2046 requires a boundary of at most 70 characters. Go's
@@ -192,6 +250,8 @@ pub(super) struct MultipartParser<'a> {
     data: &'a [u8],
     /// Whether `data` holds only the prefix a body limit retained.
     truncated: bool,
+    /// What the parts it reads may still hold, charged as each is read.
+    memory: Cell<MemoryBudget>,
 }
 
 impl<'a> MultipartParser<'a> {
@@ -206,7 +266,81 @@ impl<'a> MultipartParser<'a> {
             boundary: boundary.as_ref().to_vec(),
             data,
             truncated: false,
+            memory: Cell::new(MemoryBudget::default()),
         }
+    }
+
+    /// Limit what the parts hold to `memory`, which is what the host can spare for this body.
+    pub(super) fn with_memory_budget(self, memory: MemoryBudget) -> Self {
+        self.memory.set(memory);
+        self
+    }
+
+    /// What is left of the budget after the parts read so far.
+    pub(super) fn memory_left(&self) -> MemoryBudget {
+        self.memory.get()
+    }
+
+    /// Takes `bytes` from the budget, or fails with the budget error and takes nothing.
+    fn reserve(&self, bytes: usize) -> Result<(), ParseError> {
+        let mut memory = self.memory.get();
+        let charged = memory.charge(bytes);
+        self.memory.set(memory);
+        if charged { Ok(()) } else { Err(ParseError::Budget) }
+    }
+
+    /// Gives `bytes` back.
+    fn release(&self, bytes: usize) {
+        let mut memory = self.memory.get();
+        memory.refund(bytes);
+        self.memory.set(memory);
+    }
+
+    /// Reads the part in `data` into `parts`, with the memory it takes reserved before it is allocated.
+    ///
+    /// The parse copies the header block and every parameter of the disposition, which the header limits bound
+    /// but not by what the host has left, so it reserves what [`header_parse_cost`] bounds first and gives that
+    /// back once the part is built. The part itself is then charged at what it keeps, while that reservation is
+    /// still held, so the peak is covered. A part that does not fit leaves the parts before it in `parts`.
+    ///
+    /// `truncated` carries the delimiter markers of a part a body limit cut, which is read as far as it goes and
+    /// has its partial delimiter trimmed.
+    fn read_part(
+        &self,
+        parts: &mut Vec<Part<'a>>,
+        data: &'a [u8],
+        total_header_bytes: &mut usize,
+        truncated: Option<(&[u8], &[u8])>,
+    ) -> Result<(), ParseError> {
+        let held = Cell::new(0_usize);
+        let reserve = |block: &[u8]| {
+            if !self.memory.get().is_limited() {
+                return Ok(());
+            }
+            let cost = header_parse_cost(block);
+            self.reserve(cost)?;
+            held.set(cost);
+            Ok(())
+        };
+        let parsed = match truncated {
+            Some(_) => parse_truncated_part(data, total_header_bytes, &reserve),
+            None => parse_part(data, total_header_bytes, &reserve).map(Some),
+        };
+        let kept = parsed.and_then(|part| {
+            let Some(mut part) = part else {
+                return Ok(None);
+            };
+            if let Some((dash_boundary, nl_boundary)) = truncated {
+                part.data = trim_truncated_part_data(part.data, dash_boundary, nl_boundary);
+            }
+            self.reserve(part.retained_bytes())?;
+            Ok(Some(part))
+        });
+        self.release(held.get());
+        if let Some(part) = kept? {
+            parts.push(part);
+        }
+        Ok(())
     }
 
     /// Mark `data` as the prefix a body limit retained under `ProcessPartial`.
@@ -294,6 +428,7 @@ impl<'a> MultipartParser<'a> {
             pos = skip_line_ending(self.data, pos);
         }
         let mut total_header_bytes = 0_usize;
+        let cut = Some((boundary_marker.as_slice(), nl_boundary_marker.as_slice()));
 
         // Parse each part
         while !closed {
@@ -317,10 +452,7 @@ impl<'a> MultipartParser<'a> {
                 None if self.truncated => {
                     // Go reads this last part until the limit's `io.ErrUnexpectedEOF`,
                     // trims the partial delimiter it stopped on, and keeps the part.
-                    if let Some(mut part) = parse_truncated_part(remaining, &mut total_header_bytes)? {
-                        part.data = trim_truncated_part_data(part.data, &boundary_marker, &nl_boundary_marker);
-                        parts.push(part);
-                    }
+                    self.read_part(parts, remaining, &mut total_header_bytes, cut)?;
                     return Ok(());
                 },
                 None => {
@@ -328,10 +460,7 @@ impl<'a> MultipartParser<'a> {
                     // part in progress: Go's `NextPart` returns it, and only reading it
                     // fails with `io.ErrUnexpectedEOF`. A partial delimiter at the end is
                     // trimmed like the limit-truncated case.
-                    if let Some(mut part) = parse_truncated_part(remaining, &mut total_header_bytes)? {
-                        part.data = trim_truncated_part_data(part.data, &boundary_marker, &nl_boundary_marker);
-                        parts.push(part);
-                    }
+                    self.read_part(parts, remaining, &mut total_header_bytes, cut)?;
                     return Err(ParseError::Parse("missing final boundary".to_owned()));
                 },
             };
@@ -359,8 +488,7 @@ impl<'a> MultipartParser<'a> {
             };
 
             // Parse this part (propagate errors)
-            let part = parse_part(part_data, &mut total_header_bytes)?;
-            parts.push(part);
+            self.read_part(parts, part_data, &mut total_header_bytes, None)?;
 
             // Go reports a bad delimiter line only after the part before it was read, so
             // the strict error follows a published part.
@@ -394,7 +522,11 @@ impl<'a> MultipartParser<'a> {
 /// Go's `NextPart` reports the unfinished header block as `io.EOF`, which the
 /// multipart body processor treats as the end of a partial body, while a malformed
 /// complete header line is still an error.
-fn parse_truncated_part<'a>(data: &'a [u8], total_header_bytes: &mut usize) -> Result<Option<Part<'a>>, ParseError> {
+fn parse_truncated_part<'a>(
+    data: &'a [u8],
+    total_header_bytes: &mut usize,
+    reserve: Reserve<'_>,
+) -> Result<Option<Part<'a>>, ParseError> {
     if find_header_end(data).is_none() {
         if let Some(end) = data.iter().rposition(|&byte| byte == b'\n') {
             let complete = data.get(..end.saturating_add(1)).unwrap_or_default();
@@ -404,11 +536,12 @@ fn parse_truncated_part<'a>(data: &'a [u8], total_header_bytes: &mut usize) -> R
                     complete.len()
                 )));
             }
+            reserve(complete)?;
             parse_headers(complete)?;
         }
         return Ok(None);
     }
-    parse_part(data, total_header_bytes).map(Some)
+    parse_part(data, total_header_bytes, reserve).map(Some)
 }
 
 /// Strip the partial delimiter Go's `scanUntilBoundary` withholds from a part cut
@@ -430,11 +563,52 @@ fn trim_truncated_part_data<'a>(data: &'a [u8], dash_boundary: &[u8], nl_boundar
     data
 }
 
+/// The most the parse of a header block can hold at once, for the host's budget to reserve before it starts.
+///
+/// The headers are copied out of the block, a folded one is joined beside them, the duplicate check keeps each
+/// name, and the disposition is read into parameters that are copied again as the name, the filename and its
+/// alternatives are chosen: well under a dozen copies of the block, however it is made up. Every `;` can start a
+/// parameter and every line a header, each with an entry the vectors and maps grow by twice and an allocation of
+/// its own.
+fn header_parse_cost(block: &[u8]) -> usize {
+    /// What the copies of one header's name and value add besides their bytes: the entry in the part's list and in
+    /// the duplicate check, grown by up to twice, and two allocations.
+    const HEADER_BYTES: usize =
+        2 * (size_of::<(String, Vec<u8>)>() + size_of::<String>() + 8) + 3 * ALLOCATION_OVERHEAD_BYTES;
+    /// What one parameter adds: its slice in the split, its entry in the parsed list and in the media type's
+    /// index, and the allocations of the copies of its name and value.
+    const PARAM_BYTES: usize = size_of::<&[u8]>() + 3 * size_of::<HeaderParam>() + 4 * ALLOCATION_OVERHEAD_BYTES;
+    let (mut lines, mut params) = (1_usize, 1_usize);
+    for &byte in block {
+        match byte {
+            b'\n' => lines = lines.saturating_add(1),
+            b';' => params = params.saturating_add(1),
+            _ => {},
+        }
+    }
+    block
+        .len()
+        .saturating_mul(12)
+        .saturating_add(
+            lines
+                .min(MAX_PART_HEADERS.saturating_add(1))
+                .saturating_mul(HEADER_BYTES),
+        )
+        .saturating_add(params.saturating_mul(PARAM_BYTES))
+}
+
 /// Parse a single part (headers + body)
 ///
 /// `total_header_bytes` accumulates the raw header bytes of every part parsed
 /// from the same body.
-fn parse_part<'a>(data: &'a [u8], total_header_bytes: &mut usize) -> Result<Part<'a>, ParseError> {
+///
+/// `reserve` is told the header block once it is within the limits and before anything is copied out of it, and
+/// can refuse it.
+fn parse_part<'a>(
+    data: &'a [u8],
+    total_header_bytes: &mut usize,
+    reserve: Reserve<'_>,
+) -> Result<Part<'a>, ParseError> {
     // Find the blank line that separates headers from body
     let (header_end, separator_len) =
         find_header_end(data).ok_or_else(|| ParseError::MalformedHeaders("no blank line after headers".to_owned()))?;
@@ -466,6 +640,7 @@ fn parse_part<'a>(data: &'a [u8], total_header_bytes: &mut usize) -> Result<Part
         .get(body_start..)
         .ok_or_else(|| ParseError::MalformedHeaders("invalid body range".to_owned()))?;
 
+    reserve(header_data)?;
     // Parse headers
     let headers = parse_headers(header_data)?;
 
@@ -1552,11 +1727,38 @@ Content-Disposition: form-data; name=\"q\"\r\n\
     }
 
     #[test]
+    fn a_decoded_filename_is_charged_for_the_capacity_it_keeps() {
+        // `%41` decodes to one byte but the buffer was sized for the three it came in.
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"f\"; filename*=UTF-8''%41%41%41%41%41%41%41%41\r\n\r\nx\r\n--b--\r\n";
+        let (parts, error) = MultipartParser::new("b", body).parse();
+        assert!(error.is_none());
+        let part = parts.first().unwrap();
+        let filename = part.filename.as_ref().unwrap();
+        assert_eq!(filename.as_slice(), b"AAAAAAAA");
+        assert!(
+            filename.capacity() >= 24,
+            "the buffer keeps the encoded size: {}",
+            filename.capacity()
+        );
+        // What the part holds beyond that is its name, a header and the fixed allocations.
+        let mut shrunk = part.clone();
+        shrunk.filename.as_mut().unwrap().shrink_to_fit();
+        assert!(
+            part.owned_bytes() >= shrunk.owned_bytes() + filename.capacity() - filename.len(),
+            "{} against {}",
+            part.owned_bytes(),
+            shrunk.owned_bytes()
+        );
+        assert_eq!(part.retained_bytes(), Part::slot_bytes() + part.owned_bytes());
+    }
+
+    #[test]
     fn a_part_without_a_blank_line_still_fails() {
         let mut total_header_bytes = 0;
         let error = parse_part(
             b"Content-Disposition: form-data; name=\"a\"\r\n",
             &mut total_header_bytes,
+            &|_| Ok(()),
         )
         .unwrap_err();
         assert!(matches!(
