@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn an_empty_configuration_compiles_without_policies() {
-        let generation = parse_generation("{}");
+        let generation = parse_generation(r#"{"directives_map": {}}"#);
         assert!(generation.policies.is_empty(), "no policy is configured");
         assert!(generation.select("a.example").is_none(), "nothing is selected");
         assert_eq!(
@@ -1841,7 +1841,7 @@ mod tests {
 
     #[test]
     fn a_skipped_include_budget_diagnostic_is_rejected() {
-        let mut config = parse_config("{}");
+        let mut config = parse_config(r#"{"directives_map": {}}"#);
         let mut directives = vec!["SecIgnoreRuleCompilationErrors On".to_owned()];
         // The parser's per-top-level-parse budget is 1024 reads; the 1025th Include fails.
         // Re-including one file keeps the fixture under the rule-data file cap, which
@@ -1923,7 +1923,7 @@ SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
 
     #[test]
     fn the_policy_count_accepts_the_boundary_and_rejects_one_more() {
-        let mut config = parse_config("{}");
+        let mut config = parse_config(r#"{"directives_map": {}}"#);
         for index in 0..MAX_POLICIES {
             config.directives_map.insert(format!("p{index}"), Vec::new());
         }

@@ -21,8 +21,11 @@
 //!
 //! # Accepted values
 //!
-//! * Blank or whitespace-only input is an empty [`Config`]: every request then passes uninspected. A document whose top
-//!   level is not an object is treated the same way, because upstream reads every key from it as absent.
+//! * Blank or whitespace-only input is an empty [`Config`]: every request then passes uninspected. [`Config::parse`]
+//!   accepts it so a first load with no plugin configuration stays an explicit, warned pass-through; the root context
+//!   refuses it as a reload, so it can never replace an active generation. A document whose top level is not an object,
+//!   or an object with none of the recognised keys below (so `{}` or only misspelled keys), is rejected: it would
+//!   otherwise install a generation that inspects nothing, in place of a working one.
 //! * `directives_map` is an object of policy name to an array of directives, or to a single scalar, which becomes a
 //!   one-element list. Array elements are coerced with [`scalar_text`]: strings, numbers, booleans and `null`
 //!   contribute their text; an array or object anywhere in a policy's directive list is rejected, naming the policy and
@@ -31,8 +34,9 @@
 //!   absent value selects no policy: the first configured policy is not used implicitly. The name is resolved during
 //!   compilation.
 //! * `per_authority_directives` maps an authority to a policy name. Every referenced policy must exist. An empty
-//!   authority or an empty policy name is rejected. Scalars are coerced and non-scalars are rejected. At most
-//!   [`MAX_AUTHORITIES`] authorities are accepted.
+//!   authority or an empty policy name is rejected. An authority key whose port is the default for a scheme (`:80` or
+//!   `:443`) is rejected, because the request-time lookup strips that port: configure the bare host instead. Scalars
+//!   are coerced and non-scalars are rejected. At most [`MAX_AUTHORITIES`] authorities are accepted.
 //! * Policy, authority and `rule_data` names are at most [`MAX_NAME_BYTES`] bytes; a configured name over the limit is
 //!   rejected rather than embedded in a log line.
 //! * The legacy flat `rules` key is unsupported. Its presence is rejected with guidance to use `directives_map` and
@@ -50,10 +54,12 @@
 //!   plane that will not carry the plain JSON. Inside that wrapper it is the only accepted top-level key: any other
 //!   key, known or unknown, rejects the document. Its value must be one line of standard padded base64, and the
 //!   decompressed document is parsed by every rule above, capped at [`MAX_CONFIGURATION_BYTES`]. A blank or non-object
-//!   decompressed document yields the same empty [`Config`] as the plain path, and one that itself holds
-//!   `config_gzip_b64` is rejected rather than nested. Exactly one gzip member is accepted: its deflate stream must end
-//!   where its trailer begins, and nothing may follow the trailer.
-//! * Unknown keys are ignored in a plain document.
+//!   decompressed document is rejected, and so is one that itself holds `config_gzip_b64`, rather than nested. Exactly
+//!   one gzip member is accepted: its deflate stream must end where its trailer begins, and nothing may follow the
+//!   trailer.
+//! * Unknown keys are ignored in a plain document, as long as at least one recognised key is present: control planes
+//!   may add their own keys, so only a document with no recognised key at all is rejected. The recognised keys are
+//!   [`RECOGNISED_KEYS`].
 //!
 //! # Known divergences from upstream
 //!
@@ -64,7 +70,8 @@
 //! Runtime authority lookup lowercases the request authority and strips only its scheme's default port before
 //! selection, and uses Envoy's `request.host` property when `:authority` is absent. Upstream uses the raw authority
 //! string as an exact key and does not use that property fallback. Invalid or non-lowercase authority keys are
-//! rejected; bracketed IPv6 literals retain their brackets, and non-default ports remain part of the lookup key.
+//! rejected; bracketed IPv6 literals retain their brackets, and non-default ports remain part of the lookup key. A key
+//! carrying a default port can never be looked up, so it is rejected at parse time.
 //!
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
@@ -80,6 +87,8 @@
 //!   one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic. Upstream
 //!   would compile the rest of the policy and serve it; a policy that silently loses a rule line is a fail-open, so
 //!   this build keeps strict compilation.
+//! * A non-object document, and an object with no recognised key, are rejected where upstream reads them as an empty
+//!   configuration. Rejecting keeps the previous generation instead of silently dropping enforcement.
 //! * A present `directives_map` or `per_authority_directives` that is not an object is rejected. Upstream's `ForEach`
 //!   on `null` iterates once and on an array iterates its elements, so such a document does something rather than
 //!   nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is read as empty instead:
@@ -136,6 +145,21 @@ use miniz_oxide::{
     DataFormat, MZFlush, MZStatus,
 };
 use serde_json::{Map, Value};
+
+/// Top-level keys a plain document may use; a document with none of them is rejected.
+///
+/// `rules` is listed so its dedicated rejection is reported rather than the generic one, and `metric_labels` is
+/// accepted for upstream compatibility.
+pub(crate) const RECOGNISED_KEYS: [&str; 8] = [
+    "directives_map",
+    "default_directives",
+    "per_authority_directives",
+    "enable_filter_state_logs",
+    "rule_data",
+    "metric_labels",
+    "rules",
+    "config_gzip_b64",
+];
 
 /// Longest policy, authority or `rule_data` name, in bytes.
 const MAX_NAME_BYTES: usize = 4096;
@@ -260,6 +284,13 @@ pub(crate) enum ConfigError {
         /// Offending authority key.
         authority: String,
     },
+    /// An authority key carries a scheme's default port, which request-time lookup strips.
+    DefaultPortAuthority {
+        /// Offending authority key.
+        authority: String,
+        /// The key without its default port.
+        host: String,
+    },
     /// An authority entry names an empty policy.
     EmptyPolicyName {
         /// Authority the entry is for.
@@ -272,6 +303,15 @@ pub(crate) enum ConfigError {
         /// Which bound it breaks.
         reason: String,
     },
+    /// The top-level document is valid JSON but not an object.
+    NotAnObject {
+        /// JSON type that was found.
+        found: &'static str,
+    },
+    /// The top-level object holds none of the [`RECOGNISED_KEYS`].
+    NoRecognisedKey,
+    /// A decompressed `config_gzip_b64` document is blank.
+    BlankCompressedDocument,
     /// `config_gzip_b64` is empty, whitespace or not a string.
     EmptyBase64,
     /// `config_gzip_b64` is not standard padded base64.
@@ -342,6 +382,22 @@ impl Display for ConfigError {
                 "per_authority_directives authority {} is invalid or not lowercase",
                 display_name(authority)
             ),
+            Self::DefaultPortAuthority { authority, host } => write!(
+                f,
+                "per_authority_directives authority {} carries a default port (80 or 443), which the request-time \
+                 lookup strips; use the bare host {} instead",
+                display_name(authority),
+                display_name(host)
+            ),
+            Self::NotAnObject { found } => {
+                write!(f, "plugin configuration must be a JSON object, not {found}")
+            },
+            Self::NoRecognisedKey => write!(
+                f,
+                "plugin configuration has none of the recognised keys ({}); check for a misspelled key",
+                RECOGNISED_KEYS.join(", ")
+            ),
+            Self::BlankCompressedDocument => f.write_str("the decompressed configuration is blank"),
             Self::EmptyPolicyName { authority } => {
                 write!(
                     f,
@@ -381,9 +437,10 @@ impl Config {
     /// one of the `config_gzip_b64` errors. Policy references are resolved
     /// during compilation, not here.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let Some(object) = Self::parse_object(bytes)? else {
+        if is_blank(bytes) {
             return Ok(Self::default());
-        };
+        }
+        let object = Self::parse_object(bytes)?;
         let Some(encoded) = object.get("config_gzip_b64") else {
             return Self::from_plain(&object);
         };
@@ -406,27 +463,26 @@ impl Config {
     /// As [`Config::parse`], with [`ConfigError::NestedCompression`] for a
     /// document that itself holds `config_gzip_b64`.
     fn parse_plain(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let Some(object) = Self::parse_object(bytes)? else {
-            return Ok(Self::default());
-        };
+        if is_blank(bytes) {
+            return Err(ConfigError::BlankCompressedDocument);
+        }
+        let object = Self::parse_object(bytes)?;
         if object.contains_key("config_gzip_b64") {
             return Err(ConfigError::NestedCompression);
         }
         Self::from_plain(&object)
     }
 
-    /// Parses a document into its top-level object, if it has one.
+    /// Parses a non-blank document into its top-level object.
     ///
-    /// A non-object document yields `None`, because every key upstream reads
-    /// from such a document is absent.
-    fn parse_object(bytes: &[u8]) -> Result<Option<Map<String, Value>>, ConfigError> {
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return Ok(None);
-        }
+    /// A non-object document and an object with no recognised key are rejected:
+    /// either would otherwise become a generation that inspects nothing.
+    fn parse_object(bytes: &[u8]) -> Result<Map<String, Value>, ConfigError> {
         check_json_value_count(bytes)?;
         match serde_json::from_slice(bytes).map_err(ConfigError::InvalidJson)? {
-            Value::Object(object) => Ok(Some(object)),
-            _ => Ok(None),
+            Value::Object(object) if RECOGNISED_KEYS.iter().any(|key| object.contains_key(*key)) => Ok(object),
+            Value::Object(_) => Err(ConfigError::NoRecognisedKey),
+            other => Err(ConfigError::NotAnObject { found: kind(&other) }),
         }
     }
 
@@ -447,6 +503,11 @@ impl Config {
         };
         Ok(config)
     }
+}
+
+/// Whether `bytes` is empty or only ASCII whitespace, which [`Config::parse`] reads as an empty configuration.
+pub(crate) fn is_blank(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
 }
 
 /// The fixed part of a gzip member header, before its optional fields.
@@ -755,6 +816,17 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
                 authority: authority.clone(),
             });
         }
+        // Request-time lookup strips the scheme's default port, so a key holding one would never match.
+        for scheme in [b"http".as_slice(), b"https".as_slice()] {
+            if let Some(host) =
+                crate::stream::normalize_authority(authority.as_bytes(), scheme).filter(|host| host != authority)
+            {
+                return Err(ConfigError::DefaultPortAuthority {
+                    authority: authority.clone(),
+                    host,
+                });
+            }
+        }
         if policy.is_empty() {
             return Err(ConfigError::EmptyPolicyName {
                 authority: authority.clone(),
@@ -992,13 +1064,60 @@ mod tests {
     }
 
     #[test]
-    fn non_object_documents_are_accepted_as_empty() {
-        for input in ["[]", "\"text\"", "5", "true", "null"] {
-            assert!(
-                Config::parse(input.as_bytes()).is_ok(),
-                "upstream reads a non-object document as empty: {input}"
+    fn non_object_documents_are_rejected() {
+        for (input, found) in [
+            ("[]", "array"),
+            ("\"text\"", "string"),
+            ("5", "number"),
+            ("true", "boolean"),
+            ("null", "null"),
+        ] {
+            let error = parse_error(input);
+            assert_eq!(
+                error,
+                format!("plugin configuration must be a JSON object, not {found}"),
+                "{input}"
             );
         }
+    }
+
+    #[test]
+    fn an_object_with_no_recognised_key_is_rejected() {
+        for input in [
+            "{}",
+            r#"{"unknown": 1}"#,
+            r#"{"directive_map": {"p": []}, "default_directive": "p"}"#,
+            r#"{"Directives_Map": {"p": []}}"#,
+        ] {
+            let error = Config::parse(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::NoRecognisedKey),
+                "{input} reported {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("none of the recognised keys (directives_map"),
+                "message was {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_compressed_document_is_rejected() {
+        for inner in ["", "  \n", "[]", "{}", "null"] {
+            assert!(
+                Config::parse(compressed(inner).as_bytes()).is_err(),
+                "a compressed {inner:?} is rejected"
+            );
+        }
+        assert!(
+            matches!(
+                Config::parse(compressed("").as_bytes()).unwrap_err(),
+                ConfigError::BlankCompressedDocument
+            ),
+            "a blank decompressed document has its own error"
+        );
     }
 
     #[test]
@@ -1033,7 +1152,10 @@ mod tests {
 
     #[test]
     fn enable_filter_state_logs_defaults_to_false_and_tolerates_other_types() {
-        assert!(!parse("{}").enable_filter_state_logs, "absent is false");
+        assert!(
+            !parse(r#"{"directives_map": {}}"#).enable_filter_state_logs,
+            "absent is false"
+        );
         assert!(
             parse(r#"{"enable_filter_state_logs": true}"#).enable_filter_state_logs,
             "true"
@@ -1147,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_ignored() {
+    fn unknown_keys_alongside_a_recognised_key_are_ignored() {
         let config = parse(r#"{"unknown": {"nested": true}, "enable_filter_state_logs": true}"#);
         assert!(config.directives_map.is_empty(), "no policy is configured");
         assert!(config.enable_filter_state_logs, "known keys are still read");
@@ -1199,10 +1321,37 @@ mod tests {
             );
         }
 
-        for authority in ["a.example:80", "a.example:443", "[2001:db8::1]:443"] {
+        for authority in [
+            "a.example:8080",
+            "a.example:81",
+            "[2001:db8::1]:8443",
+            "[2001:db8::1]",
+            "a.example",
+        ] {
             let input =
                 format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
             assert!(Config::parse(input.as_bytes()).is_ok(), "authority {authority:?}");
+        }
+    }
+
+    #[test]
+    fn per_authority_keys_with_a_default_port_are_rejected() {
+        for (authority, host) in [
+            ("a.example:80", "a.example"),
+            ("a.example:443", "a.example"),
+            ("[2001:db8::1]:443", "[2001:db8::1]"),
+            ("[2001:db8::1]:80", "[2001:db8::1]"),
+        ] {
+            let input =
+                format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
+            let error = Config::parse(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::DefaultPortAuthority { authority: a, host: h } if a == authority && h == host),
+                "authority {authority:?} reported {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("use the bare host"), "message was {message:?}");
+            assert!(message.contains(&format!("{host:?}")), "message was {message:?}");
         }
     }
 

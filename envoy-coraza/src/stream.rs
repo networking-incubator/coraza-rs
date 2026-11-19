@@ -470,12 +470,22 @@ impl CorazaHttp {
         headers: &[(String, Vec<u8>)],
         end_of_stream: bool,
     ) -> Action {
-        let fallback_authority = property(vec!["request", "host"]);
+        // A host failure on a property that feeds inspection must not read as an absent value.
+        let fallback_authority = match find_header(headers, ":authority") {
+            Some(_) => None,
+            None => match property(vec!["request", "host"]) {
+                Ok(host) => host,
+                Err(error) => return self.reject_property_hostcall(&error),
+            },
+        };
         let raw_authority = request_authority(headers, fallback_authority.as_deref());
-        let scheme = find_header(headers, ":scheme")
-            .map(<[u8]>::to_vec)
-            .or_else(|| property(vec!["request", "scheme"]))
-            .unwrap_or_default();
+        let scheme = match find_header(headers, ":scheme") {
+            Some(scheme) => scheme.to_vec(),
+            None => match property(vec!["request", "scheme"]) {
+                Ok(scheme) => scheme.unwrap_or_default(),
+                Err(error) => return self.reject_property_hostcall(&error),
+            },
+        };
         let authority = raw_authority.as_slice();
         let Some(authority_text) = str::from_utf8(authority).ok() else {
             return self.reject_request(
@@ -501,22 +511,29 @@ impl CorazaHttp {
         self.selected_policy = Some(policy_name.to_owned());
         self.tx = Some(Box::new(policy.waf.new_transaction()));
 
-        let Some(metadata) = request_metadata(headers) else {
-            return self.reject_request(
-                503,
-                REQUEST_INCOMPLETE_BODY,
-                TerminalOutcome::Incomplete {
-                    phase: "request-metadata",
-                    status: 503,
-                },
-            );
+        let metadata = match request_metadata(headers) {
+            Ok(Some(metadata)) => metadata,
+            Err(error) => return self.reject_property_hostcall(&error),
+            Ok(None) => {
+                return self.reject_request(
+                    503,
+                    REQUEST_INCOMPLETE_BODY,
+                    TerminalOutcome::Incomplete {
+                        phase: "request-metadata",
+                        status: 503,
+                    },
+                );
+            },
         };
         metadata.method.clone_into(&mut self.request_method);
         metadata.protocol.clone_into(&mut self.request_protocol);
         let diagnostics_before = self.diagnostic_count();
-        let (interruption, engine_off, body_access) =
-            prepare_transaction(self, policy, authority_text, headers, &metadata);
+        let prepared = prepare_transaction(self, policy, authority_text, headers, &metadata);
         self.mark_diagnostic_change(diagnostics_before);
+        let (interruption, engine_off, body_access) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return self.reject_property_hostcall(&error),
+        };
 
         if let Some(interruption) = interruption {
             return self.reject_interruption(&interruption, "request-headers", InterruptionPhase::RequestHeaders);
@@ -835,7 +852,11 @@ impl CorazaHttp {
             .and_then(|value| str::from_utf8(value).ok())
             .and_then(|value| value.parse::<u16>().ok())
             .or_else(|| {
-                property(vec!["response", "code"]).and_then(|value| str::from_utf8(&value).ok()?.parse::<u16>().ok())
+                // An unreadable status property already fails closed as a missing status.
+                property(vec!["response", "code"])
+                    .ok()
+                    .flatten()
+                    .and_then(|value| str::from_utf8(&value).ok()?.parse::<u16>().ok())
             });
         let Some(status) = status else {
             return self.reject_response(
@@ -1283,6 +1304,25 @@ impl CorazaHttp {
         )
     }
 
+    /// Fails the request closed after a hostcall error on a property that feeds inspection.
+    ///
+    /// A missing property (`Ok(None)`) is not an error. A host failure is, and must not
+    /// read as an absent value: an empty `REMOTE_ADDR` would let an IP rule be bypassed.
+    fn reject_property_hostcall(&mut self, error: &PropertyError) -> Action {
+        log_error(&format!(
+            "envoy-coraza: cannot read property {}: {:?}; rejecting the request",
+            error.path, error.status
+        ));
+        self.reject_request(
+            503,
+            REQUEST_INCOMPLETE_BODY,
+            TerminalOutcome::Incomplete {
+                phase: "request-property-hostcall",
+                status: 503,
+            },
+        )
+    }
+
     fn reject_response(&mut self, status: u16, body: &'static [u8], outcome: TerminalOutcome) -> Action {
         self.finish_once(outcome);
         let result = self.replace_response(status, body, self.response_body_size);
@@ -1534,22 +1574,34 @@ impl Drop for CorazaHttp {
     }
 }
 
-fn property(path: Vec<&str>) -> Option<Vec<u8>> {
-    hostcalls::get_property(path).unwrap_or_default()
+/// A property hostcall that failed, as opposed to a property the host does not have.
+#[derive(Debug)]
+struct PropertyError {
+    /// Dotted property path.
+    path: String,
+    /// Status the host returned.
+    status: Status,
 }
 
-fn apply_connection_metadata(tx: &mut Transaction, authority: &str) {
-    let (source_addr, source_port) = connection_endpoint("source");
-    let (destination_addr, destination_port) = connection_endpoint("destination");
+/// Reads a host property: `Ok(None)` when the host has no such property, `Err` when the hostcall itself failed.
+fn property(path: Vec<&str>) -> Result<Option<Vec<u8>>, PropertyError> {
+    let dotted = path.join(".");
+    hostcalls::get_property(path).map_err(|status| PropertyError { path: dotted, status })
+}
+
+fn apply_connection_metadata(tx: &mut Transaction, authority: &str) -> Result<(), PropertyError> {
+    let (source_addr, source_port) = connection_endpoint("source")?;
+    let (destination_addr, destination_port) = connection_endpoint("destination")?;
     tx.set_remote_addr(source_addr.as_bytes());
     tx.set_remote_port(source_port);
     tx.set_server_addr(destination_addr.as_bytes());
     tx.set_server_port(destination_port);
     tx.set_server_name(authority_host(authority).as_bytes());
+    Ok(())
 }
 
-fn connection_endpoint(direction: &str) -> (String, u16) {
-    let address = property(vec![direction, "address"]).unwrap_or_default();
+fn connection_endpoint(direction: &str) -> Result<(String, u16), PropertyError> {
+    let address = property(vec![direction, "address"])?.unwrap_or_default();
     let parsed = str::from_utf8(&address).ok().and_then(|value| {
         value
             .parse::<SocketAddr>()
@@ -1557,7 +1609,7 @@ fn connection_endpoint(direction: &str) -> (String, u16) {
             .map(|socket| (socket.ip(), socket.port()))
             .or_else(|| value.parse::<IpAddr>().ok().map(|ip| (ip, 0)))
     });
-    let port = property(vec![direction, "port"])
+    let port = property(vec![direction, "port"])?
         .and_then(|bytes| {
             let bytes: [u8; 8] = bytes.try_into().ok()?;
             Some(u64::from_le_bytes(bytes))
@@ -1566,7 +1618,7 @@ fn connection_endpoint(direction: &str) -> (String, u16) {
         .or_else(|| parsed.map(|(_, port)| port))
         .unwrap_or(0);
     let ip = parsed.map(|(ip, _)| ip.to_string()).unwrap_or_default();
-    (ip, port)
+    Ok((ip, port))
 }
 
 fn find_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
@@ -1583,26 +1635,42 @@ fn request_authority(headers: &[(String, Vec<u8>)], fallback: Option<&[u8]>) -> 
         .to_vec()
 }
 
-fn request_metadata(headers: &[(String, Vec<u8>)]) -> Option<RequestMetadata> {
-    let method = find_header(headers, ":method")
-        .map(<[u8]>::to_vec)
-        .or_else(|| property(vec!["request", "method"]))?;
-    let uri = find_header(headers, ":path")
-        .map(<[u8]>::to_vec)
-        .or_else(|| property(vec!["request", "path"]))?;
-    let method = str::from_utf8(&method).ok()?.to_owned();
+/// Reads the request line fields.
+///
+/// `Ok(None)` means a field is missing or malformed; `Err` means a property hostcall failed.
+fn request_metadata(headers: &[(String, Vec<u8>)]) -> Result<Option<RequestMetadata>, PropertyError> {
+    let method = match find_header(headers, ":method") {
+        Some(method) => Some(method.to_vec()),
+        None => property(vec!["request", "method"])?,
+    };
+    let uri = match find_header(headers, ":path") {
+        Some(uri) => Some(uri.to_vec()),
+        None => property(vec!["request", "path"])?,
+    };
     let protocol = property(vec!["request", "protocol"])?;
-    let protocol = str::from_utf8(&protocol).ok()?.to_owned();
+    let has_host = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    Ok(
+        request_line(method, uri, protocol).map(|(method, uri, protocol)| RequestMetadata {
+            method,
+            uri,
+            protocol,
+            has_host,
+        }),
+    )
+}
+
+/// Validates the request line fields, returning `None` when one is missing, not UTF-8 or empty.
+fn request_line(
+    method: Option<Vec<u8>>,
+    uri: Option<Vec<u8>>,
+    protocol: Option<Vec<u8>>,
+) -> Option<(String, Vec<u8>, String)> {
+    let method = str::from_utf8(&method?).ok()?.to_owned();
+    let protocol = str::from_utf8(&protocol?).ok()?.to_owned();
     if method.is_empty() || protocol.is_empty() {
         return None;
     }
-    let has_host = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host"));
-    Some(RequestMetadata {
-        method,
-        uri,
-        protocol,
-        has_host,
-    })
+    Some((method, uri?, protocol))
 }
 
 fn prepare_transaction(
@@ -1611,9 +1679,9 @@ fn prepare_transaction(
     authority: &str,
     headers: &[(String, Vec<u8>)],
     metadata: &RequestMetadata,
-) -> (Option<Interruption>, bool, bool) {
+) -> Result<(Option<Interruption>, bool, bool), PropertyError> {
     let transaction = stream.tx.get_or_insert_with(|| Box::new(policy.waf.new_transaction()));
-    apply_connection_metadata(transaction, authority);
+    apply_connection_metadata(transaction, authority)?;
     transaction.process_uri(&metadata.uri, &metadata.method, &metadata.protocol);
     for (name, value) in headers {
         transaction.add_request_header(name, value);
@@ -1624,7 +1692,7 @@ fn prepare_transaction(
     let interruption = transaction.process_request_headers();
     let engine_off = transaction.rule_engine() == RuleEngineStatus::Off;
     let body_access = transaction.request_body_access();
-    (interruption, engine_off, body_access)
+    Ok((interruption, engine_off, body_access))
 }
 
 fn headers_within_limits(headers: &[(String, Vec<u8>)], reported_count: usize) -> bool {
@@ -2199,5 +2267,227 @@ mod tests {
         assert_eq!(root.get(), 1024);
         drop(stream);
         assert_eq!(root.get(), 0);
+    }
+}
+
+/// Request-header tests that drive a stream through the scripted Proxy-Wasm host.
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "Stream tests use fixed fixtures.")]
+mod scripted_host_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use proxy_wasm::{
+        traits::HttpContext as _,
+        types::{Action, Status},
+    };
+
+    use super::{CorazaHttp, TerminalOutcome};
+    use crate::{config::Config, policy::Generation, test_hostcalls};
+
+    /// Denies the source address 1.2.3.4 and nothing else.
+    const DENY_SOURCE: &str = r#"SecRule REMOTE_ADDR \"@ipMatch 1.2.3.4\" \"id:200,phase:1,deny,status:403\""#;
+
+    /// A stream pinned to the generation `config` compiles to.
+    fn stream(config: &str) -> CorazaHttp {
+        let config = Config::parse(config.as_bytes()).expect("configuration is valid");
+        let generation = Generation::compile(config).expect("policy compiles");
+        CorazaHttp::new(Some(Rc::new(generation)), Rc::new(Cell::new(0)))
+    }
+
+    /// A stream whose default policy denies source address 1.2.3.4.
+    fn ip_deny_stream() -> CorazaHttp {
+        stream(&format!(
+            r#"{{"directives_map": {{"p": ["SecRuleEngine On", "{DENY_SOURCE}"]}}, "default_directives": "p"}}"#
+        ))
+    }
+
+    /// Scripts a complete GET request from 1.2.3.4 to `authority` over `scheme`; returns its header count.
+    fn script_request(authority: &str, scheme: &str) -> usize {
+        test_hostcalls::reset();
+        let headers: [(&str, &[u8]); 4] = [
+            (":authority", authority.as_bytes()),
+            (":scheme", scheme.as_bytes()),
+            (":method", b"GET"),
+            (":path", b"/"),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        test_hostcalls::set_property("request.protocol", b"HTTP/1.1");
+        test_hostcalls::set_property("source.address", b"1.2.3.4:5555");
+        test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
+        test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
+        test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
+        headers.len()
+    }
+
+    /// The policy an `authority` request over `scheme` selects.
+    fn selected_policy(config: &str, authority: &str, scheme: &str) -> Option<String> {
+        let mut stream = stream(config);
+        let count = script_request(authority, scheme);
+        stream.on_http_request_headers(count, true);
+        stream.selected_policy.clone()
+    }
+
+    /// Two policies, `strict` for the authority table and `open` for the default.
+    fn authority_config(key: &str) -> String {
+        format!(
+            r#"{{"directives_map": {{"strict": ["SecRuleEngine On"], "open": ["SecRuleEngine On"]}},
+                "default_directives": "open", "per_authority_directives": {{"{key}": "strict"}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_non_default_port_key_matches_a_request_to_that_port() {
+        let config = authority_config("b.example:8080");
+        assert_eq!(
+            selected_policy(&config, "b.example:8080", "http").as_deref(),
+            Some("strict"),
+            "the port stays part of the lookup key"
+        );
+        assert_eq!(
+            selected_policy(&config, "b.example", "http").as_deref(),
+            Some("open"),
+            "the bare host is a different authority"
+        );
+    }
+
+    #[test]
+    fn a_bare_host_key_matches_requests_carrying_the_default_port() {
+        let config = authority_config("b.example");
+        for (authority, scheme) in [
+            ("b.example:80", "http"),
+            ("b.example:443", "https"),
+            ("B.Example:80", "http"),
+            ("b.example", "http"),
+        ] {
+            assert_eq!(
+                selected_policy(&config, authority, scheme).as_deref(),
+                Some("strict"),
+                "{authority} over {scheme}"
+            );
+        }
+        assert_eq!(
+            selected_policy(&config, "b.example:8080", "http").as_deref(),
+            Some("open"),
+            "a non-default port is another authority"
+        );
+    }
+
+    #[test]
+    fn a_default_port_key_is_refused_so_it_can_never_silently_miss() {
+        for key in ["b.example:80", "b.example:443"] {
+            let config = authority_config(key);
+            assert!(
+                Config::parse(config.as_bytes()).is_err(),
+                "{key} would never be looked up, so it is rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_address_is_enforced_when_the_host_reports_it() {
+        let mut stream = ip_deny_stream();
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [403], "the IP rule denies");
+    }
+
+    #[test]
+    fn a_missing_property_keeps_its_previous_behavior() {
+        // The host reports no source address: REMOTE_ADDR is empty and the request is still inspected.
+        let mut stream = ip_deny_stream();
+        let count = script_request("a.example", "http");
+        test_hostcalls::remove_property("source.address");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert_eq!(stream.selected_policy.as_deref(), Some("p"), "the request is inspected");
+
+        // A missing port falls back to the address's own port and never loses the address.
+        let mut stream = ip_deny_stream();
+        let count = script_request("a.example", "http");
+        test_hostcalls::remove_property("source.port");
+        test_hostcalls::remove_property("destination.port");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(
+            test_hostcalls::local_reply_statuses(),
+            [403],
+            "the IP rule still denies"
+        );
+    }
+
+    #[test]
+    fn a_property_hostcall_failure_fails_closed_instead_of_clearing_the_value() {
+        for property in [
+            "source.address",
+            "source.port",
+            "destination.address",
+            "destination.port",
+            "request.protocol",
+        ] {
+            for status in [
+                Status::InternalFailure,
+                Status::SerializationFailure,
+                Status::BadArgument,
+            ] {
+                let mut stream = ip_deny_stream();
+                let count = script_request("a.example", "http");
+                test_hostcalls::fail_property(property, status);
+                assert_eq!(
+                    stream.on_http_request_headers(count, true),
+                    Action::Pause,
+                    "{property} {status:?}: the request is held"
+                );
+                assert_eq!(test_hostcalls::local_reply_statuses(), [503], "{property} {status:?}");
+                assert_eq!(
+                    stream.final_outcome,
+                    Some(TerminalOutcome::Incomplete {
+                        phase: "request-property-hostcall",
+                        status: 503,
+                    }),
+                    "{property} {status:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_and_scheme_fallbacks_fail_closed_only_when_they_are_consulted() {
+        let strip = |name: &str| -> Vec<(&'static str, Vec<u8>)> {
+            let all: [(&'static str, &[u8]); 4] = [
+                (":authority", b"a.example"),
+                (":scheme", b"http"),
+                (":method", b"GET"),
+                (":path", b"/"),
+            ];
+            all.iter()
+                .filter(|(header, _)| *header != name)
+                .map(|(header, value)| (*header, value.to_vec()))
+                .collect()
+        };
+        for (absent_header, property) in [(":authority", "request.host"), (":scheme", "request.scheme")] {
+            let headers = strip(absent_header);
+            let borrowed: Vec<(&str, &[u8])> = headers.iter().map(|(name, value)| (*name, value.as_slice())).collect();
+
+            let mut stream = ip_deny_stream();
+            let count = script_request("a.example", "http");
+            test_hostcalls::set_request_headers(&borrowed);
+            test_hostcalls::fail_property(property, Status::InternalFailure);
+            assert_eq!(
+                stream.on_http_request_headers(borrowed.len(), true),
+                Action::Pause,
+                "{property} is needed because {absent_header} is absent"
+            );
+            assert_eq!(test_hostcalls::local_reply_statuses(), [503], "{property}");
+
+            // With the header present the property is never read, so its failure is irrelevant.
+            let mut stream = ip_deny_stream();
+            script_request("a.example", "http");
+            test_hostcalls::fail_property(property, Status::InternalFailure);
+            assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [403],
+                "{property} is not consulted: the IP rule decides"
+            );
+        }
     }
 }

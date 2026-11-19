@@ -21,14 +21,132 @@
 //! `/tmp/envoy-coraza-test-hostcalls.o` shim returned, so no test fabricates host data.
 //! The signatures mirror the SDK's `extern "C"` blocks exactly; the WASM build is
 //! unaffected because this module is `#[cfg(test)]`-gated. Buffers, maps, and properties
-//! are reported missing rather than fabricated, so no stub ever hands the SDK bytes to
-//! `Vec::from_raw_parts`. The stubs satisfy the native linker; they are not a test host.
+//! are reported missing unless a test scripts them.
+//!
+//! Four hostcalls are programmable per test thread, so a test can drive the filter without
+//! fabricating anything it did not ask for: the plugin configuration buffer
+//! ([`set_plugin_configuration`]), the request header map ([`set_request_headers`]), a
+//! property value or failure ([`set_property`], [`fail_property`]), and the status codes of
+//! local replies ([`local_reply_statuses`]).
+//! Each test runs on its own thread, so the scripted state is isolated; call [`reset`] to
+//! clear it explicitly. Everything else stays a fixed stub that reports `Status::NotFound`.
 
-// no_mangle is an attribute-level escape from the crate's unsafe-code guard; there are no
-// unsafe blocks and no pointer dereferences in this module.
-#![expect(unsafe_code, reason = "test-only hostcall stubs export symbols via no_mangle")]
+// no_mangle is an attribute-level escape from the crate's unsafe-code guard. The scripted
+// host also needs two unsafe blocks, in `hand_out` and `proxy_get_property`, to read and
+// write the SDK's FFI pointers; each carries its own SAFETY comment.
+#![expect(
+    unsafe_code,
+    reason = "test-only hostcall stubs export symbols via no_mangle and exchange FFI pointers"
+)]
+
+use std::{cell::RefCell, collections::BTreeMap};
 
 use proxy_wasm::types::{BufferType, LogLevel, MapType, Status};
+
+/// The scripted host state of one test thread.
+struct Host {
+    /// Plugin configuration buffer, or `None` to report it missing.
+    plugin_configuration: Option<Vec<u8>>,
+    /// Request header map, or `None` to report it missing.
+    request_headers: Option<Vec<(String, Vec<u8>)>>,
+    /// Dotted property path to its scripted value or failure status.
+    properties: BTreeMap<String, Result<Vec<u8>, Status>>,
+    /// Status codes of the local replies the filter sent.
+    local_replies: Vec<u32>,
+}
+
+thread_local! {
+    static HOST: RefCell<Host> = const {
+        RefCell::new(Host {
+            plugin_configuration: None,
+            request_headers: None,
+            properties: BTreeMap::new(),
+            local_replies: Vec::new(),
+        })
+    };
+}
+
+/// Clears everything scripted on this thread.
+pub(crate) fn reset() {
+    HOST.with_borrow_mut(|host| {
+        host.plugin_configuration = None;
+        host.request_headers = None;
+        host.properties.clear();
+        host.local_replies.clear();
+    });
+}
+
+/// Scripts the plugin configuration buffer, or its absence with `None`.
+pub(crate) fn set_plugin_configuration(configuration: Option<&[u8]>) {
+    HOST.with_borrow_mut(|host| host.plugin_configuration = configuration.map(<[u8]>::to_vec));
+}
+
+/// Scripts the request header map the host returns.
+pub(crate) fn set_request_headers(headers: &[(&str, &[u8])]) {
+    HOST.with_borrow_mut(|host| {
+        host.request_headers = Some(
+            headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
+                .collect(),
+        );
+    });
+}
+
+/// Scripts a property (dotted path, such as `source.address`) the host returns.
+pub(crate) fn set_property(path: &str, value: &[u8]) {
+    HOST.with_borrow_mut(|host| host.properties.insert(path.to_owned(), Ok(value.to_vec())));
+}
+
+/// Makes the host report a property missing again.
+pub(crate) fn remove_property(path: &str) {
+    HOST.with_borrow_mut(|host| host.properties.remove(path));
+}
+
+/// Scripts a hostcall failure for a property: the host answers `status` instead of a value.
+pub(crate) fn fail_property(path: &str, status: Status) {
+    HOST.with_borrow_mut(|host| host.properties.insert(path.to_owned(), Err(status)));
+}
+
+/// The status codes of every local reply sent so far, in order.
+pub(crate) fn local_reply_statuses() -> Vec<u32> {
+    HOST.with_borrow(|host| host.local_replies.clone())
+}
+
+/// Hands `data` to the SDK the way a host does: a heap allocation whose capacity equals its
+/// length, which the SDK takes ownership of with `Vec::from_raw_parts`. Empty data is left
+/// as the null pointer the SDK reads as an empty result.
+fn hand_out(data: Vec<u8>, data_out: *mut *mut u8, size_out: *mut usize) {
+    if data.is_empty() {
+        return;
+    }
+    let size = data.len();
+    let leaked = Box::leak(data.into_boxed_slice());
+    // SAFETY: the SDK passes pointers to live locals for both out-parameters, and the leaked
+    // boxed slice is exactly `size` bytes, as `Vec::from_raw_parts(ptr, size, size)` requires.
+    unsafe {
+        *data_out = leaked.as_mut_ptr();
+        *size_out = size;
+    }
+}
+
+/// Serializes a header map in the Proxy-Wasm wire format the SDK deserializes.
+fn serialize_map(map: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let length = |len: usize| u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&length(map.len()));
+    for (name, value) in map {
+        bytes.extend_from_slice(&length(name.len()));
+        bytes.extend_from_slice(&length(value.len()));
+    }
+    for (name, value) in map {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+    }
+    bytes
+}
 
 #[no_mangle]
 extern "C" fn proxy_log(_level: LogLevel, _message_data: *const u8, _message_size: usize) -> Status {
@@ -37,13 +155,20 @@ extern "C" fn proxy_log(_level: LogLevel, _message_data: *const u8, _message_siz
 
 #[no_mangle]
 extern "C" fn proxy_get_buffer_bytes(
-    _buffer_type: BufferType,
+    buffer_type: BufferType,
     _start: usize,
     _max_size: usize,
-    _return_buffer_data: *mut *mut u8,
-    _return_buffer_size: *mut usize,
+    return_buffer_data: *mut *mut u8,
+    return_buffer_size: *mut usize,
 ) -> Status {
-    Status::NotFound
+    let configuration = HOST.with_borrow(|host| host.plugin_configuration.clone());
+    match (buffer_type, configuration) {
+        (BufferType::PluginConfiguration, Some(configuration)) => {
+            hand_out(configuration, return_buffer_data, return_buffer_size);
+            Status::Ok
+        },
+        _ => Status::NotFound,
+    }
 }
 
 #[no_mangle]
@@ -59,11 +184,18 @@ extern "C" fn proxy_set_buffer_bytes(
 
 #[no_mangle]
 extern "C" fn proxy_get_header_map_pairs(
-    _map_type: MapType,
-    _return_map_data: *mut *mut u8,
-    _return_map_size: *mut usize,
+    map_type: MapType,
+    return_map_data: *mut *mut u8,
+    return_map_size: *mut usize,
 ) -> Status {
-    Status::NotFound
+    let headers = HOST.with_borrow(|host| host.request_headers.clone());
+    match (map_type, headers) {
+        (MapType::HttpRequestHeaders, Some(headers)) => {
+            hand_out(serialize_map(&headers), return_map_data, return_map_size);
+            Status::Ok
+        },
+        _ => Status::NotFound,
+    }
 }
 
 #[no_mangle]
@@ -73,7 +205,7 @@ extern "C" fn proxy_set_header_map_pairs(_map_type: MapType, _map_data: *const u
 
 #[no_mangle]
 extern "C" fn proxy_send_local_response(
-    _status_code: u32,
+    status_code: u32,
     _status_code_details_data: *const u8,
     _status_code_details_size: usize,
     _body_data: *const u8,
@@ -82,17 +214,28 @@ extern "C" fn proxy_send_local_response(
     _headers_size: usize,
     _grpc_status: i32,
 ) -> Status {
+    HOST.with_borrow_mut(|host| host.local_replies.push(status_code));
     Status::NotFound
 }
 
 #[no_mangle]
 extern "C" fn proxy_get_property(
-    _path_data: *const u8,
-    _path_size: usize,
-    _return_value_data: *mut *mut u8,
-    _return_value_size: *mut usize,
+    path_data: *const u8,
+    path_size: usize,
+    return_value_data: *mut *mut u8,
+    return_value_size: *mut usize,
 ) -> Status {
-    Status::NotFound
+    // SAFETY: the SDK passes the serialized property path it owns for the duration of the call.
+    let raw = unsafe { std::slice::from_raw_parts(path_data, path_size) };
+    let path = String::from_utf8_lossy(raw).replace('\0', ".");
+    match HOST.with_borrow(|host| host.properties.get(&path).cloned()) {
+        Some(Ok(value)) => {
+            hand_out(value, return_value_data, return_value_size);
+            Status::Ok
+        },
+        Some(Err(status)) => status,
+        None => Status::NotFound,
+    }
 }
 
 #[no_mangle]
