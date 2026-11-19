@@ -101,9 +101,11 @@ pub fn sqli(input: &[u8]) -> Option<Fingerprint> {
 /// The lookup is the default table, plus the dialect identifiers (such as
 /// `JSON_EXTRACT`) on a retry, plus `ATTACH`, `COPY`, `DETACH` and `VACUUM`
 /// only as a statement directly after a `;`. Elsewhere those four stay
-/// ordinary words, and seeing one never causes a retry. [`sqli()`] does not
-/// use this retry. Its lookup is unchanged, but it scans inputs of any length
-/// (see [`MAX_INPUT_LEN`]).
+/// ordinary words, and seeing one never causes a retry. The retry is gated on
+/// a strict-only identifier after a default miss, so one call runs at most two
+/// detector passes. This function has no bounded variant: callers that need a work bound
+/// must pre-slice the input. [`sqli()`] does not use this retry. Its lookup is
+/// unchanged, but it scans inputs of any length (see [`MAX_INPUT_LEN`]).
 #[must_use]
 pub fn sqli_with_strict_fallback(input: &[u8]) -> Option<Fingerprint> {
     sqli::detect_with_strict_fallback(input)

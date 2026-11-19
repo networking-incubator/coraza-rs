@@ -30,7 +30,7 @@ use crate::{
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugLevel, DebugLogger, Writer, noop_logger},
     rules::RuleGroup,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionPool},
 };
 
 /// Next process-unique transaction identifier suffix.
@@ -60,6 +60,8 @@ pub struct Waf {
     config: Arc<WafConfig>,
     /// Compiled rules shared by each transaction.
     rules: Arc<RuleGroup>,
+    /// Reusable request state, bounded to this WAF instance.
+    transaction_pool: Arc<TransactionPool>,
     /// Writer shared by transactions created by this WAF.
     audit_logger: Arc<AuditLogger>,
     /// Optional connector callback for rules with the `log` action.
@@ -158,6 +160,7 @@ impl Waf {
         Ok(Self {
             config: Arc::new(config),
             rules: Arc::new(rules),
+            transaction_pool: Arc::new(TransactionPool::new()),
             audit_logger: Arc::new(audit_logger),
             error_log,
             debug_logger,
@@ -247,7 +250,12 @@ impl Waf {
     /// writer reconnects and re-sends a frame after a write failure.
     pub fn new_transaction_with_id(&self, id: impl Into<String>) -> Transaction {
         self.log_waf_created_once();
-        let mut transaction = Transaction::with_rules(Arc::clone(&self.config), Arc::clone(&self.rules), id);
+        let mut transaction = Transaction::with_pool(
+            Arc::clone(&self.config),
+            Arc::clone(&self.rules),
+            id,
+            Arc::clone(&self.transaction_pool),
+        );
         transaction.set_audit_logger(Arc::clone(&self.audit_logger));
         transaction.set_debug_logger(Arc::clone(&self.debug_logger));
         if let Some(error_log) = &self.error_log {
@@ -296,6 +304,7 @@ impl Default for Waf {
         Self {
             config,
             rules: Arc::new(RuleGroup::new()),
+            transaction_pool: Arc::new(TransactionPool::new()),
             audit_logger: Arc::new(AuditLogger::discard()),
             error_log: None,
             debug_logger: noop_logger(),
@@ -361,9 +370,12 @@ pub(crate) fn validate_config(config: &WafConfig) -> Result<(), ConfigError> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "WAF tests use fixed valid configurations")]
 mod tests {
+    use std::sync::Arc;
+
     use super::Waf;
     use crate::{
         config::WafConfig,
+        seclang::Parser,
         types::{AuditEngineStatus, AuditLogType},
     };
 
@@ -403,6 +415,121 @@ mod tests {
 
         transaction.finish().unwrap();
         assert!(path.exists(), "finish did not open the audit writer");
+    }
+
+    #[test]
+    fn pooled_transaction_reuse_clears_request_state() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecRule ARGS:q \"@streq hit\" \"id:1,phase:1,pass,setvar:TX.score=1\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let pool = Arc::clone(&waf.transaction_pool);
+
+        {
+            let mut first = waf.new_transaction_with_id("pool-first");
+            first.process_uri("/private/path", "POST", "HTTP/1.1");
+            first.add_request_header("X-Pool", "private");
+            first.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            first.add_get_argument("q", "hit");
+            first.add_response_header("X-Pool", "private");
+            assert!(first.process_request_headers().is_none());
+            assert!(first.process_request_body(b"secret=body").is_none());
+            first.set_tx_variable("private", "secret");
+            first.set_tx_variable("0", "stale capture");
+            first.interrupt(1, "deny", 403, "");
+            assert_eq!(first.matched_rules().len(), 1);
+            assert_eq!(
+                first
+                    .get_variable(crate::types::RuleVariable::ArgsPost, Some("secret"))
+                    .as_deref(),
+                Some("body")
+            );
+            assert_eq!(
+                first
+                    .get_variable(crate::types::RuleVariable::MatchedVar, None)
+                    .as_deref(),
+                Some("hit")
+            );
+        }
+
+        assert_eq!(pool.len(), 1, "a finished transaction should enter the bounded pool");
+        let second = waf.new_transaction_with_id("pool-second");
+        assert_eq!(pool.len(), 0, "the next request should reuse the free state");
+        assert_eq!(second.id(), "pool-second");
+        assert!(second.matched_rules().is_empty());
+        assert!(second.interruption().is_none());
+        for (variable, key) in [
+            (crate::types::RuleVariable::Args, Some("q")),
+            (crate::types::RuleVariable::ArgsPost, Some("secret")),
+            (crate::types::RuleVariable::RequestHeaders, Some("x-pool")),
+            (crate::types::RuleVariable::ResponseHeaders, Some("x-pool")),
+            (crate::types::RuleVariable::TX, Some("private")),
+        ] {
+            assert_eq!(second.get_variable(variable, key), None, "{variable:?}");
+        }
+        assert_eq!(
+            second
+                .get_variable(crate::types::RuleVariable::TX, Some("0"))
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            second
+                .get_variable(crate::types::RuleVariable::MatchedVar, None)
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            second
+                .get_variable(crate::types::RuleVariable::RequestURI, None)
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn pooled_transaction_body_memory_does_not_inherit_post_capacity() {
+        let mut parser = Parser::new();
+        parser.from_string("SecRequestBodyAccess On").unwrap();
+        let waf = parser.into_waf().unwrap();
+        let empty_bytes = {
+            let empty = waf.new_transaction_with_id("pool-empty-baseline");
+            empty.body_memory_bytes()
+        };
+
+        let value = "v".repeat(128);
+        let body = (0..40)
+            .map(|index| format!("field{index}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        {
+            let mut populated = waf.new_transaction_with_id("pool-populated");
+            populated.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            assert!(populated.process_request_headers().is_none());
+            assert!(populated.process_request_body(body.as_bytes()).is_none());
+            assert!(
+                populated
+                    .get_variable(crate::types::RuleVariable::ArgsPost, Some("field39"))
+                    .is_some()
+            );
+            assert!(populated.body_memory_bytes() > empty_bytes);
+        }
+
+        let reused = waf.new_transaction_with_id("pool-empty-reused");
+        assert!(
+            reused
+                .get_variable(crate::types::RuleVariable::ArgsPost, Some("field39"))
+                .is_none()
+        );
+        assert_eq!(
+            reused.body_memory_bytes(),
+            empty_bytes,
+            "an empty request must not inherit body-map capacity from the pooled request"
+        );
     }
 
     #[cfg(unix)]

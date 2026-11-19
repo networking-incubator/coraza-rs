@@ -34,7 +34,7 @@
 //! - **Simple Mode**: Apply transformations in sequence, returning the final value
 //! - **Multi-Match Mode**: Collect all intermediate transformed values for matching
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::transformations::{CustomTransformation, Transformation, TransformationError};
 
@@ -54,6 +54,32 @@ impl TransformationFunction {
         match self {
             Self::Builtin(function) => function(input),
             Self::Custom(transformation) => transformation.transform(input),
+        }
+    }
+}
+
+/// A transformed input that can borrow the request or own its transformed bytes.
+pub(crate) enum TransformationValue<'a> {
+    /// The original collection bytes.
+    Borrowed(&'a [u8]),
+    /// A newly transformed value.
+    Owned(Vec<u8>),
+}
+
+impl TransformationValue<'_> {
+    /// The bytes presented to the operator.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    /// Materialize only when the operator reports a match.
+    pub(crate) fn into_owned(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes,
         }
     }
 }
@@ -182,20 +208,26 @@ impl TransformationChain {
     /// - The final transformed string
     /// - A vector of transformation errors encountered (if any)
     pub fn apply(&self, input: &[u8]) -> (Vec<u8>, Vec<TransformationError>) {
+        let (value, errors) = self.apply_cow(input);
+        (value.into_owned(), errors)
+    }
+
+    /// Apply the chain while borrowing the input until a step produces output.
+    pub(crate) fn apply_cow<'a>(&self, input: &'a [u8]) -> (Cow<'a, [u8]>, Vec<TransformationError>) {
         if self.transformations.is_empty() {
-            return (input.to_vec(), Vec::new());
+            return (Cow::Borrowed(input), Vec::new());
         }
 
-        let mut value = input.to_vec();
+        let mut value = Cow::Borrowed(input);
         let mut errors = Vec::new();
 
         for t in &self.transformations {
-            let (transformed, _changed, err) = t.function.apply(&value);
+            let (transformed, _changed, err) = t.function.apply(value.as_ref());
             if let Some(e) = err {
                 errors.push(e);
                 continue;
             }
-            value = transformed;
+            value = Cow::Owned(transformed);
         }
 
         (value, errors)
@@ -217,18 +249,22 @@ impl TransformationChain {
     /// - A vector of all values (original + all changed intermediate values)
     /// - A vector of transformation errors encountered (if any)
     pub fn apply_multimatch(&self, input: &[u8]) -> (Vec<Vec<u8>>, Vec<TransformationError>) {
-        // Always include the original value
-        let mut values = vec![input.to_vec()];
+        let (values, errors) = self.apply_multimatch_cow(input);
+        (values.into_iter().map(Cow::into_owned).collect(), errors)
+    }
+
+    /// Apply multi-match transformations without copying the original input.
+    pub(crate) fn apply_multimatch_cow<'a>(&self, input: &'a [u8]) -> (Vec<Cow<'a, [u8]>>, Vec<TransformationError>) {
+        let mut values = vec![Cow::Borrowed(input)];
         let mut errors = Vec::new();
 
         if self.transformations.is_empty() {
             return (values, errors);
         }
 
-        let mut value = input.to_vec();
-
         for t in &self.transformations {
-            let (transformed, changed, err) = t.function.apply(&value);
+            let value = values.last().map_or(input, Cow::as_ref);
+            let (transformed, changed, err) = t.function.apply(value);
             if let Some(e) = err {
                 errors.push(e);
                 continue;
@@ -236,8 +272,7 @@ impl TransformationChain {
 
             // Only collect values that changed
             if changed {
-                values.push(transformed.clone());
-                value = transformed;
+                values.push(Cow::Owned(transformed));
             }
         }
 
@@ -400,6 +435,15 @@ mod tests {
         let (result, errors) = chain.apply(b"test");
 
         assert_eq!(result, b"test");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn empty_chain_borrows_its_input() {
+        let chain = TransformationChain::new();
+        let (result, errors) = chain.apply_cow(b"test");
+
+        assert!(matches!(result, Cow::Borrowed(b"test")));
         assert!(errors.is_empty());
     }
 

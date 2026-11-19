@@ -20,12 +20,16 @@
 
 //! Selects values from single-value and map collections for rule evaluation.
 
+use std::borrow::Cow;
+
 use regex::Regex;
 
+#[cfg(test)]
+use crate::collection::MatchData;
 // Re-exported for `rules` and `transaction::ctl`, which import it from here.
 pub(crate) use crate::utils::lowercase_like_go;
 use crate::{
-    collection::{Map, MatchData, Single},
+    collection::{Map, MatchLocation, MatchRef, Single},
     types::RuleVariable,
 };
 
@@ -175,16 +179,35 @@ impl VariableSpec {
     }
 
     /// Return the matches from the collection associated with this variable.
+    #[cfg(test)]
     pub(crate) fn get_matches(&self, collection: Option<CollectionView<'_>>) -> Vec<MatchData> {
         self.get_matches_filter(collection, |_, _| false)
     }
 
+    /// Return borrowed matches so non-matching rule evaluations avoid copying values.
+    pub(crate) fn get_match_refs<'a>(&'a self, collection: Option<CollectionView<'a>>) -> Vec<MatchRef<'a>> {
+        self.get_match_refs_filter(collection, |_, _| false)
+    }
+
     /// Return matches after excluding transaction-local targets before count aggregation.
+    #[cfg(test)]
     pub(crate) fn get_matches_filter(
         &self,
         collection: Option<CollectionView<'_>>,
-        mut excluded: impl FnMut(RuleVariable, &str) -> bool,
+        excluded: impl FnMut(RuleVariable, &str) -> bool,
     ) -> Vec<MatchData> {
+        self.get_match_refs_filter(collection, excluded)
+            .into_iter()
+            .map(MatchRef::into_owned)
+            .collect()
+    }
+
+    /// Return borrowed matches after excluding transaction-local targets before count aggregation.
+    pub(crate) fn get_match_refs_filter<'a>(
+        &'a self,
+        collection: Option<CollectionView<'a>>,
+        mut excluded: impl FnMut(RuleVariable, &str) -> bool,
+    ) -> Vec<MatchRef<'a>> {
         let Some(collection) = collection.filter(|view| {
             view.variable() == self.variable
                 || (self.variable == RuleVariable::XML && view.variable() == RuleVariable::RequestXML)
@@ -197,11 +220,16 @@ impl VariableSpec {
         let count_mode = self.count;
         let has_exceptions = !self.exceptions.is_empty();
         {
-            let mut record = |variable: RuleVariable, key: &[u8], value: &[u8]| {
+            let mut record = |variable: RuleVariable, key: &'a [u8], value: &'a [u8], location: MatchLocation| {
                 if count_mode {
                     count = count.saturating_add(1);
                 } else {
-                    matches.push(MatchData::new(variable, String::from_utf8_lossy(key), value));
+                    matches.push(MatchRef {
+                        variable,
+                        key: String::from_utf8_lossy(key),
+                        value: Cow::Borrowed(value),
+                        location: Some(location),
+                    });
                 }
             };
             let mut keep = |variable: RuleVariable, key: &[u8]| {
@@ -216,20 +244,47 @@ impl VariableSpec {
             };
 
             match (collection, &self.key) {
-                (CollectionView::Map(map), _) => self.select(map, false, |key, value| {
-                    if keep(self.variable, key) {
-                        record(self.variable, key, value);
+                (CollectionView::Map(map), _) => self.select(map, false, |selected| {
+                    if keep(self.variable, selected.key) {
+                        record(
+                            self.variable,
+                            selected.key,
+                            selected.value,
+                            MatchLocation::Map {
+                                source: map.variable(),
+                                entry_index: selected.entry_index,
+                                value_index: selected.value_index,
+                                names: false,
+                            },
+                        );
                     }
                 }),
-                (CollectionView::Names(variable, map), _) => self.select(map, true, |key, _| {
-                    if keep(variable, key) {
+                (CollectionView::Names(variable, map), _) => self.select(map, true, |selected| {
+                    if keep(variable, selected.key) {
                         // Go exposes the raw name bytes as the value, so keep them exact.
-                        record(variable, key, key);
+                        record(
+                            variable,
+                            selected.key,
+                            selected.key,
+                            MatchLocation::Map {
+                                source: map.variable(),
+                                entry_index: selected.entry_index,
+                                value_index: selected.value_index,
+                                names: true,
+                            },
+                        );
                     }
                 }),
                 (CollectionView::Single(single), None) => {
                     if keep(single.variable(), b"") {
-                        record(single.variable(), b"", single.get_bytes());
+                        record(
+                            single.variable(),
+                            b"",
+                            single.get_bytes(),
+                            MatchLocation::Single {
+                                variable: single.variable(),
+                            },
+                        );
                     }
                 },
                 (CollectionView::Single(_), Some(_)) => {},
@@ -237,7 +292,12 @@ impl VariableSpec {
         }
 
         if self.count {
-            vec![MatchData::new(self.variable, self.count_key.clone(), count.to_string())]
+            vec![MatchRef {
+                variable: self.variable,
+                key: Cow::Borrowed(&self.count_key),
+                value: Cow::Owned(count.to_string().into_bytes()),
+                location: None,
+            }]
         } else {
             matches
         }
@@ -274,28 +334,71 @@ impl VariableSpec {
     /// `exact` is set for the names views: Go looks a literal names selector up as
     /// `data[key]`, without folding it (`internal/collections/named.go:129-131`), while
     /// a value view folds the selector through the map's own key.
-    fn select<'a>(&'a self, map: &'a Map, exact: bool, mut found: impl FnMut(&'a [u8], &'a [u8])) {
+    fn select<'a>(&'a self, map: &'a Map, exact: bool, mut found: impl FnMut(SelectedMapValue<'a>)) {
         match &self.key {
-            Some(VariableKey::Regex(regex)) => map.iter_regex_bytes(regex).for_each(|(key, value)| found(key, value)),
+            Some(VariableKey::Regex(regex)) => {
+                map.iter_regex_bytes_indexed(regex)
+                    .for_each(|(entry_index, value_index, key, value)| {
+                        found(SelectedMapValue {
+                            key,
+                            value,
+                            entry_index,
+                            value_index,
+                        });
+                    });
+            },
             Some(VariableKey::String(key)) if !key.is_empty() && exact => {
                 select_exact(map, key, found);
             },
             Some(VariableKey::String(key)) if !key.is_empty() => {
-                map.iter_key_bytes(key.as_bytes())
-                    .for_each(|(stored_key, value)| found(stored_key, value));
+                map.iter_key_bytes_indexed(key.as_bytes())
+                    .for_each(|(entry_index, value_index, stored_key, value)| {
+                        found(SelectedMapValue {
+                            key: stored_key,
+                            value,
+                            entry_index,
+                            value_index,
+                        });
+                    });
             },
-            _ => map.iter_bytes().for_each(|(key, value)| found(key, value)),
+            _ => map
+                .iter_bytes_indexed()
+                .for_each(|(entry_index, value_index, key, value)| {
+                    found(SelectedMapValue {
+                        key,
+                        value,
+                        entry_index,
+                        value_index,
+                    });
+                }),
         }
     }
 }
 
+/// A selected map entry and its stable position in the backing map.
+struct SelectedMapValue<'a> {
+    /// Key bytes as stored in the collection.
+    key: &'a [u8],
+    /// Selected value bytes.
+    value: &'a [u8],
+    /// Index of the map entry in insertion order.
+    entry_index: usize,
+    /// Index of the value under the entry's key.
+    value_index: usize,
+}
+
 /// Visit the entries a names view stores under the exact selector `key`.
-fn select_exact<'a>(map: &'a Map, key: &str, mut found: impl FnMut(&'a [u8], &'a [u8])) {
+fn select_exact<'a>(map: &'a Map, key: &str, mut found: impl FnMut(SelectedMapValue<'a>)) {
     // The parser has already folded a selector that Go folds, and the map is keyed by the
     // folded bytes (case-insensitive) or the raw bytes (case-sensitive), so a single
     // exact-byte lookup covers both cases and allocates nothing on this path.
-    for (stored, value) in map.iter_key_exact(key.as_bytes()) {
-        found(stored, value);
+    for (entry_index, value_index, stored, value) in map.iter_key_exact_indexed(key.as_bytes()) {
+        found(SelectedMapValue {
+            key: stored,
+            value,
+            entry_index,
+            value_index,
+        });
     }
 }
 
@@ -331,6 +434,27 @@ mod tests {
         assert_eq!(
             matches.first().map(|matched| matched.value.as_slice()),
             Some(&b"\xff"[..])
+        );
+    }
+
+    #[test]
+    fn borrowed_matches_keep_collection_values_borrowed() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add("id", b"value");
+
+        let spec = VariableSpec::new(RuleVariable::Args);
+        let matches = spec.get_match_refs(Some(CollectionView::Map(&map)));
+
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches
+                .first()
+                .is_some_and(crate::collection::MatchRef::value_is_borrowed)
+        );
+        assert_eq!(matches.first().map(crate::collection::MatchRef::key), Some("id"));
+        assert_eq!(
+            matches.first().map(crate::collection::MatchRef::value),
+            Some(&b"value"[..])
         );
     }
 

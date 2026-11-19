@@ -40,7 +40,7 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io,
     ops::RangeInclusive,
     path::Path,
@@ -1214,29 +1214,58 @@ fn directive_sec_rule_update_action_by_id(options: &mut DirectiveOptions<'_>) ->
     let (ids, actions) =
         split_last_argument(&options.opts).ok_or("syntax error: SecRuleUpdateActionById ID \"ACTIONS\"")?;
     let actions = parse_actions(actions).map_err(|e| e.message)?;
-    let mut staged_rules = options.rules.clone();
     // Collect warnings from the staged copy only; a failed update must not publish
     // warnings for actions that never reach the live rule set.
     let mut added_warnings = Vec::new();
 
-    for spec in ids.split_whitespace() {
-        let range = parse_id_range(spec)?;
-        let mut found = false;
-        for rule in staged_rules
-            .iter_mut()
-            .filter(|rule| range.contains(&rule.metadata().id))
-        {
+    if actions.iter().any(|action| action.key == "id") {
+        let ranges = ids
+            .split_whitespace()
+            .map(parse_id_range)
+            .collect::<Result<Vec<_>, _>>()?;
+        let action_compile_context = options.action_compile_context;
+        let default_actions = &*options.default_actions;
+        options.rules.update_by_id_ranges(&ranges, |rule| {
             let first_warning = rule.metadata().warnings.len();
-            apply_actions(rule, &actions, true, false, options.action_compile_context).map_err(|e| e.message)?;
-            warn_block_without_default(rule, options.default_actions);
+            apply_actions(rule, &actions, true, false, action_compile_context).map_err(|e| e.message)?;
+            warn_block_without_default(rule, default_actions);
             added_warnings.extend(rule.metadata_mut().warnings.split_off(first_warning));
-            found = true;
+            Ok(())
+        })?;
+    } else {
+        let mut staged_rules = Vec::new();
+        let mut staged_indices = HashMap::new();
+        for spec in ids.split_whitespace() {
+            let range = parse_id_range(spec)?;
+            let indices = options.rules.indices_by_id_range(*range.start(), *range.end());
+            if indices.is_empty() && range.start() == range.end() {
+                return Err(format!("rule {} not found", range.start()));
+            }
+            for index in indices {
+                let staged_index = if let Some(&staged_index) = staged_indices.get(&index) {
+                    staged_index
+                } else {
+                    let Some(rule) = options.rules.rule_at(index).cloned() else {
+                        continue;
+                    };
+                    let staged_index = staged_rules.len();
+                    staged_rules.push((index, rule));
+                    staged_indices.insert(index, staged_index);
+                    staged_index
+                };
+                let Some((_, rule)) = staged_rules.get_mut(staged_index) else {
+                    continue;
+                };
+                let first_warning = rule.metadata().warnings.len();
+                apply_actions(rule, &actions, true, false, options.action_compile_context).map_err(|e| e.message)?;
+                warn_block_without_default(rule, options.default_actions);
+                added_warnings.extend(rule.metadata_mut().warnings.split_off(first_warning));
+            }
         }
-        if !found && range.start() == range.end() {
-            return Err(format!("rule {} not found", range.start()));
+        for (index, rule) in staged_rules {
+            options.rules.replace_rule(index, rule);
         }
     }
-    *options.rules = staged_rules;
     options.warnings.append(&mut added_warnings);
     Ok(())
 }
@@ -1261,12 +1290,10 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
 
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
-        for rule in options
-            .rules
-            .iter_mut()
-            .filter(|rule| range.contains(&rule.metadata().id))
-        {
-            variables.apply_to(rule.variables_mut(), multiphase_evaluation);
+        for index in options.rules.indices_by_id_range(*range.start(), *range.end()) {
+            if let Some(rule) = options.rules.rule_at_mut(index) {
+                variables.apply_to(rule.variables_mut(), multiphase_evaluation);
+            }
         }
     }
     Ok(())
@@ -3266,6 +3293,28 @@ SecWebAppId production
     }
 
     #[test]
+    fn target_update_id_range_changes_only_rules_inside_the_range() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS:q \"@streq hit\" \"id:30,phase:1,pass\"\n\
+                 SecRule ARGS:q \"@streq hit\" \"id:10,phase:1,pass\"\n\
+                 SecRule ARGS:q \"@streq hit\" \"id:20,phase:1,pass\"\n\
+                 SecRuleUpdateTargetById 10-20 \"!ARGS:q\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("target-range");
+        tx.add_get_argument("q", "hit");
+
+        assert!(tx.process_request_headers().is_none());
+        assert_eq!(
+            tx.matched_rules().iter().map(|rule| rule.rule.id()).collect::<Vec<_>>(),
+            [30]
+        );
+    }
+
+    #[test]
     fn test_chained_rules_join_their_parent() {
         let mut parser = Parser::new();
         parser
@@ -3600,6 +3649,81 @@ SecWebAppId production
             .unwrap_err();
         assert!(error.message.contains("unknown action"), "{error:?}");
         assert!(parser.warnings().is_empty(), "{:?}", parser.warnings());
+    }
+
+    #[test]
+    fn failed_later_update_id_does_not_commit_earlier_staged_rules() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,log,pass\"\n\
+                 SecAction \"id:2,phase:1,log,pass\"",
+            )
+            .unwrap();
+
+        assert!(parser.from_string("SecRuleUpdateActionById 1 99 \"nolog\"").is_err());
+        assert!(parser.rules.find_by_id(1).unwrap().metadata().log);
+        assert!(parser.rules.find_by_id(2).unwrap().metadata().log);
+    }
+
+    #[test]
+    fn update_action_id_changes_refresh_the_rule_index() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,log,pass\"\n\
+                 SecRuleUpdateActionById 1 \"id:9,nolog\"",
+            )
+            .unwrap();
+
+        assert!(parser.rules.find_by_id(1).is_none());
+        assert!(parser.rules.find_by_id(9).is_some());
+
+        parser.from_string("SecAction \"id:1,phase:1,pass\"").unwrap();
+        assert!(parser.rules.find_by_id(1).is_some());
+    }
+
+    #[test]
+    fn id_bearing_updates_apply_sequential_ranges_to_staged_ids() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,log,pass\"\n\
+                 SecAction \"id:2,phase:1,log,pass\"",
+            )
+            .unwrap();
+
+        parser.from_string("SecRuleUpdateActionById 1-2 \"id:9\"").unwrap();
+        parser.from_string("SecRuleUpdateActionById 9 \"id:10,nolog\"").unwrap();
+
+        assert!(parser.rules.indices_by_id_range(1, 2).is_empty());
+        assert!(parser.rules.indices_by_id_range(9, 9).is_empty());
+        assert_eq!(parser.rules.indices_by_id_range(10, 10), [0, 1]);
+        for index in 0..2 {
+            let rule = parser.rules.rule_at(index).unwrap();
+            assert_eq!(rule.metadata().id(), 10);
+            assert!(!rule.metadata().log);
+        }
+    }
+
+    #[test]
+    fn failed_id_bearing_update_keeps_all_live_rules_unchanged() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,log,pass\"\n\
+                 SecAction \"id:2,phase:1,log,pass\"",
+            )
+            .unwrap();
+
+        assert!(
+            parser
+                .from_string("SecRuleUpdateActionById 1 99 \"id:9,nolog\"")
+                .is_err()
+        );
+        assert!(parser.rules.find_by_id(1).unwrap().metadata().log);
+        assert!(parser.rules.find_by_id(2).unwrap().metadata().log);
+        assert!(parser.rules.find_by_id(9).is_none());
     }
 
     #[test]

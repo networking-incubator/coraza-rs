@@ -20,6 +20,11 @@
 
 //! Ordered storage and mutation of compiled rules.
 
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::RangeInclusive,
+};
+
 use crate::{actions::RuleMetadata, rules::Rule};
 
 /// Callback invoked synchronously after a rule is inserted.
@@ -30,6 +35,8 @@ pub(crate) type RuleObserver = dyn Fn(&RuleMetadata) + Send + Sync;
 pub(crate) struct RuleGroup {
     /// Top-level rules in directive order.
     rules: Vec<Rule>,
+    /// Indices of top-level rules by current id, in directive order.
+    id_index: BTreeMap<i32, Vec<usize>>,
     /// Every rule retained right now, chain members included.
     total: usize,
     /// Rule compilation attempts, including failed attempts and chain members.
@@ -133,18 +140,20 @@ impl RuleGroup {
         }
 
         let id = rule.metadata().id();
-        if id != 0 && self.find_by_id(id).is_some() {
+        if id != 0 && self.id_index.contains_key(&id) {
             return Err(format!("duplicated rule id {id}"));
         }
 
         let inserted = if is_marker {
             self.rules.push(rule);
+            self.index_rule(self.rules.len().saturating_sub(1));
             self.rules.last()
         } else if let Some(parent) = self.open_chain() {
             parent.chain.push(rule);
             None
         } else {
             self.rules.push(rule);
+            self.index_rule(self.rules.len().saturating_sub(1));
             self.rules.last()
         };
         if let (Some(observer), Some(inserted)) = (observer, inserted) {
@@ -158,6 +167,8 @@ impl RuleGroup {
     pub(crate) fn discard_open_chain(&mut self) -> bool {
         if self.open_chain().is_some() {
             if let Some(rule) = self.rules.pop() {
+                let index = self.rules.len();
+                self.remove_index(rule.metadata().id, index);
                 self.total = self.total.saturating_sub(1 + rule.chain.len());
             }
             true
@@ -175,8 +186,177 @@ impl RuleGroup {
     }
 
     /// Finds a top-level rule by id.
+    #[cfg(test)]
     pub(crate) fn find_by_id(&self, id: i32) -> Option<&Rule> {
-        self.rules.iter().find(|rule| rule.metadata().id() == id)
+        let index = self.id_index.get(&id)?.first()?;
+        self.rules.get(*index)
+    }
+
+    /// Finds the indices of top-level rules in an inclusive id range.
+    pub(crate) fn indices_by_id_range(&self, start: i32, end: i32) -> Vec<usize> {
+        if start > end {
+            return Vec::new();
+        }
+        if start == end {
+            return self.id_index.get(&start).cloned().unwrap_or_default();
+        }
+        let mut indices: Vec<_> = self
+            .id_index
+            .range(start..=end)
+            .flat_map(|(_, indices)| indices.iter().copied())
+            .collect();
+        indices.sort_unstable();
+        indices
+    }
+
+    /// Stage updates by current id, so sequential ranges observe earlier staged id changes.
+    ///
+    /// Only touched rules are cloned. The live group and index remain unchanged if `update`
+    /// fails.
+    pub(crate) fn update_by_id_ranges(
+        &mut self,
+        ranges: &[RangeInclusive<i32>],
+        mut update: impl FnMut(&mut Rule) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut staged_rules = Vec::new();
+        let mut staged_indices = HashMap::new();
+        let mut staged_ids = HashMap::new();
+        let mut staged_by_id = BTreeMap::<i32, Vec<usize>>::new();
+
+        for range in ranges {
+            let start = *range.start();
+            let end = *range.end();
+            if start > end {
+                return Err(format!("invalid rule id range: {start}-{end}"));
+            }
+            let mut indices = Vec::new();
+            for (id, positions) in self.id_index.range(start..=end) {
+                for &index in positions {
+                    if staged_ids.get(&index).is_none_or(|&current| current == *id) {
+                        indices.push(index);
+                    }
+                }
+            }
+            for (_, positions) in staged_by_id.range(start..=end) {
+                indices.extend(positions.iter().copied());
+            }
+            indices.sort_unstable();
+            if indices.is_empty() && start == end {
+                return Err(format!("rule {start} not found"));
+            }
+
+            for index in indices {
+                let staged_index = if let Some(&staged_index) = staged_indices.get(&index) {
+                    staged_index
+                } else {
+                    let Some(rule) = self.rule_at(index).cloned() else {
+                        continue;
+                    };
+                    let staged_index = staged_rules.len();
+                    staged_rules.push((index, rule));
+                    staged_indices.insert(index, staged_index);
+                    staged_index
+                };
+                let Some((_, rule)) = staged_rules.get_mut(staged_index) else {
+                    continue;
+                };
+                let old_id = rule.metadata().id();
+                let original_id = self.rule_at(index).map_or(old_id, |rule| rule.metadata().id());
+                update(rule)?;
+                let new_id = rule.metadata().id();
+
+                if old_id != new_id {
+                    if old_id != original_id {
+                        Self::remove_index_from(&mut staged_by_id, old_id, index);
+                    }
+                    if new_id != original_id {
+                        Self::insert_index_in(&mut staged_by_id, new_id, index);
+                    }
+                }
+                if new_id == original_id {
+                    staged_ids.remove(&index);
+                } else {
+                    staged_ids.insert(index, new_id);
+                }
+            }
+        }
+
+        for (index, rule) in staged_rules {
+            self.replace_rule(index, rule);
+        }
+        Ok(())
+    }
+
+    /// Returns one top-level rule by its stable position.
+    pub(crate) fn rule_at(&self, index: usize) -> Option<&Rule> {
+        self.rules.get(index)
+    }
+
+    /// Returns one top-level rule mutably by its stable position.
+    pub(crate) fn rule_at_mut(&mut self, index: usize) -> Option<&mut Rule> {
+        self.rules.get_mut(index)
+    }
+
+    /// Replace a top-level rule staged by a load-time update.
+    pub(crate) fn replace_rule(&mut self, index: usize, rule: Rule) {
+        let Some(slot) = self.rules.get_mut(index) else {
+            return;
+        };
+        let old_id = slot.metadata().id();
+        let new_id = rule.metadata().id();
+        *slot = rule;
+        if old_id != new_id {
+            self.remove_index(old_id, index);
+            self.insert_index(new_id, index);
+        }
+    }
+
+    /// Rebuild the id index after an operation that can change metadata ids.
+    pub(crate) fn rebuild_id_index(&mut self) {
+        self.id_index.clear();
+        for index in 0..self.rules.len() {
+            let Some(id) = self.rules.get(index).map(|rule| rule.metadata().id()) else {
+                continue;
+            };
+            self.insert_index(id, index);
+        }
+    }
+
+    /// Add one top-level rule position to the id index.
+    fn index_rule(&mut self, index: usize) {
+        if let Some(rule) = self.rules.get(index) {
+            self.insert_index(rule.metadata().id(), index);
+        }
+    }
+
+    /// Insert an index in directive order for an id.
+    fn insert_index(&mut self, id: i32, index: usize) {
+        Self::insert_index_in(&mut self.id_index, id, index);
+    }
+
+    /// Insert one directive-order position into an id index.
+    fn insert_index_in(index: &mut BTreeMap<i32, Vec<usize>>, id: i32, position: usize) {
+        let indices = index.entry(id).or_default();
+        let insertion = indices.binary_search(&position).unwrap_or_else(|insertion| insertion);
+        indices.insert(insertion, position);
+    }
+
+    /// Remove one position from an id's index.
+    fn remove_index(&mut self, id: i32, index: usize) {
+        Self::remove_index_from(&mut self.id_index, id, index);
+    }
+
+    /// Remove one directive-order position from an id index.
+    fn remove_index_from(index_map: &mut BTreeMap<i32, Vec<usize>>, id: i32, index: usize) {
+        let remove_id = if let Some(indices) = index_map.get_mut(&id) {
+            indices.retain(|&candidate| candidate != index);
+            indices.is_empty()
+        } else {
+            false
+        };
+        if remove_id {
+            index_map.remove(&id);
+        }
     }
 
     /// Removes rules with ids in the inclusive range.
@@ -201,6 +381,7 @@ impl RuleGroup {
     /// Recompute the total after a bulk removal.
     fn recount(&mut self) {
         self.total = self.rules.iter().map(|rule| 1 + rule.chain.len()).sum();
+        self.rebuild_id_index();
     }
 
     /// Updates rules tagged with `tag` and returns their count.
@@ -213,11 +394,6 @@ impl RuleGroup {
             }
         }
         count
-    }
-
-    /// Iterates over top-level rules mutably.
-    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, Rule> {
-        self.rules.iter_mut()
     }
 
     /// Iterates over top-level rules in directive order.
@@ -283,6 +459,67 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicated rule id 1")
         );
+    }
+
+    #[test]
+    fn id_index_tracks_replacement_discard_and_removal() {
+        let mut group = RuleGroup::new();
+        group.add(rule("1", ""), false, None).unwrap();
+        group.add(rule("2", ""), false, None).unwrap();
+        assert!(group.find_by_id(1).is_some());
+
+        group.replace_rule(0, rule("3", ""));
+        assert!(group.find_by_id(1).is_none());
+        assert!(group.find_by_id(3).is_some());
+
+        group.delete_by_range(2, 3);
+        assert!(group.find_by_id(2).is_none());
+        assert!(group.find_by_id(3).is_none());
+        group.add(rule("3", ""), false, None).unwrap();
+        assert!(group.find_by_id(3).is_some());
+
+        group.add(rule("4", "chain"), false, None).unwrap();
+        assert!(group.discard_open_chain());
+        assert!(group.find_by_id(4).is_none());
+        group.add(rule("4", ""), false, None).unwrap();
+        assert!(group.find_by_id(4).is_some());
+    }
+
+    #[test]
+    fn id_range_index_returns_rules_in_directive_order() {
+        let mut group = RuleGroup::new();
+        group.add(rule("30", ""), false, None).unwrap();
+        group.add(rule("10", ""), false, None).unwrap();
+        group.add(rule("20", ""), false, None).unwrap();
+
+        assert_eq!(group.indices_by_id_range(10, 30), [0, 1, 2]);
+    }
+
+    #[test]
+    fn id_update_can_return_to_its_original_id_and_keep_order() {
+        let mut group = RuleGroup::new();
+        group.add(rule("5", ""), false, None).unwrap();
+        group.add(rule("10", ""), false, None).unwrap();
+        group.add(rule("30", ""), false, None).unwrap();
+        let mut update_count = 0;
+
+        group
+            .update_by_id_ranges(&[10..=10, 20..=20], |rule| {
+                let id = if update_count == 0 { "20" } else { "10" };
+                update_count += 1;
+                compile_action("id", id, rule.metadata_mut(), ActionCompileContext::default())
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(group.indices_by_id_range(10, 10), [1]);
+        assert!(group.indices_by_id_range(20, 20).is_empty());
+        assert_eq!(
+            group.iter().map(|rule| rule.metadata().id()).collect::<Vec<_>>(),
+            [5, 10, 30]
+        );
+        assert_eq!(group.indices_by_id_range(5, 30), [0, 1, 2]);
     }
 
     #[test]

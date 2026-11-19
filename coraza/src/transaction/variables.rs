@@ -24,7 +24,7 @@ use std::borrow::Cow;
 
 use super::{TX_CAPTURE_KEYS, Transaction};
 use crate::{
-    collection::{Map, MatchData, Single},
+    collection::{Map, MatchData, MatchLocation, MatchRef, Single},
     operators::Outputs,
     rules::{CollectionView, VariableSpec},
     transformations::text_of,
@@ -293,7 +293,21 @@ impl Transaction {
         }
     }
 
+    /// Borrow a valid UTF-8 variable value for read-only operator parameter expansion.
+    pub(crate) fn get_variable_cow(&self, variable: RuleVariable, key: Option<&str>) -> Option<Cow<'_, str>> {
+        match (self.collection(variable)?, key) {
+            (VariableCollection::Single(single), None) => Some(single.get()),
+            (VariableCollection::Map(map), Some(key)) => map.first(key).map(text_of),
+            (VariableCollection::Names(_, map), Some(key)) => map
+                .iter_key(key)
+                .next()
+                .map(|(stored_key, _)| Cow::Borrowed(stored_key)),
+            _ => None,
+        }
+    }
+
     /// Find the byte-preserving matches selected by a parsed variable spec.
+    #[cfg(test)]
     pub(crate) fn find_matches(&self, spec: &VariableSpec) -> Vec<MatchData> {
         let collection = self.collection(spec.variable()).map(|collection| match collection {
             VariableCollection::Single(single) => CollectionView::Single(single),
@@ -309,17 +323,65 @@ impl Transaction {
     /// (`internal/corazawaf/transaction.go:681-712`, v3.8.1): a removed key is not counted,
     /// and a count-mode match is never dropped.
     pub(crate) fn find_matches_for_rule(&self, spec: &VariableSpec, id: i32) -> Vec<MatchData> {
+        self.find_match_refs_for_rule(spec, id)
+            .into_iter()
+            .map(MatchRef::into_owned)
+            .collect()
+    }
+
+    /// Select borrowed values and defer copying until a rule can match them.
+    pub(crate) fn find_match_refs_for_rule<'a>(&'a self, spec: &'a VariableSpec, id: i32) -> Vec<MatchRef<'a>> {
         if !self.removed_rule_targets.contains_key(&id) {
-            return self.find_matches(spec);
+            let collection = self.collection(spec.variable()).map(|collection| match collection {
+                VariableCollection::Single(single) => CollectionView::Single(single),
+                VariableCollection::Map(map) => CollectionView::Map(map),
+                VariableCollection::Names(variable, map) => CollectionView::Names(variable, map),
+            });
+            return spec.get_match_refs(collection);
         }
         let collection = self.collection(spec.variable()).map(|collection| match collection {
             VariableCollection::Single(single) => CollectionView::Single(single),
             VariableCollection::Map(map) => CollectionView::Map(map),
             VariableCollection::Names(variable, map) => CollectionView::Names(variable, map),
         });
-        spec.get_matches_filter(collection, |variable, key| {
+        spec.get_match_refs_filter(collection, |variable, key| {
             self.is_rule_target_removed(id, variable, key)
         })
+    }
+
+    /// Fetch one selected value by its stable source position.
+    pub(crate) fn find_match_ref_at(&self, variable: RuleVariable, location: MatchLocation) -> Option<MatchRef<'_>> {
+        match location {
+            MatchLocation::Map {
+                source,
+                entry_index,
+                value_index,
+                names,
+            } => {
+                let map = match self.collection(source)? {
+                    VariableCollection::Map(map) | VariableCollection::Names(_, map) => map,
+                    VariableCollection::Single(_) => return None,
+                };
+                let (key, value) = map.value_at(entry_index, value_index, names)?;
+                Some(MatchRef {
+                    variable,
+                    key: String::from_utf8_lossy(key),
+                    value: Cow::Borrowed(value),
+                    location: Some(location),
+                })
+            },
+            MatchLocation::Single { variable: source } => {
+                let Some(VariableCollection::Single(single)) = self.collection(source) else {
+                    return None;
+                };
+                Some(MatchRef {
+                    variable,
+                    key: Cow::Borrowed(""),
+                    value: Cow::Borrowed(single.get_bytes()),
+                    location: Some(location),
+                })
+            },
+        }
     }
 
     /// Set one stored single-value variable.
@@ -368,19 +430,28 @@ impl Transaction {
 
     /// Replace the value of a transaction variable.
     pub fn set_tx_variable(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        self.matched_vars_dirty = true;
         self.tx.set(key, [value]);
     }
 
     /// Record the value and variable name matched by an operator.
     pub(crate) fn record_matched_variable(&mut self, matched: &MatchData) {
-        let name = if matched.key.is_empty() {
-            matched.variable.name().to_owned()
-        } else {
-            format!("{}:{}", matched.variable.name(), matched.key)
+        let Some(inner) = self.inner.as_deref_mut() else {
+            return;
         };
-        self.matched_vars.add(&name, &matched.value);
-        self.matched_var.set(&matched.value);
-        self.matched_var_name.set(name);
+        inner.matched_vars_dirty = true;
+        let variable = matched.variable.name().as_bytes();
+        if matched.key.is_empty() {
+            inner.matched_var_name.set(variable);
+        } else {
+            inner
+                .matched_var_name
+                .set_joined(variable, b":", matched.key.as_bytes());
+        }
+        inner
+            .matched_vars
+            .add_bytes(inner.matched_var_name.get_bytes(), &matched.value);
+        inner.matched_var.set(&matched.value);
     }
 
     /// Update `RULE` values before evaluating a compiled rule.
@@ -388,18 +459,18 @@ impl Transaction {
     pub(crate) fn set_rule_variables(
         &mut self,
         id: i32,
-        message: Option<String>,
+        message: Option<Cow<'_, str>>,
         revision: &str,
-        log_data: Option<String>,
+        log_data: Option<Cow<'_, str>>,
         severity: &str,
     ) {
         self.rule.set_index("id", 0, id.to_string());
         if let Some(message) = message {
-            self.rule.set_index("msg", 0, message);
+            self.rule.set_index("msg", 0, message.as_bytes());
         }
         self.rule.set_index("rev", 0, revision);
         if let Some(log_data) = log_data {
-            self.rule.set_index("logdata", 0, log_data);
+            self.rule.set_index("logdata", 0, log_data.as_bytes());
         }
         self.rule.set_index("severity", 0, severity);
     }

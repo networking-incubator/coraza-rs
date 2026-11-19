@@ -20,7 +20,7 @@
 
 //! Runtime expansion of `%{VARIABLE.key}` operator parameters.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use crate::{transaction::Transaction, types::RuleVariable};
 
@@ -96,6 +96,14 @@ impl Macro {
 
     /// Expand references from `tx`. An unset variable expands to an empty string.
     pub fn expand(&self, tx: &Transaction) -> String {
+        self.expand_cow(tx).into_owned()
+    }
+
+    /// Expand references, borrowing the original text when the parameter is constant.
+    pub(crate) fn expand_cow(&self, tx: &Transaction) -> Cow<'_, str> {
+        if !self.tokens.iter().any(|token| token.variable.is_some()) {
+            return Cow::Borrowed(&self.original);
+        }
         let mut result = String::with_capacity(self.original.len());
         for token in &self.tokens {
             match token.variable {
@@ -103,7 +111,24 @@ impl Macro {
                 None => result.push_str(&token.text),
             }
         }
-        result
+        Cow::Owned(result)
+    }
+
+    /// Expand an operator parameter, borrowing an exact single-variable value where possible.
+    pub(crate) fn expand_for_operator<'a>(&'a self, tx: &'a Transaction) -> Cow<'a, str> {
+        if let [
+            MacroToken {
+                variable: Some(variable),
+                key,
+                ..
+            },
+        ] = self.tokens.as_slice()
+        {
+            return tx
+                .get_variable_cow(*variable, key.as_deref())
+                .unwrap_or(Cow::Borrowed(""));
+        }
+        self.expand_cow(tx)
     }
 
     /// Return the unexpanded parameter.
@@ -190,6 +215,8 @@ impl Macro {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "macro tests use fixed valid references")]
 mod tests {
+    use std::borrow::Cow;
+
     use super::Macro;
     use crate::transaction::Transaction;
 
@@ -197,8 +224,12 @@ mod tests {
     fn empty_and_literal_parameters_are_preserved() {
         let mut tx = Transaction::new("macro-test");
         tx.set_tx_variable("id", b"42");
-        assert_eq!(Macro::new("").unwrap().expand(&tx), "");
-        assert_eq!(Macro::new("caf\u{00e9} %").unwrap().expand(&tx), "caf\u{00e9} %");
+        let empty = Macro::new("").unwrap();
+        let literal = Macro::new("caf\u{00e9} %").unwrap();
+        assert!(matches!(empty.expand_cow(&tx), Cow::Borrowed("")));
+        assert!(matches!(literal.expand_cow(&tx), Cow::Borrowed(_)));
+        assert_eq!(empty.expand(&tx), "");
+        assert_eq!(literal.expand(&tx), "caf\u{00e9} %");
         assert_eq!(
             Macro::new("caf\u{00e9} %{TX.id}").unwrap().expand(&tx),
             "caf\u{00e9} 42"
@@ -213,11 +244,39 @@ mod tests {
 
         assert_eq!(Macro::new("%{TX.SCORE}").unwrap().expand(&tx), "42");
         assert_eq!(
+            Macro::new("before%{TX.score}after").unwrap().expand_for_operator(&tx),
+            "before42after"
+        );
+        assert_eq!(
             Macro::new("method=%{REQUEST_METHOD} score=%{TX.score}")
                 .unwrap()
                 .expand(&tx),
             "method=POST score=42"
         );
+    }
+
+    #[test]
+    fn operator_expansion_borrows_a_single_valid_variable_value() {
+        let mut tx = Transaction::new("macro-test");
+        tx.set_tx_variable("needle", "a long request-backed value");
+        let parameter = Macro::new("%{TX.needle}").unwrap();
+
+        assert!(matches!(
+            parameter.expand_for_operator(&tx),
+            Cow::Borrowed("a long request-backed value")
+        ));
+    }
+
+    #[test]
+    fn operator_expansion_keeps_lossy_text_for_invalid_utf8() {
+        let mut tx = Transaction::new("macro-test");
+        tx.set_tx_variable("needle", [0xFF]);
+        let parameter = Macro::new("%{TX.needle}").unwrap();
+
+        assert!(matches!(
+            parameter.expand_for_operator(&tx),
+            Cow::Owned(text) if text == "\u{fffd}"
+        ));
     }
 
     #[test]

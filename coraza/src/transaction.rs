@@ -34,9 +34,9 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     mem::size_of,
-    ops::RangeInclusive,
+    ops::{Deref, DerefMut, RangeInclusive},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::SystemTime,
 };
 
@@ -56,7 +56,7 @@ use crate::{
     collection::{Map, MatchData, Single},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
-    operators::Macro,
+    operators::{DynamicPmMatcher, Macro, Outputs},
     rules::{RuleGroup, VariableException},
     transformations::text_of,
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
@@ -163,11 +163,12 @@ pub enum AllowScope {
 }
 
 /// A transaction's input collections, rule state, and phase evaluation.
+#[doc(hidden)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "fields mirror independent request and response controls"
 )]
-pub struct Transaction {
+pub struct TransactionInner {
     /// The settings used to enforce transaction limits.
     config: Arc<WafConfig>,
     /// Compiled rules inherited from the WAF, possibly empty.
@@ -310,6 +311,10 @@ pub struct Transaction {
     matched_var_name: Single,
     /// Values matched by the current rule and its chain.
     matched_vars: Map,
+    /// Whether matched variables or TX captures need clearing before the next rule.
+    matched_vars_dirty: bool,
+    /// Last dynamic `@pm` matcher, bounded to one pattern set per transaction.
+    dynamic_pm_matcher: Mutex<Option<DynamicPmMatcher>>,
     /// Metadata of the rule currently being evaluated.
     rule: Map,
     /// The request URI supplied by the connector.
@@ -372,18 +377,503 @@ pub struct Transaction {
     highest_severity: Single,
 }
 
+/// Public handle around request state, with an optional WAF-local free-list.
+pub struct Transaction {
+    /// The request state; absent only while Drop transfers it to the pool.
+    inner: Option<Box<TransactionInner>>,
+    /// The WAF's bounded transaction-state free-list.
+    pool: Option<Arc<TransactionPool>>,
+}
+
+/// A bounded free-list shared by transactions from one WAF.
+pub(crate) struct TransactionPool {
+    /// Finished states and their estimated retained capacity.
+    free: Mutex<TransactionPoolState>,
+}
+
+/// Pool entries and the total capacity estimate used to admit them.
+struct TransactionPoolState {
+    /// Finished states available for reuse.
+    transactions: Vec<(Box<TransactionInner>, usize)>,
+    /// Estimated dynamic capacity retained by those states.
+    retained_bytes: usize,
+}
+
+/// Maximum number of finished states retained by one WAF.
+// shortcut: raise the 16-state cap only after profiling worker concurrency.
+const MAX_POOL_SIZE: usize = 16;
+/// Maximum estimated dynamic capacity retained by one WAF's transaction pool.
+const MAX_POOL_RETAINED_BYTES: usize = 2 * 1024 * 1024;
+
+impl TransactionPool {
+    /// Create an empty per-WAF pool.
+    pub(crate) fn new() -> Self {
+        Self {
+            free: Mutex::new(TransactionPoolState {
+                transactions: Vec::new(),
+                retained_bytes: 0,
+            }),
+        }
+    }
+
+    /// Take a previously finished transaction state.
+    fn take(&self) -> Option<Box<TransactionInner>> {
+        let mut free = self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (inner, retained_bytes) = free.transactions.pop()?;
+        free.retained_bytes = free.retained_bytes.saturating_sub(retained_bytes);
+        drop(free);
+        Some(inner)
+    }
+
+    /// Retain a bounded count and capacity of finished states.
+    fn put(&self, inner: Box<TransactionInner>) {
+        // shortcut: raise the 2 MiB WAF-local cap only after profiling worker memory.
+        let retained_bytes = inner.pool_retained_capacity_bytes();
+        let mut free = self.free.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.transactions.len() < MAX_POOL_SIZE
+            && retained_bytes <= MAX_POOL_RETAINED_BYTES.saturating_sub(free.retained_bytes)
+        {
+            free.retained_bytes = free.retained_bytes.saturating_add(retained_bytes);
+            free.transactions.push((inner, retained_bytes));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transactions
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_bytes
+    }
+}
+
+impl Deref for Transaction {
+    type Target = TransactionInner;
+
+    #[expect(clippy::expect_used, reason = "a live transaction always owns its state")]
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_deref()
+            .expect("transaction state is present while the handle is live")
+    }
+}
+
+impl DerefMut for Transaction {
+    #[expect(clippy::expect_used, reason = "a live transaction always owns its state")]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_deref_mut()
+            .expect("transaction state is present while the handle is live")
+    }
+}
+
+impl TransactionInner {
+    /// Reset request-scoped state while keeping small collection buffers for reuse.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Every transaction-local field is reset together before a state re-enters the WAF pool."
+    )]
+    fn reset_for_pool(&mut self) {
+        macro_rules! reset_maps {
+            ($($field:ident $(.$nested:ident)*),+ $(,)?) => {
+                $(self.$field $(.$nested)*.reset_for_reuse();)+
+            };
+        }
+        macro_rules! reset_singles {
+            ($($field:ident $(.$nested:ident)*),+ $(,)?) => {
+                $(self.$field $(.$nested)*.reset_for_reuse();)+
+            };
+        }
+        macro_rules! release_maps {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field.reset_and_release();)+
+            };
+        }
+
+        self.rule_engine = self.config.rule_engine;
+        self.request_body_access = self.config.request_body_access;
+        self.request_body_limit = self.config.request_body_limit;
+        self.request_body_buffer = BodyBuffer::default();
+        self.force_request_body_variable = false;
+        self.request_body_processor = None;
+        self.response_body_access = self.config.response_body_access;
+        self.response_body_limit = self.config.response_body_limit;
+        self.response_body_buffer = BodyBuffer::default();
+        self.force_response_body_variable = false;
+        self.response_body_processor = None;
+        self.audit_engine = self.config.audit_engine;
+        self.audit_log_parts = self.config.audit_log_parts.clone();
+        self.audit_logger = None;
+        self.debug_logger = noop_logger();
+        self.debug_log_level = None;
+        self.audit_log_callback = None;
+        self.error_log = None;
+        self.matched_rules = Vec::new();
+        self.started = std::time::UNIX_EPOCH;
+        self.last_phase = None;
+        self.audit_attempted = false;
+        self.audit_error = None;
+        self.uploads_closed = false;
+        self.finalized = false;
+        self.finalization_errors.clear();
+        if self.finalization_errors.capacity() > 64 {
+            self.finalization_errors = Vec::new();
+        }
+        self.interruption = None;
+        self.would_be_interruption = None;
+        self.skip = 0;
+        self.removed_rule_ids.clear();
+        self.removed_rule_id_ranges.clear();
+        if self.removed_rule_id_ranges.capacity() > 128 {
+            self.removed_rule_id_ranges = Vec::new();
+        }
+        self.removed_rule_targets.clear();
+        self.applied_rule_removals.clear();
+        self.skip_after = None;
+        self.allow = AllowType::Unset;
+        self.unique_id.reset_for_reuse();
+        self.args_combined_size = 0;
+        self.args_combined_size_value.set("0");
+        self.arguments_limit_reached.set("0");
+        // body_memory_bytes charges these capacities to an active stream's budget.
+        reset_maps!(
+            args_get,
+            args_path,
+            request_headers,
+            request_cookies,
+            response_headers,
+            env,
+            rule,
+        );
+        // body_memory_bytes charges these capacities to the active stream budget.
+        release_maps!(
+            args,
+            args_post,
+            request_xml,
+            response_args,
+            response_xml,
+            files,
+            files_names,
+            files_sizes,
+            files_tmp_names,
+            multipart_name,
+            multipart_filename,
+            multipart_filename_charset,
+            multipart_filename_language,
+            multipart_part_headers,
+            matched_vars,
+        );
+        self.tx.reset_and_release();
+        for key in TX_CAPTURE_KEYS {
+            self.tx.set_index(key, 0, "");
+        }
+        self.matched_vars_dirty = false;
+        let dynamic_pm_matcher = self
+            .dynamic_pm_matcher
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(dynamic_pm_matcher.take());
+        self.uploaded_paths.clear();
+        if self.uploaded_paths.capacity() > 256 {
+            self.uploaded_paths = Vec::new();
+        }
+        self.args_path_indices.clear();
+        if self.args_path_indices.capacity() > 1024 {
+            self.args_path_indices = Vec::new();
+        }
+        self.files_combined_size.set("0");
+        self.multipart_strict_error.set("0");
+        self.multipart_duplicate_part_header.set("0");
+        self.multipart_invalid_quoting.set("0");
+        reset_singles!(
+            matched_var,
+            matched_var_name,
+            request_uri,
+            request_method,
+            request_protocol,
+            remote_addr,
+            remote_port,
+            server_addr,
+            server_port,
+            server_name,
+            response_status,
+            response_content_type,
+            response_protocol,
+            request_body_length,
+            inbound_data_error,
+            reqbody_error,
+            reqbody_error_msg,
+            reqbody_processor,
+            reqbody_processor_error,
+            reqbody_processor_error_msg,
+            response_content_length,
+            outbound_data_error,
+            res_body_error,
+            res_body_error_msg,
+            res_body_processor,
+            res_body_processor_error,
+            res_body_processor_error_msg,
+            highest_severity,
+        );
+        self.request_body.reset_and_release();
+        self.response_body.reset_and_release();
+        self.request_body_length.set("0");
+        self.inbound_data_error.set("0");
+        self.reqbody_error.set("0");
+        self.reqbody_processor_error.set("0");
+        self.outbound_data_error.set("0");
+        self.highest_severity.set("255");
+        reset_singles!(
+            computed.request_uri_raw,
+            computed.request_line,
+            computed.request_filename,
+            computed.request_basename,
+            computed.query_string,
+            computed.urlencoded_error,
+            computed.full_request_length,
+            computed.multipart_data_after,
+            computed.duration,
+            computed.uri_parse_error,
+            computed.time,
+            computed.time_day,
+            computed.time_epoch,
+            computed.time_hour,
+            computed.time_min,
+            computed.time_mon,
+            computed.time_sec,
+            computed.time_wday,
+            computed.time_year,
+        );
+        self.computed.urlencoded_error.set("0");
+        self.computed.full_request_length.set("0");
+        self.computed.multipart_data_after.set("0");
+        self.computed.duration.set("0");
+        self.computed.uri_parse_error.set("0");
+        self.computed.custom_body_processors = None;
+    }
+
+    /// Estimate all dynamic capacity retained by a pooled transaction state.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The estimate must cover every transaction collection and retained Vec."
+    )]
+    fn pool_retained_capacity_bytes(&self) -> usize {
+        let map_bytes = [
+            self.args.allocated_bytes(),
+            self.args_get.allocated_bytes(),
+            self.args_post.allocated_bytes(),
+            self.request_xml.allocated_bytes(),
+            self.response_args.allocated_bytes(),
+            self.response_xml.allocated_bytes(),
+            self.files.allocated_bytes(),
+            self.files_names.allocated_bytes(),
+            self.files_sizes.allocated_bytes(),
+            self.files_tmp_names.allocated_bytes(),
+            self.multipart_name.allocated_bytes(),
+            self.multipart_filename.allocated_bytes(),
+            self.multipart_filename_charset.allocated_bytes(),
+            self.multipart_filename_language.allocated_bytes(),
+            self.multipart_part_headers.allocated_bytes(),
+            self.args_path.allocated_bytes(),
+            self.request_headers.allocated_bytes(),
+            self.request_cookies.allocated_bytes(),
+            self.response_headers.allocated_bytes(),
+            self.tx.allocated_bytes(),
+            self.env.allocated_bytes(),
+            self.matched_vars.allocated_bytes(),
+            self.rule.allocated_bytes(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add);
+        let single_bytes = [
+            self.unique_id.allocated_bytes(),
+            self.args_combined_size_value.allocated_bytes(),
+            self.arguments_limit_reached.allocated_bytes(),
+            self.files_combined_size.allocated_bytes(),
+            self.multipart_strict_error.allocated_bytes(),
+            self.multipart_duplicate_part_header.allocated_bytes(),
+            self.multipart_invalid_quoting.allocated_bytes(),
+            self.matched_var.allocated_bytes(),
+            self.matched_var_name.allocated_bytes(),
+            self.request_uri.allocated_bytes(),
+            self.request_method.allocated_bytes(),
+            self.request_protocol.allocated_bytes(),
+            self.remote_addr.allocated_bytes(),
+            self.remote_port.allocated_bytes(),
+            self.server_addr.allocated_bytes(),
+            self.server_port.allocated_bytes(),
+            self.server_name.allocated_bytes(),
+            self.response_status.allocated_bytes(),
+            self.response_content_type.allocated_bytes(),
+            self.response_protocol.allocated_bytes(),
+            self.request_body.allocated_bytes(),
+            self.request_body_length.allocated_bytes(),
+            self.inbound_data_error.allocated_bytes(),
+            self.reqbody_error.allocated_bytes(),
+            self.reqbody_error_msg.allocated_bytes(),
+            self.reqbody_processor.allocated_bytes(),
+            self.reqbody_processor_error.allocated_bytes(),
+            self.reqbody_processor_error_msg.allocated_bytes(),
+            self.response_body.allocated_bytes(),
+            self.response_content_length.allocated_bytes(),
+            self.outbound_data_error.allocated_bytes(),
+            self.res_body_error.allocated_bytes(),
+            self.res_body_error_msg.allocated_bytes(),
+            self.res_body_processor.allocated_bytes(),
+            self.res_body_processor_error.allocated_bytes(),
+            self.res_body_processor_error_msg.allocated_bytes(),
+            self.highest_severity.allocated_bytes(),
+            self.computed.request_uri_raw.allocated_bytes(),
+            self.computed.request_line.allocated_bytes(),
+            self.computed.request_filename.allocated_bytes(),
+            self.computed.request_basename.allocated_bytes(),
+            self.computed.query_string.allocated_bytes(),
+            self.computed.urlencoded_error.allocated_bytes(),
+            self.computed.full_request_length.allocated_bytes(),
+            self.computed.multipart_data_after.allocated_bytes(),
+            self.computed.duration.allocated_bytes(),
+            self.computed.uri_parse_error.allocated_bytes(),
+            self.computed.time.allocated_bytes(),
+            self.computed.time_day.allocated_bytes(),
+            self.computed.time_epoch.allocated_bytes(),
+            self.computed.time_hour.allocated_bytes(),
+            self.computed.time_min.allocated_bytes(),
+            self.computed.time_mon.allocated_bytes(),
+            self.computed.time_sec.allocated_bytes(),
+            self.computed.time_wday.allocated_bytes(),
+            self.computed.time_year.allocated_bytes(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add);
+        let path_key_bytes = self
+            .args_path_indices
+            .iter()
+            .map(|(key, _)| key.capacity())
+            .fold(0_usize, usize::saturating_add);
+        let vector_bytes = self
+            .matched_rules
+            .capacity()
+            .saturating_mul(size_of::<MatchedRule>())
+            .saturating_add(self.finalization_errors.capacity().saturating_mul(size_of::<Failure>()))
+            .saturating_add(
+                self.removed_rule_id_ranges
+                    .capacity()
+                    .saturating_mul(size_of::<RangeInclusive<i32>>()),
+            )
+            .saturating_add(self.uploaded_paths.capacity().saturating_mul(size_of::<PathBuf>()))
+            .saturating_add(
+                self.args_path_indices
+                    .capacity()
+                    .saturating_mul(size_of::<(Vec<u8>, usize)>())
+                    .saturating_add(path_key_bytes),
+            )
+            .saturating_add(
+                self.audit_log_parts
+                    .capacity()
+                    .saturating_mul(size_of::<AuditLogPart>()),
+            );
+        let dynamic_pm_bytes = self
+            .dynamic_pm_matcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, DynamicPmMatcher::retained_memory_bytes);
+
+        size_of::<Self>()
+            .saturating_add(size_of::<ComputedVariables>())
+            .saturating_add(128)
+            .saturating_add(map_bytes)
+            .saturating_add(single_bytes)
+            .saturating_add(vector_bytes)
+            .saturating_add(self.request_body_buffer.allocated_bytes())
+            .saturating_add(self.response_body_buffer.allocated_bytes())
+            .saturating_add(dynamic_pm_bytes)
+    }
+
+    /// Install the next request's WAF settings, identifier, and time variables.
+    fn begin_request(&mut self, config: Arc<WafConfig>, rules: Arc<RuleGroup>, id: String) {
+        self.rule_engine = config.rule_engine;
+        self.request_body_access = config.request_body_access;
+        self.request_body_limit = config.request_body_limit;
+        self.response_body_access = config.response_body_access;
+        self.response_body_limit = config.response_body_limit;
+        self.audit_engine = config.audit_engine;
+        self.audit_log_parts = config.audit_log_parts.clone();
+        self.unique_id.set(id);
+        self.started = SystemTime::now();
+
+        let epoch = self
+            .started
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let at = LocalTime::from_unix(i64::try_from(epoch).unwrap_or(i64::MAX));
+        self.computed
+            .time
+            .set(format!("{:02}:{:02}:{:02}", at.hour, at.minute, at.second));
+        self.computed.time_day.set(at.day.to_string());
+        self.computed.time_epoch.set(epoch.to_string());
+        self.computed.time_hour.set(format!("{:02}", at.hour));
+        self.computed.time_min.set(format!("{:02}", at.minute));
+        self.computed.time_mon.set(at.month.to_string());
+        self.computed.time_sec.set(format!("{:02}", at.second));
+        self.computed.time_wday.set(at.weekday.to_string());
+        self.computed.time_year.set(at.year.to_string());
+        self.config = config;
+        self.rules = rules;
+    }
+}
+
 /// The `TX` capture keys, `"0"` through `"10"`.
 ///
 /// Go seeds all eleven on every transaction (`internal/corazawaf/waf.go:264-268`,
 /// v3.8.1), so they stay present and a rule that reads a missing capture still sees an
 /// empty value.
 const TX_CAPTURE_KEYS: [&str; 11] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+/// Maximum source bytes accepted for a transaction-local dynamic `@pm` matcher.
+const MAX_DYNAMIC_PM_PATTERN_BYTES: usize = 64 * 1024;
+/// Maximum estimated retained bytes for one transaction-local dynamic matcher.
+const MAX_CACHED_DYNAMIC_PM_BYTES: usize = 256 * 1024;
 
 #[expect(
     clippy::multiple_inherent_impl,
     reason = "transaction impl blocks are split across submodules"
 )]
 impl Transaction {
+    /// Evaluate a macro-backed phrase matcher, reusing the last pattern set for this request.
+    pub(crate) fn evaluate_dynamic_pm(&self, patterns: String, input: &[u8], out: &mut Outputs) -> bool {
+        let mut cache = self
+            .dynamic_pm_matcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Hold this lock across compile/evaluate to serialize generations and avoid mismatched matchers; no callbacks
+        // re-enter it.
+        if patterns.len() > MAX_DYNAMIC_PM_PATTERN_BYTES {
+            drop(cache.take());
+            return DynamicPmMatcher::evaluate_uncached(&patterns, input, out);
+        }
+        if let Some(matcher) = cache.as_ref().filter(|matcher| matcher.matches_patterns(&patterns)) {
+            return matcher.evaluate(input, out);
+        }
+
+        drop(cache.take());
+        let matcher = DynamicPmMatcher::new(patterns);
+        let result = matcher.evaluate(input, out);
+        if matcher.estimated_memory_bytes() <= MAX_CACHED_DYNAMIC_PM_BYTES {
+            *cache = Some(matcher);
+        }
+        result
+    }
+
     /// Create a transaction with the default WAF configuration.
     pub fn new(id: impl Into<String>) -> Self {
         Self::with_config(id, Arc::new(WafConfig::default()))
@@ -456,7 +946,7 @@ impl Transaction {
             .as_secs();
         let at = LocalTime::from_unix(i64::try_from(epoch).unwrap_or(i64::MAX));
 
-        let mut transaction = Self {
+        let mut transaction = Box::new(TransactionInner {
             rule_engine: config.rule_engine,
             request_body_access: config.request_body_access,
             request_body_limit: config.request_body_limit,
@@ -528,6 +1018,8 @@ impl Transaction {
             matched_var: Single::new(RuleVariable::MatchedVar),
             matched_var_name: Single::new(RuleVariable::MatchedVarName),
             matched_vars: map(RuleVariable::MatchedVars),
+            matched_vars_dirty: true,
+            dynamic_pm_matcher: Mutex::new(None),
             rule: map(RuleVariable::Rule),
             request_uri: Single::new(RuleVariable::RequestURI),
             computed: Box::new(ComputedVariables {
@@ -588,13 +1080,37 @@ impl Transaction {
                 value.set("255");
                 value
             },
-        };
+        });
         // Go seeds its capture variables `TX:0`..`TX:10` to empty on every transaction
         // (`internal/corazawaf/waf.go:264-268` in v3.8.1). Seeding them here means the
         // per-rule reset below only rewrites existing values.
         for key in TX_CAPTURE_KEYS {
             transaction.tx.set_index(key, 0, "");
         }
+        Self {
+            inner: Some(transaction),
+            pool: None,
+        }
+    }
+
+    /// Create a transaction, reusing a finished state from this WAF when available.
+    pub(crate) fn with_pool(
+        config: Arc<WafConfig>,
+        rules: Arc<RuleGroup>,
+        id: impl Into<String>,
+        pool: Arc<TransactionPool>,
+    ) -> Self {
+        let id = id.into();
+        if let Some(mut inner) = pool.take() {
+            inner.begin_request(config, rules, id);
+            return Self {
+                inner: Some(inner),
+                pool: Some(pool),
+            };
+        }
+
+        let mut transaction = Self::with_rules(config, rules, id);
+        transaction.pool = Some(pool);
         transaction
     }
 
@@ -773,8 +1289,8 @@ impl Transaction {
     /// Estimate dynamic memory retained for request and response body data.
     ///
     /// This includes body buffers, raw body variables, parsed body collections,
-    /// and match data. Collection backing capacities are counted, so this is a
-    /// conservative estimate for connector retained-body budgets.
+    /// cached dynamic `@pm` matchers, and match data. Collection backing capacities are
+    /// counted, so this is a conservative estimate for connector retained-body budgets.
     pub fn body_memory_bytes(&self) -> usize {
         let maps = [
             &self.args,
@@ -795,12 +1311,19 @@ impl Transaction {
             &self.matched_vars,
         ];
         let singles = [&self.request_body, &self.response_body];
+        let dynamic_pm_bytes = self
+            .dynamic_pm_matcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, DynamicPmMatcher::retained_memory_bytes);
         maps.into_iter()
             .map(Map::allocated_bytes)
             .chain(singles.into_iter().map(Single::allocated_bytes))
             .chain([
                 self.request_body_buffer.allocated_bytes(),
                 self.response_body_buffer.allocated_bytes(),
+                dynamic_pm_bytes,
                 self.matched_rules_memory_bytes(),
             ])
             .fold(0_usize, usize::saturating_add)
@@ -1131,8 +1654,9 @@ impl Transaction {
     /// uses this so a disappeared spill file is reported by `finish` instead of silently
     /// producing an entry with an empty body.
     fn audit_log_checked(&mut self) -> AuditLog {
-        let has = |part| self.audit_log_parts.contains(&part);
-        let request_body = if has(AuditLogPart::RequestBody) {
+        let has_request_body = self.audit_log_parts.contains(&AuditLogPart::RequestBody);
+        let has_response_body = self.audit_log_parts.contains(&AuditLogPart::IntermediaryResponseBody);
+        let request_body = if has_request_body {
             match self.request_body_buffer.retained() {
                 Ok(body) => Some(body.into_owned()),
                 Err(error) => {
@@ -1143,7 +1667,7 @@ impl Transaction {
         } else {
             None
         };
-        let response_body = if has(AuditLogPart::IntermediaryResponseBody) {
+        let response_body = if has_response_body {
             match self.response_body_buffer.retained() {
                 Ok(body) => Some(body.into_owned()),
                 Err(error) => {
@@ -1423,11 +1947,12 @@ impl Transaction {
         if !collection.eq_ignore_ascii_case("TX") {
             return;
         }
+        self.matched_vars_dirty = true;
         let (key, value) = assignment.split_once('=').unwrap_or((assignment, "1"));
         let Ok(key) = Macro::new(key) else {
             return;
         };
-        let key = key.expand(self).to_ascii_lowercase();
+        let key = key.expand_cow(self).to_ascii_lowercase();
         if key.is_empty() {
             return;
         }
@@ -1438,7 +1963,7 @@ impl Transaction {
         let Ok(value) = Macro::new(value) else {
             return;
         };
-        let value = value.expand(self);
+        let value = value.expand_cow(self);
         let arithmetic = value
             .strip_prefix('+')
             .map(|number| (true, number))
@@ -1453,7 +1978,7 @@ impl Transaction {
                 Err(_) if number.is_empty() => 0,
                 Err(_) if number.starts_with("tx.") => return,
                 Err(_) => {
-                    self.set_tx_variable(&key, value);
+                    self.set_tx_variable(&key, value.as_bytes());
                     return;
                 },
             };
@@ -1472,7 +1997,7 @@ impl Transaction {
             self.set_tx_variable(&key, result.to_string());
             return;
         }
-        self.set_tx_variable(&key, value);
+        self.set_tx_variable(&key, value.as_bytes());
     }
 
     /// Set a transaction-scoped `ENV` value without changing the process environment.
@@ -1483,7 +2008,8 @@ impl Transaction {
         let Ok(value) = Macro::new(value) else {
             return;
         };
-        self.env.set(key.trim(), [value.expand(self)]);
+        let value = value.expand_cow(self).into_owned();
+        self.env.set(key.trim(), [value]);
     }
 
     /// Set the request URI supplied by the connector.
@@ -1727,10 +2253,14 @@ impl Transaction {
     /// rule keeps one rule's match from leaking into the next. The keys are seeded by the
     /// constructor, so this rewrite allocates nothing.
     fn reset_matched_vars(&mut self) {
+        if !self.matched_vars_dirty {
+            return;
+        }
         self.matched_vars.reset();
         for key in TX_CAPTURE_KEYS.iter().take(10) {
             self.tx.set_index(key, 0, "");
         }
+        self.matched_vars_dirty = false;
     }
 
     /// Whether an argument was dropped because the configured limit was reached.
@@ -1753,7 +2283,8 @@ impl Transaction {
             .args_combined_size
             .saturating_add(key.len())
             .saturating_add(value.len());
-        self.args_combined_size_value.set(self.args_combined_size.to_string());
+        let combined_size = self.args_combined_size.to_string();
+        self.args_combined_size_value.set(combined_size);
     }
 }
 
@@ -2217,6 +2748,16 @@ impl Drop for Transaction {
         }
         // Best effort: the terminal outcome is observable through `finish`.
         drop(self.finish());
+        if self.pool.is_none() || self.audit_error.is_some() || !self.finalization_errors.is_empty() {
+            return;
+        }
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        inner.reset_for_pool();
+        if let Some(pool) = &self.pool {
+            pool.put(inner);
+        }
     }
 }
 
@@ -2233,7 +2774,8 @@ mod tests {
     };
 
     use super::{
-        BodyIngestionStats, RuleGroup, Transaction, VariableCollection,
+        BodyIngestionStats, DynamicPmMatcher, MAX_CACHED_DYNAMIC_PM_BYTES, MAX_DYNAMIC_PM_PATTERN_BYTES,
+        MAX_POOL_RETAINED_BYTES, RuleGroup, Transaction, TransactionPool, VariableCollection,
         body_buffer::{BufferFailure, inject_failure},
     };
     use crate::{
@@ -2258,6 +2800,75 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    #[test]
+    fn dynamic_pm_cache_bounds_compiled_automaton_memory() {
+        let small = Transaction::new("small-dynamic-pm");
+        assert!(small.evaluate_dynamic_pm("needle".to_owned(), b"needle", &mut Outputs::default()));
+        assert!(
+            small.dynamic_pm_matcher.lock().unwrap().is_some(),
+            "a small compiled matcher should be reused"
+        );
+
+        let oversized_source = "x".repeat(MAX_DYNAMIC_PM_PATTERN_BYTES + 1);
+        assert!(
+            !small.evaluate_dynamic_pm(oversized_source, b"x", &mut Outputs::default()),
+            "an input shorter than the phrase does not need an uncached automaton"
+        );
+        assert!(
+            small.dynamic_pm_matcher.lock().unwrap().is_none(),
+            "an oversized source must evict any previously retained matcher"
+        );
+
+        let patterns = (0..5_800)
+            .map(|index| format!("p{index:04x}q{:04x}", index ^ 0x5A5A))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(patterns.len() <= MAX_DYNAMIC_PM_PATTERN_BYTES);
+        let matcher = DynamicPmMatcher::new(patterns.clone());
+        assert!(
+            matcher.estimated_memory_bytes() > MAX_CACHED_DYNAMIC_PM_BYTES,
+            "the test pattern set must exceed the compiled cache budget"
+        );
+
+        let large = Transaction::new("large-dynamic-pm");
+        let first = patterns.split(' ').next().unwrap().to_owned();
+        assert!(large.evaluate_dynamic_pm(patterns, first.as_bytes(), &mut Outputs::default()));
+        assert!(
+            large.dynamic_pm_matcher.lock().unwrap().is_none(),
+            "an oversized compiled matcher must not remain in the transaction cache"
+        );
+    }
+
+    #[test]
+    fn transaction_pool_enforces_total_retained_capacity_budget() {
+        let parts = MAX_POOL_RETAINED_BYTES / 3 + 64 * 1024;
+        let config = Arc::new(WafConfig {
+            audit_log_parts: vec![AuditLogPart::Header; parts],
+            ..WafConfig::default()
+        });
+        let rules = Arc::new(RuleGroup::new());
+        let pool = Arc::new(TransactionPool::new());
+        let first = Transaction::with_pool(Arc::clone(&config), Arc::clone(&rules), "pool-first", Arc::clone(&pool));
+        let second = Transaction::with_pool(
+            Arc::clone(&config),
+            Arc::clone(&rules),
+            "pool-second",
+            Arc::clone(&pool),
+        );
+        let third = Transaction::with_pool(config, rules, "pool-third", Arc::clone(&pool));
+
+        drop(first);
+        drop(second);
+        drop(third);
+
+        assert_eq!(pool.len(), 2, "the third state would exceed the WAF-wide cap");
+        assert!(pool.retained_bytes() <= MAX_POOL_RETAINED_BYTES);
+        assert!(pool.take().is_some());
+        assert!(pool.retained_bytes() > 0);
+        assert!(pool.take().is_some());
+        assert_eq!(pool.retained_bytes(), 0);
     }
 
     #[test]
@@ -2969,6 +3580,11 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
                 assert!(value.is_empty(), "TX:{} was not cleared", String::from_utf8_lossy(&key));
             }
         }
+        assert!(!tx.matched_vars_dirty, "reset marks the per-rule state clean");
+
+        tx.set_tx_variable("0", "next-rule");
+        tx.reset_matched_vars();
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("0")).as_deref(), Some(""));
     }
 
     #[test]

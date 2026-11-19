@@ -827,3 +827,82 @@ The GET and form cases are within repeated-run spread. The JSON cases show a con
 ### Verdict
 
 Accepted. The change removes non-deterministic verdicts (a correctness defect) for a cost within spread on four of six cases and ~2% on the JSON cases. Rust remains faster than Go on every case in the paired rounds. Per-transaction allocation counts were not re-measured for this change; the JSON ingestion path performs more bookkeeping allocations per distinct key by construction.
+
+## Batch D Coraza and detector performance comparison (2026-11-18)
+
+### Identity and method
+
+- Base revision: `198651c57c9b1ee4c6cf45e7c421fe64b2a85fb9`. These measurements reflect the Batch D candidate before the later in-place rule-index removal and benchmark-fixture anonymization commits; those follow-ups are not represented by these timings.
+- C oracle: libinjection `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707` (set `LIBINJECTION_DIR` to that checkout). CRS: `v4.30.0`, SHA-256 `3d678a41fd5aade34760127fef5dd64fd7a77848913fc0f70dde0cf467c94427`.
+- Toolchain: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, Cargo `1.99.1 (5f94df478 2026-08-27)`, GCC `16.2.1`; C speed driver used `cc -O3`.
+- Host: AMD Ryzen 7 PRO 7840HS, x86_64 Linux `7.3.3-300.fc45`. Runs were pinned to logical CPU 3. The governor was `performance`, but frequency scaling remained active (419 MHz–5.138 GHz; one CPU-3 snapshot was 3.393 GHz), so small timing differences remain noisy.
+- Each suite ran three alternating pairs: base→candidate, candidate→base, base→candidate. The Coraza micro driver used 5,000 iterations and five repetitions; selected one-call rows and configure rows use one iteration by design. `compare` validated 503 corpus inputs and `scaling` validated all 130 generated workloads per run.
+
+The timing commands, run from each base/candidate worktree, were:
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target"
+export TMPDIR="$CARGO_TARGET_DIR/tmp"
+mkdir -p "$TMPDIR"
+export LIBINJECTION_DIR=/path/to/pinned/libinjection
+
+taskset -c 3 cargo bench --locked --quiet -p coraza --bench micro -- \
+  --iterations 5000 --repetitions 5 \
+  --crs /path/to/crs-v4.30.0
+taskset -c 3 cargo bench --locked --quiet -p libperfusion --bench speed
+taskset -c 3 cargo bench --locked --quiet -p libperfusion --bench compare
+taskset -c 3 cargo bench --locked --quiet -p libperfusion --bench scaling
+```
+
+The selected workload medians and ranges below are the committed summary; the full per-workload TSV and raw run logs are not part of this PR.
+
+### Selected hot-path results
+
+Values are medians of the three run medians; bracketed values are the low/high run medians.
+
+| Workload | Base ns | Candidate ns | Candidate/base |
+|---|---:|---:|---:|
+| `contains/args_macro_near_miss_128k` | 257,995 [254,879–260,681] | 251,103 [248,618–251,112] | 0.973 |
+| `rx/invalid_utf8_miss_4k` | 17,769 [17,696–17,817] | 17,786 [17,767–19,427] | 1.001 |
+| `select/txn_early_match_1000_args_8k` | 2,698,643 [2,672,428–2,806,394] | 1,394,521 [1,354,128–1,527,972] | 0.517 |
+| `configure/update_id_action_668_rules_800_directives` | 62,126,763 [61,730,460–62,216,335] | 1,054,564 [1,051,326–1,077,135] | 0.017 |
+| `configure/update_target_30000_rules_800_ranges` | 361,404,650 [351,353,834–362,438,980] | 50,425,258 [49,640,669–50,630,172] | 0.140 |
+| `configure/30000_rules` | 296,297,262 [293,436,415–302,849,691] | 25,366,422 [24,887,603–25,820,569] | 0.086 |
+| `select/txn_message_macro_miss_20args` | 19,920 [19,861–20,255] | 13,838 [13,783–13,885] | 0.695 |
+| `crs/phase12_10args` | 1,149,289 [1,144,421–1,149,849] | 857,656 [853,044–870,853] | 0.746 |
+
+The earlier 15-repetition `@contains` diagnostic showed a 6.3% candidate slowdown before the final operator-macro borrow: base 252,854 ns [251,462–256,191], candidate 268,805 ns [264,507–276,429]. The cause was an intermediate owned string for an exact single-variable macro. After borrowing valid UTF-8 values for read-only operator expansion, a focused 15-repetition pair measured base 252,846 ns [251,413–259,809] and candidate 251,102 ns [249,660–254,409] (0.993×; sample ranges overlap). The final three-pair micro row is also slightly faster, not a claimed speedup.
+
+The earlier invalid-UTF-8 `@rx` estimate of about +6% did not reproduce: the focused post-fix pair was 17,809 ns [17,755–18,655] base vs 17,789 ns [17,669–18,649] candidate. The full paired row remains within sample spread. The regex UTF-8 validation path is unchanged.
+
+`speed` candidate/base ratios have a 1.003 median across seven workloads (0.989–1.006). `compare` ratios have medians of 1.011 for the capped API and 1.014 for the caller-bounded API; their timed sample ranges overlap. The `scaling` ratio median is 0.999 (10th–90th percentile 0.971–1.014; full range 0.846–1.072). The 4 KiB SQLi `attack_after_whitespace` hit is 0.995× with overlapping samples, so the prior outlier is inconclusive, not a demonstrated regression. One small `sqli/statement_word_prose_miss` micro median is 1.017× with overlapping samples; treat it as inconclusive. No detector implementation change was made in Batch D.
+
+### Batch D disposition
+
+| Finding | Disposition |
+|---|---|
+| P-01 | Cache prototype remains removed. Same-source ablation measured cached 157.5 µs vs uncached 116.1 µs for shared-prefix matching and 1.92 ms vs 0.845 ms for CRS execution. |
+| P-02 | Fixed: match candidates lazily using stable map/single locators; snapshot only TX/ENV/matched-variable sources and operator/action mutation edges. Tests cover 1,000 8-KiB ARGS, ordering, matched outcomes, and mutation behavior. |
+| P-03 | Copy-on-write transformations and borrowed empty-chain evaluation remain; the empty-chain micro difference is within sample/timer noise. |
+| P-04 | Fixed for retained state: the dynamic `@pm` cache admits source expansions up to 64 KiB and estimated compiled/phrase memory up to 256 KiB. Larger expansions run uncached to preserve operator semantics. The retained cache is included in `body_memory_bytes()`. |
+| P-05 | Constant macro values use copy-on-write expansion; invalid UTF-8 retains the existing lossy-text behavior. |
+| P-06 | No whole-input UTF-8 shortcut: regex Unicode semantics require validation. Final invalid-byte measurements do not show a repeatable slowdown. |
+| P-07 / P-09 | Matched state resets only when dirty; attacker-controlled map keys use randomized AHash. `make audit` passes with the existing allowed advisory and dependency-duplication warnings. |
+| Operator-macro follow-up | Borrowing exact single-variable operator parameters removes redundant materialization in the measured `@contains` path; this is not a reimplementation of the already-merged P-08 algorithm. |
+| P-10 | Residual: lazy `msg`/`logdata` expansion is not implemented. Operator macros can read the current `RULE.msg`/`RULE.logdata`; a regression test preserves that behavior. |
+| P-11 | Fixed: capacities counted against body budgets are released before pooling; the WAF-local pool is capped at 16 states and 2 MiB estimated retained capacity. Regression tests cover 40 POST args, empty-request accounting, and the byte cap. |
+| P-12–P-14 | Reuse bounded `Single`/matched-state buffers and skip dynamic `@pm` matching when the input is shorter than its shortest phrase. |
+| P-15 | Fixed: ID-bearing updates stage only selected rules and update the ID index sequentially; tests cover sequential ranges and atomic failure. |
+| P-16 | Fixed: BTree ID ranges drive target updates and retain directive order; tests and both 30k-rule/range-update benchmarks cover the path. |
+| P-17 | Residual: documentation/probes preserve the default-plus-strict detection union and its at-most-two scans. There is no bounded helper; callers must pre-slice, and the reported 680-payload corpus remains unavailable. |
+
+`TransactionInner` remains `#[doc(hidden)] pub` because it is `Deref::Target`; making it private would require a broad forwarding/API refactor. `Transaction: Send + Sync` is covered by a regression test.
+
+The `@pm` cap bounds retained cache size, not peak compilation memory: oversized expansions still compile uncached, and one temporary automaton may exceed 256 KiB before the post-build estimate decides not to retain it.
+
+### Verification
+
+- `make lint`, `make test`, and `make audit` passed. Audit reports the allowed `RUSTSEC-2026-0486` advisory for `rustix 1.1.5`, duplicate dependency warnings (including the AHash `getrandom` path), and unmatched license allowances.
+- `make parity-differential` passed: 869 pinned C results, 17,380 Go-oracle comparisons with zero oracle errors, and 770 generated differential cases. The one token-stream difference is diagnostic-only; 20 XSS differences are reviewed. The default-plus-strict SQLi union regression test passed.
+- Focused fuzz: `seclang_rule_compilation` completed 441,807 runs and `seclang_operator` 173,300 runs (60 seconds each; seed `20261007`, max length 4,096, timeout 5 seconds); no crashes were found.
+- `make build-envoy-wasm` passed using the candidate worktree's target directory; `bash examples/envoy-libperfusion/test-envoy.sh` passed against Envoy 1.40.0.

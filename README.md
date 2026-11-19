@@ -69,7 +69,7 @@ The top-level functions provide the common detection paths:
 | Function | Result |
 | --- | --- |
 | `sqli(input: &[u8])` | `Option<Fingerprint>`; the fingerprint identifies a known SQLi pattern. |
-| `sqli_with_strict_fallback(input: &[u8])` | `Option<Fingerprint>`; default table, then the local dialect identifiers on a retry after a miss; `ATTACH`, `COPY`, `DETACH` and `VACUUM` count only as a statement after `;`. |
+| `sqli_with_strict_fallback(input: &[u8])` | `Option<Fingerprint>`; default table, then the local dialect identifiers on a retry after a miss that saw a strict-only identifier; `ATTACH`, `COPY`, `DETACH` and `VACUUM` count only as a statement after `;`. |
 | `sqli_with_dialect(input: &[u8])` | `Option<(Fingerprint, Dialect)>`, including the matching SQL dialect. |
 | `sqli_with_limit(input: &[u8], max_bytes: usize)` | SQLi detection over at most the first `max_bytes` bytes. |
 | `xss(input: &[u8])` | `bool`, checking the supported HTML and attribute-value contexts. |
@@ -81,6 +81,9 @@ The public constant `MAX_INPUT_LEN` is a suggested 65,536-byte bound for
 callers that need to limit scan work; the default detection functions scan the
 complete input. The `_with_limit` functions scan only a prefix of the requested
 length; a miss says nothing about bytes beyond that prefix.
+`sqli_with_strict_fallback` has no bounded variant and may run one additional
+detector pass after a token-gated miss. Callers that need a work bound must
+pre-slice the input before calling it.
 
 ### Parser and tokenizer APIs
 
