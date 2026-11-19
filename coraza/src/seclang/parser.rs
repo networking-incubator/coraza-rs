@@ -1291,8 +1291,8 @@ fn directive_sec_rule_update_target_by_id(options: &mut DirectiveOptions<'_>) ->
     for spec in ids.split_whitespace() {
         let range = parse_id_range(spec)?;
         for index in options.rules.indices_by_id_range(*range.start(), *range.end()) {
-            if let Some(rule) = options.rules.rule_at_mut(index) {
-                variables.apply_to(rule.variables_mut(), multiphase_evaluation);
+            if let Some(rule_variables) = options.rules.variables_at_mut(index) {
+                variables.apply_to(rule_variables, multiphase_evaluation);
             }
         }
     }
@@ -1314,8 +1314,8 @@ fn directive_sec_rule_update_target_by_tag(options: &mut DirectiveOptions<'_>) -
     options.rules.record_multiphase_evaluation(multiphase_evaluation)?;
     let variables = VariableList::parse(variables).map_err(|e| e.message)?;
 
-    options.rules.update_by_tag(tag, |rule| {
-        variables.apply_to(rule.variables_mut(), multiphase_evaluation);
+    options.rules.update_by_tag(tag, |rule_variables| {
+        variables.apply_to(rule_variables, multiphase_evaluation);
     });
     Ok(())
 }

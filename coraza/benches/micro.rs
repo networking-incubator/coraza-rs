@@ -214,11 +214,11 @@ fn twenty_arg_body() -> Vec<u8> {
 fn crs_body() -> Vec<u8> {
     let mut body = String::new();
     for (key, value) in [
-        ("username", "katz"),
-        ("email", "katz@example.com"),
+        ("username", "user01"),
+        ("email", "user01@example.com"),
         ("action", "save"),
         ("comment", "Hello from a normal account."),
-        ("path", "/home/katz/profile"),
+        ("path", "/home/user01/profile"),
         ("query", "plain"),
         ("lang", "en-US"),
         ("token", "0123456789abcdef"),
@@ -879,7 +879,7 @@ fn bench_crs(args: &Args, rows: &mut Vec<(&'static str, Timings)>) -> Result<(),
     let uri = "/bench/form?page=3&lang=en-US";
     let checked = phase12(&waf, uri, &body);
     let username = checked.get_variable(RuleVariable::ArgsPost, Some("username"));
-    if username.as_deref() != Some("katz") {
+    if username.as_deref() != Some("user01") {
         return Err(format!(
             "CRS request precheck did not parse username: {username:?}, interruption={:?}",
             checked.interruption()
