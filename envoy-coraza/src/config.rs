@@ -87,8 +87,8 @@
 //!   one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic. Upstream
 //!   would compile the rest of the policy and serve it; a policy that silently loses a rule line is a fail-open, so
 //!   this build keeps strict compilation.
-//! * A non-object document, and an object with no recognised key, are rejected where upstream reads them as an empty
-//!   configuration. Rejecting keeps the previous generation instead of silently dropping enforcement.
+//! * Unlike upstream, non-objects and objects with no recognised key are rejected so a reload cannot replace an
+//!   enforcing generation with an empty one.
 //! * A present `directives_map` or `per_authority_directives` that is not an object is rejected. Upstream's `ForEach`
 //!   on `null` iterates once and on an array iterates its elements, so such a document does something rather than
 //!   nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is read as empty instead:
@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_compressed_document_is_rejected() {
+    fn compressed_pass_through_documents_are_rejected() {
         for inner in ["", "  \n", "[]", "{}", "null"] {
             assert!(
                 Config::parse(compressed(inner).as_bytes()).is_err(),
