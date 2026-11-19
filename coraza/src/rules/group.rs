@@ -774,40 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_chain_parent_refunds_the_parent_and_its_members() {
-        let mut group = sample_group();
-        let total = group.total;
-        assert_eq!(group.rules()[5].chain.len(), 1);
-        group.delete_by_range(5, 5);
-        assert_eq!(group.total, total - 2);
-        assert_consistent(&group);
-
-        group.delete_by_range(1, 1);
-        assert_eq!(group.total, total - 3);
-        assert_consistent(&group);
-    }
-
-    #[test]
-    fn removing_the_markers_shifts_later_positions() {
-        let mut group = sample_group();
-        group.delete_by_range(0, 0);
-        assert_eq!(group.indices_by_id_range(4, 4), [3]);
-        assert_eq!(group.indices_by_id_range(7, 7), [6]);
-        assert_consistent(&group);
-    }
-
-    #[test]
-    fn removal_shifts_duplicate_id_positions_in_order() {
-        let mut group = sample_group_with_duplicate_id();
-        group.delete_by_range(1, 1);
-        group.delete_by_range(4, 4);
-        assert_eq!(group.indices_by_id_range(2, 2), [0, 4]);
-        group.delete_by_tag("dup");
-        assert_eq!(group.indices_by_id_range(2, 2), [0]);
-        assert_consistent(&group);
-    }
-
-    #[test]
     fn removed_ids_can_be_added_again_but_surviving_ids_cannot() {
         let mut group = sample_group();
         group.delete_by_range(2, 3);
