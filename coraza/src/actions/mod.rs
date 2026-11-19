@@ -209,7 +209,8 @@ impl CompiledAction {
                 tx.interrupt(rule.id, self.name.as_str(), status, "");
             },
             "redirect" => {
-                let data = Macro::new(&self.argument).map_or_else(|_| self.argument.clone(), |value| value.expand(tx));
+                let data = Macro::new(&self.argument)
+                    .map_or_else(|_| self.argument.clone(), |value| value.expand_cow(tx).into_owned());
                 // Go's `redirect.go` only honors a status a client can redirect with;
                 // any other value falls back to 302.
                 let status = if matches!(rule.status, 301 | 302 | 303 | 307) {

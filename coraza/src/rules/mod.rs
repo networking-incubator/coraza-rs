@@ -31,4 +31,5 @@ pub(crate) use group::{RuleGroup, RuleObserver};
 pub(crate) use operator::RuleOperator;
 pub(crate) use rule::Rule;
 pub use transformation::TransformationChain;
+pub(crate) use transformation::TransformationValue;
 pub(crate) use variable::{CollectionView, VariableException, VariableKey, VariableSpec, lowercase_like_go};

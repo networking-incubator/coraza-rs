@@ -8,6 +8,7 @@ repository.workspace = true
 description = "SecLang rule compilation and request processing for a separate Rust implementation of Coraza"
 
 [dependencies]
+ahash = { workspace = true }
 aho-corasick = "1.1"
 base64 = { version = "0.23", default-features = false, features = [
   "alloc",

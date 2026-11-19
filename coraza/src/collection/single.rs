@@ -44,7 +44,32 @@ impl Single {
 
     /// Set the value.
     pub(crate) fn set(&mut self, value: impl AsRef<[u8]>) {
-        self.data = value.as_ref().to_vec();
+        self.data.clear();
+        self.data.extend_from_slice(value.as_ref());
+    }
+
+    /// Set a value assembled from a prefix, separator, and suffix.
+    pub(crate) fn set_joined(&mut self, prefix: &[u8], separator: &[u8], suffix: &[u8]) {
+        self.data.clear();
+        self.data.extend_from_slice(prefix);
+        self.data.extend_from_slice(separator);
+        self.data.extend_from_slice(suffix);
+    }
+
+    /// Clear request data and drop unusually large retained buffers before pooling.
+    pub(crate) fn reset_for_reuse(&mut self) {
+        // shortcut: drop buffers above 4 KiB; raise after profiling shows large values recur.
+        const MAX_RETAINED_CAPACITY: usize = 4 * 1024;
+        self.data.clear();
+        if self.data.capacity() > MAX_RETAINED_CAPACITY {
+            self.data = Vec::new();
+        }
+    }
+
+    /// Remove request data and release capacity charged to an active body budget.
+    pub(crate) fn reset_and_release(&mut self) {
+        self.data.clear();
+        self.data.shrink_to_fit();
     }
 
     /// The stored bytes; empty if unset.
@@ -100,6 +125,18 @@ mod tests {
         let mut single = Single::new(RuleVariable::RequestMethod);
         single.set("GET");
         assert_eq!(single.get(), "GET");
+    }
+
+    #[test]
+    fn replacing_a_value_reuses_its_buffer() {
+        let mut single = Single::new(RuleVariable::RequestURI);
+        single.set("a longer request target");
+        let capacity = single.allocated_bytes();
+
+        single.set("short");
+
+        assert_eq!(single.get_bytes(), b"short");
+        assert_eq!(single.allocated_bytes(), capacity);
     }
 
     #[test]

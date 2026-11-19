@@ -20,7 +20,7 @@
 
 //! Regular expression matching.
 
-use std::path::Path;
+use std::{mem::size_of, path::Path};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 
@@ -458,54 +458,87 @@ pub fn rx(pattern: &str) -> Result<Rx, Box<dyn std::error::Error>> {
 pub struct Pm {
     /// Phrases with transaction variable references parsed.
     macro_param: Macro,
-    /// Matcher cached when the parameter has no variable references.
+    /// Matcher compiled once when the parameter has no variable references.
     cached_matcher: Option<AhoCorasick>,
+    /// Dynamic parameters are compiled when first seen on a transaction.
+    dynamic: bool,
+    /// Shortest phrase length in bytes; zero when an empty phrase is present.
+    min_pattern_len: usize,
+}
+
+/// The last macro-expanded phrase set evaluated by one transaction.
+#[derive(Debug)]
+pub(crate) struct DynamicPmMatcher {
+    /// The lowercase macro expansion this matcher represents.
+    patterns: String,
+    /// Matcher compilation can fail for an oversized state graph.
+    matcher: Option<AhoCorasick>,
+    /// Shortest phrase size used to skip impossible inputs.
+    min_pattern_len: usize,
+}
+
+impl DynamicPmMatcher {
+    /// Build a matcher for one lowercase macro expansion.
+    pub(crate) fn new(patterns: String) -> Self {
+        Self {
+            matcher: compile_pm_matcher(&patterns),
+            min_pattern_len: shortest_phrase(&patterns),
+            patterns,
+        }
+    }
+
+    /// Estimate bytes retained by this transaction's cached matcher.
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.patterns.capacity())
+            .saturating_add(self.matcher.as_ref().map_or(0, AhoCorasick::memory_usage))
+    }
+
+    /// Include the temporary phrase-reference vector used while compiling.
+    pub(crate) fn estimated_memory_bytes(&self) -> usize {
+        let phrase_descriptors = self
+            .patterns
+            .split(' ')
+            .count()
+            .saturating_mul(size_of::<&str>())
+            .saturating_mul(2);
+        self.retained_memory_bytes().saturating_add(phrase_descriptors)
+    }
+
+    /// Evaluate the compiled phrases, preserving the empty-pattern and capture behavior.
+    pub(crate) fn evaluate(&self, input: &[u8], out: &mut Outputs) -> bool {
+        self.matcher
+            .as_ref()
+            .is_some_and(|matcher| evaluate_pm_matcher(matcher, self.min_pattern_len, input, out))
+    }
+
+    /// Compile and evaluate once without retaining oversized macro expansions.
+    pub(crate) fn evaluate_uncached(patterns: &str, input: &[u8], out: &mut Outputs) -> bool {
+        let min_pattern_len = shortest_phrase(patterns);
+        input.len() >= min_pattern_len
+            && compile_pm_matcher(patterns)
+                .as_ref()
+                .is_some_and(|matcher| evaluate_pm_matcher(matcher, min_pattern_len, input, out))
+    }
+
+    /// Whether this cache entry represents the requested expansion.
+    pub(crate) fn matches_patterns(&self, patterns: &str) -> bool {
+        self.patterns == patterns
+    }
 }
 
 impl Operator for Pm {
     fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
-        let expanded;
-        let matcher = if let Some(matcher) = &self.cached_matcher {
-            matcher
-        } else {
-            let patterns = self.macro_param.expand(tx).to_lowercase();
-            // Go keeps empty phrases from `strings.Split`: an empty phrase
-            // matches every input.
-            let dict: Vec<&str> = patterns.split(' ').collect();
-            match AhoCorasick::builder()
-                .match_kind(MatchKind::LeftmostLongest)
-                .ascii_case_insensitive(true)
-                .build(&dict)
-            {
-                Ok(matcher) => {
-                    expanded = matcher;
-                    &expanded
-                },
-                Err(_) => return false,
+        if self.dynamic {
+            let patterns = self.macro_param.expand_for_operator(tx).to_lowercase();
+            if input.len() < shortest_phrase(&patterns) {
+                return false;
             }
-        };
-
-        if !out.wants_captures() {
-            return matcher.is_match(input);
+            return tx.evaluate_dynamic_pm(patterns, input, out);
         }
-        let mut matched = false;
-        // Go restarts matching after each match's start (its `Find` loop advances
-        // one byte past it), so overlapping phrases after a match are still
-        // captured: `@pm abc bcd` on `xabcyzabcde` captures abc, abc, bcd.
-        // `find_iter` is non-overlapping, so search from `start + 1` in a loop.
-        let mut offset = 0;
-        for index in 0..10 {
-            let Some(rest) = input.get(offset..) else { break };
-            let Some(found) = matcher.find_iter(rest).next() else {
-                break;
-            };
-            let start = offset + found.start();
-            let end = offset + found.end();
-            out.capture(index, input.get(start..end).unwrap_or_default());
-            matched = true;
-            offset = start + 1;
-        }
-        matched
+        self.cached_matcher
+            .as_ref()
+            .is_some_and(|matcher| evaluate_pm_matcher(matcher, self.min_pattern_len, input, out))
     }
 }
 
@@ -516,21 +549,56 @@ impl Operator for Pm {
 /// Returns an error for malformed macro syntax.
 pub fn pm(patterns: &str) -> Result<Pm, MacroError> {
     let macro_param = Macro::new(patterns)?;
-    let cached_matcher = if patterns.contains("%{") {
-        None
-    } else {
-        let patterns = patterns.to_lowercase();
-        let dict: Vec<&str> = patterns.split(' ').collect();
-        AhoCorasick::builder()
-            .match_kind(MatchKind::LeftmostLongest)
-            .ascii_case_insensitive(true)
-            .build(&dict)
-            .ok()
-    };
+    let dynamic = patterns.contains("%{");
+    let patterns = patterns.to_lowercase();
+    let min_pattern_len = shortest_phrase(&patterns);
+    let cached_matcher = if dynamic { None } else { compile_pm_matcher(&patterns) };
     Ok(Pm {
         macro_param,
         cached_matcher,
+        dynamic,
+        min_pattern_len,
     })
+}
+
+/// Compile phrases split the way Go's `strings.Split` does, retaining empty phrases.
+fn compile_pm_matcher(patterns: &str) -> Option<AhoCorasick> {
+    let dict: Vec<&str> = patterns.split(' ').collect();
+    AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .ascii_case_insensitive(true)
+        .build(&dict)
+        .ok()
+}
+
+/// The shortest phrase length in bytes, including empty phrases.
+fn shortest_phrase(patterns: &str) -> usize {
+    patterns.split(' ').map(str::len).min().unwrap_or(0)
+}
+
+/// Match phrases, restarting one byte after each match start when captures are enabled.
+fn evaluate_pm_matcher(matcher: &AhoCorasick, min_len: usize, input: &[u8], out: &mut Outputs) -> bool {
+    if input.len() < min_len {
+        return false;
+    }
+    if !out.wants_captures() {
+        return matcher.is_match(input);
+    }
+    let mut matched = false;
+    // Go restarts matching after each match's start, so overlapping phrases are captured.
+    let mut offset = 0;
+    for index in 0..10 {
+        let Some(rest) = input.get(offset..) else { break };
+        let Some(found) = matcher.find_iter(rest).next() else {
+            break;
+        };
+        let start = offset + found.start();
+        let end = offset + found.end();
+        out.capture(index, input.get(start..end).unwrap_or_default());
+        matched = true;
+        offset = start + 1;
+    }
+    matched
 }
 
 /// Case-insensitive phrase matching from a file, with one phrase per line.
@@ -672,7 +740,7 @@ pub struct Within {
 
 impl Operator for Within {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        contains_bytes(self.macro_param.expand(tx).as_bytes(), input)
+        contains_bytes(self.macro_param.expand_for_operator(tx).as_bytes(), input)
     }
 }
 
@@ -696,7 +764,7 @@ pub struct StrMatch {
 
 impl Operator for StrMatch {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        contains_bytes(input, self.macro_param.expand(tx).as_bytes())
+        contains_bytes(input, self.macro_param.expand_for_operator(tx).as_bytes())
     }
 }
 
@@ -1107,6 +1175,29 @@ mod tests {
                 .unwrap()
                 .evaluate(&tx, b"needle", &mut Outputs::default())
         );
+    }
+
+    #[test]
+    fn dynamic_pm_reuses_only_the_current_expansion() {
+        let mut tx = Transaction::new("operator-test");
+        tx.set_tx_variable("terms", b"bad");
+        let operator = pm("%{TX.terms}").unwrap();
+
+        assert!(operator.evaluate(&tx, b"bad", &mut Outputs::default()));
+        tx.set_tx_variable("terms", b"good");
+        assert!(!operator.evaluate(&tx, b"bad", &mut Outputs::default()));
+        assert!(operator.evaluate(&tx, b"good", &mut Outputs::default()));
+    }
+
+    #[test]
+    fn pm_minimum_length_keeps_empty_phrases_and_equal_length_matches() {
+        let tx = Transaction::new("operator-test");
+        let operator = pm("longerphrase").unwrap();
+        assert!(!operator.evaluate(&tx, b"short", &mut Outputs::default()));
+        assert!(operator.evaluate(&tx, b"longerphrase", &mut Outputs::default()));
+
+        let empty_phrase = pm(" phrase").unwrap();
+        assert!(empty_phrase.evaluate(&tx, b"", &mut Outputs::default()));
     }
 
     #[test]

@@ -64,6 +64,11 @@ impl RuleOperator {
     pub(crate) fn fails_closed_on_not_inspected(&self) -> bool {
         self.operator.fails_closed_on_not_inspected()
     }
+
+    /// Whether this operator can mutate the transaction's selected argument maps.
+    pub(crate) fn may_write_path_arguments(&self) -> bool {
+        self.operator.may_write_path_arguments()
+    }
 }
 
 #[cfg(test)]

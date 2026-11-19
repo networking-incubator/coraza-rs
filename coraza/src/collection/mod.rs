@@ -32,6 +32,8 @@
 //! - [`Single`] - a variable with one value
 //! - [`Map`] - a variable with values selected by key
 
+use std::borrow::Cow;
+
 use crate::types::RuleVariable;
 
 mod map;
@@ -61,6 +63,76 @@ pub struct MatchData {
     pub chain_level: usize,
 }
 
+/// A stable position for fetching one selected value after its collection borrow ends.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MatchLocation {
+    /// A value in a map, optionally exposing the key as the selected value.
+    Map {
+        /// The transaction collection that owns the map.
+        source: RuleVariable,
+        /// Entry position in insertion order.
+        entry_index: usize,
+        /// Value position for repeated keys.
+        value_index: usize,
+        /// Whether this selector returns the key bytes rather than the stored value.
+        names: bool,
+    },
+    /// A single-value collection.
+    Single {
+        /// The transaction collection that owns the value.
+        variable: RuleVariable,
+    },
+}
+
+/// A selected match that borrows collection values until an operator reports a result.
+pub(crate) struct MatchRef<'a> {
+    /// The selected variable.
+    pub(crate) variable: RuleVariable,
+    /// The lossy key reported to actions and logs.
+    pub(crate) key: Cow<'a, str>,
+    /// The original selected bytes.
+    pub(crate) value: Cow<'a, [u8]>,
+    /// The source position, if this match can be fetched again after releasing its borrow.
+    pub(crate) location: Option<MatchLocation>,
+}
+
+impl MatchRef<'_> {
+    /// The variable this match refers to.
+    pub(crate) fn variable(&self) -> RuleVariable {
+        self.variable
+    }
+
+    /// The lossy text key reported to rule actions and logs.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The selected value bytes.
+    pub(crate) fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// The source position, if this match came from a transaction collection.
+    pub(crate) fn location(&self) -> Option<MatchLocation> {
+        self.location
+    }
+
+    /// Copy this match when an operator result requires mutation of its collection.
+    pub(crate) fn to_owned(&self) -> MatchData {
+        MatchData::new(self.variable, self.key.as_ref(), self.value.as_ref())
+    }
+
+    /// Materialize the selected match after it matters to rule evaluation.
+    pub(crate) fn into_owned(self) -> MatchData {
+        MatchData::new(self.variable, self.key.into_owned(), self.value.into_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn value_is_borrowed(&self) -> bool {
+        matches!(self.value, Cow::Borrowed(_))
+    }
+}
+
 impl MatchData {
     /// Create a new `MatchData` instance.
     pub(crate) fn new(variable: RuleVariable, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
@@ -80,7 +152,7 @@ impl MatchData {
     }
 
     /// The value as text, invalid UTF-8 replaced with U+FFFD.
-    pub fn value_text(&self) -> std::borrow::Cow<'_, str> {
+    pub fn value_text(&self) -> Cow<'_, str> {
         crate::transformations::text_of(&self.value)
     }
 

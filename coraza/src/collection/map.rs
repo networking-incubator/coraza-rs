@@ -52,7 +52,7 @@ pub struct Map {
     case_sensitive: bool,
     /// Internal storage from `lookup_key` to `Vec<KeyValue>`, in insertion order.
     /// Keys are lowercase for case-insensitive maps.
-    data: IndexMap<Key, Vec<KeyValue>>,
+    data: IndexMap<Key, Vec<KeyValue>, ahash::RandomState>,
     /// The variable this collection represents
     variable: RuleVariable,
 }
@@ -220,7 +220,7 @@ impl Map {
     pub(crate) fn new(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: false,
-            data: IndexMap::new(),
+            data: IndexMap::with_hasher(ahash::RandomState::new()),
             variable,
         }
     }
@@ -231,7 +231,7 @@ impl Map {
     pub(crate) fn new_case_sensitive(variable: RuleVariable) -> Self {
         Self {
             case_sensitive: true,
-            data: IndexMap::new(),
+            data: IndexMap::with_hasher(ahash::RandomState::new()),
             variable,
         }
     }
@@ -260,8 +260,19 @@ impl Map {
     }
 
     /// Every key, exactly as stored, and value, in insertion order.
+    #[cfg(test)]
     pub(crate) fn iter_bytes(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         self.data.values().flatten().map(|kv| (kv.key.as_bytes(), kv.value()))
+    }
+
+    /// Every key and value with its stable map-entry/value position.
+    pub(crate) fn iter_bytes_indexed(&self) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
+        self.data.iter().enumerate().flat_map(|(entry_index, (_, values))| {
+            values
+                .iter()
+                .enumerate()
+                .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+        })
     }
 
     /// The keys and values stored under `key` (whatever its case, in a case-insensitive map).
@@ -276,29 +287,52 @@ impl Map {
             .map(|kv| (kv.key.text(), kv.value()))
     }
 
-    /// The keys and values stored under `key`, folded the way a keyed lookup folds it.
-    ///
-    /// This is not an exact-byte lookup: a case-insensitive map folds `key` first.
-    /// [`Map::iter_key_exact`] takes the bytes as they are.
-    pub(crate) fn iter_key_bytes(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+    /// Values under a folded key with their stable map-entry/value position.
+    pub(crate) fn iter_key_bytes_indexed(&self, key: &[u8]) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
         let lookup = self.lookup_key(key);
         self.data
-            .get(lookup.as_ref())
+            .get_full(lookup.as_ref())
             .into_iter()
-            .flatten()
-            .map(|kv| (kv.key.as_bytes(), kv.value()))
+            .flat_map(|(entry_index, _, values)| {
+                values
+                    .iter()
+                    .enumerate()
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+            })
     }
 
     /// The keys and values stored under the exact `key` bytes, without folding.
     ///
     /// A case-insensitive map is keyed by the folded bytes and a case-sensitive map by the
     /// raw bytes, so one exact lookup covers both. Nothing is allocated on this path.
+    #[cfg(test)]
     pub(crate) fn iter_key_exact(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         self.data
             .get(key)
             .into_iter()
             .flatten()
             .map(|kv| (kv.key.as_bytes(), kv.value()))
+    }
+
+    /// Values under an exact key with their stable map-entry/value position.
+    pub(crate) fn iter_key_exact_indexed(&self, key: &[u8]) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
+        self.data
+            .get_full(key)
+            .into_iter()
+            .flat_map(|(entry_index, _, values)| {
+                values
+                    .iter()
+                    .enumerate()
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+            })
+    }
+
+    /// Return one selected value by its stable map-entry/value position.
+    pub(crate) fn value_at(&self, entry_index: usize, value_index: usize, names: bool) -> Option<(&[u8], &[u8])> {
+        let (_, values) = self.data.get_index(entry_index)?;
+        let value = values.get(value_index)?;
+        let key = value.key.as_bytes();
+        Some((key, if names { key } else { value.value() }))
     }
 
     /// The keys and values whose (lookup) key matches `regex`.
@@ -313,13 +347,21 @@ impl Map {
             .map(|kv| (kv.key.text(), kv.value()))
     }
 
-    /// The keys and values whose (lookup) key matches `regex`, with keys as stored.
-    pub(crate) fn iter_regex_bytes<'a>(&'a self, regex: &'a Regex) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+    /// Keys and values matching `regex`, with stable map-entry/value positions.
+    pub(crate) fn iter_regex_bytes_indexed<'a>(
+        &'a self,
+        regex: &'a Regex,
+    ) -> impl Iterator<Item = (usize, usize, &'a [u8], &'a [u8])> {
         self.data
             .iter()
-            .filter(|(lookup_key, _)| regex.is_match(lookup_key.text()))
-            .flat_map(|(_, values)| values)
-            .map(|kv| (kv.key.as_bytes(), kv.value()))
+            .enumerate()
+            .filter(move |(_, (lookup_key, _))| regex.is_match(lookup_key.text()))
+            .flat_map(|(entry_index, (_, values))| {
+                values
+                    .iter()
+                    .enumerate()
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+            })
     }
 
     /// Name of the variable this map holds (e.g. `ARGS`).
@@ -421,6 +463,27 @@ impl Map {
     /// Removes every key.
     pub(crate) fn reset(&mut self) {
         self.data.clear();
+    }
+
+    /// Remove all entries while retaining only a bounded amount of table capacity.
+    pub(crate) fn reset_for_reuse(&mut self) {
+        self.data.clear();
+        self.trim_for_reuse();
+    }
+
+    /// Remove request data and release capacity charged to an active body budget.
+    pub(crate) fn reset_and_release(&mut self) {
+        self.data.clear();
+        self.data.shrink_to_fit();
+    }
+
+    /// Drop the backing table if it grew beyond the pool's retention budget.
+    pub(crate) fn trim_for_reuse(&mut self) {
+        // shortcut: drop tables above 16 KiB; raise after profiling shows large maps recur.
+        const MAX_RETAINED_TABLE_BYTES: usize = 16 * 1024;
+        if self.allocated_bytes() > MAX_RETAINED_TABLE_BYTES {
+            self.data = IndexMap::with_hasher(ahash::RandomState::new());
+        }
     }
 
     /// Number of distinct keys.

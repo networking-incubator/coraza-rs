@@ -53,7 +53,7 @@ fn as_int(input: &[u8]) -> i64 {
 
 /// Expand and parse an integer parameter, using zero when parsing fails.
 fn parameter_int(parameter: &Macro, tx: &Transaction) -> i64 {
-    parse_int(parameter.expand(tx).as_bytes())
+    parse_int(parameter.expand_for_operator(tx).as_bytes())
 }
 
 /// Numeric equality. Invalid integers are treated as zero.
@@ -185,7 +185,7 @@ pub struct StrEq {
 
 impl Operator for StrEq {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        input == self.macro_param.expand(tx).as_bytes()
+        input == self.macro_param.expand_for_operator(tx).as_bytes()
     }
 }
 
@@ -209,7 +209,7 @@ pub struct Contains {
 
 impl Operator for Contains {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        contains_bytes(input, self.macro_param.expand(tx).as_bytes())
+        contains_bytes(input, self.macro_param.expand_for_operator(tx).as_bytes())
     }
 }
 
@@ -233,7 +233,7 @@ pub struct BeginsWith {
 
 impl Operator for BeginsWith {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        input.starts_with(self.macro_param.expand(tx).as_bytes())
+        input.starts_with(self.macro_param.expand_for_operator(tx).as_bytes())
     }
 }
 
@@ -257,7 +257,7 @@ pub struct EndsWith {
 
 impl Operator for EndsWith {
     fn evaluate(&self, tx: &Transaction, input: &[u8], _out: &mut Outputs) -> bool {
-        input.ends_with(self.macro_param.expand(tx).as_bytes())
+        input.ends_with(self.macro_param.expand_for_operator(tx).as_bytes())
     }
 }
 

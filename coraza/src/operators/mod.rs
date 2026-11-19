@@ -44,6 +44,7 @@ pub use detection::{DetectSQLi, DetectXSS, detect_sqli, detect_xss};
 pub use inspect_file::{InspectFile, inspect_file};
 pub use ip::{IpMatch, IpMatchFromDataset, IpMatchFromFile, ip_match, ip_match_from_dataset, ip_match_from_file};
 pub use macros::{Macro, MacroError};
+pub(crate) use pattern::DynamicPmMatcher;
 pub use pattern::{
     Pm, PmFromDataset, PmFromFile, RestPath, Rx, StrMatch, Within, pm, pm_from_dataset, pm_from_file, rest_path, rx,
     strmatch, within,
@@ -233,6 +234,11 @@ impl Outputs {
         self.capturing
     }
 
+    /// Whether the operator produced no captures or path arguments.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.captures.is_empty() && self.path_arguments.is_empty()
+    }
+
     /// Add a capture when the rule requested them.
     pub fn capture(&mut self, index: usize, value: &[u8]) {
         if self.capturing {
@@ -411,6 +417,11 @@ impl OperatorEnum {
             Self::Rbl(_) => true,
             _ => false,
         }
+    }
+
+    /// Whether this operator can add path arguments to the transaction.
+    pub(crate) fn may_write_path_arguments(&self) -> bool {
+        matches!(self, Self::RestPath(_) | Self::Custom(_))
     }
 
     /// Evaluate the selected operator.
