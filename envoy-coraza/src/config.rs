@@ -21,11 +21,13 @@
 //!
 //! # Accepted values
 //!
-//! * Blank or whitespace-only input is an empty [`Config`]: every request then passes uninspected. [`Config::parse`]
-//!   accepts it so a first load with no plugin configuration stays an explicit, warned pass-through; the root context
-//!   refuses it as a reload, so it can never replace an active generation. A document whose top level is not an object,
-//!   or an object with none of the recognised keys below (so `{}` or only misspelled keys), is rejected: it would
-//!   otherwise install a generation that inspects nothing, in place of a working one.
+//! * Blank, whitespace-only or missing input is rejected on every load. Envoy creates a fresh root context for each
+//!   configuration update and never calls `on_configure` twice on one root, so a load cannot tell a first load from a
+//!   reload; accepting blank input would let a cleared configuration be acknowledged as "inspect nothing". The
+//!   rejection makes Envoy keep the previous configuration. A document whose top level is not an object, or an object
+//!   with none of the recognised keys below (so `{}` or only misspelled keys), is rejected for the same reason. The one
+//!   deliberate way to configure an uninspected filter is an explicit recognised key such as `{"directives_map": {}}`,
+//!   which is accepted and logged as a warning.
 //! * `directives_map` is an object of policy name to an array of directives, or to a single scalar, which becomes a
 //!   one-element list. Array elements are coerced with [`scalar_text`]: strings, numbers, booleans and `null`
 //!   contribute their text; an array or object anywhere in a policy's directive list is rejected, naming the policy and
@@ -310,6 +312,8 @@ pub(crate) enum ConfigError {
     },
     /// The top-level object holds none of the [`RECOGNISED_KEYS`].
     NoRecognisedKey,
+    /// The plugin configuration is empty, whitespace-only or missing.
+    BlankConfiguration,
     /// A decompressed `config_gzip_b64` document is blank.
     BlankCompressedDocument,
     /// `config_gzip_b64` is empty, whitespace or not a string.
@@ -397,6 +401,12 @@ impl Display for ConfigError {
                 "plugin configuration has none of the recognised keys ({}); check for a misspelled key",
                 RECOGNISED_KEYS.join(", ")
             ),
+            Self::BlankConfiguration => write!(
+                f,
+                "plugin configuration is blank or missing; supply one of the recognised keys ({}), for example \
+                 {{\"directives_map\": {{}}}} for an explicitly uninspected filter",
+                RECOGNISED_KEYS.join(", ")
+            ),
             Self::BlankCompressedDocument => f.write_str("the decompressed configuration is blank"),
             Self::EmptyPolicyName { authority } => {
                 write!(
@@ -432,13 +442,14 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidJson`] for malformed JSON, a typed error
+    /// Returns [`ConfigError::BlankConfiguration`] for blank input,
+    /// [`ConfigError::InvalidJson`] for malformed JSON, a typed error
     /// for a key whose shape, authority or `rule_data` entry breaks a bound, or
     /// one of the `config_gzip_b64` errors. Policy references are resolved
     /// during compilation, not here.
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ConfigError> {
         if is_blank(bytes) {
-            return Ok(Self::default());
+            return Err(ConfigError::BlankConfiguration);
         }
         let object = Self::parse_object(bytes)?;
         let Some(encoded) = object.get("config_gzip_b64") else {
@@ -505,8 +516,8 @@ impl Config {
     }
 }
 
-/// Whether `bytes` is empty or only ASCII whitespace, which [`Config::parse`] reads as an empty configuration.
-pub(crate) fn is_blank(bytes: &[u8]) -> bool {
+/// Whether `bytes` is empty or only ASCII whitespace, which [`Config::parse`] rejects.
+fn is_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(u8::is_ascii_whitespace)
 }
 
@@ -1019,18 +1030,25 @@ mod tests {
     }
 
     #[test]
-    fn blank_input_is_accepted_as_an_empty_configuration() {
+    fn blank_input_is_rejected_and_an_explicit_empty_policy_map_is_the_only_pass_through() {
         for input in ["", " ", "\n\t ", "  \r\n"] {
-            let config = parse(input);
-            assert!(config.directives_map.is_empty(), "blank input selects no policy");
-            assert!(config.default_directives.is_none(), "blank input has no default");
             assert!(
-                config.per_authority_directives.is_empty(),
-                "blank input has no authorities"
+                matches!(
+                    Config::parse(input.as_bytes()).unwrap_err(),
+                    ConfigError::BlankConfiguration
+                ),
+                "{input:?} is rejected"
             );
-            assert!(config.rule_data.is_empty(), "blank input has no rule data");
-            assert!(!config.enable_filter_state_logs, "blank input keeps state logs off");
         }
+        let config = parse(r#"{"directives_map": {}}"#);
+        assert!(
+            config.directives_map.is_empty(),
+            "an explicit empty map selects no policy"
+        );
+        assert!(
+            config.default_directives.is_none(),
+            "an explicit empty map has no default"
+        );
     }
 
     #[test]

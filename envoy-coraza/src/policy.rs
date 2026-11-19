@@ -21,6 +21,7 @@
 
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::BTreeMap,
     fmt::{self, Display, Formatter},
     io,
@@ -249,6 +250,8 @@ pub(crate) struct Generation {
     generation_id: u64,
     /// Configure-time warnings, one per policy that needs one.
     warnings: Vec<String>,
+    /// Whether a request that matched no policy was already reported at warning level.
+    unmatched_reported: Cell<bool>,
 }
 
 /// A generation that cannot be built.
@@ -575,6 +578,7 @@ impl Generation {
             diagnostics,
             generation_id: 0,
             warnings,
+            unmatched_reported: Cell::new(false),
         })
     }
 
@@ -600,6 +604,14 @@ impl Generation {
     /// Configure-time warnings, one per policy that needs one.
     pub(crate) fn warnings(&self) -> impl Iterator<Item = &str> {
         self.warnings.iter().map(String::as_str)
+    }
+
+    /// Records that a request matched no policy and returns whether it is the first one of this generation.
+    ///
+    /// Only the first is worth a warning: with no default policy every request of an unconfigured authority is
+    /// unmatched, and one warning per request floods the log.
+    pub(crate) fn first_unmatched_request(&self) -> bool {
+        !self.unmatched_reported.replace(true)
     }
 
     /// Whether the legacy interruption filter-state fields are enabled.
@@ -746,6 +758,23 @@ mod tests {
             ["envoy-coraza: no policies configured; every request passes uninspected"],
             "an empty generation warns that nothing is inspected"
         );
+    }
+
+    #[test]
+    fn only_the_first_unmatched_request_of_a_generation_is_reported() {
+        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        assert!(
+            generation.first_unmatched_request(),
+            "the first unmatched request is reported"
+        );
+        for _ in 0..3 {
+            assert!(
+                !generation.first_unmatched_request(),
+                "later ones are not reported again"
+            );
+        }
+        let fresh = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        assert!(fresh.first_unmatched_request(), "each generation reports once");
     }
 
     #[test]

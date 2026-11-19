@@ -20,9 +20,18 @@
 
 //! Built-in body decoders and the custom body-processor API.
 
-use std::{mem::size_of, path::Path, sync::Arc};
+use std::{
+    mem::size_of,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use crate::config::UploadKeepFiles;
+use crate::{
+    collection::{
+        FIRST_INSERT_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
+    },
+    config::UploadKeepFiles,
+};
 
 /// Whether a custom body processor is handling request or response bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,21 +133,119 @@ pub struct BodyProcessorOutput {
     file_capacity: usize,
     /// Whether the current target has an engine-managed file storage sink.
     file_storage_available: bool,
-    /// Maximum staged-output bytes, including copied data and per-entry storage.
+    /// Maximum staged content bytes: argument and XML names and values with their per-entry storage, and
+    /// file content. It is the body limit, so content that fits the limit is never refused for its metadata.
     byte_capacity: usize,
-    /// Bytes already accepted by the output methods.
+    /// Content bytes already accepted by the output methods.
     output_bytes: usize,
-    /// Whether an output entry exceeded the cumulative byte budget.
+    /// Maximum bytes for file metadata, which has its own allowance: see [`metadata_capacity`].
+    metadata_capacity: usize,
+    /// File metadata bytes already accepted.
+    metadata_bytes: usize,
+    /// Bytes the path of one temporary file occupies in `FILES_TMPNAMES` and in the transaction's own list.
+    upload_path_bytes: usize,
+    /// Collections each staged argument is copied into when published: `ARGS_POST` and `ARGS` for a request,
+    /// `RESPONSE_ARGS` for a response.
+    argument_copies: usize,
+    /// Whether an output entry exceeded a cumulative budget.
     pub(crate) byte_limit_reached: bool,
+    /// The error for the budget that was exceeded.
+    pub(crate) limit_error: &'static str,
 }
 
-/// Error reported when a custom processor exceeds its cumulative output budget.
+/// Error reported when a custom processor exceeds its cumulative content budget.
 const OUTPUT_BYTE_LIMIT_ERROR: &str = "custom body processor output exceeded byte limit";
 
-/// Estimated engine-side copies per file: the `FILES`, `FILES_SIZES`, `FILES_NAMES`,
-/// `MULTIPART_PART_HEADERS`, `MULTIPART_NAME` and `MULTIPART_FILENAME` entries,
-/// including the `Content-Type: ` prefix and the decimal size text.
-const FILE_COLLECTION_OVERHEAD: usize = 64;
+/// Error reported when a custom processor exceeds its cumulative file-metadata budget.
+const METADATA_BYTE_LIMIT_ERROR: &str = "custom body processor file metadata exceeded byte limit";
+
+/// Error reported when the collection copies of a processor's arguments and XML values exceed the same budget.
+const COLLECTION_BYTE_LIMIT_ERROR: &str = "custom body processor collection copies exceeded byte limit";
+
+/// Metadata, which is what the engine retains beyond the staged content, may use this multiple of the content
+/// budget: many small files with long names, and many tiny arguments or XML values, are bounded relative to the
+/// body that produced them without costing the content any of its own allowance.
+const METADATA_BUDGET_FACTOR: usize = 4;
+
+/// Keeps small body limits usable: one file's metadata is several kilobytes however small its content is,
+/// because every collection it touches allocates its first table.
+const METADATA_BUDGET_FLOOR: usize = 32 * 1024;
+
+/// The file-metadata allowance for a content budget of `byte_capacity` bytes.
+fn metadata_capacity(byte_capacity: usize) -> usize {
+    byte_capacity
+        .saturating_mul(METADATA_BUDGET_FACTOR)
+        .max(METADATA_BUDGET_FLOOR)
+}
+
+/// Bytes the engine retains in `copies` collections for one staged name/value entry beyond the staged copy,
+/// charged conservatively with the model [`file_metadata_bytes`] uses for each insertion.
+///
+/// A processor emitting minimal entries pays little for them staged, but each publication into a collection costs
+/// hundreds of bytes of tables and a copy of its key at least twice, and a request argument goes into two.
+fn collection_copy_bytes(name: usize, value: usize, copies: usize, first: bool) -> usize {
+    /// Key bytes retained per input key byte by one insertion.
+    const KEY: usize = KEY_COPIES_PER_INSERT * KEY_RETAINED_BYTES_PER_BYTE;
+
+    let first_allocations = if first { FIRST_INSERT_OVERHEAD_BYTES } else { 0 };
+    INSERT_OVERHEAD_BYTES
+        .saturating_add(first_allocations)
+        .saturating_add(name.saturating_mul(KEY))
+        .saturating_add(value)
+        .saturating_mul(copies)
+}
+
+/// Bytes the engine retains for one custom file beyond its content, charged conservatively.
+///
+/// `add_body_processor_file` inserts a file into `MULTIPART_PART_HEADERS` (the content type with its
+/// `Content-Type: ` prefix), `FILES` and `FILES_NAMES` (under an empty key), `MULTIPART_NAME`,
+/// `MULTIPART_FILENAME`, `FILES_SIZES` (the size as decimal text) and `FILES_TMPNAMES` (the temporary path),
+/// and keeps the native `PathBuf` of the temporary file in the transaction's list for cleanup.
+/// Each insertion keeps its key twice, once as the lookup key and once beside the value, and an invalid UTF-8
+/// key byte can cost four bytes per copy, so every insertion is charged `INSERT_OVERHEAD_BYTES` plus its
+/// key bytes times the copies and expansion plus its value. The staged struct and its three byte strings are
+/// added on top. The first file also pays for the initial allocation of the seven collections it touches.
+fn file_metadata_bytes(name: usize, filename: usize, content_type: usize, upload_path: usize, first: bool) -> usize {
+    /// Longest decimal rendering of a `u64`, the value in `FILES_SIZES`.
+    const SIZE_TEXT_BYTES: usize = 20;
+    /// The `Content-Type: ` prefix stored with the content type.
+    const CONTENT_TYPE_PREFIX_BYTES: usize = 14;
+    /// Key bytes retained per input key byte by one insertion.
+    const KEY: usize = KEY_COPIES_PER_INSERT * KEY_RETAINED_BYTES_PER_BYTE;
+
+    // (key bytes, value bytes) of each insertion; the empty key is held for free.
+    let insertions = [
+        (name, CONTENT_TYPE_PREFIX_BYTES.saturating_add(content_type)),
+        (0, filename),
+        (name, name),
+        (name, filename),
+        (filename, SIZE_TEXT_BYTES),
+        (0, name),
+        (0, upload_path),
+    ];
+    let first_allocations = if first {
+        FIRST_INSERT_OVERHEAD_BYTES.saturating_mul(insertions.len())
+    } else {
+        0
+    };
+    insertions
+        .into_iter()
+        .fold(
+            size_of::<BodyProcessorFile>().saturating_add(first_allocations),
+            |total, (key, value)| {
+                total
+                    .saturating_add(INSERT_OVERHEAD_BYTES)
+                    .saturating_add(key.saturating_mul(KEY))
+                    .saturating_add(value)
+            },
+        )
+        .saturating_add(name)
+        .saturating_add(filename)
+        .saturating_add(content_type)
+        // The `PathBuf` kept for cleanup: its bytes, and its slot in a list that may have doubled.
+        .saturating_add(upload_path)
+        .saturating_add(2 * size_of::<PathBuf>())
+}
 
 /// 256 bytes preserves useful diagnostic context while bounding transaction and log storage.
 pub(crate) const CUSTOM_BODY_PROCESSOR_TEXT_LIMIT: usize = 256;
@@ -166,6 +273,8 @@ pub(crate) struct BodyProcessorFile {
 
 impl BodyProcessorOutput {
     /// Build an output limited to the transaction's remaining capacity.
+    ///
+    /// `byte_capacity` bounds content; file metadata has its own, larger allowance derived from it.
     pub(crate) fn new(
         argument_capacity: usize,
         file_capacity: usize,
@@ -177,29 +286,94 @@ impl BodyProcessorOutput {
             file_capacity,
             file_storage_available,
             byte_capacity,
+            metadata_capacity: metadata_capacity(byte_capacity),
+            // A request's, which is the larger; the transaction narrows it for a response.
+            argument_copies: 2,
             ..Self::default()
         }
     }
 
-    /// Reserve output bytes before copying any caller-provided slices.
-    fn reserve_bytes(&mut self, parts: &[&[u8]], entry_storage: usize) -> bool {
+    /// The files staged so far.
+    #[cfg(test)]
+    pub(crate) fn staged_files(&self) -> &[BodyProcessorFile] {
+        &self.files
+    }
+
+    /// The metadata allowance this output was given.
+    #[cfg(test)]
+    pub(crate) fn metadata_allowance(&self) -> usize {
+        self.metadata_capacity
+    }
+
+    /// File metadata bytes charged so far.
+    #[cfg(test)]
+    pub(crate) fn metadata_charged(&self) -> usize {
+        self.metadata_bytes
+    }
+
+    /// Account for the copies of an argument's collections: one for a response, two for a request.
+    pub(crate) fn with_argument_copies(mut self, copies: usize) -> Self {
+        self.argument_copies = copies;
+        self
+    }
+
+    /// Account for the path length of a temporary upload file, which `FILES_TMPNAMES` and the transaction's
+    /// cleanup list retain.
+    pub(crate) fn with_upload_path_bytes(mut self, bytes: usize) -> Self {
+        // The file name `tempfile` appends to the directory is a fixed-length random one.
+        const TEMP_NAME_BYTES: usize = 32;
+        self.upload_path_bytes = bytes.saturating_add(TEMP_NAME_BYTES);
+        self
+    }
+
+    /// Reserve content bytes, then file metadata bytes, before copying any caller-provided slices.
+    ///
+    /// Nothing is reserved unless both fit, so a refused entry leaves both budgets as they were.
+    fn reserve(&mut self, content: Option<usize>, metadata: usize, metadata_error: &'static str) -> bool {
         if self.byte_limit_reached {
             return false;
         }
-        let additional = parts
-            .iter()
-            .try_fold(entry_storage, |total, part| total.checked_add(part.len()));
-        let total = additional.and_then(|additional| self.output_bytes.checked_add(additional));
-        let Some(total) = total.filter(|total| *total <= self.byte_capacity) else {
+        let content_total = content.and_then(|content| self.output_bytes.checked_add(content));
+        let content_total = content_total.filter(|total| *total <= self.byte_capacity);
+        let metadata_total = self
+            .metadata_bytes
+            .checked_add(metadata)
+            .filter(|total| *total <= self.metadata_capacity);
+        let (Some(content_total), Some(metadata_total)) = (content_total, metadata_total) else {
             self.byte_limit_reached = true;
-            self.error = Some(OUTPUT_BYTE_LIMIT_ERROR.to_owned());
+            self.limit_error = if content_total.is_none() {
+                OUTPUT_BYTE_LIMIT_ERROR
+            } else {
+                metadata_error
+            };
+            self.error = Some(self.limit_error.to_owned());
             return false;
         };
-        self.output_bytes = total;
+        self.output_bytes = content_total;
+        self.metadata_bytes = metadata_total;
         true
     }
 
+    /// Reserve the content bytes of one name/value entry and its staged storage, and the metadata bytes of the
+    /// collection copies the engine makes of it later.
+    fn reserve_entry(&mut self, name: &[u8], value: &[u8], copies: usize, first: bool) -> bool {
+        let staged = size_of::<(Vec<u8>, Vec<u8>)>()
+            .checked_add(name.len())
+            .and_then(|total| total.checked_add(value.len()));
+        let metadata = collection_copy_bytes(name.len(), value.len(), copies, first);
+        self.reserve(
+            Some(staged.unwrap_or(usize::MAX)),
+            metadata,
+            COLLECTION_BYTE_LIMIT_ERROR,
+        )
+    }
+
     /// Add an argument to `ARGS_POST` or `RESPONSE_ARGS`.
+    ///
+    /// Its staged bytes count against the content budget and the copies the engine makes in its collections
+    /// against the metadata budget, so a raised argument limit does not let tiny arguments retain far more
+    /// than the body. Exhausting either budget refuses the argument and every later output, and reports an
+    /// error.
     ///
     /// Values beyond the resolved argument limit are dropped and set
     /// `ARGUMENTS_LIMIT_REACHED` when the output is merged.
@@ -208,13 +382,19 @@ impl BodyProcessorOutput {
             self.argument_limit_reached = true;
             return;
         }
-        if !self.reserve_bytes(&[name, value], size_of::<(Vec<u8>, Vec<u8>)>()) {
+        if !self.reserve_entry(name, value, self.argument_copies, self.arguments.is_empty()) {
             return;
         }
         self.arguments.push((name.to_vec(), value.to_vec()));
     }
 
     /// Add a file whose bytes the engine will write to its private temporary-file path.
+    ///
+    /// The file content counts against the body-limit byte budget shared with arguments and XML values.
+    /// Its names, content type and the engine-side `FILES*` and `MULTIPART_*` entries count against a separate
+    /// metadata budget of four times the body limit (at least 32768 bytes), so metadata never reduces the largest
+    /// content a file can have. Exhausting either budget refuses the file and every later output, and reports
+    /// an error.
     ///
     /// The processor cannot select or invent the path. Files beyond the resolved upload
     /// limit are still recorded and flagged, so the engine still publishes `FILES`,
@@ -234,14 +414,18 @@ impl BodyProcessorOutput {
         if self.files.len() >= self.file_capacity {
             self.file_limit_reached = true;
         }
-        // Charge the copies the engine makes later, in `add_body_processor_file`, not only
-        // the staged struct: the byte budget is the only bound on a processor's output.
-        let metadata = size_of::<BodyProcessorFile>()
-            .saturating_add(name.len().saturating_mul(5))
-            .saturating_add(filename.len().saturating_mul(3))
-            .saturating_add(content_type.len())
-            .saturating_add(FILE_COLLECTION_OVERHEAD);
-        if !self.reserve_bytes(&[name, filename, content_type, bytes], metadata) {
+        // The content is charged against the content budget, which is the body limit. Everything else the
+        // engine retains for the file, the staged struct and the copies `add_body_processor_file` makes later
+        // in the `FILES*` and `MULTIPART_*` collections, is charged against the separate metadata budget, so
+        // a file that fits the body limit is not refused for its names. Both are reserved before any copy.
+        let metadata = file_metadata_bytes(
+            name.len(),
+            filename.len(),
+            content_type.len(),
+            self.upload_path_bytes,
+            self.files.is_empty(),
+        );
+        if !self.reserve(Some(bytes.len()), metadata, METADATA_BYTE_LIMIT_ERROR) {
             return;
         }
         self.files.push(BodyProcessorFile {
@@ -253,8 +437,11 @@ impl BodyProcessorOutput {
     }
 
     /// Add a value to the request or response XML collection under `path`.
+    ///
+    /// Charged like an argument: its staged bytes against the content budget and its collection copy against the
+    /// metadata budget.
     pub fn add_xml(&mut self, path: &[u8], value: &[u8]) {
-        if !self.reserve_bytes(&[path, value], size_of::<(Vec<u8>, Vec<u8>)>()) {
+        if !self.reserve_entry(path, value, 1, self.xml.is_empty()) {
             return;
         }
         self.xml.push((path.to_vec(), value.to_vec()));
@@ -281,7 +468,7 @@ pub(crate) mod xml;
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyProcessorFile, BodyProcessorOutput};
+    use super::{BodyProcessorOutput, FIRST_INSERT_OVERHEAD_BYTES, file_metadata_bytes};
 
     #[test]
     fn file_output_is_rejected_without_a_storage_sink() {
@@ -316,20 +503,93 @@ mod tests {
         assert_eq!(output.arguments.len(), 1);
     }
 
-    #[test]
-    fn file_metadata_counts_against_the_output_byte_budget() {
-        // Enough for the staged struct and the file bytes, but not for the engine-side
-        // FILES*/MULTIPART_* copies that `add_body_processor_file` makes from them.
-        let capacity = size_of::<BodyProcessorFile>() + 4;
-        let mut output = BodyProcessorOutput::new(4, 4, capacity, true);
-        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+    /// The metadata charge of the file the tests below stage, as the first file of an output.
+    fn first_file_metadata() -> usize {
+        file_metadata_bytes(b"name".len(), b"file.txt".len(), b"text/plain".len(), 0, true)
+    }
 
-        assert!(output.files.is_empty());
+    #[test]
+    fn file_metadata_counts_against_its_own_budget_with_an_accepted_boundary() {
+        // The content budget is ample, so only the metadata charge can refuse the file.
+        let charge = first_file_metadata();
+        let mut output = BodyProcessorOutput::new(4, 4, 1 << 20, true);
+        output.metadata_capacity = charge;
+        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+        assert_eq!(
+            output.files.len(),
+            1,
+            "a metadata budget of exactly the charge accepts the file"
+        );
+        assert_eq!(output.metadata_bytes, charge);
+        assert!(!output.byte_limit_reached);
+
+        let mut output = BodyProcessorOutput::new(4, 4, 1 << 20, true);
+        output.metadata_capacity = charge - 1;
+        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+        assert!(output.files.is_empty(), "one byte under the charge refuses the file");
         assert!(output.byte_limit_reached);
+        assert_eq!(output.output_bytes, 0, "a refused file reserves no content bytes");
+        assert_eq!(output.metadata_bytes, 0, "a refused file reserves no metadata bytes");
+        assert_eq!(
+            output.error.as_deref(),
+            Some("custom body processor file metadata exceeded byte limit")
+        );
+    }
+
+    #[test]
+    fn file_content_is_charged_against_the_content_budget_alone() {
+        // The metadata allowance is ample, so only the content can refuse the file, and exactly at its length.
+        let mut output = BodyProcessorOutput::new(4, 4, 4, true);
+        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+        assert_eq!(output.files.len(), 1, "content of exactly the budget is accepted");
+        assert_eq!(
+            output.output_bytes, 4,
+            "names and metadata did not consume content bytes"
+        );
+
+        let mut output = BodyProcessorOutput::new(4, 4, 3, true);
+        output.add_file(b"name", b"file.txt", b"text/plain", b"data");
+        assert!(
+            output.files.is_empty(),
+            "one content byte over the budget refuses the file"
+        );
         assert_eq!(
             output.error.as_deref(),
             Some("custom body processor output exceeded byte limit")
         );
+    }
+
+    #[test]
+    fn metadata_charge_grows_with_every_retained_copy_and_only_the_first_file_pays_for_new_tables() {
+        let base = file_metadata_bytes(1, 1, 1, 0, false);
+        // `name` is the key of three insertions (two copies each, up to four times as large for invalid UTF-8)
+        // and a value of two, plus the staged copy; `filename` is the key of one insertion, a value of two and
+        // staged once. The charge must grow at least that fast.
+        let more_name = file_metadata_bytes(101, 1, 1, 0, false);
+        assert!(
+            more_name - base >= 100 * (3 * 2 * 4 + 3),
+            "name bytes are charged per copy"
+        );
+        let more_filename = file_metadata_bytes(1, 101, 1, 0, false);
+        assert!(
+            more_filename - base >= 100 * (2 * 4 + 3),
+            "filename bytes are charged per copy"
+        );
+        assert!(file_metadata_bytes(1, 1, 1, 0, true) > base);
+        assert_eq!(
+            file_metadata_bytes(1, 1, 1, 0, true) - base,
+            FIRST_INSERT_OVERHEAD_BYTES * 7,
+            "the first file pays for the initial allocation of its seven collections"
+        );
+    }
+
+    #[test]
+    fn the_native_path_copy_of_an_upload_is_charged_beside_its_collection_entry() {
+        // The path is held in `FILES_TMPNAMES` and again as a `PathBuf` in the transaction's cleanup list, so each
+        // path byte costs twice.
+        let without = file_metadata_bytes(1, 1, 1, 0, false);
+        let with = file_metadata_bytes(1, 1, 1, 1000, false);
+        assert!(with - without >= 2 * 1000, "1000 path bytes added {}", with - without);
     }
 
     #[test]

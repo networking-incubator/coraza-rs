@@ -382,7 +382,23 @@ pub(super) fn process_custom_body_processor(
     processor: &dyn CustomBodyProcessor,
 ) {
     let upload_dir = upload_directory(&tx.config.upload_dir);
-    let options_upload_dir = upload_dir.as_deref().unwrap_or_else(|| Path::new(""));
+    process_custom_body_in(tx, body, direction, truncated, processor, upload_dir.as_deref());
+}
+
+/// [`process_custom_body_processor`] with the upload directory already chosen.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the body processor inputs and the chosen upload directory are all explicit"
+)]
+fn process_custom_body_in(
+    tx: &mut Transaction,
+    body: &[u8],
+    direction: BodyDirection,
+    truncated: bool,
+    processor: &dyn CustomBodyProcessor,
+    upload_dir: Option<&Path>,
+) {
+    let options_upload_dir = upload_dir.unwrap_or_else(|| Path::new(""));
     // Both directions pass the raw `Content-Type` header, parameters included, so a
     // custom processor sees the same shape the built-in processors and Go receive
     // (`internal/corazawaf/transaction.go:1132-1135`). `RESPONSE_CONTENT_TYPE` is a
@@ -404,7 +420,14 @@ pub(super) fn process_custom_body_processor(
         tx.config.upload_file_limit.saturating_sub(tx.uploaded_paths.len()),
         byte_capacity,
         !cfg!(target_os = "wasi"),
-    );
+    )
+    // `FILES_TMPNAMES` stores the path lossily (an invalid byte becomes U+FFFD, three bytes), so the lossy length
+    // is the one retained; it is never shorter than the native one.
+    .with_upload_path_bytes(options_upload_dir.to_string_lossy().len())
+    .with_argument_copies(match direction {
+        BodyDirection::Request => 2,
+        BodyDirection::Response => 1,
+    });
     let options = BodyProcessorOptions {
         mime,
         upload_dir: options_upload_dir,
@@ -425,7 +448,7 @@ pub(super) fn process_custom_body_processor(
         .err()
         .map(|message| truncate_custom_body_text(&message));
     let mut error = if output.byte_limit_reached {
-        Some("custom body processor output exceeded byte limit".to_owned())
+        Some(output.limit_error.to_owned())
     } else {
         processor_error.or_else(|| output.error.take())
     };
@@ -463,7 +486,7 @@ pub(super) fn process_custom_body_processor(
         }
     }
     for file in &output.files {
-        let Some(upload_dir) = upload_dir.as_deref() else {
+        let Some(upload_dir) = upload_dir else {
             if error.is_none() {
                 error = Some("file uploads are unavailable on this host".to_owned());
             }
@@ -536,9 +559,13 @@ fn add_response_body_argument(tx: &mut Transaction, name: &[u8], value: &[u8]) {
 ///
 /// `std::env::temp_dir()` aborts on WASI. Callers use this only when they actually
 /// need to write a file; a field-only body or a rejected upload never calls it.
+///
+/// A relative directory is made absolute against the current directory, which is where `tempfile` resolves
+/// it, so the length used to charge the retained file paths is the one of the paths actually created.
 fn upload_directory(configured: &str) -> Option<PathBuf> {
     if !configured.is_empty() {
-        return Some(PathBuf::from(configured));
+        let configured = PathBuf::from(configured);
+        return Some(std::path::absolute(&configured).unwrap_or(configured));
     }
     if cfg!(target_os = "wasi") {
         return None;
@@ -2955,5 +2982,293 @@ mod json_tests {
         assert_eq!(text(&parsed, "json.b"), ["😀"]);
         assert_eq!(text(&parsed, "json.c"), ["\u{fffd}"]);
         assert_eq!(text(&parsed, "json.d"), ["\u{fffd}"]);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "custom file tests use fixed fixtures")]
+mod custom_file_metadata_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{add_body_processor_file, process_custom_body_processor};
+    use crate::{
+        body_processors::{
+            BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorOptions, BodyProcessorOutput,
+        },
+        transaction::Transaction,
+    };
+
+    /// Bytes the collections `add_body_processor_file` writes hold, by the engine's own estimate.
+    fn file_collection_bytes(tx: &Transaction) -> usize {
+        [
+            &tx.files,
+            &tx.files_names,
+            &tx.files_sizes,
+            &tx.files_tmp_names,
+            &tx.multipart_name,
+            &tx.multipart_filename,
+            &tx.multipart_part_headers,
+        ]
+        .into_iter()
+        .map(crate::collection::Map::allocated_bytes)
+        .sum()
+    }
+
+    /// A custom file's name, filename and content type.
+    type CustomFile = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+    /// Stages `files` in an output with ample budgets, publishes them as the engine does, and returns the metadata
+    /// bytes charged with the bytes the collections grew by.
+    fn charged_and_measured(files: &[CustomFile], upload_file_limit: usize) -> (usize, usize) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut output = BodyProcessorOutput::new(0, files.len(), 1 << 30, true)
+            .with_upload_path_bytes(directory.path().as_os_str().len());
+        for (name, filename, content_type) in files {
+            output.add_file(name, filename, content_type, b"x");
+        }
+        assert_eq!(output.staged_files().len(), files.len(), "every file was staged");
+
+        let config = crate::config::WafConfig {
+            upload_file_limit,
+            ..crate::config::WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("custom-file-metadata", std::sync::Arc::new(config));
+        let before = file_collection_bytes(&tx);
+        for file in output.staged_files() {
+            add_body_processor_file(&mut tx, directory.path(), file).unwrap();
+        }
+        // The native copies of the temporary paths the transaction keeps for cleanup.
+        let paths = tx
+            .uploaded_paths
+            .capacity()
+            .saturating_mul(size_of::<PathBuf>())
+            .saturating_add(tx.uploaded_paths.iter().map(PathBuf::capacity).sum::<usize>());
+        let measured = file_collection_bytes(&tx).saturating_sub(before).saturating_add(paths);
+        tx.finish().unwrap();
+        (output.metadata_charged(), measured)
+    }
+
+    #[test]
+    fn the_metadata_charge_covers_what_the_collections_retain() {
+        let long_ascii = vec![(vec![b'n'; 4096], vec![b'f'; 4096], vec![b'c'; 512])];
+        // Every byte invalid: each copy of the key is held raw and as three-byte replacement characters.
+        let invalid_utf8 = vec![(vec![0xFF; 2048], vec![0xFE; 2048], b"text/plain".to_vec())];
+        let invalid_names_only = vec![(vec![0x80; 1], vec![0x80; 1], b"t".to_vec())];
+        let many_files: Vec<_> = (0..500)
+            .map(|index| {
+                (
+                    format!("field-{index}").into_bytes(),
+                    format!("file-{index}.txt").into_bytes(),
+                    b"text/plain".to_vec(),
+                )
+            })
+            .collect();
+        // The same name for every file: one entry per collection with many values.
+        let repeated: Vec<_> = (0..500)
+            .map(|_| (b"upload".to_vec(), b"same.txt".to_vec(), b"text/plain".to_vec()))
+            .collect();
+
+        for (label, files, upload_file_limit) in [
+            ("long ASCII names", long_ascii, 100),
+            ("invalid UTF-8 names", invalid_utf8, 100),
+            ("a one-byte invalid name", invalid_names_only, 100),
+            ("many files", many_files.clone(), 1_000),
+            ("many files past the upload limit", many_files, 2),
+            ("repeated names", repeated, 1_000),
+        ] {
+            let (charged, measured) = charged_and_measured(&files, upload_file_limit);
+            assert!(
+                charged >= measured,
+                "{label}: the collections grew by {measured} bytes but only {charged} were charged"
+            );
+        }
+    }
+
+    /// A transaction that accepts `arguments` arguments, so only the output's own budgets can stop a flood.
+    fn roomy_transaction(arguments: usize) -> Transaction {
+        let config = crate::config::WafConfig {
+            argument_limit: arguments,
+            ..crate::config::WafConfig::default()
+        };
+        Transaction::with_config("custom-flood", std::sync::Arc::new(config))
+    }
+
+    #[test]
+    fn an_xml_flood_stops_at_the_metadata_allowance_with_the_collection_retained_inside_it() {
+        // A body of a few bytes can make a processor emit minimal entries without end: staged, each is a few dozen
+        // bytes and the content budget (the body limit) admits tens of thousands, but each costs the XML collection
+        // hundreds of bytes.
+        let mut output = BodyProcessorOutput::new(0, 0, 1 << 20, true);
+        for _ in 0..300_000 {
+            output.add_xml(b"/*", b"");
+        }
+        assert!(output.byte_limit_reached);
+        assert_eq!(
+            output.limit_error,
+            "custom body processor collection copies exceeded byte limit"
+        );
+        assert!(output.xml.len() < 300_000, "staged {}", output.xml.len());
+
+        let mut tx = roomy_transaction(1000);
+        for (path, value) in &output.xml {
+            tx.request_xml.add_bytes(path, value);
+        }
+        let retained = tx.request_xml.allocated_bytes();
+        assert!(
+            retained <= output.metadata_charged() && output.metadata_charged() <= output.metadata_allowance(),
+            "{retained} bytes retained, {} charged, {} allowed",
+            output.metadata_charged(),
+            output.metadata_allowance()
+        );
+        assert!(
+            retained <= 4 << 20,
+            "{retained} bytes retained under a 1 MiB body limit"
+        );
+    }
+
+    #[test]
+    fn a_raised_argument_limit_does_not_let_tiny_arguments_retain_more_than_the_allowance() {
+        for (copies, label) in [(2, "request"), (1, "response")] {
+            let mut output = BodyProcessorOutput::new(300_000, 0, 1 << 20, true).with_argument_copies(copies);
+            for index in 0..300_000_u32 {
+                output.add_argument(&index.to_le_bytes(), b"");
+            }
+            assert!(output.byte_limit_reached, "{label}");
+            assert_eq!(
+                output.limit_error, "custom body processor collection copies exceeded byte limit",
+                "{label}"
+            );
+            assert!(
+                !output.argument_limit_reached,
+                "{label}: the budget, not the count, stopped it"
+            );
+
+            let mut tx = roomy_transaction(300_000);
+            for (name, value) in &output.arguments {
+                if copies == 2 {
+                    tx.add_post_argument(name, value);
+                } else {
+                    tx.response_args.add_bytes(name, value);
+                }
+            }
+            let retained = if copies == 2 {
+                tx.args_post.allocated_bytes() + tx.args.allocated_bytes()
+            } else {
+                tx.response_args.allocated_bytes()
+            };
+            assert!(
+                retained <= output.metadata_charged() && output.metadata_charged() <= output.metadata_allowance(),
+                "{label}: {retained} bytes retained, {} charged, {} allowed",
+                output.metadata_charged(),
+                output.metadata_allowance()
+            );
+            assert!(
+                retained <= 4 << 20,
+                "{label}: {retained} bytes retained under a 1 MiB body limit"
+            );
+            assert!(
+                output.arguments.len() > 1000,
+                "{label}: ordinary argument counts still fit"
+            );
+        }
+    }
+
+    /// A processor that stages one file and records the upload directory it was given and what the file cost.
+    struct ChargeProbe(std::sync::Mutex<Option<(PathBuf, usize)>>);
+
+    impl CustomBodyProcessor for ChargeProbe {
+        fn process(
+            &self,
+            _body: &[u8],
+            _direction: BodyDirection,
+            options: &BodyProcessorOptions<'_>,
+            out: &mut BodyProcessorOutput,
+        ) -> Result<(), String> {
+            out.add_file(b"f", b"f.txt", b"text/plain", b"x");
+            *self.0.lock().unwrap() = Some((options.upload_dir.to_path_buf(), out.metadata_charged()));
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_upload_directory_that_is_not_utf8_is_charged_by_its_lossy_path_length() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join(std::ffi::OsStr::from_bytes(b"up\xFF\xFEloads"));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(directory.to_str().is_none(), "the directory is not UTF-8");
+        assert!(
+            directory.to_string_lossy().len() > directory.as_os_str().len(),
+            "the lossy form is longer than the native one"
+        );
+        let mut tx = Transaction::with_config(
+            "lossy-upload-dir",
+            std::sync::Arc::new(crate::config::WafConfig::default()),
+        );
+        let probe = ChargeProbe(std::sync::Mutex::new(None));
+
+        super::process_custom_body_in(&mut tx, b"", BodyDirection::Request, false, &probe, Some(&directory));
+
+        let (_, charged) = probe.0.lock().unwrap().take().unwrap();
+        let stored_len = tx.files_tmp_names.first(b"").unwrap().len();
+        assert_eq!(
+            stored_len,
+            tx.uploaded_paths.first().unwrap().to_string_lossy().len(),
+            "FILES_TMPNAMES holds the lossy path"
+        );
+        let mut reference = BodyProcessorOutput::new(0, 1, 1 << 20, true)
+            .with_upload_path_bytes(directory.to_string_lossy().len())
+            .with_argument_copies(2);
+        reference.add_file(b"f", b"f.txt", b"text/plain", b"x");
+        assert_eq!(
+            charged,
+            reference.metadata_charged(),
+            "the charge is the lossy directory length plus the file name"
+        );
+        assert!(
+            stored_len <= directory.to_string_lossy().len() + 32,
+            "the charge covers the stored path: {stored_len}"
+        );
+        tx.finish().unwrap();
+    }
+
+    #[test]
+    fn a_relative_upload_directory_is_charged_by_its_absolute_path_length() {
+        // `tempfile` resolves a relative directory against the current directory, so the retained paths carry
+        // that prefix. The directory is made inside it, and its name alone is the configured value.
+        let current = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&current).unwrap();
+        let relative = directory.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(Path::new(&relative).is_relative());
+        let config = crate::config::WafConfig {
+            upload_dir: relative.clone(),
+            ..crate::config::WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("relative-upload-dir", std::sync::Arc::new(config));
+        let probe = ChargeProbe(std::sync::Mutex::new(None));
+
+        process_custom_body_processor(&mut tx, b"", BodyDirection::Request, false, &probe);
+
+        let (upload_dir, charged) = probe.0.lock().unwrap().take().unwrap();
+        let absolute = current.join(&relative);
+        assert_eq!(
+            upload_dir, absolute,
+            "the processor and the file write share the absolute directory"
+        );
+        let mut reference = BodyProcessorOutput::new(0, 1, 1 << 20, true)
+            // The lossy length, as the production charge uses.
+            .with_upload_path_bytes(absolute.to_string_lossy().len())
+            .with_argument_copies(2);
+        reference.add_file(b"f", b"f.txt", b"text/plain", b"x");
+        assert_eq!(charged, reference.metadata_charged());
+        let created = tx.uploaded_paths.first().cloned().unwrap();
+        assert!(created.starts_with(&absolute), "{created:?}");
+        assert!(
+            created.as_os_str().len() <= absolute.as_os_str().len() + 32 + 1,
+            "the charge covers the retained path"
+        );
+        tx.finish().unwrap();
     }
 }

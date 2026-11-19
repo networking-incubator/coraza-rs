@@ -69,13 +69,12 @@ impl CorazaRoot {
     /// Parses, compiles and installs a configuration.
     ///
     /// The generation is replaced only after a successful compile, so a rejected
-    /// reload keeps the active generation serving its streams. A blank (or absent)
-    /// configuration is an explicit pass-through only on the first load; as a reload
-    /// it is rejected, so it can never replace an enforcing generation.
+    /// reload keeps the active generation serving its streams. A blank, whitespace-only
+    /// or absent configuration is rejected by [`Config::parse`] on every load: Envoy
+    /// builds a fresh root context for each configuration update, so this root cannot
+    /// tell a first load from a reload, and accepting blank input would let a cleared
+    /// configuration disable inspection.
     fn apply(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if self.generation.is_some() && config::is_blank(bytes) {
-            return Err("a blank plugin configuration cannot replace the active generation".to_owned());
-        }
         let config = Config::parse(bytes).map_err(|error| error.to_string())?;
         let next_id = self
             .next_generation_id
@@ -117,7 +116,7 @@ impl RootContext for CorazaRoot {
             return false;
         }
         // A successful hostcall with no buffer means Envoy supplied no plugin configuration. That reads as a blank
-        // document: an explicit pass-through on the first load, rejected by `apply` as a reload.
+        // document, which `apply` rejects so Envoy NACKs the update and keeps the previous configuration.
         let configuration = match hostcalls::get_buffer(BufferType::PluginConfiguration, 0, usize::MAX) {
             Ok(configuration) => configuration.unwrap_or_default(),
             Err(status) => {
@@ -425,8 +424,8 @@ mod tests {
     #[test]
     fn an_empty_configuration_warns_that_requests_are_uninspected() {
         let mut root = root();
-        root.apply(b"")
-            .expect("a blank first configuration is an explicit pass-through");
+        root.apply(br#"{"directives_map": {}}"#)
+            .expect("an explicit empty policy map is the deliberate pass-through");
         let generation = root.current_generation().expect("a generation is published");
         assert!(
             generation
@@ -451,17 +450,16 @@ mod tests {
     ];
 
     #[test]
-    fn a_blank_first_configuration_is_an_explicit_pass_through() {
-        for blank in ["", " \n\t"] {
+    fn a_blank_configuration_is_rejected_on_a_fresh_root() {
+        // Envoy builds a fresh root context for every configuration update, so a blank document can never be told
+        // apart from a first load: it must be refused rather than ACKed as "inspect nothing".
+        for blank in ["", " \n\t", "\r\n"] {
             let mut root = root();
-            root.apply(blank.as_bytes()).expect("a blank first load is accepted");
-            let generation = root.current_generation().expect("a generation is published");
-            assert!(generation.select("a.example").is_none(), "nothing is selected");
+            let error = root.apply(blank.as_bytes()).unwrap_err();
+            assert!(error.contains("blank or missing"), "message was {error:?}");
             assert!(
-                generation
-                    .warnings()
-                    .any(|warning| warning.contains("no policies configured")),
-                "the pass-through is warned about"
+                root.current_generation().is_none(),
+                "{blank:?} installed a pass-through generation"
             );
         }
     }
@@ -497,9 +495,8 @@ mod tests {
         .expect("the enforcing configuration is valid");
         let enforcing = root.current_generation().expect("a generation is published");
 
-        for input in ["", "  \n\t"]
+        for input in INVALID_CONFIG_SHAPES
             .into_iter()
-            .chain(INVALID_CONFIG_SHAPES)
             .chain([blank_gzip.as_str(), empty_object_gzip.as_str()])
         {
             assert!(
@@ -534,41 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn on_configure_accepts_a_missing_or_blank_first_configuration_but_never_as_a_reload() {
-        for first in [None, Some(b"".as_slice()), Some(b" \n".as_slice())] {
+    fn on_configure_refuses_a_missing_or_blank_configuration_on_a_fresh_root() {
+        // Each Envoy configuration update runs on a fresh root, so every shape here is what a cleared or missing
+        // configuration looks like to the filter. Refusing it makes Envoy NACK the update and keep the old one.
+        for input in [
+            None,
+            Some(b"".as_slice()),
+            Some(b" \n".as_slice()),
+            Some(b"\t\r\n ".as_slice()),
+        ] {
             let mut root = root();
+            assert!(!configure(&mut root, input), "{input:?} is refused");
             assert!(
-                configure(&mut root, first),
-                "{first:?} is an explicit first-load pass-through"
+                root.current_generation().is_none(),
+                "{input:?} installed a pass-through generation"
             );
-            assert!(root.current_generation().is_some());
-
-            let enforcing = br#"{
-                "directives_map": {"p": ["SecRule REQUEST_URI \"@contains attack\" \"id:41,phase:1,deny,status:403\""]},
-                "default_directives": "p"
-            }"#;
-            assert!(
-                configure(&mut root, Some(enforcing)),
-                "a real configuration replaces it"
-            );
-            let installed = root
-                .current_generation()
-                .expect("the enforcing generation is installed");
-
-            for reload in [
-                None,
-                Some(b"".as_slice()),
-                Some(b" \n".as_slice()),
-                Some(b"{}".as_slice()),
-            ] {
-                assert!(!configure(&mut root, reload), "{reload:?} is refused as a reload");
-                assert!(
-                    Rc::ptr_eq(&installed, &root.current_generation().expect("the generation is kept")),
-                    "{reload:?} replaced the enforcing generation"
-                );
-            }
-            assert_eq!(interrupting_rule(&root, "a.example"), 41);
         }
+    }
+
+    #[test]
+    fn on_configure_accepts_an_explicit_empty_policy_map_as_the_only_pass_through() {
+        let mut root = root();
+        assert!(
+            configure(&mut root, Some(br#"{"directives_map": {}}"#)),
+            "an explicit empty directives_map is the deliberate pass-through"
+        );
+        let generation = root.current_generation().expect("a generation is published");
+        assert!(generation.select("a.example").is_none(), "nothing is selected");
+        assert!(
+            generation
+                .warnings()
+                .any(|warning| warning.contains("no policies configured")),
+            "the pass-through is warned about"
+        );
     }
 
     #[test]

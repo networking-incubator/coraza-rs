@@ -227,6 +227,9 @@ pub struct TransactionInner {
     finalization_errors: Vec<Failure>,
     /// A disruptive action applied while the engine is on.
     interruption: Option<Interruption>,
+    /// Whether `interruption` was raised in the logging phase, after the response was released, so it was
+    /// never enforced and the audit log does not report it.
+    interruption_after_release: bool,
     /// The first disruptive action that would apply in detection-only mode.
     would_be_interruption: Option<Interruption>,
     /// Number of following same-phase rules to skip.
@@ -529,6 +532,7 @@ impl TransactionInner {
             self.finalization_errors = Vec::new();
         }
         self.interruption = None;
+        self.interruption_after_release = false;
         self.would_be_interruption = None;
         self.skip = 0;
         self.removed_rule_ids.clear();
@@ -976,6 +980,7 @@ impl Transaction {
             finalized: false,
             finalization_errors: Vec::new(),
             interruption: None,
+            interruption_after_release: false,
             would_be_interruption: None,
             skip: 0,
             removed_rule_ids: BTreeSet::new(),
@@ -1223,7 +1228,13 @@ impl Transaction {
             rule,
             matches,
             disruptive_action,
-            disruptive: disruptive_action.is_some() && self.rule_engine == RuleEngineStatus::On,
+            // An action counts as enforced only if it can take effect: `interrupt` keeps the first interruption
+            // and ignores the logging phase, so a disruptive rule after one, or in phase 5 at all, is logged as a
+            // match, not as a denial.
+            disruptive: disruptive_action.is_some()
+                && self.rule_engine == RuleEngineStatus::On
+                && self.interruption.is_none()
+                && self.last_phase != Some(RulePhase::Logging),
             client_ip: self.remote_addr.get().into_owned(),
             server_ip: self.server_addr.get().into_owned(),
             uri: self.request_uri.get().into_owned(),
@@ -1722,7 +1733,13 @@ impl Transaction {
                 ..AuditRequest::default()
             },
             highest_severity,
-            is_interrupted: self.interruption.is_some(),
+            // A logging-phase interruption came after the response was released and was never enforced.
+            is_interrupted: self.interruption.is_some() && !self.interruption_after_release,
+            interruption_rule_id: self
+                .interruption
+                .as_ref()
+                .filter(|_| !self.interruption_after_release)
+                .map(|interruption| interruption.rule_id),
             ..AuditTransaction::default()
         };
 
@@ -1794,6 +1811,8 @@ impl Transaction {
                             actionset: self.config.component_names.join(" "),
                             message: data.message.clone(),
                             error_message: if trailer { matched.error_log() } else { String::new() },
+                            rule_id: rule.id,
+                            rule_message: String::new(),
                             data: AuditMessageData {
                                 file: rule.file.clone(),
                                 line: rule.line,
@@ -1816,6 +1835,8 @@ impl Transaction {
             audited
                 .map(|matched| AuditMessage {
                     error_message: matched.error_log(),
+                    rule_id: matched.rule.id,
+                    rule_message: matched.short_message(),
                     ..AuditMessage::default()
                 })
                 .collect()
@@ -1906,7 +1927,16 @@ impl Transaction {
             data: data.to_owned(),
         };
         match self.rule_engine {
-            RuleEngineStatus::On => self.interruption = Some(interruption),
+            // The first interruption is the one enforced, and a later one must not make the audit entry
+            // name a rule that was not enforced (Go Coraza overwrites it here). A first interruption in the
+            // logging phase is still stored, as Go does, but it came after the response was released, so the
+            // audit log does not report it as enforced.
+            RuleEngineStatus::On => {
+                if self.interruption.is_none() {
+                    self.interruption_after_release = self.last_phase == Some(RulePhase::Logging);
+                    self.interruption = Some(interruption);
+                }
+            },
             RuleEngineStatus::DetectionOnly => {
                 self.would_be_interruption.get_or_insert(interruption);
             },
@@ -3540,6 +3570,72 @@ Content-Disposition: form-data; name=\"text\"; filename=\"ok.txt\"\r\n\
         let empty = body_tx("tx-body-empty", b"&&a=1&&b=2&&");
         assert!(!empty.arguments_limit_reached());
         assert_eq!(empty.args_post.value_count(), 2);
+    }
+
+    #[test]
+    fn argument_adds_stay_linear_when_the_argument_limit_is_raised() {
+        // `value_count` runs once per added argument. Summing every key made the loop quadratic (200k arguments
+        // took 14 s), so this counts the keys scanned instead of timing: the adds must scan none at all, however
+        // many arguments are held, which is O(1) work per add and linear work for the loop.
+        use crate::collection::keys_scanned;
+
+        let added = |arguments: usize| {
+            let config = WafConfig {
+                argument_limit: 2 * arguments,
+                ..WafConfig::default()
+            };
+            let mut tx = Transaction::with_config("tx-linear-args", Arc::new(config));
+            let before = keys_scanned();
+            for index in 0..arguments {
+                tx.add_get_argument(format!("a{index}"), "1");
+            }
+            let scanned = keys_scanned() - before;
+            assert!(!tx.arguments_limit_reached(), "every argument fits the raised limit");
+            assert_eq!(tx.args_get.value_count(), arguments);
+            (tx, scanned)
+        };
+        let (_, small) = added(2_000);
+        let (mut tx, large) = added(4_000);
+        assert_eq!(small, 0, "adding 2000 arguments scanned {small} keys");
+        assert_eq!(large, 0, "adding 4000 arguments scanned {large} keys");
+
+        // The counter sees a scan: the oracle visits every key once.
+        let before = keys_scanned();
+        assert_eq!(tx.args_get.value_count(), tx.args_get.summed_value_count());
+        assert_eq!(keys_scanned() - before, 4_000, "the oracle scans each key");
+
+        // The limit still applies when it is reached.
+        let config = WafConfig {
+            argument_limit: 4_000,
+            ..WafConfig::default()
+        };
+        let mut limited = Transaction::with_config("tx-linear-args-limit", Arc::new(config));
+        for index in 0..4_000 {
+            limited.add_get_argument(format!("a{index}"), "1");
+        }
+        assert!(!limited.arguments_limit_reached(), "the exact limit fits");
+        limited.add_get_argument("one-more", "1");
+        assert!(limited.arguments_limit_reached());
+        assert_eq!(limited.args_get.value_count(), 4_000);
+        tx.add_get_argument("one-more", "1");
+        assert_eq!(tx.args_get.value_count(), 4_001);
+    }
+
+    #[test]
+    fn argument_counts_start_from_zero_on_a_reused_transaction() {
+        let waf = Waf::new(WafConfig::default()).unwrap();
+        for round in 0..3 {
+            let mut tx = waf.new_transaction();
+            assert_eq!(tx.args_get.value_count(), 0, "round {round} starts empty");
+            assert_eq!(tx.args_post.value_count(), 0, "round {round} starts empty");
+            tx.add_get_argument("a", "1");
+            tx.add_get_argument("a", "2");
+            tx.add_post_argument("b", "1");
+            assert_eq!(tx.args_get.value_count(), 2);
+            assert_eq!(tx.args_post.value_count(), 1);
+            assert_eq!(tx.args.value_count(), tx.args.summed_value_count());
+            tx.finish().unwrap();
+        }
     }
 
     #[test]
@@ -5944,6 +6040,337 @@ v\r\n\
     }
 
     #[test]
+    fn a_bounded_audit_keeps_the_interrupting_rule_when_a_phase_five_rule_matches_after_it() {
+        use crate::types::AuditLogFormat;
+
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&entries);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABKZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_audit_log(move |entry| captured.lock().unwrap().push(entry.clone()));
+        parser
+            .from_string(
+                "SecRule ARGS \"@rx .\" \"id:10,phase:1,pass,log,auditlog,msg:'early %{MATCHED_VAR_NAME}'\"\n\
+                 SecRule REQUEST_METHOD \"@streq GET\" \"id:20,phase:1,deny,status:403,log,auditlog,msg:'DENY-RULE'\"\n\
+                 SecRule ARGS \"@rx .\" \"id:30,phase:5,pass,log,auditlog,msg:'late %{MATCHED_VAR_NAME}'\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("deny-then-log");
+        let query: Vec<String> = (0..60).map(|index| format!("a{index}=x")).collect();
+        tx.process_uri(format!("/?{}", query.join("&")), "GET", "HTTP/1.1");
+        let interruption = tx.process_request_headers().unwrap();
+        assert_eq!(interruption.rule_id, 20);
+        tx.process_logging().unwrap();
+
+        let entry = entries.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(entry.transaction.interruption_rule_id, Some(20));
+        let last = entry.messages.last().unwrap();
+        assert_eq!(last.data.id, 30, "a phase 5 rule matched after the interruption");
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 1024);
+            assert!(truncated && formatted.len() <= 1024, "{format:?}");
+            let kept = crate::audit_log::tests::kept_messages(format, &formatted);
+            assert!(
+                kept.iter().any(|(_, text)| text == "DENY-RULE"),
+                "{format:?}: the interrupting rule's message is kept: {kept:?}"
+            );
+            if format != AuditLogFormat::JsonLegacy {
+                assert!(kept.iter().any(|(id, _)| *id == Some(20)), "{format:?}: {kept:?}");
+            }
+            assert!(kept.len() < entry.messages.len(), "{format:?}: messages were dropped");
+        }
+    }
+
+    #[test]
+    fn a_bounded_audit_without_part_k_keeps_the_interrupting_rules_id_and_message() {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&entries);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABHZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_audit_log(move |entry| captured.lock().unwrap().push(entry.clone()));
+        // The deny is in the middle: logging rules match before it and after it, and without part K its
+        // messages carry no rule data, only the error log text.
+        let rule = |id: i32, phase: i32, action: &str| {
+            format!(
+                "SecRule REQUEST_METHOD \"@streq GET\" \"id:{id},phase:{phase},{action},log,auditlog,msg:'m-{id}'\"\n"
+            )
+        };
+        let rules: String = (100..160)
+            .map(|id| rule(id, 1, "pass"))
+            .chain([rule(20, 1, "deny,status:403")])
+            .chain((200..240).map(|id| rule(id, 5, "pass")))
+            .collect();
+        parser.from_string(&rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("deny-then-log-h-only");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 20);
+        tx.process_logging().unwrap();
+
+        let entry = entries.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(entry.transaction.interruption_rule_id, Some(20));
+        assert!(
+            entry.messages.last().unwrap().error_message.contains("m-239"),
+            "a phase 5 rule matched after the interruption"
+        );
+
+        let (formatted, truncated) = entry.format_bounded(crate::types::AuditLogFormat::Json, 4096);
+        assert!(truncated && formatted.len() <= 4096);
+        let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        let messages = document
+            .pointer("/messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(messages.len() < entry.messages.len(), "messages were dropped");
+        assert!(
+            messages.iter().any(|message| {
+                message
+                    .pointer("/error_message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains("[id \"20\"]") && text.contains("m-20"))
+            }),
+            "the deny's id and message are kept, in the compact form a reduced record uses: {formatted}"
+        );
+    }
+
+    /// A rule matching every `GET`, with `ABHZ` audit parts (no part K) in mind.
+    fn h_only_rule(id: i32, phase: i32, action: &str, msg: &str) -> String {
+        format!("SecRule REQUEST_METHOD \"@streq GET\" \"id:{id},phase:{phase},{action},log,auditlog,msg:'{msg}'\"\n")
+    }
+
+    /// The audit entry of a `GET` from 192.0.2.1 that rule 4242 denies, with part H and without part K.
+    fn h_only_audit(rules: &str) -> crate::audit_log::AuditLog {
+        h_only_audit_padded(rules, "")
+    }
+
+    /// [`h_only_audit`] for a request with an `X-Pad` header of `padding`.
+    fn h_only_audit_padded(rules: &str, padding: &str) -> crate::audit_log::AuditLog {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&entries);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABHZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_audit_log(move |entry| captured.lock().unwrap().push(entry.clone()));
+        parser.from_string(rules).unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("h-only-reduced");
+        tx.set_remote_addr("192.0.2.1");
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        if !padding.is_empty() {
+            tx.add_request_header("X-Pad", padding);
+        }
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 4242);
+        tx.process_logging().unwrap();
+        let mut recorded = entries.lock().unwrap();
+        recorded.pop().unwrap()
+    }
+
+    /// Whether a bounded document names rule 4242 and (a part of) its message `Blocked-by-policy`.
+    fn names_the_deny(format: crate::types::AuditLogFormat, document: &serde_json::Value) -> bool {
+        use crate::types::AuditLogFormat;
+
+        let list = |pointer: &str| document.pointer(pointer).and_then(serde_json::Value::as_array).unwrap();
+        let text = |value: &serde_json::Value, pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let compact = |text: &str| text.contains("[id \"4242\"]") && text.contains("Blocked-by");
+        match format {
+            AuditLogFormat::Json => list("/messages").iter().any(|message| {
+                message.pointer("/data/id").and_then(serde_json::Value::as_i64) == Some(4242)
+                    && compact(&text(message, "/error_message"))
+            }),
+            AuditLogFormat::JsonLegacy => list("/audit_data/messages")
+                .iter()
+                .any(|message| compact(message.as_str().unwrap())),
+            _ => list("/enrichments").iter().any(|enrichment| {
+                let data: serde_json::Value = serde_json::from_str(&text(enrichment, "/data")).unwrap();
+                data.pointer("/id").and_then(serde_json::Value::as_i64) == Some(4242)
+                    && text(enrichment, "/name").contains("Blocked-by")
+            }),
+        }
+    }
+
+    #[test]
+    fn a_reduced_audit_without_part_k_still_names_the_interrupting_rule_in_every_format() {
+        use crate::types::AuditLogFormat;
+
+        let rules: String = (100..160)
+            .map(|id| h_only_rule(id, 1, "pass", &format!("m-{id}")))
+            .chain([h_only_rule(4242, 1, "deny,status:403", "Blocked-by-policy")])
+            .chain((200..240).map(|id| h_only_rule(id, 5, "pass", &format!("m-{id}"))))
+            .collect();
+        // A reduction down to the 32 bytes each message may keep: the error log prefix alone is longer, since
+        // it starts with `[client "192.0.2.1"] Coraza: Access denied (phase 1). `.
+        let reduced = h_only_audit(&rules);
+        assert_eq!(reduced.transaction.interruption_rule_id, Some(4242));
+        let pinned = reduced.messages.iter().find(|message| message.rule_id == 4242).unwrap();
+        assert!(
+            pinned
+                .error_message
+                .starts_with("[client \"192.0.2.1\"] Coraza: Access denied")
+        );
+        assert!(
+            pinned.data.id == 0 && pinned.message.is_empty(),
+            "no part K: no rule data"
+        );
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            // JSONLegacy writes an empty string for each of these messages, so it takes a tighter bound to reduce.
+            let limit = if format == AuditLogFormat::JsonLegacy {
+                640
+            } else {
+                4096
+            };
+            let (formatted, truncated) = reduced.format_bounded(format, limit);
+            assert!(truncated && formatted.len() <= limit, "{format:?}: {formatted}");
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            // Only a part of the message fits beside the id in the 32 bytes the entry keeps.
+            assert!(
+                names_the_deny(format, &document),
+                "{format:?}: the deny rule's id and message are kept: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn shrinking_only_the_request_of_an_audit_without_part_k_still_names_the_interrupting_rule() {
+        use crate::types::AuditLogFormat;
+
+        // One short deny message and a request far over the limit: cutting the request alone makes the record
+        // fit, so no message is shortened. The padding is a header: a URI would also be part of the error log
+        // text, which the JSON format writes, and so would shorten the message.
+        let padding = "u".repeat(20 * 1024);
+        let entry = h_only_audit_padded(&h_only_rule(4242, 1, "deny,status:403", "Blocked-by-policy"), &padding);
+        let full_error = entry
+            .messages
+            .iter()
+            .find(|m| m.rule_id == 4242)
+            .unwrap()
+            .error_message
+            .clone();
+        assert!(
+            full_error.starts_with("[client \"192.0.2.1\"] Coraza: Access denied"),
+            "{full_error}"
+        );
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated && formatted.len() <= 4096, "{format:?}: {}", formatted.len());
+            assert!(
+                !formatted.contains(&"u".repeat(8 * 1024)),
+                "{format:?}: the request was cut"
+            );
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            let text = |value: &serde_json::Value, pointer: &str| {
+                value
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            match format {
+                AuditLogFormat::Json => {
+                    // The message is whole: nothing but the request was reduced.
+                    let messages = document
+                        .pointer("/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .unwrap();
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|message| text(message, "/error_message") == full_error),
+                        "{format:?}: {formatted}"
+                    );
+                },
+                AuditLogFormat::JsonLegacy => {
+                    let messages = document
+                        .pointer("/audit_data/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .unwrap();
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|message| { message.as_str() == Some("[id \"4242\"] [msg \"Blocked-by-policy\"]") }),
+                        "{format:?}: the id and the whole message: {formatted}"
+                    );
+                },
+                _ => {
+                    let enrichments = document
+                        .pointer("/enrichments")
+                        .and_then(serde_json::Value::as_array)
+                        .unwrap();
+                    assert!(
+                        enrichments.iter().any(|enrichment| {
+                            let data: serde_json::Value = serde_json::from_str(&text(enrichment, "/data")).unwrap();
+                            data.pointer("/id").and_then(serde_json::Value::as_i64) == Some(4242)
+                                && text(enrichment, "/name") == "Blocked-by-policy"
+                        }),
+                        "{format:?}: the id and the whole message: {formatted}"
+                    );
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn a_fitting_audit_without_part_k_keeps_its_full_error_log_text() {
+        use crate::types::AuditLogFormat;
+
+        let rules = format!(
+            "{}{}",
+            h_only_rule(100, 1, "pass", "m-100"),
+            h_only_rule(4242, 1, "deny,status:403", "Blocked-by-policy")
+        );
+        let fitting = h_only_audit(&rules);
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = fitting.format_bounded(format, 64 * 1024);
+            assert!(!truncated, "{format:?}");
+            let mut bounded: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            let mut full: serde_json::Value = serde_json::from_str(&fitting.format(format)).unwrap();
+            // OCSF stamps the time it is written at.
+            for document in [&mut bounded, &mut full] {
+                if let Some(metadata) = document
+                    .pointer_mut("/metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.remove("logged_time");
+                }
+            }
+            assert_eq!(bounded, full, "{format:?}");
+        }
+        let (formatted, _) = fitting.format_bounded(AuditLogFormat::Json, 64 * 1024);
+        let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        let kept = document
+            .pointer("/messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let denied = kept
+            .iter()
+            .filter_map(|message| message.pointer("/error_message").and_then(serde_json::Value::as_str))
+            .find(|text| text.contains("Access denied"))
+            .unwrap();
+        assert!(
+            denied.starts_with("[client \"192.0.2.1\"] Coraza: Access denied (phase 1). Blocked-by-policy [file"),
+            "{denied}"
+        );
+    }
+
+    #[test]
     fn audit_logging_records_matches_and_request_response_data_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.json");
@@ -6070,6 +6497,154 @@ v\r\n\
         assert_eq!(
             tx.get_variable(RuleVariable::TX, Some("logged")).as_deref(),
             Some("yes")
+        );
+    }
+
+    #[test]
+    fn a_phase_five_disruptive_rule_does_not_replace_an_earlier_interruption() {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&entries);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABKZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_audit_log(move |entry| captured.lock().unwrap().push(entry.clone()));
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains attack\" \"id:801,phase:1,deny,status:403,log,auditlog\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:802,phase:5,deny,status:500,log,auditlog\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("first-interruption-wins");
+        tx.add_get_argument("q", "attack");
+
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 801);
+        tx.process_logging().unwrap();
+
+        let kept = tx.interruption().unwrap();
+        assert_eq!((kept.rule_id, kept.status), (801, 403));
+        let entry = entries.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(entry.transaction.interruption_rule_id, Some(801));
+        assert!(
+            entry.messages.iter().any(|message| message.data.id == 802),
+            "the phase 5 rule still matched and is logged"
+        );
+    }
+
+    #[test]
+    fn a_disruptive_match_after_an_interruption_is_not_reported_as_enforced() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&logs);
+        let mut parser = crate::seclang::Parser::new();
+        *parser.config_mut() = WafConfig {
+            audit_engine: AuditEngineStatus::On,
+            audit_log_parts: crate::types::parse_audit_log_parts("ABHZ").unwrap(),
+            ..WafConfig::default()
+        };
+        parser.on_error_log(move |matched| {
+            captured
+                .lock()
+                .unwrap()
+                .push((matched.rule_id(), matched.disruptive, matched.error_log()));
+        });
+        parser
+            .from_string(
+                "SecRule ARGS \"@contains attack\" \"id:801,phase:1,deny,status:403,log,auditlog\"\n\
+                 SecRule ARGS \"@contains attack\" \"id:802,phase:5,deny,status:500,log,auditlog\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("late-deny-not-enforced");
+        tx.add_get_argument("q", "attack");
+        assert_eq!(tx.process_request_headers().unwrap().rule_id, 801);
+        tx.process_logging().unwrap();
+        assert_eq!(tx.interruption().map(|kept| kept.rule_id), Some(801));
+
+        let logs = logs.lock().unwrap();
+        let find = |id: i32| logs.iter().find(|(rule, ..)| *rule == id).unwrap();
+        let (_, enforced, text) = find(801);
+        assert!(*enforced && text.contains("Access denied (phase 1)"), "{text}");
+        let (_, enforced, text) = find(802);
+        assert!(!enforced, "the ignored deny is recorded as not enforced");
+        assert!(
+            text.contains("Coraza: Warning.") && !text.contains("Access denied"),
+            "its error log does not claim the access was denied: {text}"
+        );
+        assert!(
+            tx.matched_rules()
+                .iter()
+                .any(|matched| matched.rule_id() == 802 && !matched.disruptive)
+        );
+    }
+
+    #[test]
+    fn a_phase_five_deny_after_a_released_response_is_not_reported_as_enforced() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&logs);
+        let audits = Arc::new(Mutex::new(Vec::new()));
+        let captured_audits = Arc::clone(&audits);
+        for engine in [RuleEngineStatus::On, RuleEngineStatus::DetectionOnly] {
+            let mut parser = crate::seclang::Parser::new();
+            *parser.config_mut() = WafConfig {
+                rule_engine: engine,
+                audit_engine: AuditEngineStatus::On,
+                audit_log_parts: crate::types::parse_audit_log_parts("ABHKZ").unwrap(),
+                ..WafConfig::default()
+            };
+            let captured = Arc::clone(&captured);
+            parser.on_error_log(move |matched| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((matched.rule_id(), matched.disruptive, matched.error_log()));
+            });
+            let captured_audits = Arc::clone(&captured_audits);
+            parser.on_audit_log(move |entry| {
+                captured_audits
+                    .lock()
+                    .unwrap()
+                    .push((entry.transaction.is_interrupted, entry.transaction.interruption_rule_id));
+            });
+            parser
+                .from_string("SecRule ARGS \"@contains attack\" \"id:803,phase:5,deny,status:500,log,auditlog\"")
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id("phase-five-deny-only");
+            tx.add_get_argument("q", "attack");
+            assert!(tx.process_request_headers().is_none(), "nothing blocks the request");
+            tx.process_response_headers(200, "HTTP/1.1");
+            tx.process_logging().unwrap();
+
+            // As in Go, the phase five deny is still stored as the interruption (would-be under DetectionOnly).
+            let stored = if engine == RuleEngineStatus::On {
+                tx.interruption()
+            } else {
+                tx.would_be_interruption()
+            };
+            assert_eq!(stored.map(|interruption| interruption.rule_id), Some(803), "{engine:?}");
+            assert!(
+                tx.matched_rules()
+                    .iter()
+                    .any(|matched| matched.rule_id() == 803 && !matched.disruptive),
+                "{engine:?}: the match is still recorded"
+            );
+        }
+
+        for (rule, enforced, text) in logs.lock().unwrap().iter() {
+            assert_eq!(*rule, 803);
+            assert!(!enforced, "the phase five deny is not enforced");
+            assert!(
+                text.contains("Coraza: Warning.") && !text.contains("Access denied"),
+                "its error log does not claim the access was denied: {text}"
+            );
+        }
+        assert_eq!(
+            *audits.lock().unwrap(),
+            [(false, None), (false, None)],
+            "the audit record names no enforced interruption"
         );
     }
 

@@ -43,7 +43,10 @@ use crate::{
     collection::MatchData,
     config::WafConfig,
     types::{AuditLogFormat, AuditLogPart, AuditLogParts, AuditLogType},
-    utils::{strings::go_quote, time::LocalTime},
+    utils::{
+        strings::{go_quote, push_go_quoted},
+        time::LocalTime,
+    },
 };
 
 /// Next process-local suffix for concurrent audit log filenames.
@@ -181,6 +184,9 @@ pub struct AuditTransaction {
     pub highest_severity: String,
     /// Whether a disruptive action interrupted the transaction
     pub is_interrupted: bool,
+    /// The id of the rule whose disruptive action interrupted the transaction, if one did. Formatters that
+    /// have to drop messages keep this rule's, since logging rules can match after it.
+    pub interruption_rule_id: Option<i32>,
 }
 
 /// The request of an [`AuditTransaction`].
@@ -259,6 +265,15 @@ pub struct AuditMessage {
     pub error_message: String,
     /// The rule and match
     pub data: AuditMessageData,
+    /// The id of the rule behind this message, which bounded formatting uses to keep the interrupting
+    /// rule's message. It is never written out, and it is set even when `data` is not (part `H` without `K`).
+    #[doc(hidden)]
+    pub rule_id: i32,
+    /// The rule's first expanded `msg`, kept only for a message with part `H` and without `K`, which has no
+    /// `data`. A reduced bounded record writes it beside `rule_id`, as the error log text's own prefix may not
+    /// fit. It is never written out in a record that fits.
+    #[doc(hidden)]
+    pub rule_message: String,
 }
 
 /// The rule and match behind an [`AuditMessage`].
@@ -318,6 +333,11 @@ impl MatchedRule {
     /// The first expanded rule message, or an empty string when none was set.
     pub fn message(&self) -> &str {
         self.first_with_message().map_or("", |matched| &matched.message)
+    }
+
+    /// [`MatchedRule::message`] cut as the error log cuts it, for an audit message that has no rule data.
+    pub(crate) fn short_message(&self) -> String {
+        truncated(self.message(), MAX_LOG_MESSAGE).to_owned()
     }
 
     /// The expanded log data paired with [`MatchedRule::message`].
@@ -501,37 +521,165 @@ impl AuditLog {
 
     /// Formats an audit entry for a bounded sink, returning whether source data was cut.
     ///
-    /// This hidden connector seam leaves [`AuditLog::format`] unchanged. Its temporary
-    /// view retains at most `max_bytes` of text and `ceil(max_bytes / 64)` collection
-    /// entries before using the configured formatter. OCSF's nested JSON escaping is the
-    /// largest pre-sink expansion, at most 36 times the retained text plus bounded
-    /// collection overhead.
+    /// This hidden connector seam leaves [`AuditLog::format`] unchanged. Native output copies a temporary
+    /// view of at most `max_bytes` of text and `ceil(max_bytes / 64)` collection entries before formatting,
+    /// and is cut at `max_bytes`.
+    ///
+    /// The JSON formats are never cut mid-token: the output is always one valid JSON document of at most
+    /// `max_bytes` bytes, carrying the same data as [`AuditLog::format`] when that fits (the bytes can differ:
+    /// DEL and the C1 controls, which `format` leaves raw, are escaped here, and OCSF's `logged_time` is read
+    /// again at each call), and otherwise reduced and marked
+    /// with `"truncated": true` (`JSON` and `JSONLegacy`) or `"unmapped": {"truncated": true}` (OCSF). Their
+    /// copy is bounded by `max_bytes` too, whatever the entry holds: text, and entries at most half as many as
+    /// bytes, since an entry takes at least three bytes of output. Reduction keeps what an investigation needs
+    /// first: the matched rules, with their ids and messages, outlast the request's headers, URI and bodies,
+    /// and the rule that interrupted the transaction outlasts the other rules. A document too small for even
+    /// the marker (31 bytes for OCSF, 18 for the others) is empty. Control characters are escaped, so the
+    /// output is one line.
     #[doc(hidden)]
     pub fn format_bounded(&self, format: AuditLogFormat, max_bytes: usize) -> (String, bool) {
+        if format != AuditLogFormat::Native {
+            return self.format_json_bounded(format, max_bytes);
+        }
         let mut budget = AuditCopyBudget::new(max_bytes);
         let view = self.bounded_copy(format, &mut budget);
-        let (output, formatter_truncated) = match format {
-            AuditLogFormat::Native => {
-                let mut output = view.native();
-                let truncated = output.len() > max_bytes;
-                if truncated {
-                    output.truncate(utf8_boundary(&output, max_bytes));
-                }
-                (output, truncated)
-            },
-            AuditLogFormat::Json => serialize_json_bounded(&view.json(), max_bytes),
-            AuditLogFormat::JsonLegacy => serialize_json_bounded(&view.json_legacy(), max_bytes),
-            AuditLogFormat::Ocsf => serialize_json_bounded(&view.ocsf(), max_bytes),
+        let mut output = view.native();
+        let truncated = output.len() > max_bytes;
+        if truncated {
+            output.truncate(utf8_boundary(&output, max_bytes));
+        }
+        (output, budget.truncated || truncated)
+    }
+
+    /// Formats one of the JSON formats as a valid document within `max_bytes`.
+    ///
+    /// The first attempt keeps everything, within allowances that any record that fits `max_bytes` stays inside
+    /// of: the request's text has a pool of its own, apart from the messages' pool, which is shared by all of
+    /// them, so a short message leaves its unused bytes to the others and request padding takes none of them.
+    /// Only a real overflow shrinks the next attempt, in this order: the request's text (URI, headers, bodies,
+    /// arguments), then the text each message may keep, then the number of messages. Dropped messages are the
+    /// later ones, except the one whose rule interrupted the transaction, which is always kept. A record that
+    /// still does not fit is reduced to its transaction id and pinned message, and one that cannot fit even
+    /// then becomes a bare marker. The result is reported cut only when content was reduced.
+    fn format_json_bounded(&self, format: AuditLogFormat, max_bytes: usize) -> (String, bool) {
+        /// The smallest text each message keeps before messages themselves are dropped.
+        const MIN_MESSAGE_BYTES: usize = 32;
+
+        let total = self.messages.len();
+        let mut plan = AuditShrinkPlan {
+            request_bytes: max_bytes,
+            message_bytes: max_bytes,
+            message_each: None,
+            // Every message is at least three bytes of output, so a record that fits holds fewer than this.
+            message_count: total.min(AuditCopyBudget::generous(max_bytes).items_left),
+            reduced: false,
         };
-        (output, budget.truncated || formatter_truncated)
+        let mut shrunk = false;
+        loop {
+            let mut budget = AuditCopyBudget::generous(max_bytes);
+            let view = self.bounded_copy_planned(format, &mut budget, Some(plan));
+            let truncated = shrunk || budget.truncated;
+            let mut document = match format {
+                AuditLogFormat::JsonLegacy => view.json_legacy(),
+                AuditLogFormat::Ocsf => view.ocsf(),
+                _ => view.json(),
+            };
+            if truncated {
+                mark_truncated(&mut document, format);
+            }
+            let text = escape_json_controls(&document.to_string());
+            if text.len() <= max_bytes {
+                return (text, truncated);
+            }
+            shrunk = true;
+            plan.reduced = true;
+            if plan.request_bytes > 0 {
+                // Halve what the request really took, not its allowance, so a request with little text does
+                // not cost an attempt per halving of an allowance it never used.
+                plan.request_bytes = if budget.request_bytes_used < 64 {
+                    0
+                } else {
+                    budget.request_bytes_used / 2
+                };
+            } else if plan.message_each.is_none_or(|each| each > MIN_MESSAGE_BYTES) {
+                let each = plan
+                    .message_each
+                    .unwrap_or_else(|| max_bytes / plan.message_count.max(1));
+                plan.message_each = Some((each / 2).max(MIN_MESSAGE_BYTES));
+            } else if plan.message_count > 1 {
+                // Keep the share of the messages that the record is over its limit by, so a record a little
+                // over loses a little and one far over takes few attempts to get under.
+                let share = u128::try_from(plan.message_count)
+                    .unwrap_or(u128::MAX)
+                    .saturating_mul(u128::try_from(max_bytes).unwrap_or(u128::MAX))
+                    / u128::try_from(text.len()).unwrap_or(1).max(1);
+                plan.message_count = usize::try_from(share)
+                    .unwrap_or(usize::MAX)
+                    .clamp(1, plan.message_count - 1);
+            } else {
+                // Even one message does not fit beside the record's own metadata, which a huge producer entry
+                // can fill. Keep what identifies the record and the rule that mattered, and drop the rest.
+                let mut budget = AuditCopyBudget::generous(max_bytes);
+                let mut view = self.bounded_copy_planned(format, &mut budget, Some(plan));
+                view.compact();
+                let mut document = match format {
+                    AuditLogFormat::JsonLegacy => view.json_legacy(),
+                    AuditLogFormat::Ocsf => view.ocsf(),
+                    _ => view.json(),
+                };
+                mark_truncated(&mut document, format);
+                let compact = escape_json_controls(&document.to_string());
+                if compact.len() <= max_bytes {
+                    return (compact, true);
+                }
+                let minimal = bare_truncation_marker(format);
+                let fits = minimal.len() <= max_bytes;
+                return (if fits { minimal.to_owned() } else { String::new() }, true);
+            }
+        }
+    }
+
+    /// Drops what is not needed to identify the record and its pinned rule: the producer, the request, the
+    /// response and the connection's text, and the rules' tags. The transaction id, the interruption and the
+    /// messages stay.
+    fn compact(&mut self) {
+        let transaction = &mut self.transaction;
+        transaction.producer = None;
+        transaction.response = None;
+        transaction.request = AuditRequest::default();
+        transaction.timestamp.clear();
+        transaction.client_ip.clear();
+        transaction.host_ip.clear();
+        transaction.server_id.clear();
+        transaction.highest_severity.clear();
+        // The rules' tags are optional too: one-byte tags still cost an array entry each, which OCSF escapes a
+        // second time inside the enrichment's `data` string, so thousands of them can outweigh the whole budget.
+        for message in &mut self.messages {
+            message.data.tags.clear();
+        }
     }
 
     /// Copies only the fields used by `format`, within `budget`.
+    fn bounded_copy(&self, format: AuditLogFormat, budget: &mut AuditCopyBudget) -> Self {
+        self.bounded_copy_planned(format, budget, None)
+    }
+
+    /// Copies only the fields used by `format`, within `budget`, or within `plan` when there is one.
+    ///
+    /// A plan gives the request's text a pool of its own, apart from `budget`, which then holds the
+    /// identifying fields; the messages share a pool of their own too, and only some of them are kept when the
+    /// plan says so. Shrinking the request's pool therefore never costs a message any of its text.
     #[expect(
         clippy::too_many_lines,
         reason = "each audit format uses a distinct bounded field view"
     )]
-    fn bounded_copy(&self, format: AuditLogFormat, budget: &mut AuditCopyBudget) -> Self {
+    fn bounded_copy_planned(
+        &self,
+        format: AuditLogFormat,
+        budget: &mut AuditCopyBudget,
+        plan: Option<AuditShrinkPlan>,
+    ) -> Self {
+        let mut request_pool = plan.map(|plan| AuditCopyBudget::generous(plan.request_bytes));
         let native = format == AuditLogFormat::Native;
         let native_headers = native && self.parts.contains(&AuditLogPart::RequestHeaders);
         let native_request_body = native && self.parts.contains(&AuditLogPart::RequestBody);
@@ -589,50 +737,59 @@ impl AuditLog {
         } else {
             false
         };
+        let interruption_rule_id = transaction.interruption_rule_id;
+        let request_budget: &mut AuditCopyBudget = match request_pool.as_mut() {
+            Some(pool) => pool,
+            None => &mut *budget,
+        };
         let request = &transaction.request;
         let bounded_request = AuditRequest {
             method: if !native || native_headers {
-                budget.string(&request.method)
+                request_budget.string(&request.method)
             } else {
                 String::new()
             },
             protocol: if json || ocsf || native_headers {
-                budget.string(&request.protocol)
+                request_budget.string(&request.protocol)
             } else {
                 String::new()
             },
             uri: if !native || native_headers {
-                budget.string(&request.uri)
+                request_budget.string(&request.uri)
             } else {
                 String::new()
             },
             http_version: if json || legacy {
-                budget.string(&request.http_version)
+                request_budget.string(&request.http_version)
             } else {
                 String::new()
             },
             headers: if json || legacy || ocsf || native_headers {
-                budget.headers(&request.headers)
+                request_budget.headers(&request.headers)
             } else {
                 None
             },
             body: if json || native_request_body {
-                budget.string(&request.body)
+                request_budget.string(&request.body)
             } else {
                 String::new()
             },
             files: if json || ocsf || native_files {
-                budget.files(&request.files)
+                request_budget.files(&request.files)
             } else {
                 None
             },
             length: if json || ocsf { request.length } else { 0 },
-            args: if ocsf { budget.args(&request.args) } else { Vec::new() },
+            args: if ocsf {
+                request_budget.args(&request.args)
+            } else {
+                Vec::new()
+            },
         };
 
         let response = transaction.response.as_ref().map(|response| AuditResponse {
             protocol: if json || legacy || native_response_headers {
-                budget.string(&response.protocol)
+                request_budget.string(&response.protocol)
             } else {
                 String::new()
             },
@@ -642,12 +799,12 @@ impl AuditLog {
                 0
             },
             headers: if json || legacy || ocsf || native_response_headers {
-                budget.headers(&response.headers)
+                request_budget.headers(&response.headers)
             } else {
                 None
             },
             body: if json || native_response_body {
-                budget.string(&response.body)
+                request_budget.string(&response.body)
             } else {
                 String::new()
             },
@@ -676,10 +833,23 @@ impl AuditLog {
         } else {
             AuditMessageCopy::None
         };
+        if let Some(pool) = &request_pool {
+            budget.request_bytes_used = pool.bytes_used;
+            budget.truncated |= pool.truncated;
+            budget.bytes_used += pool.bytes_used;
+            budget.items_used += pool.items_used;
+        }
         let messages = if message_mode == AuditMessageCopy::None {
             Vec::new()
+        } else if let Some(plan) = plan {
+            budget.planned_messages(&self.messages, message_mode, plan, transaction.interruption_rule_id)
         } else {
-            budget.sequence(&self.messages, |budget, message| budget.message(message, message_mode))
+            let mut mode = message_mode;
+            budget.sequence(&self.messages, |budget, message| {
+                let copied = budget.message(message, mode);
+                mode = mode.after_first();
+                copied
+            })
         };
 
         Self {
@@ -698,6 +868,7 @@ impl AuditLog {
                 producer,
                 highest_severity,
                 is_interrupted,
+                interruption_rule_id,
             },
             messages,
         }
@@ -1110,8 +1281,10 @@ enum AuditMessageCopy {
     Json,
     /// Copy only the expanded text used by `JSONLegacy`.
     Legacy,
-    /// Copy the OCSF message and nested rule data.
+    /// Copy the OCSF message and nested rule data: the first message, whose text OCSF writes.
     Ocsf,
+    /// Copy the nested rule data only, for the messages after the first, whose text OCSF never writes.
+    OcsfEnrichment,
     /// Copy the native trailer and/or rules section.
     Native {
         /// Copy the message's error log text for part H.
@@ -1119,6 +1292,35 @@ enum AuditMessageCopy {
         /// Copy the matched rule text for part K.
         raw: bool,
     },
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Messages copied by the formatter on this thread, which tests read to bound its work.
+    static MESSAGES_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl AuditMessageCopy {
+    /// The mode for the messages after the first: OCSF writes only the first message's text.
+    fn after_first(self) -> Self {
+        if self == Self::Ocsf { Self::OcsfEnrichment } else { self }
+    }
+}
+
+/// How much of an entry a bounded JSON attempt keeps, see [`AuditLog::format_json_bounded`].
+#[derive(Clone, Copy)]
+struct AuditShrinkPlan {
+    /// Text bytes for the request and response: URI, headers, bodies, arguments and files.
+    request_bytes: usize,
+    /// Text bytes all the messages share.
+    message_bytes: usize,
+    /// Text bytes one message may take from the shared ones; unlimited until the record has overflowed.
+    message_each: Option<usize>,
+    /// Messages kept: the interrupting one (or the last) and the first others.
+    message_count: usize,
+    /// Whether an earlier attempt overflowed, so this one is reduced in some way: a record that fits whole is
+    /// left as it is, and only a reduced one gets its interrupting rule's identity written compactly.
+    reduced: bool,
 }
 
 /// Limits owned strings and collection entries while preparing an audit formatter view.
@@ -1133,6 +1335,8 @@ struct AuditCopyBudget {
     items_used: usize,
     /// Whether any source content exceeded the copy budget.
     truncated: bool,
+    /// Bytes of the request's and response's text the plan's request pool copied.
+    request_bytes_used: usize,
 }
 
 impl AuditCopyBudget {
@@ -1144,6 +1348,19 @@ impl AuditCopyBudget {
             bytes_used: 0,
             items_used: 0,
             truncated: false,
+            request_bytes_used: 0,
+        }
+    }
+
+    /// A pool for a record bound to `max_bytes` of output, which cannot be reduced by its entry count.
+    ///
+    /// Every entry takes at least three bytes of JSON, so a record that fits holds fewer than half as many
+    /// entries as bytes, and nothing that fits is refused for having too many. The copy stays linear in
+    /// `max_bytes`, as the text is.
+    fn generous(max_bytes: usize) -> Self {
+        Self {
+            items_left: max_bytes / 2 + 1,
+            ..Self::new(max_bytes)
         }
     }
 
@@ -1176,6 +1393,124 @@ impl AuditCopyBudget {
     fn sequence<T, U>(&mut self, values: &[T], mut copy: impl FnMut(&mut Self, &T) -> U) -> Vec<U> {
         let count = self.item_count(values.len());
         values.iter().take(count).map(|value| copy(self, value)).collect()
+    }
+
+    /// Copies the messages `plan` keeps out of one shared pool.
+    ///
+    /// Only the kept messages are visited and copied. They are the one whose rule interrupted the
+    /// transaction (the last message when none did), found without copying, and the first of the others: the
+    /// first matches say how the request started to go wrong, and a logging rule that runs after the
+    /// interruption must not displace it. The pinned message is copied first, so it has its text however the
+    /// pool is used.
+    fn planned_messages(
+        &mut self,
+        messages: &[AuditMessage],
+        mode: AuditMessageCopy,
+        plan: AuditShrinkPlan,
+        interrupting: Option<i32>,
+    ) -> Vec<AuditMessage> {
+        let kept = plan.message_count.min(messages.len());
+        if kept < messages.len() {
+            self.truncated = true;
+        }
+        let pinned = interrupting
+            .and_then(|id| {
+                messages
+                    .iter()
+                    .rposition(|message| message.rule_id == id || message.data.id == id)
+            })
+            // Without an interruption the last message is the one kept, as the one most likely to be the blocking
+            // rule's.
+            .or_else(|| messages.len().checked_sub(1))
+            .filter(|_| kept > 0);
+        let mut pool = Self::generous(plan.message_bytes);
+        // The message written first is the first one kept: the first of them, unless only the pinned one is.
+        let head_count = kept - usize::from(pinned.is_some());
+        let first = if head_count == 0 { pinned } else { Some(0) };
+        let reduced = plan.reduced;
+        let mut copy_one = |index: usize| {
+            let before = pool.bytes_left;
+            pool.bytes_left = before.min(plan.message_each.unwrap_or(usize::MAX));
+            let allowed = pool.bytes_left;
+            let mode = if Some(index) == first { mode } else { mode.after_first() };
+            let copy = messages.get(index).map(|message| {
+                if reduced && Some(index) == pinned {
+                    pool.pinned_message(message, mode)
+                } else {
+                    pool.message(message, mode)
+                }
+            });
+            pool.bytes_left = before - (allowed - pool.bytes_left);
+            copy
+        };
+        let pinned_copy = pinned.and_then(&mut copy_one);
+        let mut out: Vec<AuditMessage> = (0..messages.len())
+            .filter(|index| Some(*index) != pinned)
+            .take(head_count)
+            .filter_map(&mut copy_one)
+            .collect();
+        if let (Some(index), Some(copy)) = (pinned, pinned_copy) {
+            // Back in its place among the others, which are the first ones.
+            let position = index.min(out.len());
+            out.insert(position, copy);
+        }
+        self.truncated |= pool.truncated;
+        self.bytes_used += pool.bytes_used;
+        self.items_used += pool.items_used;
+        out
+    }
+
+    /// Copies the interrupting message of a reduced record, so that it still names its rule.
+    ///
+    /// A message with part `H` and without `K` carries its rule only inside the error log text, behind a
+    /// prefix (the client address and the outcome) that a tight allowance is spent on before the rule's `id`
+    /// and `msg` are reached, and the legacy and OCSF documents do not write that text at all. So when the
+    /// allowance cannot hold the text, the rule's `id` and `msg` are written in a compact form instead, from
+    /// `rule_id`, which is set whether or not the message has `data`. Any other message is copied as usual.
+    fn pinned_message(&mut self, message: &AuditMessage, mode: AuditMessageCopy) -> AuditMessage {
+        let identity_missing = message.rule_id != 0
+            && message.data.id == 0
+            && message.data.msg.is_empty()
+            && message.message.is_empty()
+            && message.data.data.is_empty();
+        let limit = self.bytes_left;
+        let needs_identity = match mode {
+            AuditMessageCopy::Json => message.error_message.len() > limit,
+            AuditMessageCopy::Legacy | AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment => true,
+            AuditMessageCopy::None | AuditMessageCopy::Native { .. } => false,
+        };
+        if !identity_missing || !needs_identity {
+            return self.message(message, mode);
+        }
+        #[cfg(test)]
+        MESSAGES_COPIED.with(|copied| copied.set(copied.get() + 1));
+        let mut copy = AuditMessage {
+            rule_id: message.rule_id,
+            ..AuditMessage::default()
+        };
+        match mode {
+            AuditMessageCopy::Json => {
+                copy.data.id = message.rule_id;
+                copy.error_message = self.string(&reduced_identity(message.rule_id, &message.rule_message, limit));
+            },
+            AuditMessageCopy::Legacy => {
+                copy.message = self.string(&reduced_identity(message.rule_id, &message.rule_message, limit));
+            },
+            _ => {
+                // OCSF names a rule by its enrichment (`id` in the data, `msg` as the name); the first message's
+                // text is written beside, and takes what the name leaves.
+                copy.data.id = message.rule_id;
+                copy.data.msg = self.string(truncated(&message.rule_message, limit / 2));
+                if mode == AuditMessageCopy::Ocsf {
+                    copy.message = self.string(&reduced_identity(
+                        message.rule_id,
+                        &message.rule_message,
+                        self.bytes_left,
+                    ));
+                }
+            },
+        }
+        copy
     }
 
     /// Copies string entries in a list.
@@ -1248,71 +1583,115 @@ impl AuditCopyBudget {
 
     /// Copies only message fields used by the selected audit format.
     fn message(&mut self, message: &AuditMessage, mode: AuditMessageCopy) -> AuditMessage {
+        #[cfg(test)]
+        MESSAGES_COPIED.with(|copied| copied.set(copied.get() + 1));
         let json = mode == AuditMessageCopy::Json;
         let legacy = mode == AuditMessageCopy::Legacy;
-        let ocsf = mode == AuditMessageCopy::Ocsf;
+        let ocsf = matches!(mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment);
         let (native_error, native_raw) = match mode {
             AuditMessageCopy::Native { error, raw } => (error, raw),
             _ => (false, false),
         };
         let all_data = json || ocsf;
         let data = &message.data;
+        // A tight allowance, which a message's text shares with its siblings, must cut the long and the
+        // duplicated fields (the rule's `raw` text, its file, `message` repeating `data.msg`) before the
+        // text that says what matched, so that is copied first.
+        let msg = if all_data {
+            self.string(&data.msg)
+        } else {
+            String::new()
+        };
+        let matched_data = if all_data {
+            self.string(&data.data)
+        } else {
+            String::new()
+        };
+        // OCSF writes the text of its first message only; `OcsfEnrichment` copies the data of the others.
+        let text = if json || legacy || mode == AuditMessageCopy::Ocsf {
+            self.string(&message.message)
+        } else {
+            String::new()
+        };
+        let file = if all_data {
+            self.string(&data.file)
+        } else {
+            String::new()
+        };
+        let rev = if all_data {
+            self.string(&data.rev)
+        } else {
+            String::new()
+        };
+        let ver = if all_data {
+            self.string(&data.ver)
+        } else {
+            String::new()
+        };
+        let tags = if all_data { self.strings(&data.tags) } else { Vec::new() };
+        let actionset = if json {
+            self.string(&message.actionset)
+        } else {
+            String::new()
+        };
+        let error_message = if json || native_error {
+            self.string(&message.error_message)
+        } else {
+            String::new()
+        };
+        let raw = if all_data || native_raw {
+            self.string(&data.raw)
+        } else {
+            String::new()
+        };
         AuditMessage {
-            actionset: if json {
-                self.string(&message.actionset)
-            } else {
-                String::new()
-            },
-            message: if json || legacy || ocsf {
-                self.string(&message.message)
-            } else {
-                String::new()
-            },
-            error_message: if json || native_error {
-                self.string(&message.error_message)
-            } else {
-                String::new()
-            },
+            actionset,
+            message: text,
+            error_message,
+            rule_id: message.rule_id,
+            rule_message: String::new(),
             data: AuditMessageData {
-                file: if all_data {
-                    self.string(&data.file)
-                } else {
-                    String::new()
-                },
+                file,
                 line: if all_data { data.line } else { 0 },
                 id: if all_data { data.id } else { 0 },
-                rev: if all_data {
-                    self.string(&data.rev)
-                } else {
-                    String::new()
-                },
-                msg: if all_data {
-                    self.string(&data.msg)
-                } else {
-                    String::new()
-                },
-                data: if all_data {
-                    self.string(&data.data)
-                } else {
-                    String::new()
-                },
+                rev,
+                msg,
+                data: matched_data,
                 severity: if all_data { data.severity } else { 0 },
-                ver: if all_data {
-                    self.string(&data.ver)
-                } else {
-                    String::new()
-                },
+                ver,
                 maturity: if all_data { data.maturity } else { 0 },
                 accuracy: if all_data { data.accuracy } else { 0 },
-                tags: if all_data { self.strings(&data.tags) } else { Vec::new() },
-                raw: if all_data || native_raw {
-                    self.string(&data.raw)
-                } else {
-                    String::new()
-                },
+                tags,
+                raw,
             },
         }
     }
+}
+
+/// A rule's identity in the compact form of the error log, `[id "N"] [msg "…"]`, within `limit` bytes.
+///
+/// The `msg` keeps the longest prefix whose quoted form fits, so quoting never cuts the closing `"]` off: the
+/// prefix is chosen by its quoted length, character by character, and an escape sequence is never split. A
+/// message of which no character fits leaves the `msg` out.
+fn reduced_identity(id: i32, msg: &str, limit: usize) -> String {
+    let mut identity = format!("[id \"{id}\"]");
+    // ` [msg ""]` around the quoted text.
+    let room = limit.saturating_sub(identity.len() + 9);
+    let mut quoted = String::new();
+    for character in msg.chars() {
+        let before = quoted.len();
+        push_go_quoted(&mut quoted, character);
+        if quoted.len() > room {
+            quoted.truncate(before);
+            break;
+        }
+    }
+    if !quoted.is_empty() {
+        identity.push_str(" [msg \"");
+        identity.push_str(&quoted);
+        identity.push_str("\"]");
+    }
+    identity
 }
 
 /// Returns the longest UTF-8 boundary no later than `max_bytes`.
@@ -1323,58 +1702,48 @@ fn utf8_boundary(value: &str, max_bytes: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Serializes JSON directly into a capped output buffer.
-fn serialize_json_bounded(value: &Value, max_bytes: usize) -> (String, bool) {
-    let mut output = AuditFormatBuffer::new(max_bytes);
-    let failed = serde_json::to_writer(&mut output, value).is_err();
-    let truncated = output.truncated || failed;
-    (output.into_string(), truncated)
-}
-
-/// Byte buffer that stops JSON serialization at its configured output limit.
-struct AuditFormatBuffer {
-    /// Serialized JSON bytes retained so far.
-    bytes: Vec<u8>,
-    /// Maximum serialized byte count.
-    max_bytes: usize,
-    /// Whether the serializer attempted to write beyond the limit.
-    truncated: bool,
-}
-
-impl AuditFormatBuffer {
-    /// Creates a sink with the exact output capacity.
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(max_bytes),
-            max_bytes,
-            truncated: false,
-        }
-    }
-
-    /// Converts the retained UTF-8 prefix into a string.
-    fn into_string(mut self) -> String {
-        if let Err(error) = std::str::from_utf8(&self.bytes) {
-            self.bytes.truncate(error.valid_up_to());
-        }
-        String::from_utf8(self.bytes).unwrap_or_default()
+/// The smallest valid document for `format` that says its record was reduced: the member goes where
+/// [`mark_truncated`] puts it. OCSF has no root-level members of its own to spare, so its marker is longer.
+fn bare_truncation_marker(format: AuditLogFormat) -> &'static str {
+    if format == AuditLogFormat::Ocsf {
+        r#"{"unmapped":{"truncated":true}}"#
+    } else {
+        r#"{"truncated":true}"#
     }
 }
 
-impl Write for AuditFormatBuffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let remaining = self.max_bytes.saturating_sub(self.bytes.len());
-        if buf.len() <= remaining {
-            self.bytes.extend_from_slice(buf);
-            return Ok(buf.len());
-        }
-        self.bytes.extend_from_slice(buf.get(..remaining).unwrap_or_default());
-        self.truncated = true;
-        Err(io::Error::new(io::ErrorKind::WriteZero, "audit output limit reached"))
+/// Records on `document` that it was reduced: a top-level `truncated` member, or `unmapped.truncated` for OCSF,
+/// whose schema keeps members it does not define under `unmapped`.
+fn mark_truncated(document: &mut Value, format: AuditLogFormat) {
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    if format == AuditLogFormat::Ocsf {
+        object.insert("unmapped".to_owned(), json!({"truncated": true}));
+    } else {
+        object.insert("truncated".to_owned(), Value::Bool(true));
     }
+}
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+/// Escapes what JSON leaves raw but a log line should not carry: DEL and the C1 controls.
+///
+/// `serde_json` already writes every control below U+0020 as an escape. These can only occur inside strings,
+/// where `\u00XX` is a valid escape.
+fn escape_json_controls(json: &str) -> String {
+    use std::fmt::Write as _;
+
+    if !json.chars().any(|character| ('\u{7f}'..='\u{9f}').contains(&character)) {
+        return json.to_owned();
     }
+    let mut escaped = String::with_capacity(json.len());
+    for character in json.chars() {
+        if ('\u{7f}'..='\u{9f}').contains(&character) {
+            write!(escaped, "\\u{:04x}", u32::from(character)).unwrap_or(());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 /// `value` without the object fields that are null, `""`, `0`, `false` or `[]`, at any
@@ -3043,7 +3412,7 @@ fn index_field(value: &str) -> String {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "audit log tests use fixed temporary paths")]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditCopyBudget, AuditLog,
         AuditLogger, AuditMessage, AuditMessageData, AuditRequest, AuditTransaction, DEFAULT_SYSLOG_WRITE_TIMEOUT,
@@ -3394,11 +3763,635 @@ mod tests {
     }
 
     #[test]
-    fn bounded_json_output_drops_a_partial_multibyte_character() {
-        let (formatted, truncated) = super::serialize_json_bounded(&serde_json::json!("é"), 2);
+    fn bounded_json_formats_are_valid_json_at_every_size_down_to_the_bare_marker() {
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ACHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                request: AuditRequest {
+                    uri: format!("/{}", "u".repeat(5000)),
+                    body: "b".repeat(5000),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                message: "blocked".to_owned(),
+                data: AuditMessageData {
+                    id: 949_110,
+                    msg: "blocked".to_owned(),
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            for limit in [0_usize, 10, 18, 40, 300, 1000, 4000, 16 * 1024] {
+                let (formatted, truncated) = entry.format_bounded(format, limit);
+                assert!(
+                    formatted.len() <= limit,
+                    "{format:?} limit {limit}: {} bytes",
+                    formatted.len()
+                );
+                if limit < super::bare_truncation_marker(format).len() {
+                    assert!(formatted.is_empty(), "{format:?} limit {limit}: nothing valid fits");
+                    continue;
+                }
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&formatted).is_ok(),
+                    "{format:?} limit {limit}: {formatted}"
+                );
+                assert_eq!(
+                    truncated,
+                    limit < 16 * 1024,
+                    "{format:?} limit {limit}: only a record that did not fit whole is reported cut"
+                );
+            }
+        }
+    }
 
-        assert_eq!(formatted, "\"");
+    #[test]
+    fn the_tiny_limit_fallback_is_valid_for_each_format_and_marks_ocsf_under_unmapped() {
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ACHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                request: AuditRequest {
+                    uri: "/".repeat(500),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            ..AuditLog::default()
+        };
+        for (format, marker) in [
+            (AuditLogFormat::Json, r#"{"truncated":true}"#),
+            (AuditLogFormat::JsonLegacy, r#"{"truncated":true}"#),
+            (AuditLogFormat::Ocsf, r#"{"unmapped":{"truncated":true}}"#),
+        ] {
+            let (formatted, truncated) = entry.format_bounded(format, marker.len());
+            assert_eq!(formatted, marker, "{format:?}");
+            assert!(truncated, "{format:?}");
+            let (formatted, truncated) = entry.format_bounded(format, marker.len() - 1);
+            assert!(formatted.is_empty(), "{format:?}: the marker does not fit: {formatted}");
+            assert!(truncated, "{format:?}");
+        }
+    }
+
+    /// The rule ids and message texts a formatted JSON document keeps, in order; `JSONLegacy` has no ids.
+    pub(crate) fn kept_messages(format: AuditLogFormat, formatted: &str) -> Vec<(Option<i64>, String)> {
+        let value: serde_json::Value = serde_json::from_str(formatted).unwrap();
+        let text = |value: &serde_json::Value, pointer: &str| {
+            // An empty text is left out of the document.
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let list = |pointer: &str| value.pointer(pointer).unwrap().as_array().unwrap().clone();
+        match format {
+            AuditLogFormat::Json => list("/messages")
+                .iter()
+                .map(|message| {
+                    (
+                        message.pointer("/data/id").and_then(serde_json::Value::as_i64),
+                        text(message, "/message"),
+                    )
+                })
+                .collect(),
+            AuditLogFormat::JsonLegacy => list("/audit_data/messages")
+                .iter()
+                .map(|message| (None, message.as_str().unwrap().to_owned()))
+                .collect(),
+            _ => list("/enrichments")
+                .iter()
+                .map(|enrichment| {
+                    let data: serde_json::Value = serde_json::from_str(&text(enrichment, "/data")).unwrap();
+                    (
+                        data.pointer("/id").and_then(serde_json::Value::as_i64),
+                        text(enrichment, "/name"),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The `[msg "…"]` field of a compact identity, which must be there whole: the closing quote and bracket
+    /// present, and the quoted text a valid string that decodes to a prefix of `message`.
+    fn compact_msg_prefix(identity: &str, message: &str) -> String {
+        let field = identity.split_once(" [msg ").map(|(_, field)| field).unwrap();
+        let quoted = field.strip_suffix(']');
+        assert!(quoted.is_some(), "no closing bracket: {identity}");
+        let decoded = serde_json::from_str::<String>(quoted.unwrap());
+        assert!(decoded.is_ok(), "not a quoted string: {identity}");
+        let decoded = decoded.unwrap();
+        assert!(
+            message.starts_with(&decoded),
+            "{decoded:?} is not a prefix of {message:?}"
+        );
+        decoded
+    }
+
+    #[test]
+    fn a_compact_identity_keeps_its_msg_field_whole_when_quoting_expands_the_text() {
+        // Rule 4242 at a 32-byte allowance leaves 12 bytes for the quoted message.
+        for message in [
+            "\\".repeat(40),
+            "\"".repeat(40),
+            format!("a{}", "\\".repeat(40)),
+            // An escape sequence is never split, nor a character: 3-byte characters do not fit in 12 bytes
+            // as anything but whole ones.
+            "\u{20ac}\\".repeat(20),
+            "ab\"cd\\ef".repeat(10),
+        ] {
+            for limit in [32, 31, 30, 29, 33, 64] {
+                let identity = super::reduced_identity(4242, &message, limit);
+                assert!(identity.starts_with("[id \"4242\"]"), "{identity}");
+                assert!(identity.len() <= limit, "{limit}: {identity}");
+                assert!(identity.ends_with("\"]"), "{limit}: {identity}");
+                let decoded = compact_msg_prefix(&identity, &message);
+                assert!(!decoded.is_empty(), "{limit}: some of the message fits: {identity}");
+            }
+        }
+        // A message that fits is written whole, and one with nothing that fits leaves the field out.
+        let identity = super::reduced_identity(4242, "a\\b", 64);
+        assert_eq!(identity, "[id \"4242\"] [msg \"a\\\\b\"]");
+        assert_eq!(super::reduced_identity(4242, "\\", 20), "[id \"4242\"]");
+    }
+
+    #[test]
+    fn a_pinned_message_with_escapes_keeps_its_compact_msg_field_whole() {
+        for message in ["\\".repeat(40), "\"".repeat(40)] {
+            let source = AuditMessage {
+                rule_id: 4242,
+                rule_message: message.clone(),
+                error_message: "e".repeat(500),
+                ..AuditMessage::default()
+            };
+            for mode in [super::AuditMessageCopy::Json, super::AuditMessageCopy::Legacy] {
+                let mut budget = AuditCopyBudget::generous(32);
+                let copy = budget.pinned_message(&source, mode);
+                let identity = if mode == super::AuditMessageCopy::Json {
+                    copy.error_message
+                } else {
+                    copy.message
+                };
+                assert!(
+                    identity.starts_with("[id \"4242\"]") && identity.ends_with("\"]"),
+                    "{identity}"
+                );
+                compact_msg_prefix(&identity, &message);
+            }
+        }
+    }
+
+    /// A message of `text` bytes of message text for rule `id`.
+    fn message_of(id: i32, text: usize) -> AuditMessage {
+        AuditMessage {
+            message: "m".repeat(text),
+            data: AuditMessageData {
+                id,
+                msg: "m".repeat(text),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        }
+    }
+
+    #[test]
+    fn a_record_that_fits_is_the_unbounded_serialisation_with_no_marker() {
+        // One long message among short ones: an even split of the cap over the messages (about 800 bytes each)
+        // used to cut the long one, although the whole record is far under the 16 KiB.
+        let mut messages = vec![message_of(1, 10), message_of(2, 5600), message_of(3, 10)];
+        messages.extend((4..12).map(|id| message_of(id, 20)));
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ABCHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                request: AuditRequest {
+                    uri: "/path".to_owned(),
+                    body: "b".repeat(100),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let whole = entry.format(format);
+            assert!(
+                whole.len() > 5600 && whole.len() < 16 * 1024,
+                "{format:?}: {}",
+                whole.len()
+            );
+            let (formatted, truncated) = entry.format_bounded(format, 16 * 1024);
+            assert!(!truncated, "{format:?}: nothing was reduced");
+            if format == AuditLogFormat::Ocsf {
+                // Every OCSF record carries the time it was formatted at.
+                let without_time = |text: &str| {
+                    let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
+                    value
+                        .pointer_mut("/metadata")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("logged_time");
+                    value
+                };
+                assert_eq!(without_time(&formatted), without_time(&whole), "{format:?}");
+            } else {
+                assert_eq!(formatted, whole, "{format:?}");
+            }
+            assert!(!formatted.contains("truncated"), "{format:?}: no marker");
+        }
+    }
+
+    /// `text` parsed, with the time OCSF stamps on each formatting taken out.
+    fn parsed_without_time(text: &str) -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(text).unwrap();
+        if let Some(metadata) = value
+            .pointer_mut("/metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("logged_time");
+        }
+        value
+    }
+
+    #[test]
+    fn a_record_that_fits_keeps_its_data_though_its_bytes_may_differ() {
+        // DEL and the C1 controls are left raw by `format` and escaped by the bounded formatter.
+        let text = "a\u{85}b\u{7f}c\u{9f}d";
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ABCHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                request: AuditRequest {
+                    uri: format!("/{text}"),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                message: text.to_owned(),
+                data: AuditMessageData {
+                    id: 5,
+                    msg: text.to_owned(),
+                    data: text.to_owned(),
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let whole = entry.format(format);
+            let (formatted, truncated) = entry.format_bounded(format, 16 * 1024);
+            assert!(!truncated, "{format:?}");
+            assert!(
+                whole.contains('\u{85}'),
+                "{format:?}: the unbounded output leaves it raw"
+            );
+            assert!(
+                !formatted.contains('\u{85}') && formatted.contains("\\u0085"),
+                "{format:?}: {formatted}"
+            );
+            assert_eq!(
+                parsed_without_time(&formatted),
+                parsed_without_time(&whole),
+                "{format:?}: the escaped output decodes to the same value"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_producer_entry_leaves_a_compact_record_with_the_id_and_the_interrupting_rule() {
+        // Every attempt overflowed on the producer, and the record fell to the bare marker.
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-compact".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(4242),
+                producer: Some(super::AuditProducer {
+                    connector: "c".repeat(16 * 1024),
+                    rulesets: vec!["r".repeat(16 * 1024)],
+                    ..super::AuditProducer::default()
+                }),
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                message: "DENY-RULE".to_owned(),
+                data: AuditMessageData {
+                    id: 4242,
+                    msg: "DENY-RULE".to_owned(),
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated && formatted.len() <= 4096, "{format:?}");
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            let marker = if format == AuditLogFormat::Ocsf {
+                "/unmapped/truncated"
+            } else {
+                "/truncated"
+            };
+            assert_eq!(
+                document.pointer(marker),
+                Some(&serde_json::Value::Bool(true)),
+                "{format:?}"
+            );
+            let kept = kept_messages(format, &formatted);
+            assert!(
+                kept.iter()
+                    .any(|(id, text)| text == "DENY-RULE" && id.is_none_or(|id| id == 4242)),
+                "{format:?}: the interrupting rule is kept: {formatted}"
+            );
+            if format == AuditLogFormat::JsonLegacy {
+                assert!(formatted.contains("tx-compact"), "{formatted}");
+            } else {
+                let id_pointer = if format == AuditLogFormat::Ocsf {
+                    "/http_request/uid"
+                } else {
+                    "/transaction/id"
+                };
+                assert_eq!(
+                    document.pointer(id_pointer).and_then(serde_json::Value::as_str),
+                    Some("tx-compact"),
+                    "{format:?}: the transaction id is kept"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ocsf_is_not_charged_for_message_text_it_never_writes() {
+        // OCSF writes the first message's text only; a long `message` on a later one is never serialised.
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                ..AuditTransaction::default()
+            },
+            messages: vec![
+                AuditMessage {
+                    message: "first message text".to_owned(),
+                    data: AuditMessageData {
+                        id: 1,
+                        msg: "first".to_owned(),
+                        ..AuditMessageData::default()
+                    },
+                    ..AuditMessage::default()
+                },
+                AuditMessage {
+                    message: "x".repeat(16 * 1024),
+                    data: AuditMessageData {
+                        id: 2,
+                        msg: "second".to_owned(),
+                        ..AuditMessageData::default()
+                    },
+                    ..AuditMessage::default()
+                },
+            ],
+        };
+        let whole = entry.format(AuditLogFormat::Ocsf);
+        assert!(whole.len() < 2048, "{}", whole.len());
+        let (formatted, truncated) = entry.format_bounded(AuditLogFormat::Ocsf, 16 * 1024);
+        assert!(!truncated, "{formatted}");
+        let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(
+            document.pointer("/message").and_then(serde_json::Value::as_str),
+            Some("first message text")
+        );
+        assert_eq!(kept_messages(AuditLogFormat::Ocsf, &formatted).len(), 2);
+    }
+
+    #[test]
+    fn many_tiny_messages_that_fit_are_all_kept() {
+        // 3000 empty messages are `""` each in JSONLegacy, 9 KB in all: far more entries than the 64-byte-per-entry
+        // allowance of the native copy would admit, and they fit.
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                ..AuditTransaction::default()
+            },
+            messages: (1..=3000).map(|id| message_of(id, 0)).collect(),
+        };
+        let whole = entry.format(AuditLogFormat::JsonLegacy);
+        assert!(whole.len() < 16 * 1024, "{}", whole.len());
+        let (formatted, truncated) = entry.format_bounded(AuditLogFormat::JsonLegacy, 16 * 1024);
+        assert!(!truncated);
+        assert_eq!(formatted, whole);
+    }
+
+    #[test]
+    fn request_padding_does_not_consume_message_text() {
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ACKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                request: AuditRequest {
+                    body: "b".repeat(20_000),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![message_of(1, 3000), message_of(2, 3000)],
+        };
+        let (formatted, truncated) = entry.format_bounded(AuditLogFormat::Json, 16 * 1024);
         assert!(truncated);
+        assert!(formatted.len() <= 16 * 1024);
+        assert!(
+            formatted.contains(&"m".repeat(3000)),
+            "message text survives the padding"
+        );
+        assert_eq!(kept_messages(AuditLogFormat::Json, &formatted).len(), 2);
+    }
+
+    #[test]
+    fn the_interrupting_message_is_kept_when_messages_are_dropped() {
+        // The interrupting rule is neither first nor last: a logging rule matches after it.
+        let tagged = |id: i32| AuditMessage {
+            message: format!("msg-{id} {}", "m".repeat(200)),
+            data: AuditMessageData {
+                id,
+                msg: format!("msg-{id}"),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let mut messages: Vec<_> = (1..=100).map(tagged).collect();
+        messages.push(tagged(900));
+        messages.extend((1..=100).map(|id| tagged(1000 + id)));
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(900),
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated && formatted.len() <= 4096, "{format:?}");
+            let kept = kept_messages(format, &formatted);
+            assert!(kept.len() < 201, "{format:?}: messages were dropped");
+            assert!(
+                kept.iter().any(|(_, text)| text.starts_with("msg-900")),
+                "{format:?}: the interrupting rule's message is kept: {kept:?}"
+            );
+            if format != AuditLogFormat::JsonLegacy {
+                let ids: Vec<_> = kept.iter().map(|(id, _)| *id).collect();
+                assert!(ids.contains(&Some(900)), "{format:?}: {ids:?}");
+                assert!(ids.is_sorted(), "{format:?}: kept messages stay in order: {ids:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_full_of_rule_tags_keeps_its_identity_and_deny_rule_when_reduced() {
+        // One short deny and thousands of one-byte tags: text reduction cannot remove the array entries, and
+        // OCSF escapes the array again inside the enrichment's `data` string, so only dropping the tags fits.
+        let deny = AuditMessage {
+            message: "DENY-RULE".to_owned(),
+            rule_id: 900,
+            data: AuditMessageData {
+                id: 900,
+                msg: "DENY-RULE".to_owned(),
+                tags: vec!["t".to_owned(); 4000],
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-many-tags".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(900),
+                ..AuditTransaction::default()
+            },
+            messages: vec![deny],
+        };
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            // JSONLegacy does not write tags, so its record fits whole.
+            assert_eq!(
+                entry.format(format).len() > 16 * 1024,
+                format != AuditLogFormat::JsonLegacy,
+                "{format:?}"
+            );
+            let (formatted, truncated) = entry.format_bounded(format, 16 * 1024);
+            assert_eq!(truncated, format != AuditLogFormat::JsonLegacy, "{format:?}");
+            assert!(formatted.len() <= 16 * 1024, "{format:?}");
+            assert_ne!(
+                formatted,
+                super::bare_truncation_marker(format),
+                "{format:?}: more than the bare marker"
+            );
+            assert!(
+                formatted.contains("tx-many-tags"),
+                "{format:?}: the transaction id: {formatted}"
+            );
+            let kept = kept_messages(format, &formatted);
+            assert!(
+                kept.iter().any(|(_, text)| text == "DENY-RULE"),
+                "{format:?}: the deny rule's message: {kept:?}"
+            );
+            if format != AuditLogFormat::JsonLegacy {
+                assert!(kept.iter().any(|(id, _)| *id == Some(900)), "{format:?}: {kept:?}");
+            }
+        }
+
+        // A record that fits keeps its tags.
+        let mut small = entry.clone();
+        if let Some(message) = small.messages.first_mut() {
+            message.data.tags = vec!["tag-a".to_owned(), "tag-b".to_owned()];
+        }
+        let (formatted, truncated) = small.format_bounded(AuditLogFormat::Json, 16 * 1024);
+        assert!(!truncated && formatted.contains("tag-b"), "{formatted}");
+    }
+
+    #[test]
+    fn the_last_message_is_kept_when_nothing_interrupted_the_transaction() {
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                ..AuditTransaction::default()
+            },
+            messages: (1..=300).map(|id| message_of(id, 100)).collect(),
+        };
+        let (formatted, truncated) = entry.format_bounded(AuditLogFormat::Json, 4096);
+        assert!(truncated);
+        let ids: Vec<_> = kept_messages(AuditLogFormat::Json, &formatted)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids.first(), Some(&Some(1)));
+        assert_eq!(ids.last(), Some(&Some(300)));
+    }
+
+    #[test]
+    fn the_formatter_copies_a_bounded_number_of_messages_out_of_a_huge_list() {
+        let mut messages: Vec<_> = (1..=100_000).map(|id| message_of(id, 0)).collect();
+        messages.push(message_of(7, 5));
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-1".to_owned(),
+                interruption_rule_id: Some(7),
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+        let plan = super::AuditShrinkPlan {
+            request_bytes: 16 * 1024,
+            message_bytes: 16 * 1024,
+            message_each: None,
+            message_count: 100_001_usize.min(AuditCopyBudget::generous(16 * 1024).items_left),
+            reduced: false,
+        };
+        let mut budget = AuditCopyBudget::generous(16 * 1024);
+        let view = entry.bounded_copy_planned(AuditLogFormat::Json, &mut budget, Some(plan));
+        assert!(view.messages.len() <= 16 * 1024 / 2 + 1, "{}", view.messages.len());
+        assert!(budget.items_used <= 16 * 1024 / 2 + 1);
+        assert!(
+            view.messages.iter().any(|message| message.data.id == 7),
+            "the interrupting message"
+        );
+        assert!(budget.truncated);
+
+        // The whole path, which copies and serialises only what it keeps, in every format. Its work is
+        // bounded by the messages it copies, counted at the copy: a bounded number per attempt, however many
+        // the entry holds. Copying all 100001 of them even once would exceed the bound.
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            super::MESSAGES_COPIED.with(|copied| copied.set(0));
+            let (formatted, truncated) = entry.format_bounded(format, 16 * 1024);
+            let copies = super::MESSAGES_COPIED.with(std::cell::Cell::get);
+            assert!(truncated && formatted.len() <= 16 * 1024, "{format:?}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&formatted).is_ok(),
+                "{format:?}"
+            );
+            assert!(
+                copies > 0 && copies <= 50_000,
+                "{format:?}: {copies} message copies for 100001 messages"
+            );
+            // Id 7 is also an earlier, empty message: the pinned one is told apart by its text.
+            let kept = kept_messages(format, &formatted);
+            assert!(
+                kept.iter()
+                    .any(|(id, text)| text == "mmmmm" && id.is_none_or(|id| id == 7)),
+                "{format:?}: the pinned message with its text is kept: {} kept",
+                kept.len()
+            );
+        }
     }
 
     #[test]
