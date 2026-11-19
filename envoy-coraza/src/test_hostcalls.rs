@@ -23,11 +23,13 @@
 //! unaffected because this module is `#[cfg(test)]`-gated. Buffers, maps, and properties
 //! are reported missing unless a test scripts them.
 //!
-//! Four hostcalls are programmable per test thread, so a test can drive the filter without
+//! Several hostcalls are programmable per test thread, so a test can drive the filter without
 //! fabricating anything it did not ask for: the plugin configuration buffer
-//! ([`set_plugin_configuration`]), the request header map ([`set_request_headers`]), a
-//! property value or failure ([`set_property`], [`fail_property`]), and the status codes of
-//! local replies ([`local_reply_statuses`]).
+//! ([`set_plugin_configuration`]), the request and response header maps ([`set_request_headers`],
+//! [`set_response_headers`]), the request and response body buffers ([`set_request_body`],
+//! [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]), and what the
+//! filter did: the status codes of local replies ([`local_reply_statuses`]), of response replacements
+//! ([`response_replacement_statuses`]) and the filter-state properties it published ([`published_property`]).
 //! Each test runs on its own thread, so the scripted state is isolated; call [`reset`] to
 //! clear it explicitly. Everything else stays a fixed stub that reports `Status::NotFound`.
 
@@ -49,6 +51,16 @@ struct Host {
     plugin_configuration: Option<Vec<u8>>,
     /// Request header map, or `None` to report it missing.
     request_headers: Option<Vec<(String, Vec<u8>)>>,
+    /// Request body buffer, or `None` to report it missing.
+    request_body: Option<Vec<u8>>,
+    /// Response header map, or `None` to report it missing.
+    response_headers: Option<Vec<(String, Vec<u8>)>>,
+    /// Response body buffer, or `None` to report it missing.
+    response_body: Option<Vec<u8>>,
+    /// The `:status` of every response header map the filter set, in order.
+    response_replacements: Vec<String>,
+    /// Filter-state properties the filter published, by dotted path.
+    published: BTreeMap<String, String>,
     /// Dotted property path to its scripted value or failure status.
     properties: BTreeMap<String, Result<Vec<u8>, Status>>,
     /// Status codes of the local replies the filter sent.
@@ -60,6 +72,11 @@ thread_local! {
         RefCell::new(Host {
             plugin_configuration: None,
             request_headers: None,
+            request_body: None,
+            response_headers: None,
+            response_body: None,
+            response_replacements: Vec::new(),
+            published: BTreeMap::new(),
             properties: BTreeMap::new(),
             local_replies: Vec::new(),
         })
@@ -71,6 +88,11 @@ pub(crate) fn reset() {
     HOST.with_borrow_mut(|host| {
         host.plugin_configuration = None;
         host.request_headers = None;
+        host.request_body = None;
+        host.response_headers = None;
+        host.response_body = None;
+        host.response_replacements.clear();
+        host.published.clear();
         host.properties.clear();
         host.local_replies.clear();
     });
@@ -91,6 +113,38 @@ pub(crate) fn set_request_headers(headers: &[(&str, &[u8])]) {
                 .collect(),
         );
     });
+}
+
+/// Scripts the request body buffer the host returns.
+pub(crate) fn set_request_body(body: &[u8]) {
+    HOST.with_borrow_mut(|host| host.request_body = Some(body.to_vec()));
+}
+
+/// Scripts the response header map the host returns.
+pub(crate) fn set_response_headers(headers: &[(&str, &[u8])]) {
+    HOST.with_borrow_mut(|host| {
+        host.response_headers = Some(
+            headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
+                .collect(),
+        );
+    });
+}
+
+/// Scripts the response body buffer the host returns.
+pub(crate) fn set_response_body(body: &[u8]) {
+    HOST.with_borrow_mut(|host| host.response_body = Some(body.to_vec()));
+}
+
+/// The `:status` of every response header map the filter has set so far, in order: the replacements it made.
+pub(crate) fn response_replacement_statuses() -> Vec<String> {
+    HOST.with_borrow(|host| host.response_replacements.clone())
+}
+
+/// What the filter published at the filter-state property `path`, such as `io.coraza.waf.v1.inspection_complete`.
+pub(crate) fn published_property(path: &str) -> Option<String> {
+    HOST.with_borrow(|host| host.published.get(path).cloned())
 }
 
 /// Scripts a property (dotted path, such as `source.address`) the host returns.
@@ -156,15 +210,29 @@ extern "C" fn proxy_log(_level: LogLevel, _message_data: *const u8, _message_siz
 #[no_mangle]
 extern "C" fn proxy_get_buffer_bytes(
     buffer_type: BufferType,
-    _start: usize,
-    _max_size: usize,
+    start: usize,
+    max_size: usize,
     return_buffer_data: *mut *mut u8,
     return_buffer_size: *mut usize,
 ) -> Status {
-    let configuration = HOST.with_borrow(|host| host.plugin_configuration.clone());
-    match (buffer_type, configuration) {
-        (BufferType::PluginConfiguration, Some(configuration)) => {
+    let (configuration, request_body, response_body) = HOST.with_borrow(|host| {
+        (
+            host.plugin_configuration.clone(),
+            host.request_body.clone(),
+            host.response_body.clone(),
+        )
+    });
+    let window = |body: Vec<u8>| {
+        let end = start.saturating_add(max_size).min(body.len());
+        body.get(start.min(end)..end).unwrap_or_default().to_vec()
+    };
+    match (buffer_type, configuration, request_body, response_body) {
+        (BufferType::PluginConfiguration, Some(configuration), ..) => {
             hand_out(configuration, return_buffer_data, return_buffer_size);
+            Status::Ok
+        },
+        (BufferType::HttpRequestBody, _, Some(body), _) | (BufferType::HttpResponseBody, _, _, Some(body)) => {
+            hand_out(window(body), return_buffer_data, return_buffer_size);
             Status::Ok
         },
         _ => Status::NotFound,
@@ -173,13 +241,17 @@ extern "C" fn proxy_get_buffer_bytes(
 
 #[no_mangle]
 extern "C" fn proxy_set_buffer_bytes(
-    _buffer_type: BufferType,
+    buffer_type: BufferType,
     _start: usize,
     _size: usize,
     _buffer_data: *const u8,
     _buffer_size: usize,
 ) -> Status {
-    Status::NotFound
+    // A response replaced by the filter is scripted to succeed, so that the filter's reply can be observed.
+    match buffer_type {
+        BufferType::HttpResponseBody => Status::Ok,
+        _ => Status::NotFound,
+    }
 }
 
 #[no_mangle]
@@ -188,9 +260,9 @@ extern "C" fn proxy_get_header_map_pairs(
     return_map_data: *mut *mut u8,
     return_map_size: *mut usize,
 ) -> Status {
-    let headers = HOST.with_borrow(|host| host.request_headers.clone());
-    match (map_type, headers) {
-        (MapType::HttpRequestHeaders, Some(headers)) => {
+    let (request, response) = HOST.with_borrow(|host| (host.request_headers.clone(), host.response_headers.clone()));
+    match (map_type, request, response) {
+        (MapType::HttpRequestHeaders, Some(headers), _) | (MapType::HttpResponseHeaders, _, Some(headers)) => {
             hand_out(serialize_map(&headers), return_map_data, return_map_size);
             Status::Ok
         },
@@ -199,8 +271,44 @@ extern "C" fn proxy_get_header_map_pairs(
 }
 
 #[no_mangle]
-extern "C" fn proxy_set_header_map_pairs(_map_type: MapType, _map_data: *const u8, _map_size: usize) -> Status {
-    Status::NotFound
+extern "C" fn proxy_set_header_map_pairs(map_type: MapType, map_data: *const u8, map_size: usize) -> Status {
+    match map_type {
+        MapType::HttpResponseHeaders => {
+            let status = if map_size == 0 {
+                None
+            } else {
+                // SAFETY: the SDK passes the serialized map it owns for the duration of the call.
+                let raw = unsafe { std::slice::from_raw_parts(map_data, map_size) };
+                status_of(raw)
+            };
+            HOST.with_borrow_mut(|host| host.response_replacements.push(status.unwrap_or_default()));
+            Status::Ok
+        },
+        MapType::HttpResponseTrailers => Status::Ok,
+        _ => Status::NotFound,
+    }
+}
+
+/// The `:status` value in a serialized header map, if it has one.
+fn status_of(raw: &[u8]) -> Option<String> {
+    let word = |at: usize| -> Option<usize> {
+        let bytes: [u8; 4] = raw.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        usize::try_from(u32::from_le_bytes(bytes)).ok()
+    };
+    let count = word(0)?;
+    let mut offset = 4_usize.checked_add(count.checked_mul(8)?)?;
+    for index in 0..count {
+        let name_len = word(4 + index * 8)?;
+        let value_len = word(8 + index * 8)?;
+        let name = raw.get(offset..offset.checked_add(name_len)?)?;
+        offset = offset.checked_add(name_len)?.checked_add(1)?;
+        let value = raw.get(offset..offset.checked_add(value_len)?)?;
+        offset = offset.checked_add(value_len)?.checked_add(1)?;
+        if name == b":status" {
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    None
 }
 
 #[no_mangle]
@@ -240,11 +348,24 @@ extern "C" fn proxy_get_property(
 
 #[no_mangle]
 extern "C" fn proxy_set_property(
-    _path_data: *const u8,
-    _path_size: usize,
-    _value_data: *const u8,
-    _value_size: usize,
+    path_data: *const u8,
+    path_size: usize,
+    value_data: *const u8,
+    value_size: usize,
 ) -> Status {
+    // Published values are remembered for the tests to read, and the host still reports the property missing.
+    if path_size > 0 && value_size > 0 {
+        // SAFETY: the SDK passes the serialized path and the value it owns for the duration of the call.
+        let (path, value) = unsafe {
+            (
+                std::slice::from_raw_parts(path_data, path_size),
+                std::slice::from_raw_parts(value_data, value_size),
+            )
+        };
+        let path = String::from_utf8_lossy(path).replace('\0', ".");
+        let value = String::from_utf8_lossy(value).into_owned();
+        HOST.with_borrow_mut(|host| host.published.insert(path, value));
+    }
     Status::NotFound
 }
 

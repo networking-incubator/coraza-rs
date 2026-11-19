@@ -9,6 +9,7 @@
 use std::fmt;
 
 use super::tables::{AUTO_CLOSE, FIRST, HTML_ENTITIES, SECOND};
+use crate::{body_processors::budget::MemoryBudget, collection::ALLOCATION_OVERHEAD_BYTES};
 
 /// An element's name as written: `prefix:local`, or `local` alone
 #[derive(Debug, Clone)]
@@ -32,12 +33,10 @@ struct Open {
 /// What [`Decoder::token`] reads, as far as the body processor needs it
 #[derive(Debug)]
 pub(super) enum Token {
-    /// A start tag, and the values of its attributes in order
+    /// A start tag; the values of its attributes went to the sink as they were read
     Start {
         /// Parsed element name.
         name: Name,
-        /// Attribute values in document order.
-        attribute_values: Vec<String>,
     },
 
     /// An end tag, or the end of an element the decoder closed itself
@@ -53,6 +52,12 @@ pub(super) enum Token {
 /// Why [`Decoder::token`] can't read on
 #[derive(Debug)]
 pub(super) enum DecodeError {
+    /// Reading on would take the decoder past the memory budget its host set; there is no Go counterpart.
+    MemoryBudget {
+        /// The budget the host set, in bytes.
+        budget: usize,
+    },
+
     /// The input ended within a token or an element: Go's `SyntaxError` "unexpected EOF"
     UnexpectedEof {
         /// Current one-based line number.
@@ -74,6 +79,9 @@ pub(super) enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DecodeError::MemoryBudget { budget } => {
+                write!(f, "parsed XML exceeds the {budget} byte body memory budget")
+            },
             DecodeError::UnexpectedEof { line } => {
                 write!(f, "XML syntax error on line {line}: unexpected EOF")
             },
@@ -113,7 +121,32 @@ pub(super) struct Decoder<'a> {
     pending_end: Option<Name>,
     /// The token read before the end of an element closed automatically
     next_token: Option<Token>,
+    /// The memory its host allows it, which charges everything the decoder holds, values and scratch alike
+    memory: MemoryBudget,
+    /// Stack entries already charged against `memory`: the stack's high-water mark, as it never shrinks
+    open_charged: usize,
+    /// Scratch bytes charged against `memory` since the token began, given back when it ends
+    scratch: usize,
+    /// Attribute values the start tag being read has handed over, which it takes back if it does not complete
+    tag_attributes: usize,
+    /// Bytes of the names of the elements open now
+    open_name_bytes: usize,
+    /// The most `open_name_bytes` has reached, which is what has been charged for names
+    name_bytes_charged: usize,
 }
+
+/// Bytes the names of an open element hold: those in the stack and the ones of the token that opened it, which the
+/// caller still holds.
+fn name_bytes(name: &Name) -> usize {
+    name.local
+        .len()
+        .saturating_add(name.space.len())
+        .saturating_mul(2)
+        .saturating_add(4 * ALLOCATION_OVERHEAD_BYTES)
+}
+
+/// How much of a value an error message quotes when the decoder has a budget to keep.
+const EXCERPT_BYTES: usize = 64;
 
 impl<'a> Decoder<'a> {
     /// Create a decoder over an XML document.
@@ -125,6 +158,100 @@ impl<'a> Decoder<'a> {
             open: Vec::new(),
             pending_end: None,
             next_token: None,
+            memory: MemoryBudget::default(),
+            open_charged: 0,
+            scratch: 0,
+            tag_attributes: 0,
+            open_name_bytes: 0,
+            name_bytes_charged: 0,
+        }
+    }
+
+    /// Limits everything this decoder holds, values and its own scratch, to the host's `memory` budget.
+    ///
+    /// The decoder reads ahead to size what it is about to allocate, and charges that first, so a body of any
+    /// shape stops it before it goes past the budget. An unlimited budget leaves it as it was.
+    pub(super) fn with_memory_budget(mut self, memory: MemoryBudget) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// Reserves `bytes` of the memory budget for a value about to be kept, which is a no-op without a budget.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::MemoryBudget`] when the budget cannot cover it. The budget is not reduced then.
+    pub(super) fn charge(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        self.reserve(bytes)
+    }
+
+    /// Reserves `bytes` of the host's memory budget, which is a no-op without one.
+    fn reserve(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        if self.memory.charge(bytes) {
+            Ok(())
+        } else {
+            Err(DecodeError::MemoryBudget {
+                budget: self.memory.limit(),
+            })
+        }
+    }
+
+    /// Whether the host set a memory budget, which is when the decoder looks ahead to size its scratch.
+    fn is_limited(&self) -> bool {
+        self.memory.is_limited()
+    }
+
+    /// Reserves `bytes` for a buffer the decoder is about to fill. It stays reserved until
+    /// [`Decoder::release_scratch`], which every token does at its end.
+    fn scratch(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        self.reserve(bytes)?;
+        self.scratch = self.scratch.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Gives back what [`Decoder::scratch`] reserved: the buffers it covered are gone, or are now values, which the
+    /// caller charges for itself.
+    fn release_scratch(&mut self) {
+        self.memory.refund(self.scratch);
+        self.scratch = 0;
+    }
+
+    /// Gives back what [`Decoder::scratch`] reserved since `mark`, a value [`Decoder::scratch_mark`] returned: one
+    /// part of a token, such as an attribute, is done with its buffers while the rest of the token still holds its own.
+    fn release_scratch_to(&mut self, mark: usize) {
+        let release = self.scratch.saturating_sub(mark);
+        self.memory.refund(release);
+        self.scratch = mark;
+    }
+
+    /// The scratch the token holds now, to give back what comes after it alone.
+    const fn scratch_mark(&self) -> usize {
+        self.scratch
+    }
+
+    /// The length of the input from the offset to the first byte `stop` accepts, or to its end.
+    fn run_len(&self, stop: impl Fn(u8) -> bool) -> usize {
+        let rest = self.input.get(self.offset..).unwrap_or_default();
+        rest.iter().position(|&b| stop(b)).unwrap_or(rest.len())
+    }
+
+    /// The length of the name that starts at the offset.
+    fn name_run(&self) -> usize {
+        self.run_len(|b| b.is_ascii() && !is_name_byte(b))
+    }
+
+    /// The most bytes the text read up to `end` can take: the input up to its end, which references and line
+    /// ends only shorten.
+    fn text_bound(&self, end: TextEnd) -> usize {
+        match end {
+            TextEnd::Markup => self.run_len(|b| b == b'<'),
+            TextEnd::Quote(quote) => self.run_len(|b| b == quote || b == b'<'),
+            TextEnd::Cdata => {
+                let rest = self.input.get(self.offset..).unwrap_or_default();
+                rest.windows(3)
+                    .position(|window| window == b"]]>")
+                    .map_or(rest.len(), |at| at.saturating_add(3))
+            },
         }
     }
 
@@ -138,10 +265,17 @@ impl<'a> Decoder<'a> {
     ///
     /// If the input is malformed as Go's decoder reads it, with `Strict` off, or ends
     /// within a token or an element.
-    pub(super) fn token(&mut self) -> Result<Option<Token>, DecodeError> {
+    pub(super) fn token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
+        let token = self.next_checked_token(attribute);
+        self.release_scratch();
+        token
+    }
+
+    /// [`Decoder::token`], before the scratch it reserved is given back.
+    fn next_checked_token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
         let token = match self.next_token.take() {
             Some(token) => token,
-            None => match self.raw_token()? {
+            None => match self.raw_token(attribute)? {
                 Some(token) => token,
                 None if self.open.is_empty() => return Ok(None),
                 None => return Err(DecodeError::UnexpectedEof { line: self.line }),
@@ -155,13 +289,24 @@ impl<'a> Decoder<'a> {
             None => token,
         };
         Ok(Some(match token {
-            Token::Start { name, attribute_values } => {
+            Token::Start { name } => {
+                // Nothing else bounds how deep a document nests, and each level is held until it closes: its entry
+                // in the stack, which keeps its capacity, and its names.
+                if self.open.len() >= self.open_charged {
+                    self.reserve(2 * size_of::<Open>())?;
+                    self.open_charged = self.open.len().saturating_add(1);
+                }
+                self.open_name_bytes = self.open_name_bytes.saturating_add(name_bytes(&name));
+                if self.open_name_bytes > self.name_bytes_charged {
+                    self.reserve(self.open_name_bytes - self.name_bytes_charged)?;
+                    self.name_bytes_charged = self.open_name_bytes;
+                }
                 let auto_close = AUTO_CLOSE.iter().copied().find(|html| equal_fold(html, &name.local));
                 self.open.push(Open {
                     name: name.clone(),
                     auto_close,
                 });
-                Token::Start { name, attribute_values }
+                Token::Start { name }
             },
             Token::End(name) => Token::End(self.pop_element(name)?),
             token => token,
@@ -175,6 +320,7 @@ impl<'a> Decoder<'a> {
         let Some(Open { name: open, .. }) = self.open.pop() else {
             return Err(self.syntax_error(format!("unexpected end element </{}>", name.local)));
         };
+        self.open_name_bytes = self.open_name_bytes.saturating_sub(name_bytes(&open));
         if open.local != name.local {
             self.pending_end = Some(name);
             return Ok(open);
@@ -201,7 +347,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The next token as written (Go's `rawToken`), or `None` at the end of the input.
-    fn raw_token(&mut self) -> Result<Option<Token>, DecodeError> {
+    fn raw_token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
         if let Some(name) = self.pending_end.take() {
             return Ok(Some(Token::End(name)));
         }
@@ -247,7 +393,7 @@ impl<'a> Decoder<'a> {
             },
             _ => {
                 self.ungetc();
-                self.start_tag()?
+                self.start_tag(attribute)?
             },
         };
         Ok(Some(token))
@@ -260,37 +406,72 @@ impl<'a> Decoder<'a> {
             .name()?
             .ok_or_else(|| self.syntax_error("expected target name after <?"))?;
         self.space();
+        // Only the declaration's content is read, so any other instruction is skipped without buffering it.
+        let keep = target == "xml";
         let mut content = Vec::new();
+        if keep && self.is_limited() {
+            let rest = self.input.get(self.offset..).unwrap_or_default();
+            let bound = rest
+                .windows(2)
+                .position(|window| window == b"?>")
+                .map_or(rest.len(), |at| at.saturating_add(2));
+            self.scratch(bound.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
+            content.reserve_exact(bound);
+        }
         let mut previous = 0;
         loop {
             let b = self.mustgetc()?;
             if previous == b'?' && b == b'>' {
                 break;
             }
-            content.push(b);
+            if keep {
+                content.push(b);
+            }
             previous = b;
         }
         content.pop();
-        if target != "xml" {
+        if !keep {
             return Ok(());
         }
         // Quoted as Go's %q quotes, but for unprintable characters, escaped as Rust escapes
         // them, and bytes that aren't UTF-8, replaced
         let version = proc_inst("version", &content);
         if !version.is_empty() && version != b"1.0" {
+            let shown = self.excerpt(version)?;
             return Err(DecodeError::Declaration(format!(
-                "xml: unsupported version {:?}; only version 1.0 is supported",
-                String::from_utf8_lossy(version)
+                "xml: unsupported version {shown:?}; only version 1.0 is supported",
             )));
         }
         let encoding = proc_inst("encoding", &content);
         if !encoding.is_empty() && !encoding.eq_ignore_ascii_case(b"utf-8") {
+            let shown = self.excerpt(encoding)?;
             return Err(DecodeError::Declaration(format!(
-                "xml: encoding {:?} declared but Decoder.CharsetReader is nil",
-                String::from_utf8_lossy(encoding)
+                "xml: encoding {shown:?} declared but Decoder.CharsetReader is nil",
             )));
         }
         Ok(())
+    }
+
+    /// `bytes` as text for an error message. Without a budget that is all of them, as Go quotes them. With one it is
+    /// the first [`EXCERPT_BYTES`], the message's own storage reserved first, so that a value the declaration or a
+    /// name is made of, which is held beside it, is not copied whole into a second buffer past the budget.
+    fn excerpt(&mut self, bytes: &[u8]) -> Result<String, DecodeError> {
+        if !self.is_limited() {
+            return Ok(String::from_utf8_lossy(bytes).into_owned());
+        }
+        let shown = bytes.get(..EXCERPT_BYTES).unwrap_or(bytes);
+        // The text of the bytes, which a lossy view can triple, and the message quoting it, which escapes can multiply
+        // again.
+        self.scratch(
+            EXCERPT_BYTES
+                .saturating_mul(16)
+                .saturating_add(4 * ALLOCATION_OVERHEAD_BYTES),
+        )?;
+        let mut text = String::from_utf8_lossy(shown).into_owned();
+        if shown.len() < bytes.len() {
+            text.push_str("...");
+        }
+        Ok(text)
     }
 
     /// Reads a comment, after its `<!-`.
@@ -366,11 +547,16 @@ impl<'a> Decoder<'a> {
     /// Reads a start tag, from its name. An attribute without a value has its local name
     /// for one, and an unquoted value is the run of letters, digits, `_`, `:` and `-`
     /// (not `Strict`).
-    fn start_tag(&mut self) -> Result<Token, DecodeError> {
+    ///
+    /// A single start tag can hold as many attributes as the body has bytes, so each value is charged as it is
+    /// read and handed to `emit` at once, instead of waiting in a list beside the collection it joins. A tag that
+    /// does not complete leaves them with the caller, who is told how many by [`Decoder::unfinished_attributes`]
+    /// and drops them, as a token that was never returned never had them.
+    fn start_tag(&mut self, emit: &mut dyn FnMut(String)) -> Result<Token, DecodeError> {
         let name = self
             .nsname()?
             .ok_or_else(|| self.syntax_error("expected element name after <"))?;
-        let mut attribute_values = Vec::new();
+        self.tag_attributes = 0;
         loop {
             self.space();
             match self.mustgetc()? {
@@ -384,6 +570,9 @@ impl<'a> Decoder<'a> {
                 b'>' => break,
                 _ => self.ungetc(),
             }
+            // The attribute's own buffers are given back when it is read; the element's name, which the tag holds
+            // to its end, keeps what it reserved.
+            let mark = self.scratch_mark();
             let attribute = self
                 .nsname()?
                 .ok_or_else(|| self.syntax_error("expected attribute name in element"))?;
@@ -395,9 +584,18 @@ impl<'a> Decoder<'a> {
                 self.ungetc();
                 attribute.local
             };
-            attribute_values.push(value);
+            self.release_scratch_to(mark);
+            self.charge(super::value_cost(value.len()))?;
+            self.tag_attributes = self.tag_attributes.saturating_add(1);
+            emit(value);
         }
-        Ok(Token::Start { name, attribute_values })
+        self.tag_attributes = 0;
+        Ok(Token::Start { name })
+    }
+
+    /// How many attribute values the start tag the input ended in had handed over before it ended.
+    pub(super) const fn unfinished_attributes(&self) -> usize {
+        self.tag_attributes
     }
 
     /// Reads an attribute's value, after its `=` (Go's `attrval`).
@@ -408,6 +606,11 @@ impl<'a> Decoder<'a> {
         }
         self.ungetc();
         let mut value = String::new();
+        if self.is_limited() {
+            let run = self.run_len(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-')));
+            self.scratch(run.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
+            value.reserve_exact(run);
+        }
         loop {
             let b = self.mustgetc()?;
             if b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-') {
@@ -426,6 +629,13 @@ impl<'a> Decoder<'a> {
     fn text(&mut self, end: TextEnd) -> Result<String, DecodeError> {
         let (mut b0, mut b1) = (0, 0);
         let mut text = Vec::new();
+        if self.is_limited() {
+            // The text cannot outgrow the input it is read from, so the buffer is sized once, and charged, instead
+            // of doubling past the budget on the way to a value the budget would then refuse.
+            let bound = self.text_bound(end);
+            self.scratch(bound.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
+            text.reserve_exact(bound);
+        }
         loop {
             let Some(b) = self.getc() else {
                 if end == TextEnd::Cdata {
@@ -462,7 +672,12 @@ impl<'a> Decoder<'a> {
             }
             (b0, b1) = (b1, b);
         }
-        self.characters(text)
+        let mut value = self.characters(text)?;
+        if self.is_limited() {
+            // The value is kept: drop what its references and line ends saved.
+            value.shrink_to_fit();
+        }
+        Ok(value)
     }
 
     /// Reads an entity or character reference, after its `&`, onto `text`: what it stands
@@ -536,11 +751,16 @@ impl<'a> Decoder<'a> {
     /// Reads a name, split at its colon if it has one between other characters (Go's
     /// `nsname`); `None` if there is no name, or one with more colons.
     fn nsname(&mut self) -> Result<Option<Name>, DecodeError> {
+        // The name itself is reserved as it is read; what is left to reserve is the two halves it may be split
+        // into beside it.
         let Some(name) = self.name()? else {
             return Ok(None);
         };
         if name.matches(':').count() > 1 {
             return Ok(None);
+        }
+        if self.is_limited() && name.contains(':') {
+            self.scratch(name.len().saturating_add(2 * ALLOCATION_OVERHEAD_BYTES))?;
         }
         Ok(Some(match name.split_once(':') {
             Some((space, local)) if !space.is_empty() && !local.is_empty() => Name {
@@ -561,11 +781,18 @@ impl<'a> Decoder<'a> {
     /// If the bytes it reads as one aren't a valid XML name.
     fn name(&mut self) -> Result<Option<String>, DecodeError> {
         let mut name = Vec::new();
+        if self.is_limited() {
+            // Whatever the name is for, it is read whole before anything is known about it, so it is reserved first.
+            let run = self.name_run();
+            self.scratch(run.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
+            name.reserve_exact(run);
+        }
         if !self.read_name(&mut name)? {
             return Ok(None);
         }
         if !is_name(&name) {
-            return Err(self.syntax_error(format!("invalid XML name: {}", String::from_utf8_lossy(&name))));
+            let shown = self.excerpt(&name)?;
+            return Err(self.syntax_error(format!("invalid XML name: {shown}")));
         }
         let name = String::from_utf8(name).map_err(|_error| self.syntax_error("invalid UTF-8"))?;
         Ok(Some(name))

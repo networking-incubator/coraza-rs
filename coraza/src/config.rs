@@ -260,7 +260,10 @@ pub struct WafConfig {
     pub upload_file_mode: u32,
 
     /// Host policy: reject multipart requests that contain file parts before any upload
-    /// is written to a temporary file. `false`, the default, preserves native behavior.
+    /// is written to a temporary file. A body the multipart parser stopped in before its end, because the
+    /// body is malformed or a memory budget ran out, may hide a file part it did not read, so it is rejected too,
+    /// after the rules of the request body phase had the chance to deny the failure first.
+    /// `false`, the default, preserves native behavior.
     pub reject_multipart_file_uploads: bool,
 
     /// Whether uploaded files are kept after the transaction ends
