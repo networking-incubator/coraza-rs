@@ -825,26 +825,38 @@ mod tests {
 
     #[test]
     fn selected_tx_values_survive_per_match_tx_mutation() {
-        let waf = build_waf("SecRule TX \"@streq hit\" \"id:971,phase:1,pass,setvar:TX.visits=+1\"");
-        let mut tx = waf.new_transaction_with_id("tx-snapshot");
-        tx.set_tx_variable("first", "hit");
-        tx.set_tx_variable("second", "hit");
+        // The first match rewrites or deletes a later selected key; that key must still be
+        // evaluated as it was when the rule selected it.
+        for effect in ["setvar:TX.second=miss", "setvar:!TX.second"] {
+            let waf = build_waf(&format!(
+                "SecRule TX \"@streq hit\" \"id:971,phase:1,pass,{effect},setvar:TX.visits=+1\""
+            ));
+            let mut tx = waf.new_transaction_with_id("tx-snapshot");
+            tx.set_tx_variable("first", "hit");
+            tx.set_tx_variable("second", "hit");
 
-        assert!(tx.process_request_headers().is_none());
+            assert!(tx.process_request_headers().is_none());
 
-        let matched = tx.matched_rules().first().unwrap();
-        assert_eq!(
-            matched.matches.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
-            ["first", "second"]
-        );
-        assert_eq!(tx.get_variable(RuleVariable::TX, Some("visits")).as_deref(), Some("2"));
+            let matched = tx.matched_rules().first().unwrap();
+            assert_eq!(
+                matched.matches.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
+                ["first", "second"],
+                "{effect}"
+            );
+            assert!(matched.matches.iter().all(|item| item.value == b"hit"), "{effect}");
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some("visits")).as_deref(),
+                Some("2"),
+                "{effect}"
+            );
+        }
     }
 
     #[test]
     fn selected_env_values_survive_per_match_env_mutation() {
         let waf = build_waf(
             "SecAction \"id:972,phase:1,pass,setenv:first=hit,setenv:second=hit\"\n\
-             SecRule ENV \"@streq hit\" \"id:973,phase:1,pass,setenv:created=yes\"",
+             SecRule ENV \"@streq hit\" \"id:973,phase:1,pass,setenv:second=miss\"",
         );
         let mut tx = waf.new_transaction_with_id("env-snapshot");
 
@@ -855,9 +867,10 @@ mod tests {
             matched.matches.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
             ["first", "second"]
         );
+        assert!(matched.matches.iter().all(|item| item.value == b"hit"));
         assert_eq!(
-            tx.get_variable(RuleVariable::Env, Some("created")).as_deref(),
-            Some("yes")
+            tx.get_variable(RuleVariable::Env, Some("second")).as_deref(),
+            Some("miss")
         );
     }
 
@@ -878,8 +891,12 @@ mod tests {
         );
     }
 
+    /// Recording a match only appends to `MATCHED_VARS`; it never moves or rewrites an entry that is
+    /// already selected, and `reset_matched_vars` runs between rules, not within one. No effect
+    /// reachable today distinguishes a snapshot from a re-fetch here, so this checks the selection
+    /// and its order, not the snapshot.
     #[test]
-    fn selected_matched_vars_survive_matched_var_recording() {
+    fn matched_vars_selection_lists_every_recorded_value_in_order() {
         let mut tx = Transaction::new("matched-vars-snapshot");
         tx.record_matched_variable(&MatchData::new(RuleVariable::Args, "first", b"hit".to_vec()));
         tx.record_matched_variable(&MatchData::new(RuleVariable::Args, "second", b"hit".to_vec()));
@@ -908,8 +925,12 @@ mod tests {
         );
     }
 
+    /// The public `Transaction` mutators a custom action can call only append to maps (or replace
+    /// single values, which have no later selected values), so no custom action can change an
+    /// already-selected entry today. This checks that an appending action leaves the selection
+    /// intact, not the snapshot itself.
     #[test]
-    fn custom_per_match_action_snapshots_values_before_mutation() {
+    fn custom_per_match_action_appending_an_argument_leaves_the_selection_intact() {
         let mut parser = Parser::new();
         parser
             .register_action("appendarg", Arc::new(|_| Ok(Box::new(AppendArgumentAction))))
@@ -936,15 +957,18 @@ mod tests {
         let waf = build_waf("SecRule ARGS \"@restpath /users/{id}\" \"id:976,phase:1,pass\"");
         let mut tx = waf.new_transaction_with_id("restpath-snapshot");
         tx.add_get_argument("first", "/users/42");
-        tx.add_get_argument("second", "/users/43");
+        // The first match rewrites this existing path argument in `ARGS`; it was selected as
+        // a matching value and must still be evaluated as such.
+        tx.add_path_argument("id", "/users/43");
 
         assert!(tx.process_request_headers().is_none());
 
         let matched = tx.matched_rules().first().unwrap();
         assert_eq!(
             matched.matches.iter().map(|item| item.key.as_str()).collect::<Vec<_>>(),
-            ["first", "second"]
+            ["first", "id"]
         );
+        assert_eq!(matched.matches.get(1).unwrap().value, b"/users/43");
         assert_eq!(
             tx.get_variable(RuleVariable::ArgsPath, Some("id")).as_deref(),
             Some("43")

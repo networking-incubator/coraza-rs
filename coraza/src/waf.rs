@@ -492,6 +492,101 @@ mod tests {
     }
 
     #[test]
+    fn pooled_transaction_reuse_does_not_inherit_ctl_state() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecRule ARGS:ctl \"@streq go\" \"id:1,phase:1,pass,\
+                 ctl:ruleRemoveById=100,ctl:ruleRemoveById=200-210,ctl:ruleRemoveTargetById=300;ARGS:q,\
+                 ctl:ruleRemoveByTag=canary-tag,ctl:ruleEngine=DetectionOnly\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:100,phase:1,pass\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:205,phase:1,pass\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:300,phase:1,pass\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:400,phase:1,pass,tag:'canary-tag'\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:500,phase:1,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let pool = Arc::clone(&waf.transaction_pool);
+
+        {
+            let mut first = waf.new_transaction_with_id("pool-ctl-first");
+            first.add_get_argument("ctl", "go");
+            first.add_get_argument("q", "bad");
+            assert!(first.process_request_headers().is_none());
+            assert_eq!(
+                first
+                    .matched_rules()
+                    .iter()
+                    .map(|rule| rule.rule.id())
+                    .collect::<Vec<_>>(),
+                [1, 500],
+                "every ctl effect should have disabled its canary rule"
+            );
+            assert!(first.interruption().is_none(), "DetectionOnly must not interrupt");
+        }
+
+        assert_eq!(pool.len(), 1, "a finished transaction should enter the bounded pool");
+        let mut second = waf.new_transaction_with_id("pool-ctl-second");
+        assert_eq!(pool.len(), 0, "the next request should reuse the free state");
+        second.add_get_argument("q", "bad");
+        let interruption = second.process_request_headers();
+
+        assert_eq!(
+            second
+                .matched_rules()
+                .iter()
+                .map(|rule| rule.rule.id())
+                .collect::<Vec<_>>(),
+            [100, 205, 300, 400, 500],
+            "a reused transaction must evaluate every rule like a clean one"
+        );
+        assert_eq!(interruption.map(|interruption| interruption.status), Some(403));
+    }
+
+    #[test]
+    fn pooled_transaction_reuse_does_not_inherit_allow_state() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecRuleEngine On\n\
+                 SecRule ARGS:ctl \"@streq go\" \"id:1,phase:1,pass,allow\"\n\
+                 SecRule ARGS:q \"@streq bad\" \"id:500,phase:1,deny,status:403\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let pool = Arc::clone(&waf.transaction_pool);
+
+        {
+            let mut first = waf.new_transaction_with_id("pool-allow-first");
+            first.add_get_argument("ctl", "go");
+            first.add_get_argument("q", "bad");
+            assert!(first.process_request_headers().is_none());
+            assert_eq!(
+                first
+                    .matched_rules()
+                    .iter()
+                    .map(|rule| rule.rule.id())
+                    .collect::<Vec<_>>(),
+                [1],
+                "allow should have skipped the canary rule"
+            );
+        }
+
+        assert_eq!(pool.len(), 1, "a finished transaction should enter the bounded pool");
+        let mut second = waf.new_transaction_with_id("pool-allow-second");
+        assert_eq!(pool.len(), 0, "the next request should reuse the free state");
+        second.add_get_argument("q", "bad");
+
+        assert_eq!(
+            second.process_request_headers().map(|interruption| interruption.status),
+            Some(403),
+            "a reused transaction must not inherit the previous request's allow"
+        );
+    }
+
+    #[test]
     fn pooled_transaction_body_memory_does_not_inherit_post_capacity() {
         let mut parser = Parser::new();
         parser.from_string("SecRequestBodyAccess On").unwrap();
