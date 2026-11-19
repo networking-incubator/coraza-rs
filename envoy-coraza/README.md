@@ -5,6 +5,16 @@ policy generations and enforces them on request and response phases; the
 standalone Envoy harness in [`examples/envoy-coraza`](../examples/envoy-coraza)
 exercises the lifecycle checks.
 
+## Empty or missing configuration
+
+A blank, whitespace-only or missing plugin configuration is rejected on every
+load, so Envoy NACKs the update and keeps the previous configuration. Envoy
+creates a fresh root context for each configuration update (LDS or ECDS), so the
+filter cannot tell a first load from a reload, and accepting blank input would
+let a cleared configuration disable inspection. The one deliberate way to run
+an uninspected filter is an explicit recognised key, such as
+`{"directives_map": {}}`, which the filter accepts and logs as a warning.
+
 ## Recommended baseline (`@recommended-conf`)
 
 Every build, with or without the CRS, embeds Go Coraza's recommended engine

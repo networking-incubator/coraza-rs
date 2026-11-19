@@ -55,7 +55,22 @@ pub struct Map {
     data: IndexMap<Key, Vec<KeyValue>, ahash::RandomState>,
     /// The variable this collection represents
     variable: RuleVariable,
+    /// Total values across all keys, kept in step with `data` by every mutator so that
+    /// [`Map::value_count`] is O(1). Argument-limit checks call it once per added argument.
+    ///
+    /// A `u32` fills the padding after the two small fields, so `Map` and the transaction that embeds
+    /// dozens of them do not grow: a full word per map measurably slowed short requests. It saturates, which
+    /// four billion values of memory would never reach.
+    values: u32,
 }
+
+// The counter must stay in the padding, see `Map::values`. (On 32-bit targets a word is as small as the counter, so
+// there is no padding to use and no measurement behind the layout.)
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<Map>() <= size_of::<IndexMap<Key, Vec<KeyValue>, ahash::RandomState>>() + size_of::<usize>(),
+    "the value counter must fit the padding after the map's small fields"
+);
 
 /// A stored key.
 ///
@@ -78,12 +93,17 @@ enum Key {
 impl Key {
     /// Stores `bytes`, keeping their exact spelling.
     fn from_slice(bytes: &[u8]) -> Self {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => Self::Text(text.to_owned()),
-            Err(_) => Self::Bytes {
-                bytes: bytes.into(),
-                lossy: String::from_utf8_lossy(bytes).into_owned(),
-            },
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return Self::Text(text.to_owned());
+        }
+        // The lossy text grows by pushing, which can leave up to twice the capacity it needs. Trim it so a key
+        // costs the raw bytes plus at most three bytes per invalid byte, which is what
+        // `KEY_RETAINED_BYTES_PER_BYTE` charges.
+        let mut lossy = String::from_utf8_lossy(bytes).into_owned();
+        lossy.shrink_to_fit();
+        Self::Bytes {
+            bytes: bytes.into(),
+            lossy,
         }
     }
 
@@ -178,6 +198,11 @@ impl KeyValue {
     }
 }
 
+/// A value count as the counter's type.
+fn count_of(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 /// Lower-cases the valid UTF-8 parts of `key` and copies bytes that are not UTF-8 unchanged,
 /// so distinct invalid byte sequences stay distinct.
 fn lower_bytes(key: &[u8]) -> Vec<u8> {
@@ -222,6 +247,7 @@ impl Map {
             case_sensitive: false,
             data: IndexMap::with_hasher(ahash::RandomState::new()),
             variable,
+            values: 0,
         }
     }
 
@@ -233,6 +259,7 @@ impl Map {
             case_sensitive: true,
             data: IndexMap::with_hasher(ahash::RandomState::new()),
             variable,
+            values: 0,
         }
     }
 
@@ -415,6 +442,7 @@ impl Map {
                 self.data.insert(Key::from_slice(lookup.as_ref()), vec![kv]);
             },
         }
+        self.values = self.values.saturating_add(1);
     }
 
     /// Replaces the values of `key`, which keeps its position in insertion order if it is
@@ -426,10 +454,20 @@ impl Map {
             .into_iter()
             .map(|value| KeyValue::new(Key::from_slice(key), value.as_ref()))
             .collect();
-        self.data.insert(Key::from_slice(lookup.as_ref()), key_values);
+        let added = key_values.len();
+        if let Some(replaced) = self.data.insert(Key::from_slice(lookup.as_ref()), key_values) {
+            self.values = self.values.saturating_sub(count_of(replaced.len()));
+        }
+        self.values = self.values.saturating_add(count_of(added));
     }
 
     /// Replaces the value at `index` of `key`, or appends it if `index` is past the end.
+    // The nested `match` is the form the hot rewrite-in-place path was benchmarked in: the same logic as
+    // `if let` branches with an early return measured about 10% slower on short requests.
+    #[expect(
+        clippy::single_match_else,
+        reason = "the nested match keeps the hot rewrite-in-place path as benchmarked"
+    )]
     pub(crate) fn set_index(&mut self, key: impl AsRef<[u8]>, index: usize, value: impl AsRef<[u8]>) {
         let key = key.as_ref();
         let lookup = self.lookup_key(key);
@@ -439,13 +477,17 @@ impl Map {
             Some(values) => match values.get_mut(index) {
                 // Rewritten in its buffers: RULE's values are set this way for every rule evaluated
                 Some(entry) => entry.replace(key, value),
-                None => values.push(KeyValue::new(Key::from_slice(key), value)),
+                None => {
+                    values.push(KeyValue::new(Key::from_slice(key), value));
+                    self.values = self.values.saturating_add(1);
+                },
             },
             None => {
                 self.data.insert(
                     Key::from_slice(lookup.as_ref()),
                     vec![KeyValue::new(Key::from_slice(key), value)],
                 );
+                self.values = self.values.saturating_add(1);
             },
         }
     }
@@ -457,23 +499,28 @@ impl Map {
     /// guarantee this type provides.
     pub(crate) fn remove(&mut self, key: &str) {
         let lookup = self.lookup_key(key.as_bytes());
-        self.data.shift_remove(lookup.as_ref());
+        if let Some(removed) = self.data.shift_remove(lookup.as_ref()) {
+            self.values = self.values.saturating_sub(count_of(removed.len()));
+        }
     }
 
     /// Removes every key.
     pub(crate) fn reset(&mut self) {
         self.data.clear();
+        self.values = 0;
     }
 
     /// Remove all entries while retaining only a bounded amount of table capacity.
     pub(crate) fn reset_for_reuse(&mut self) {
         self.data.clear();
+        self.values = 0;
         self.trim_for_reuse();
     }
 
     /// Remove request data and release capacity charged to an active body budget.
     pub(crate) fn reset_and_release(&mut self) {
         self.data.clear();
+        self.values = 0;
         self.data.shrink_to_fit();
     }
 
@@ -483,6 +530,7 @@ impl Map {
         const MAX_RETAINED_TABLE_BYTES: usize = 16 * 1024;
         if self.allocated_bytes() > MAX_RETAINED_TABLE_BYTES {
             self.data = IndexMap::with_hasher(ahash::RandomState::new());
+            self.values = 0;
         }
     }
 
@@ -507,8 +555,22 @@ impl Map {
     }
 
     /// Number of values, counting each value of a repeated key.
+    ///
+    /// O(1): the total is maintained by every mutator, as Go's `TotalValues` is.
     pub fn value_count(&self) -> usize {
-        self.data.values().map(Vec::len).sum()
+        usize::try_from(self.values).unwrap_or(usize::MAX)
+    }
+
+    /// The value count recomputed from the stored entries, as the test oracle for the maintained total.
+    ///
+    /// Every key it visits is counted by [`keys_scanned`], so tests can tell a scan from a read of the total.
+    #[cfg(test)]
+    pub(crate) fn summed_value_count(&self) -> usize {
+        self.data
+            .values()
+            .inspect(|_| KEYS_SCANNED.with(|scanned| scanned.set(scanned.get() + 1)))
+            .map(Vec::len)
+            .sum()
     }
 
     /// Whether the map has no keys.
@@ -535,6 +597,33 @@ impl Map {
         total
     }
 }
+
+/// Bytes retained for each stored key copy per input key byte, at most.
+///
+/// A byte key that is not valid UTF-8 is held twice, as its raw bytes and as the lossy text view in which
+/// every invalid byte becomes the three-byte U+FFFD, so one input byte can cost four. Valid UTF-8 keys cost one.
+pub(crate) const KEY_RETAINED_BYTES_PER_BYTE: usize = 4;
+
+/// Key copies one inserted value can retain: the lookup key of a new entry and the original key stored beside
+/// the value.
+pub(crate) const KEY_COPIES_PER_INSERT: usize = 2;
+
+/// Worst-case bytes one inserted value costs beyond its key and value bytes.
+///
+/// The entry vector and hash index are sized from capacities that may be twice the entry count, and the index
+/// rounds up to a power of two (see [`index_table_bytes`]); a new key also starts a one-element value vector,
+/// and a repeated key may double its value vector. Both cases are bounded by this figure, which the
+/// `insert_overhead_bounds_the_measured_growth` test checks against [`Map::allocated_bytes`].
+pub(crate) const INSERT_OVERHEAD_BYTES: usize = 2
+    * (size_of::<(Key, Vec<KeyValue>)>() + 3 * size_of::<usize>() + 5 * (size_of::<usize>() + 1))
+    + 2 * size_of::<KeyValue>();
+
+/// One-time worst-case bytes a map allocates when its first entry is inserted, beyond the steady
+/// [`INSERT_OVERHEAD_BYTES`] share: the vector and hash index start at four entries, and a new key's value
+/// vector starts at four values.
+pub(crate) const FIRST_INSERT_OVERHEAD_BYTES: usize = 4
+    * (size_of::<(Key, Vec<KeyValue>)>() + 3 * size_of::<usize>() + 2 * (size_of::<usize>() + 1))
+    + 4 * size_of::<KeyValue>();
 
 /// Estimated bytes of an `IndexMap`'s backing allocations for `capacity` entries.
 ///
@@ -577,6 +666,18 @@ fn index_buckets_bytes(capacity: usize) -> usize {
     buckets
         .saturating_mul(size_of::<usize>().saturating_add(1))
         .saturating_add(size_of::<usize>().saturating_mul(2))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Keys visited by [`Map::summed_value_count`] on this thread.
+    static KEYS_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Keys the key-scanning count has visited on this thread so far, which tests read to bound work without a clock.
+#[cfg(test)]
+pub(crate) fn keys_scanned() -> usize {
+    KEYS_SCANNED.with(std::cell::Cell::get)
 }
 
 impl std::fmt::Display for Map {
@@ -927,6 +1028,112 @@ mod tests {
         assert_eq!(map.first(b"x\xfe"), Some(&b"fe"[..]));
         // Only the lossy text projection merges them.
         assert_eq!(map.entries().len(), 1);
+    }
+
+    #[test]
+    fn insert_overhead_bounds_the_measured_growth() {
+        use super::{
+            FIRST_INSERT_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
+        };
+
+        // Every insertion, new key or repeated, valid or invalid UTF-8, must keep the measured allocation
+        // at or under what the charge predicts for the entries inserted so far.
+        for (label, distinct, invalid) in [
+            ("distinct ascii keys", true, false),
+            ("distinct invalid UTF-8 keys", true, true),
+            ("one repeated key", false, false),
+            ("one repeated invalid UTF-8 key", false, true),
+        ] {
+            let mut map = Map::new(RuleVariable::Files);
+            let mut charged = FIRST_INSERT_OVERHEAD_BYTES;
+            for index in 0..3000_usize {
+                let mut key = if distinct {
+                    format!("key-{index}").into_bytes()
+                } else {
+                    b"same-key".to_vec()
+                };
+                if invalid {
+                    key.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+                }
+                let value = vec![b'v'; index % 40];
+                map.add_bytes(&key, &value);
+                charged += INSERT_OVERHEAD_BYTES
+                    + key.len() * KEY_COPIES_PER_INSERT * KEY_RETAINED_BYTES_PER_BYTE
+                    + value.len();
+                assert!(
+                    map.allocated_bytes() <= charged,
+                    "{label}: after {} inserts the map holds {} bytes but only {charged} were charged",
+                    index + 1,
+                    map.allocated_bytes()
+                );
+            }
+        }
+    }
+
+    /// The maintained total must equal the values actually stored after every mutation.
+    #[track_caller]
+    fn assert_count(map: &Map, expected: usize) {
+        assert_eq!(map.value_count(), expected, "value_count");
+        assert_eq!(map.value_count(), map.summed_value_count(), "oracle");
+    }
+
+    #[test]
+    fn value_count_stays_consistent_across_every_mutation() {
+        let mut map = Map::new(RuleVariable::RequestHeaders);
+        assert_count(&map, 0);
+
+        map.add("A", "1");
+        map.add("a", "2");
+        map.add_bytes(b"b\xff", "3");
+        assert_count(&map, 3);
+
+        // `set_index` appends past the end and rewrites in place within it.
+        map.set_index("A", 2, "4");
+        assert_count(&map, 4);
+        map.set_index("a", 0, "rewritten");
+        assert_count(&map, 4);
+        map.set_index("new", 7, "5");
+        assert_count(&map, 5);
+
+        // `set` replaces a key's values, shrinking or growing the total, and inserts a new key.
+        map.set("a", ["x"]);
+        assert_count(&map, 3);
+        map.set("a", ["x", "y", "z"]);
+        assert_count(&map, 5);
+        map.set("fresh", ["p", "q"]);
+        assert_count(&map, 7);
+        map.set("fresh", Vec::<&str>::new());
+        assert_count(&map, 5);
+
+        // `remove` drops every value of the key, and an absent key changes nothing.
+        map.remove("A");
+        assert_count(&map, 2);
+        map.remove("missing");
+        assert_count(&map, 2);
+
+        map.reset();
+        assert_count(&map, 0);
+
+        map.add("k", "v");
+        map.add("k", "w");
+        map.reset_for_reuse();
+        assert_count(&map, 0);
+
+        map.add("k", "v");
+        map.reset_and_release();
+        assert_count(&map, 0);
+
+        // A table dropped by the retention budget starts again from zero.
+        for index in 0..4096 {
+            map.add(&format!("key{index}"), "value");
+        }
+        assert_count(&map, 4096);
+        map.trim_for_reuse();
+        assert_count(&map, map.summed_value_count());
+        map.reset_for_reuse();
+        assert_count(&map, 0);
+        map.add("again", "1");
+        assert_count(&map, 1);
     }
 
     /// The doc example of `collection::map::Map`, before it became internal.

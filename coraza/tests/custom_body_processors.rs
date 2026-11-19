@@ -1200,3 +1200,285 @@ impl BodyProcessor for MimeRecorder {
         Ok(())
     }
 }
+
+/// What an [`Emit`] processor adds to its output.
+type Emitter = Arc<dyn Fn(&mut BodyProcessorOutput) + Send + Sync>;
+
+/// Emits what its closure emits, whatever the body is.
+struct Emit(Emitter);
+
+impl BodyProcessor for Emit {
+    fn process(
+        &self,
+        _body: &[u8],
+        _direction: BodyDirection,
+        _options: &BodyProcessorOptions<'_>,
+        out: &mut BodyProcessorOutput,
+    ) -> Result<(), String> {
+        (self.0)(out);
+        Ok(())
+    }
+}
+
+/// One 800-byte upload followed by one argument, the shape that used to lose both at a 1,024-byte limit.
+fn upload_then_argument(content: &'static [u8]) -> Emitter {
+    Arc::new(move |out| {
+        out.add_file(b"upload", b"payload.txt", b"text/plain", content);
+        out.add_argument(b"after", b"x");
+    })
+}
+
+/// Runs `emit` as the request processor under a 1,024-byte body limit.
+fn run_request(emit: Emitter, rules: &str) -> Transaction {
+    let directory = tempfile::tempdir().unwrap();
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().request_body_limit = 1024;
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.register_body_processor("emit", Arc::new(move || Box::new(Emit(Arc::clone(&emit)))));
+    parser
+        .from_string(&format!(
+            "SecRuleEngine On\nSecAction \"id:1,phase:1,ctl:requestBodyProcessor=emit,pass\"\n{rules}"
+        ))
+        .unwrap();
+    let mut tx = request_transaction(&parser.compile().unwrap(), &[b'A'; 800], b"application/x-custom");
+    tx.finish().unwrap();
+    tx
+}
+
+/// Runs `emit` as the response processor under a 1,024-byte body limit.
+fn run_response(emit: Emitter, rules: &str) -> Transaction {
+    let directory = tempfile::tempdir().unwrap();
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().response_body_access = true;
+    parser.config_mut().response_body_limit = 1024;
+    parser
+        .config_mut()
+        .response_body_mime_types
+        .push("text/plain".to_owned());
+    parser.config_mut().upload_dir = directory.path().to_string_lossy().into_owned();
+    parser.register_body_processor("emit", Arc::new(move || Box::new(Emit(Arc::clone(&emit)))));
+    parser
+        .from_string(&format!(
+            "SecRuleEngine On\nSecAction \"id:1,phase:3,ctl:responseBodyProcessor=emit,pass\"\n{rules}"
+        ))
+        .unwrap();
+    let waf = parser.compile().unwrap();
+    let mut tx = waf.new_transaction();
+    tx.process_request_headers();
+    tx.process_request_body(b"");
+    tx.add_response_header("Content-Type", "text/plain");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.process_response_body(&[b'A'; 800]);
+    tx.finish().unwrap();
+    tx
+}
+
+/// Whether a body error variable was raised; it is `0` or empty otherwise, depending on the direction.
+fn errored(tx: &Transaction, variable: RuleVariable) -> bool {
+    tx.get_variable(variable, None).as_deref() == Some("1")
+}
+
+const FILES_RULE: &str = "SecRule FILES \"@streq payload.txt\" \"id:11,phase:2,deny,status:403\"";
+const RESPONSE_FILES_RULE: &str = "SecRule FILES \"@streq payload.txt\" \"id:11,phase:4,log,pass\"";
+
+#[test]
+fn an_upload_that_fits_the_body_limit_keeps_its_metadata_and_the_next_argument() {
+    static CONTENT: [u8; 800] = [b'A'; 800];
+    let tx = run_request(upload_then_argument(&CONTENT), FILES_RULE);
+
+    assert!(!errored(&tx, RuleVariable::ReqbodyError));
+    assert_eq!(
+        tx.get_variable(RuleVariable::Files, Some("")).as_deref(),
+        Some("payload.txt")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("payload.txt"))
+            .as_deref(),
+        Some("800")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::ArgsPost, Some("after")).as_deref(),
+        Some("x")
+    );
+    assert_eq!(
+        tx.interruption()
+            .map(|interruption| (interruption.rule_id, interruption.status)),
+        Some((11, 403)),
+        "a FILES rule matches the retained upload"
+    );
+
+    let tx = run_response(upload_then_argument(&CONTENT), RESPONSE_FILES_RULE);
+    assert!(!errored(&tx, RuleVariable::ResBodyError));
+    assert_eq!(
+        tx.get_variable(RuleVariable::FilesSizes, Some("payload.txt"))
+            .as_deref(),
+        Some("800")
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::ResponseArgs, Some("after")).as_deref(),
+        Some("x")
+    );
+    assert!(
+        tx.matched_rules().iter().any(|matched| matched.rule.id() == 11),
+        "a FILES rule matches the retained response upload"
+    );
+}
+
+#[test]
+fn file_content_may_use_the_whole_body_limit_and_not_one_byte_more() {
+    static FULL: [u8; 1024] = [b'A'; 1024];
+    static OVER: [u8; 1025] = [b'A'; 1025];
+    for request in [true, false] {
+        let run = if request { run_request } else { run_response };
+        let (error, message) = if request {
+            (RuleVariable::ReqbodyError, RuleVariable::ReqbodyErrorMsg)
+        } else {
+            (RuleVariable::ResBodyError, RuleVariable::ResBodyErrorMsg)
+        };
+
+        let only_file: Emitter = Arc::new(|out| out.add_file(b"upload", b"payload.txt", b"text/plain", &FULL));
+        let tx = run(only_file, "");
+        assert!(!errored(&tx, error), "request={request}");
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("payload.txt"))
+                .as_deref(),
+            Some("1024"),
+            "content of exactly the body limit is kept"
+        );
+
+        let tx = run(upload_then_argument(&OVER), "");
+        assert!(errored(&tx, error), "request={request}");
+        assert_eq!(
+            tx.get_variable(message, None).as_deref(),
+            Some("EMIT: custom body processor output exceeded byte limit")
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::FilesSizes, Some("payload.txt")),
+            None,
+            "content over the body limit is refused before it is copied"
+        );
+        let arguments = if request {
+            RuleVariable::ArgsPost
+        } else {
+            RuleVariable::ResponseArgs
+        };
+        assert_eq!(
+            tx.get_variable(arguments, Some("after")),
+            None,
+            "request={request}: the argument after the refused file is not published"
+        );
+    }
+}
+
+#[test]
+fn file_metadata_exhaustion_is_bounded_keeps_the_prefix_and_reports_its_own_error() {
+    // Many tiny files with long names: the content stays far under the limit, so only the separate
+    // metadata allowance (four times the limit, at least 32 KiB) can stop them.
+    let emit: Emitter = Arc::new(|out| {
+        for index in 0..10_000_u32 {
+            let name = format!("{index:0>200}");
+            out.add_file(name.as_bytes(), name.as_bytes(), b"text/plain", b"x");
+        }
+        out.add_argument(b"after", b"x");
+    });
+    for (request, tx) in [
+        (true, run_request(Arc::clone(&emit), "")),
+        (false, run_response(emit, "")),
+    ] {
+        let (error, message) = if request {
+            (RuleVariable::ReqbodyError, RuleVariable::ReqbodyErrorMsg)
+        } else {
+            (RuleVariable::ResBodyError, RuleVariable::ResBodyErrorMsg)
+        };
+        assert!(errored(&tx, error), "request={request}");
+        assert_eq!(
+            tx.get_variable(message, None).as_deref(),
+            Some("EMIT: custom body processor file metadata exceeded byte limit")
+        );
+        let VariableCollection::Map(files) = tx.collection(RuleVariable::Files).unwrap() else {
+            panic!("FILES is a map");
+        };
+        let kept = files.get("").len();
+        assert!(kept >= 1, "the files before the budget ran out are kept");
+        assert!(kept < 40, "metadata for 10,000 files was bounded, kept {kept}");
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPost, Some("after")), None);
+        assert_eq!(tx.get_variable(RuleVariable::ResponseArgs, Some("after")), None);
+    }
+}
+
+/// Runs `emit` as the request processor over a four-byte body, under a body limit of 1,048,576 bytes and
+/// `argument_limit` arguments.
+fn run_flood(emit: Emitter, argument_limit: usize) -> Transaction {
+    let mut parser = Parser::new();
+    parser.config_mut().request_body_access = true;
+    parser.config_mut().request_body_limit = 1 << 20;
+    parser.config_mut().argument_limit = argument_limit;
+    parser.register_body_processor("emit", Arc::new(move || Box::new(Emit(Arc::clone(&emit)))));
+    parser
+        .from_string("SecRuleEngine On\nSecAction \"id:1,phase:1,ctl:requestBodyProcessor=emit,pass\"")
+        .unwrap();
+    let mut tx = request_transaction(&parser.compile().unwrap(), b"four", b"application/x-custom");
+    tx.finish().unwrap();
+    tx
+}
+
+#[test]
+fn an_xml_entry_flood_from_a_tiny_body_stops_with_an_error_inside_the_allowance() {
+    let flood: Emitter = Arc::new(|out| {
+        for _ in 0..300_000 {
+            out.add_xml(b"/*", b"");
+        }
+    });
+    let tx = run_flood(flood, 1000);
+
+    assert!(errored(&tx, RuleVariable::ReqbodyError));
+    assert_eq!(
+        tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+        Some("EMIT: custom body processor collection copies exceeded byte limit")
+    );
+    let VariableCollection::Map(xml) = tx.collection(RuleVariable::XML).unwrap() else {
+        panic!("XML is a map");
+    };
+    let kept = xml.get("/*").len();
+    assert!(
+        (1..300_000).contains(&kept),
+        "the prefix is kept and the flood stopped: {kept}"
+    );
+    // The allowance is four times the body limit.
+    assert!(
+        tx.body_memory_bytes() <= 5 << 20,
+        "{} bytes retained from a four-byte body",
+        tx.body_memory_bytes()
+    );
+}
+
+#[test]
+fn an_argument_flood_under_a_raised_limit_stops_with_an_error_inside_the_allowance() {
+    let flood: Emitter = Arc::new(|out| {
+        for index in 0..300_000_u32 {
+            out.add_argument(&index.to_le_bytes(), b"");
+        }
+    });
+    let tx = run_flood(flood, 1_000_000);
+
+    assert!(errored(&tx, RuleVariable::ReqbodyError));
+    assert_eq!(
+        tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+        Some("EMIT: custom body processor collection copies exceeded byte limit")
+    );
+    let VariableCollection::Map(args) = tx.collection(RuleVariable::ArgsPost).unwrap() else {
+        panic!("ARGS_POST is a map");
+    };
+    assert!(
+        (1000..300_000).contains(&args.value_count()),
+        "ordinary counts fit and the flood stopped: {}",
+        args.value_count()
+    );
+    assert!(
+        tx.body_memory_bytes() <= 5 << 20,
+        "{} bytes retained from a four-byte body",
+        tx.body_memory_bytes()
+    );
+}

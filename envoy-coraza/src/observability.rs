@@ -203,14 +203,27 @@ pub(crate) fn error_log(matched: &MatchedRule, diagnostics: &Diagnostics) {
 
 /// Emits one selected Coraza audit entry using configured parts and format.
 pub(crate) fn audit_log(entry: &AuditLog, format: AuditLogFormat, diagnostics: &Diagnostics) {
-    let (formatted, truncated) = entry.format_bounded(format, MAX_AUDIT_LOG_BYTES);
-    if formatted.is_empty() {
+    let Some(message) = audit_message(entry, format) else {
         return;
-    }
-    let message = sanitize_audit(&formatted, MAX_AUDIT_LOG_BYTES, truncated);
+    };
     if hostcalls::log(LogLevel::Critical, &message).is_err() {
         diagnostics.hostcall_failure("audit log");
     }
+}
+
+/// The bounded, sanitized log line for one audit entry, or `None` when there is nothing to log.
+fn audit_message(entry: &AuditLog, format: AuditLogFormat) -> Option<String> {
+    let (formatted, truncated) = entry.format_bounded(format, MAX_AUDIT_LOG_BYTES);
+    if formatted.is_empty() {
+        return None;
+    }
+    // The JSON formats come back whole and within the cap, with a `truncated` member when they were reduced; a
+    // plain-text marker would make them invalid JSON, so only the native text gets one.
+    Some(sanitize_audit(
+        &formatted,
+        MAX_AUDIT_LOG_BYTES,
+        truncated && format == AuditLogFormat::Native,
+    ))
 }
 
 /// Escapes audit controls while retaining a bounded prefix and truncation marker.
@@ -310,9 +323,14 @@ fn category(tags: &[String]) -> String {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "audit tests use fixed fixtures")]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use coraza::types::AuditLogFormat;
+
     use super::{
-        bounded, category, sanitize_audit, InterruptionPhase, MAX_AUDIT_LOG_BYTES, MAX_ERROR_LOG_BYTES,
+        audit_message, bounded, category, sanitize_audit, InterruptionPhase, MAX_AUDIT_LOG_BYTES, MAX_ERROR_LOG_BYTES,
         TRUNCATION_MARKER,
     };
 
@@ -384,5 +402,185 @@ mod tests {
         assert!(output.ends_with(TRUNCATION_MARKER));
         assert!(!output.contains('é'));
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    /// The value at the path of object keys, if every step exists.
+    fn at<'a>(document: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+        path.iter().try_fold(document, |value, key| value.get(*key))
+    }
+
+    /// The rule ids of the messages under `path`, which hold their rule data directly or as a JSON string.
+    fn rule_ids(document: &serde_json::Value, path: &[&str], nested: bool) -> Vec<i64> {
+        at(document, path)
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|message| {
+                let data = message.get("data").unwrap();
+                let id = if nested {
+                    let text: serde_json::Value = serde_json::from_str(data.as_str().unwrap()).unwrap();
+                    text.get("id").and_then(serde_json::Value::as_i64)
+                } else {
+                    data.get("id").and_then(serde_json::Value::as_i64)
+                };
+                id.unwrap()
+            })
+            .collect()
+    }
+
+    /// A transaction that matches rule 1 and is denied by rule 949110, with `pad` bytes in its URI and a header.
+    fn audit_entry(pad: usize) -> coraza::audit_log::AuditLog {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&entries);
+        let mut parser = coraza::seclang::Parser::new();
+        parser.on_audit_log(move |entry| sink.lock().unwrap().push(entry.clone()));
+        parser
+            .from_string(
+                "SecRuleEngine On\nSecAuditEngine RelevantOnly\nSecAuditLogParts ABHKZ\n\
+                 SecRule ARGS:q \"@contains attack\" \"id:1,phase:1,pass,log,auditlog,msg:'first rule'\"\n\
+                 SecRule ARGS:q \"@contains attack\" \"id:949110,phase:1,deny,status:403,log,auditlog,msg:'blocking rule'\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction();
+        tx.process_uri(format!("/?q=attack&pad={}", "A".repeat(pad)), "GET", "HTTP/1.1");
+        tx.add_request_header("X-Pad", "B".repeat(pad).as_bytes());
+        assert!(tx.process_request_headers().is_some(), "the blocking rule interrupts");
+        tx.finish().unwrap();
+        let entry = entries.lock().unwrap().pop().unwrap();
+        entry
+    }
+
+    /// The three JSON audit formats.
+    const JSON_FORMATS: [AuditLogFormat; 3] = [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf];
+
+    #[test]
+    fn oversized_json_audit_records_stay_valid_json_marked_truncated_and_keep_the_matched_rules() {
+        for pad in [0_usize, 100, 8_000, 16_000, 64_000, 1 << 20] {
+            let entry = audit_entry(pad);
+            for format in JSON_FORMATS {
+                let line = audit_message(&entry, format).unwrap();
+                assert!(
+                    line.len() <= MAX_AUDIT_LOG_BYTES,
+                    "pad={pad} {format:?}: {} bytes",
+                    line.len()
+                );
+                let document: serde_json::Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|error| unreachable!("pad={pad} {format:?} is not JSON: {error}"));
+
+                let marker = if format == AuditLogFormat::Ocsf {
+                    at(&document, &["unmapped", "truncated"])
+                } else {
+                    at(&document, &["truncated"])
+                };
+                assert_eq!(
+                    marker == Some(&serde_json::Value::Bool(true)),
+                    pad >= 8_000,
+                    "pad={pad} {format:?}: the marker says whether it was reduced"
+                );
+                assert!(!line.contains(TRUNCATION_MARKER), "no plain-text marker inside JSON");
+
+                // The interrupting rule outlives the padding in every format. The legacy format carries
+                // only rule messages; the others carry the rule id as well.
+                match format {
+                    AuditLogFormat::Json => {
+                        assert_eq!(rule_ids(&document, &["messages"], false), [1, 949_110], "pad={pad}");
+                    },
+                    AuditLogFormat::JsonLegacy => {
+                        assert_eq!(
+                            at(&document, &["audit_data", "messages"]),
+                            Some(&serde_json::json!(["first rule", "blocking rule"])),
+                            "pad={pad}"
+                        );
+                    },
+                    _ => {
+                        assert_eq!(rule_ids(&document, &["enrichments"], true), [1, 949_110], "pad={pad}");
+                    },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_header_only_audit_trailer_keeps_the_interrupting_rule_id_in_the_error_message() {
+        // Part `H` without `K` carries the rule only in its error log line.
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&entries);
+        let mut parser = coraza::seclang::Parser::new();
+        parser.on_audit_log(move |entry| sink.lock().unwrap().push(entry.clone()));
+        parser
+            .from_string(
+                "SecRuleEngine On\nSecAuditEngine RelevantOnly\nSecAuditLogParts ABHZ\n\
+                 SecRule ARGS:q \"@contains attack\" \"id:949110,phase:1,deny,status:403,log,auditlog,msg:'blocking rule'\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction();
+        tx.process_uri(format!("/?q=attack&pad={}", "A".repeat(64_000)), "GET", "HTTP/1.1");
+        assert!(tx.process_request_headers().is_some());
+        tx.finish().unwrap();
+        let entry = entries.lock().unwrap().pop().unwrap();
+
+        let line = audit_message(&entry, AuditLogFormat::Json).unwrap();
+        assert!(line.len() <= MAX_AUDIT_LOG_BYTES);
+        let document: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(at(&document, &["truncated"]), Some(&serde_json::Value::Bool(true)));
+        assert!(line.contains("949110"), "the rule id survives in the error message");
+    }
+
+    #[test]
+    fn oversized_json_audit_records_escape_every_control_character() {
+        let mut entry = audit_entry(0);
+        // DEL and a C1 control are raw in JSON; the line must carry them as escapes.
+        "A\u{7f}B\u{85}\u{7}C\n"
+            .repeat(4000)
+            .clone_into(&mut entry.transaction.request.uri);
+        for format in JSON_FORMATS {
+            let line = audit_message(&entry, format).unwrap();
+            assert!(line.len() <= MAX_AUDIT_LOG_BYTES, "{format:?}");
+            assert!(serde_json::from_str::<serde_json::Value>(&line).is_ok(), "{format:?}");
+            assert!(
+                !line.chars().any(char::is_control),
+                "{format:?} carries a raw control character"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_that_fits_is_unchanged_and_unmarked() {
+        let entry = audit_entry(10);
+        for format in JSON_FORMATS {
+            let line = audit_message(&entry, format).unwrap();
+            let (formatted, truncated) = entry.format_bounded(format, MAX_AUDIT_LOG_BYTES);
+            assert!(!truncated, "{format:?}");
+            if format != AuditLogFormat::Ocsf {
+                // OCSF stamps the time it was formatted at.
+                assert_eq!(line, formatted);
+            }
+            assert!(!line.contains("truncated"), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn many_oversized_messages_keep_the_first_and_last_rule() {
+        let mut entry = audit_entry(0);
+        let template = entry.messages.last().unwrap().clone();
+        entry.messages = (0..400)
+            .map(|index| {
+                let mut message = template.clone();
+                message.data.id = 1000 + index;
+                message.data.raw = "R".repeat(2000);
+                message.data.msg = format!("rule {index}");
+                message.message = format!("rule {index}");
+                message
+            })
+            .collect();
+        for format in JSON_FORMATS {
+            let line = audit_message(&entry, format).unwrap();
+            assert!(line.len() <= MAX_AUDIT_LOG_BYTES, "{format:?}");
+            assert!(serde_json::from_str::<serde_json::Value>(&line).is_ok(), "{format:?}");
+            assert!(line.contains("rule 0"), "{format:?} keeps the first message");
+            assert!(line.contains("rule 399"), "{format:?} keeps the last message");
+        }
     }
 }

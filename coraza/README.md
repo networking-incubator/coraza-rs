@@ -435,6 +435,21 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   `audit_log_custom_format` fields (hidden from generated docs). This pre-1.0 API
   addition breaks exhaustive struct literals and patterns; literals now need
   `..Default::default()` and patterns need `..` to remain forward compatible.
+- `AuditMessage` has two new public fields (hidden from generated docs):
+  `rule_id: i32`, which bounded audit formatting uses to keep the interrupting
+  rule's message, and `rule_message: String`, which a reduced bounded record
+  uses to name the rule of a message that has part `H` but no part `K`. Neither
+  is serialised in a record that fits. This pre-1.0 addition breaks code that
+  builds an `AuditMessage` with every field named. Set the new fields, or end
+  the literal with `..AuditMessage::default()` (the type implements `Default`)
+  when a fixture needs no distinct `rule_id`.
+- `AuditTransaction` has a new public field, `interruption_rule_id:
+  Option<i32>`: the id of the rule whose disruptive action interrupted the
+  transaction, which bounded formatters use to keep that rule's message when
+  they drop messages. This pre-1.0 addition breaks exhaustive struct literals
+  and patterns. A literal must initialise it or end with
+  `..AuditTransaction::default()` (the type implements `Default`); a pattern
+  that does not need it should end with `..`.
 - `Operator` now requires `Send + Sync`.
 - `MatchData::chain_level` is a new public `usize` field (parent level is zero),
   replacing the pre-release `u16`. Exhaustive `MatchData` literals must now
@@ -498,6 +513,22 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   cleanup errors, like `finish`, and the transaction attempts the audit write at
   most once instead of retrying it. The syslog writer still reconnects and
   re-sends one frame after a write failure.
+- The first interruption is kept in every engine mode. A later disruptive
+  rule, such as a phase 5 `deny` after a phase 1 `deny`, no longer replaces it
+  under `SecRuleEngine On`, matching `DetectionOnly`. This is a deliberate
+  deviation: Go's `Transaction.Interrupt` overwrites the interruption in `On`
+  mode. A later rule cannot replace an earlier interruption, so
+  `Transaction::interruption()` and the audit log's interruption report the
+  first one recorded.
+- Disruptive actions in the logging phase (phase 5) are not reported as
+  enforced. The logging phase runs after the response is released, so a phase 5
+  `deny` can never take effect. As in Go, it is still stored by
+  `Transaction::interruption()` when it is the first interruption. However, the
+  audit log's `is_interrupted` and interruption rule do not report it. Its
+  error log text and `MatchedRule::disruptive` do not claim it was enforced,
+  just like a disruptive rule that matches after an earlier interruption. This
+  is a deliberate deviation in what is logged: Go's audit entry reports it as an
+  interruption.
 
 ## FTW integration
 

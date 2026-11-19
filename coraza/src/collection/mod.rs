@@ -40,6 +40,11 @@ mod map;
 mod single;
 
 pub use map::Map;
+#[cfg(test)]
+pub(crate) use map::keys_scanned;
+pub(crate) use map::{
+    FIRST_INSERT_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
+};
 pub use single::Single;
 
 /// Metadata about a matched variable during rule evaluation.

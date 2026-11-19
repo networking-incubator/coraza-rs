@@ -505,7 +505,14 @@ impl CorazaHttp {
             self.lifecycle.bypass_request();
             self.request_mode = RequestMode::Uninspected;
             self.outcome = Some(TerminalOutcome::UnmatchedAuthority);
-            log_warn("envoy-coraza: no authority policy matched; request passed uninspected");
+            if generation.first_unmatched_request() {
+                log_warn(
+                    "envoy-coraza: no authority policy matched; request passed uninspected \
+                     (further such requests in this configuration generation are logged at debug level)",
+                );
+            } else {
+                log_debug("envoy-coraza: no authority policy matched; request passed uninspected");
+            }
             return Action::Continue;
         };
         self.selected_policy = Some(policy_name.to_owned());
@@ -1841,6 +1848,10 @@ fn log_error(message: &str) {
 
 fn log_warn(message: &str) {
     hostcalls::log(LogLevel::Warn, message).unwrap_or_default();
+}
+
+fn log_debug(message: &str) {
+    hostcalls::log(LogLevel::Debug, message).unwrap_or_default();
 }
 
 #[cfg(test)]

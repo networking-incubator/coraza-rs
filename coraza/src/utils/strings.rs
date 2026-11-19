@@ -131,7 +131,7 @@ pub(crate) fn go_quote_bytes(bytes: &[u8]) -> String {
 }
 
 /// Append `character` to `quoted` as Go's `strconv.Quote` escapes it.
-fn push_go_quoted(quoted: &mut String, character: char) {
+pub(crate) fn push_go_quoted(quoted: &mut String, character: char) {
     match character {
         '"' => quoted.push_str("\\\""),
         '\\' => quoted.push_str("\\\\"),
