@@ -69,8 +69,13 @@ impl CorazaRoot {
     /// Parses, compiles and installs a configuration.
     ///
     /// The generation is replaced only after a successful compile, so a rejected
-    /// reload keeps the active generation serving its streams.
+    /// reload keeps the active generation serving its streams. A blank (or absent)
+    /// configuration is an explicit pass-through only on the first load; as a reload
+    /// it is rejected, so it can never replace an enforcing generation.
     fn apply(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.generation.is_some() && config::is_blank(bytes) {
+            return Err("a blank plugin configuration cannot replace the active generation".to_owned());
+        }
         let config = Config::parse(bytes).map_err(|error| error.to_string())?;
         let next_id = self
             .next_generation_id
@@ -111,7 +116,8 @@ impl RootContext for CorazaRoot {
             log_error(&error);
             return false;
         }
-        // A successful hostcall with no buffer means Envoy supplied no plugin configuration.
+        // A successful hostcall with no buffer means Envoy supplied no plugin configuration. That reads as a blank
+        // document: an explicit pass-through on the first load, rejected by `apply` as a reload.
         let configuration = match hostcalls::get_buffer(BufferType::PluginConfiguration, 0, usize::MAX) {
             Ok(configuration) => configuration.unwrap_or_default(),
             Err(status) => {
@@ -189,6 +195,7 @@ mod tests {
     use std::rc::Rc;
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use proxy_wasm::traits::RootContext as _;
 
     use super::{check_configuration_size, CorazaRoot, MAX_CONFIGURATION_BYTES};
 
@@ -418,7 +425,8 @@ mod tests {
     #[test]
     fn an_empty_configuration_warns_that_requests_are_uninspected() {
         let mut root = root();
-        root.apply(b"{}").expect("an empty configuration is valid");
+        root.apply(b"")
+            .expect("a blank first configuration is an explicit pass-through");
         let generation = root.current_generation().expect("a generation is published");
         assert!(
             generation
@@ -427,6 +435,142 @@ mod tests {
             "warnings were {:?}",
             generation.warnings().collect::<Vec<_>>()
         );
+    }
+
+    /// Configurations that would install a generation inspecting nothing.
+    const PASS_THROUGH_SHAPES: [&str; 11] = [
+        "",
+        "  \n\t",
+        "{}",
+        "[]",
+        "null",
+        "5",
+        "\"text\"",
+        r#"{"unknown": 1}"#,
+        r#"{"directive_map": {"p": []}, "default_directive": "p"}"#,
+        r#"{"typo": {"a": "b"}, "another_typo": 1}"#,
+        r#"{"config_gzip_b64": ""}"#,
+    ];
+
+    #[test]
+    fn a_blank_first_configuration_is_an_explicit_pass_through() {
+        for blank in ["", " \n\t"] {
+            let mut root = root();
+            root.apply(blank.as_bytes()).expect("a blank first load is accepted");
+            let generation = root.current_generation().expect("a generation is published");
+            assert!(generation.select("a.example").is_none(), "nothing is selected");
+            assert!(
+                generation
+                    .warnings()
+                    .any(|warning| warning.contains("no policies configured")),
+                "the pass-through is warned about"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pass_through_shape_is_rejected_on_the_first_load() {
+        for input in PASS_THROUGH_SHAPES.iter().skip(2) {
+            let mut root = root();
+            assert!(root.apply(input.as_bytes()).is_err(), "{input:?} is rejected");
+            assert!(
+                root.current_generation().is_none(),
+                "{input:?} installed no generation on the first load"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enforcing_generation_survives_a_bad_reload_of_each_shape() {
+        let mut blank_gzip = String::from(r#"{"config_gzip_b64": ""#);
+        blank_gzip.push_str(&STANDARD.encode(crate::config::gzip_fixture(b"  ")));
+        blank_gzip.push_str("\"}");
+        let mut empty_object_gzip = String::from(r#"{"config_gzip_b64": ""#);
+        empty_object_gzip.push_str(&STANDARD.encode(crate::config::gzip_fixture(b"{}")));
+        empty_object_gzip.push_str("\"}");
+
+        let mut root = root();
+        root.apply(
+            br#"{
+                "directives_map": {"p": ["SecRule REQUEST_URI \"@contains attack\" \"id:31,phase:1,deny,status:403\""]},
+                "default_directives": "p"
+            }"#,
+        )
+        .expect("the enforcing configuration is valid");
+        let enforcing = root.current_generation().expect("a generation is published");
+
+        for input in PASS_THROUGH_SHAPES
+            .iter()
+            .copied()
+            .chain([blank_gzip.as_str(), empty_object_gzip.as_str()])
+        {
+            assert!(
+                root.apply(input.as_bytes()).is_err(),
+                "{input:?} is rejected as a reload"
+            );
+            assert!(
+                Rc::ptr_eq(&enforcing, &root.current_generation().expect("the generation is kept")),
+                "{input:?} replaced the enforcing generation"
+            );
+            assert_eq!(
+                interrupting_rule(&root, "a.example"),
+                31,
+                "{input:?} left the rule enforced"
+            );
+        }
+    }
+
+    /// Runs `on_configure` against the scripted host with `configuration` as the plugin buffer.
+    fn configure(root: &mut CorazaRoot, configuration: Option<&[u8]>) -> bool {
+        crate::test_hostcalls::set_plugin_configuration(configuration);
+        root.on_configure(configuration.map_or(0, <[u8]>::len))
+    }
+
+    #[test]
+    fn on_configure_refuses_a_pass_through_shape_on_the_first_load() {
+        for input in PASS_THROUGH_SHAPES.iter().skip(2) {
+            let mut root = root();
+            assert!(!configure(&mut root, Some(input.as_bytes())), "{input:?}");
+            assert!(root.current_generation().is_none(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn on_configure_accepts_a_missing_or_blank_first_configuration_but_never_as_a_reload() {
+        for first in [None, Some(b"".as_slice()), Some(b" \n".as_slice())] {
+            let mut root = root();
+            assert!(
+                configure(&mut root, first),
+                "{first:?} is an explicit first-load pass-through"
+            );
+            assert!(root.current_generation().is_some());
+
+            let enforcing = br#"{
+                "directives_map": {"p": ["SecRule REQUEST_URI \"@contains attack\" \"id:41,phase:1,deny,status:403\""]},
+                "default_directives": "p"
+            }"#;
+            assert!(
+                configure(&mut root, Some(enforcing)),
+                "a real configuration replaces it"
+            );
+            let installed = root
+                .current_generation()
+                .expect("the enforcing generation is installed");
+
+            for reload in [
+                None,
+                Some(b"".as_slice()),
+                Some(b" \n".as_slice()),
+                Some(b"{}".as_slice()),
+            ] {
+                assert!(!configure(&mut root, reload), "{reload:?} is refused as a reload");
+                assert!(
+                    Rc::ptr_eq(&installed, &root.current_generation().expect("the generation is kept")),
+                    "{reload:?} replaced the enforcing generation"
+                );
+            }
+            assert_eq!(interrupting_rule(&root, "a.example"), 41);
+        }
     }
 
     #[test]
