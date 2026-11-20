@@ -74,7 +74,8 @@ pub(crate) struct ParseFailure {
 
 /// Parse a multipart body using the boundary in its content type.
 ///
-/// Returns the parts read before parsing stopped, and why it stopped: Go's body processor
+/// Returns the parts read before parsing stopped, and why it stopped, and whether a body cut by the limit ended
+/// before its closing delimiter without an error, so that a part may follow the last one read: Go's body processor
 /// publishes each part as `mime/multipart.Reader.NextPart` returns it, so a malformed part
 /// later in the body keeps the parts before it.
 ///
@@ -89,7 +90,7 @@ pub(crate) fn parse<'a>(
     body: &'a [u8],
     truncated: bool,
     memory: &mut MemoryBudget,
-) -> (Vec<Part<'a>>, Option<ParseFailure>) {
+) -> (Vec<Part<'a>>, Option<ParseFailure>, bool) {
     let content_type = match media_type::parse(content_type) {
         Ok(content_type) => content_type,
         Err(error) => {
@@ -100,6 +101,7 @@ pub(crate) fn parse<'a>(
                     strict: true,
                     parts_unread: true,
                 }),
+                false,
             );
         },
     };
@@ -114,6 +116,7 @@ pub(crate) fn parse<'a>(
                 strict: false,
                 parts_unread: false,
             }),
+            false,
         );
     }
     // A missing boundary reaches `multipart.NewReader` as the empty string in Go, whose
@@ -129,10 +132,12 @@ pub(crate) fn parse<'a>(
     if let (Some(before), Some(after)) = (reading.remaining(), parser.memory_left().remaining()) {
         memory.charge(before.saturating_sub(after));
     }
+    let bounded = reading.is_limited();
     let failure = error.map(|error| ParseFailure {
-        message: error.go_message(),
         strict: error.is_strict(),
+        // The line a failure quotes is cut short under a budget, as the message is kept long after the parse.
+        message: if bounded { error.bounded() } else { error }.go_message(),
         parts_unread: true,
     });
-    (parts, failure)
+    (parts, failure, parser.cut_open())
 }

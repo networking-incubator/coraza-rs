@@ -567,6 +567,91 @@ fn a_multipart_body_the_parser_stopped_in_cannot_carry_an_unchecked_upload_past_
     assert!(request_body_errored(&tx), "the forced processor still reports it");
 }
 
+/// What `body` does to a request under `waf`, as its status and whether the body was reported as in error.
+fn status_of(waf: &Waf, content_type: &str, body: &[u8]) -> (Option<u16>, bool, bool) {
+    let mut tx = waf.new_transaction();
+    tx.add_request_header("Content-Type", content_type);
+    tx.process_request_headers();
+    let interruption = tx.process_request_body(body);
+    (
+        interruption.map(|interruption| interruption.status),
+        request_body_errored(&tx),
+        tx.request_body_stats().truncated,
+    )
+}
+
+#[test]
+fn a_multipart_body_cut_by_the_limit_is_refused_where_uploads_are_banned_whatever_it_shows() {
+    let content_type = "multipart/form-data; boundary=b";
+    let cut = "SecRequestBodyLimit 120\nSecRequestBodyLimitAction ProcessPartial";
+    let banned = waf_rejecting_uploads(cut);
+    let upload = "--b\r\nContent-Disposition: form-data; name=\"x\"; filename=\"evil.php\"\r\n\r\nPAYLOAD\r\n--b--\r\n";
+
+    // The file starts after the cut: the parser sees a field and no error, and the file was never looked at.
+    let hidden = fields_then(2, upload);
+    assert!(hidden.len() > 120);
+    assert_eq!(
+        status_of(&banned, content_type, hidden.as_bytes()),
+        (Some(413), false, true)
+    );
+
+    // The same body, whatever the part the cut leaves: a body cut before its closing delimiter can always hide
+    // a file in the bytes that were discarded, so with no file in the prefix it is refused too.
+    let fields_only = fields_then(8, "--b--\r\n");
+    assert!(fields_only.len() > 120);
+    assert_eq!(
+        status_of(&banned, content_type, fields_only.as_bytes()),
+        (Some(413), false, true)
+    );
+
+    // A body that is not cut passes, and one that ends exactly at the limit with its closing delimiter in place has
+    // nothing hidden: the limit was reached and nothing was discarded.
+    let closed = fields_then(1, "--b--\r\n");
+    assert_eq!(
+        status_of(&banned, content_type, closed.as_bytes()),
+        (None, false, false)
+    );
+    let exact = waf_rejecting_uploads(&format!(
+        "SecRequestBodyLimit {}\nSecRequestBodyLimitAction ProcessPartial",
+        closed.len()
+    ));
+    assert_eq!(status_of(&exact, content_type, closed.as_bytes()), (None, false, false));
+
+    // Where uploads are not banned nothing changes: the cut body is inspected up to its last part and passes.
+    let mut parser = Parser::new();
+    parser
+        .from_string(&format!("SecRequestBodyAccess On\nSecArgumentsLimit 100000\n{cut}"))
+        .unwrap();
+    let open = parser.into_waf().unwrap();
+    assert_eq!(status_of(&open, content_type, hidden.as_bytes()), (None, false, true));
+}
+
+#[test]
+fn error_messages_quote_an_excerpt_under_a_budget_and_all_of_it_without_one() {
+    let waf = waf("");
+    let name = "b".repeat(5000);
+    let body = format!("<a></{name}>");
+    let message_of = |budget: Option<usize>| {
+        let mut tx = request(&waf, "text/xml", budget);
+        tx.process_request_body(body.as_bytes());
+        assert!(request_body_errored(&tx));
+        let message = String::clone(&tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).unwrap());
+        (message, tx.body_memory_bytes())
+    };
+    // Go quotes the name whole, which is what the engine does by default.
+    let (full, retained) = message_of(None);
+    assert!(full.contains(&name), "{} bytes", full.len());
+    assert!(
+        retained >= 2 * full.len(),
+        "the messages are retained and counted: {retained}"
+    );
+    // With a budget the message keeps a short excerpt of the name and says so, and the messages are accounted for.
+    let (short, retained) = message_of(Some(1 << 20));
+    assert!(short.len() < 300, "{} bytes", short.len());
+    assert!(short.contains("</bbbb") && short.contains("..."), "{short}");
+    assert!(retained >= 2 * short.len());
+}
+
 #[test]
 fn a_temporary_upload_is_charged_for_the_directory_it_is_written_under_and_its_file_name() {
     // Thirty uploads, admitted or not by the budget: nothing is written, so what is observed is the charge.

@@ -119,6 +119,9 @@ pub(super) struct Decoder<'a> {
     /// The end tag to give before reading on: the end of `<a/>`, or one that closed an
     /// element of another name first (Go's `needClose` and `toClose`)
     pending_end: Option<Name>,
+    /// What `pending_end` was charged while it waits, which a limited budget keeps reserved until the name is read
+    /// again: a long mismatched end tag name is held across tokens, after the scratch it was read in was given back
+    pending_charged: usize,
     /// The token read before the end of an element closed automatically
     next_token: Option<Token>,
     /// The memory its host allows it, which charges everything the decoder holds, values and scratch alike
@@ -157,6 +160,7 @@ impl<'a> Decoder<'a> {
             line: 1,
             open: Vec::new(),
             pending_end: None,
+            pending_charged: 0,
             next_token: None,
             memory: MemoryBudget::default(),
             open_charged: 0,
@@ -318,18 +322,20 @@ impl<'a> Decoder<'a> {
     /// read again for the next element out (Go's `popElement`, not `Strict`).
     fn pop_element(&mut self, name: Name) -> Result<Name, DecodeError> {
         let Some(Open { name: open, .. }) = self.open.pop() else {
-            return Err(self.syntax_error(format!("unexpected end element </{}>", name.local)));
+            let shown = self.shown(&name.local);
+            return Err(self.syntax_error(format!("unexpected end element </{shown}>")));
         };
         self.open_name_bytes = self.open_name_bytes.saturating_sub(name_bytes(&open));
         if open.local != name.local {
-            self.pending_end = Some(name);
+            self.hold_end(name, true)?;
             return Ok(open);
         }
         if open.space != name.space {
             let space = if name.space.is_empty() { r#""""# } else { &name.space };
+            let (open_local, open_space) = (self.shown(&open.local), self.shown(&open.space));
+            let (local, space) = (self.shown(&name.local), self.shown(space));
             return Err(self.syntax_error(format!(
-                "element <{}> in space {} closed by </{}> in space {}",
-                open.local, open.space, name.local, space
+                "element <{open_local}> in space {open_space} closed by </{local}> in space {space}"
             )));
         }
         Ok(name)
@@ -349,6 +355,8 @@ impl<'a> Decoder<'a> {
     /// The next token as written (Go's `rawToken`), or `None` at the end of the input.
     fn raw_token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
         if let Some(name) = self.pending_end.take() {
+            // The name is a token now, which holds it until the token ends and gives its scratch back.
+            self.scratch = self.scratch.saturating_add(std::mem::take(&mut self.pending_charged));
             return Ok(Some(Token::End(name)));
         }
         let Some(b) = self.getc() else {
@@ -365,7 +373,8 @@ impl<'a> Decoder<'a> {
                     .ok_or_else(|| self.syntax_error("expected element name after </"))?;
                 self.space();
                 if self.mustgetc()? != b'>' {
-                    return Err(self.syntax_error(format!("invalid characters between </{} and >", name.local)));
+                    let shown = self.shown(&name.local);
+                    return Err(self.syntax_error(format!("invalid characters between </{shown} and >")));
                 }
                 Token::End(name)
             },
@@ -450,6 +459,43 @@ impl<'a> Decoder<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// Keeps `name` as the end tag to give before reading on, charging what it holds while it waits when there is a
+    /// budget. A name that is the token being read, and so no longer held as one, takes over the scratch it was read
+    /// in (`moved`), which would be given back at the token's end while the name is still alive; one that is a copy
+    /// of a name the token keeps is charged on its own.
+    fn hold_end(&mut self, name: Name, moved: bool) -> Result<(), DecodeError> {
+        if self.is_limited() {
+            let bytes = name
+                .local
+                .len()
+                .saturating_add(name.space.len())
+                .saturating_add(2 * ALLOCATION_OVERHEAD_BYTES);
+            let taken = if moved { bytes.min(self.scratch) } else { 0 };
+            self.reserve(bytes.saturating_sub(taken))?;
+            self.scratch = self.scratch.saturating_sub(taken);
+            self.pending_charged = self.pending_charged.saturating_add(bytes);
+        }
+        self.pending_end = Some(name);
+        Ok(())
+    }
+
+    /// `text` as an error message quotes it: all of it, as Go does, unless there is a budget, which bounds what the
+    /// message keeps to the first [`EXCERPT_BYTES`] bytes (ended at a character boundary) and a marker for the rest.
+    /// The message outlives the scratch the name was read in, and is stored more than once, so it cannot be the
+    /// size of the input.
+    fn shown<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
+        if !self.is_limited() || text.len() <= EXCERPT_BYTES {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut end = EXCERPT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut shown = text.get(..end).unwrap_or_default().to_owned();
+        shown.push_str("...");
+        std::borrow::Cow::Owned(shown)
     }
 
     /// `bytes` as text for an error message. Without a budget that is all of them, as Go quotes them. With one it is
@@ -564,7 +610,7 @@ impl<'a> Decoder<'a> {
                     if self.mustgetc()? != b'>' {
                         return Err(self.syntax_error("expected /> in element"));
                     }
-                    self.pending_end = Some(name.clone());
+                    self.hold_end(name.clone(), false)?;
                     break;
                 },
                 b'>' => break,

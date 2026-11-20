@@ -86,9 +86,10 @@ direction:
   that does not parse: `@recommended-conf` rule 200002 answers 400. A policy without a rule that reads
   `REQBODY_ERROR` lets the request through, but the stream's telemetry says the inspection was not complete
   (`inspection_complete=false`, `inspection_reason=body_memory_budget_stopped`). Where the host refuses file
-  uploads, a multipart body that the parser stopped in, for the budget or because a part was malformed, is also
-  refused with 413 after the body-phase rules ran if none of them denied it, since the part it did not read could be
-  an upload.
+  uploads, a multipart body that the parser stopped in, for the budget or because a part was malformed, or that
+  `SecRequestBodyLimitAction ProcessPartial` cut before its closing delimiter, is also refused with 413 after the
+  body-phase rules ran if none of them denied it, since the part it did not read, or the bytes the limit discarded,
+  could be an upload.
 * **Response.** `RES_BODY_ERROR` is set, but `@recommended-conf` has no rule for it: rule 200002 reads only
   `REQBODY_ERROR`. The budget is a limit the connector imposes and not one of the policy's, so the connector itself
   replaces a response whose parser stopped at it with 502, unless a rule denied it first. A response body that merely

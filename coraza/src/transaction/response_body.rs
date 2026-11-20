@@ -24,7 +24,8 @@ use super::{
     Interruption, Transaction,
     body_buffer::BodyBuffer,
     request_body::{
-        process_custom_body_processor, publish_json_arguments, read_json_body_within, selected_custom_body_processor,
+        JsonTarget, process_custom_body_processor, publish_json_arguments, read_json_body_within,
+        selected_custom_body_processor,
     },
     variables::BodyProcessor,
 };
@@ -148,8 +149,7 @@ impl Transaction {
                 self.config.response_body_json_depth_limit,
                 self.config.argument_limit,
                 self.memory_budget(),
-                // `RESPONSE_ARGS` alone.
-                1,
+                JsonTarget::new(&[&self.response_args]),
             );
             publish_json_arguments(self, &parsed.arguments, true);
             if parsed.truncated {

@@ -35,7 +35,11 @@ use std::{
     },
 };
 
-use coraza::{seclang::Parser, transaction::VariableCollection, types::RuleVariable};
+use coraza::{
+    seclang::Parser,
+    transaction::{Transaction, VariableCollection},
+    types::RuleVariable,
+};
 
 /// Forwards to the system allocator while tracking live and peak bytes, in two ways.
 ///
@@ -148,9 +152,9 @@ struct Setup<'a> {
     configuration: &'a str,
 }
 
-/// [`measure`] under an absolute memory budget and extra configuration.
-fn measure_with(processor: &str, content_type: &str, body: &[u8], request_xml: bool, setup: &Setup<'_>) -> Measured {
-    let Setup { budget, configuration } = *setup;
+/// A transaction that has read the headers of a request that selects `processor`, under an absolute memory budget
+/// and extra configuration.
+fn prepared(processor: &str, content_type: &str, budget: Option<usize>, configuration: &str) -> Transaction {
     let mut parser = Parser::new();
     parser
         .from_string(&format!(
@@ -159,11 +163,24 @@ fn measure_with(processor: &str, content_type: &str, body: &[u8], request_xml: b
         ))
         .unwrap();
     let waf = parser.into_waf().unwrap();
-    let mut tx = waf.new_transaction();
+    // A fixed id: the generated one grows a digit as other tests make transactions, and the matched rules keep a
+    // copy of it, so two measurements to compare could otherwise differ by that byte.
+    let mut tx = waf.new_transaction_with_id("measured");
     tx.set_body_memory_budget(budget);
     tx.add_request_header("Content-Type", content_type);
     tx.process_request_headers();
+    tx
+}
 
+/// [`measure`] under an absolute memory budget and extra configuration.
+fn measure_with(processor: &str, content_type: &str, body: &[u8], request_xml: bool, setup: &Setup<'_>) -> Measured {
+    let Setup { budget, configuration } = *setup;
+    let mut tx = prepared(processor, content_type, budget, configuration);
+    measure_body(&mut tx, body, request_xml)
+}
+
+/// Processes `body` as the request body of `tx` and measures the peak heap growth.
+fn measure_body(tx: &mut Transaction, body: &[u8], request_xml: bool) -> Measured {
     let baseline = CURRENT.load(SeqCst);
     PEAK.store(baseline, SeqCst);
     let baseline_chunks = CHUNKS.load(SeqCst);
@@ -915,5 +932,266 @@ fn json_scratch_and_the_traversal_stack_are_reserved_before_they_grow() {
             measured.peak_chunks,
             body.len()
         );
+    }
+}
+
+/// The longest an error message may be when the processor has a budget, which quotes only an excerpt of what is
+/// malformed.
+const EXCERPT_MESSAGE_LIMIT: usize = 1024;
+
+/// What the budget lets a body whose malformed part is `copies` times as long as the body cost: the engine's copies
+/// of the body, the budget and slack.
+#[track_caller]
+fn assert_malformed_input_stays_within_the_budget(label: &str, measured: &Measured, body_len: usize, budget: usize) {
+    eprintln!(
+        "{label}: body {body_len}, peak {}, retained {}, message {} bytes",
+        tenths(measured.peak_chunks, body_len),
+        tenths(measured.retained, body_len),
+        measured.message.len()
+    );
+    assert!(measured.errored, "{label}: the malformed input is reported");
+    assert!(
+        measured.message.len() <= EXCERPT_MESSAGE_LIMIT,
+        "{label}: the message quotes {} bytes of the input",
+        measured.message.len()
+    );
+    assert!(
+        measured.peak_chunks <= 2 * body_len + budget + SLACK,
+        "{label}: the peak {} is over two copies of the {body_len} byte body and the {budget} byte budget",
+        measured.peak_chunks
+    );
+    assert_accounting_is_conservative(label, measured);
+}
+
+/// A malformed body: its label, the processor, the content type, the body and whether its values go to `REQUEST_XML`.
+type MalformedCase = (&'static str, &'static str, &'static str, Vec<u8>, bool);
+
+#[test]
+fn the_diagnostics_of_malformed_input_stay_within_the_budget_and_are_accounted_for() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let size = 3 * MIB;
+    let cases: Vec<MalformedCase> = vec![
+        (
+            "xml: a long mismatched end tag name",
+            "xml",
+            "text/xml",
+            repeated(b"<a></", b"b", size, b">"),
+            true,
+        ),
+        (
+            "xml: a long end tag name with nothing open",
+            "xml",
+            "text/xml",
+            repeated(b"</", b"b", size, b">"),
+            true,
+        ),
+        (
+            "xml: characters after a long end tag name",
+            "xml",
+            "text/xml",
+            repeated(b"<a></", b"b", size, b" x>"),
+            true,
+        ),
+        (
+            "xml: an end tag name in the wrong space",
+            "xml",
+            "text/xml",
+            repeated(b"<p:a></q:", b"b", size, b">"),
+            true,
+        ),
+        (
+            "xml: a bad version in the declaration",
+            "xml",
+            "text/xml",
+            repeated(b"<?xml version=\"", b"9", size, b"\"?><a/>"),
+            true,
+        ),
+        (
+            "xml: an unsupported encoding in the declaration",
+            "xml",
+            "text/xml",
+            repeated(b"<?xml encoding=\"", b"e", size, b"\"?><a/>"),
+            true,
+        ),
+        (
+            "multipart: a header line without a colon",
+            "multipart",
+            "multipart/form-data; boundary=b",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n",
+                b"h",
+                256 * 1024,
+                b"\r\n\r\nv\r\n--b--\r\n",
+            ),
+            false,
+        ),
+        (
+            "multipart: a header name with a bad byte",
+            "multipart",
+            "multipart/form-data; boundary=b",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n(",
+                b"h",
+                256 * 1024,
+                b": v\r\n\r\nv\r\n--b--\r\n",
+            ),
+            false,
+        ),
+        (
+            "multipart: a delimiter line that goes on",
+            "multipart",
+            "multipart/form-data; boundary=b",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--b ",
+                b"x",
+                size,
+                b"\r\nmore\r\n--b--\r\n",
+            ),
+            false,
+        ),
+    ];
+    for (label, processor, content_type, body, request_xml) in cases {
+        let setup = Setup {
+            budget: Some(BUDGET),
+            configuration: "",
+        };
+        let measured = measure_with(processor, content_type, &body, request_xml, &setup);
+        assert_malformed_input_stays_within_the_budget(label, &measured, body.len(), BUDGET);
+    }
+}
+
+/// The body that adds `count` values to the one key `a`: JSON members, which all land in one path.
+fn duplicate_json_members(count: usize) -> Vec<u8> {
+    let mut body = b"{".to_vec();
+    for index in 0..count {
+        if index > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(b"\"a\":1");
+    }
+    body.push(b'}');
+    body
+}
+
+/// The number of members of the body of the test below.
+const COUNT: usize = 100_000;
+
+#[test]
+fn duplicate_json_members_are_charged_for_what_they_allocate_and_a_fitting_budget_keeps_them_all() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let body = duplicate_json_members(COUNT);
+    let configuration = "SecArgumentsLimit 1000000";
+    let unbudgeted = measure_with(
+        "json",
+        "application/json",
+        &body,
+        false,
+        &Setup {
+            budget: None,
+            configuration,
+        },
+    );
+    assert_eq!(unbudgeted.values, COUNT);
+    // The walk's own list and the entries of both collections are held together while the collections are filled,
+    // so what the body needs is the peak and not what is left afterwards. A budget a sixth above it must admit it
+    // whole: the key is one spelling, shared by every value, and charging it again for each would not.
+    let budget = unbudgeted.peak_chunks + unbudgeted.peak_chunks / 6;
+    let measured = measure_with(
+        "json",
+        "application/json",
+        &body,
+        false,
+        &Setup {
+            budget: Some(budget),
+            configuration,
+        },
+    );
+    eprintln!(
+        "{COUNT} duplicate members: unbudgeted peak {}, retained {}; budget {budget}: values {}, error {:?}",
+        unbudgeted.peak_chunks, unbudgeted.retained, measured.values, measured.message
+    );
+    assert!(
+        !measured.errored,
+        "the budget error is raised: {} of {COUNT} values were kept",
+        measured.values
+    );
+    assert_eq!(measured.values, COUNT);
+    assert_accounting_is_conservative("duplicate json members", &measured);
+    assert!(
+        measured.peak_chunks <= 2 * body.len() + budget + SLACK,
+        "peak {} is over the budget {budget}",
+        measured.peak_chunks
+    );
+}
+
+/// How a collection came to hold the values of a key before the body is processed.
+#[derive(Clone, Copy, Debug)]
+enum Existing {
+    /// Through the query string: `ARGS` alone.
+    Query,
+    /// As body arguments: `ARGS_POST` and `ARGS`.
+    Post,
+}
+
+/// Processes `body` under `budget` into a transaction whose collections already hold `existing` values of `key`.
+fn measure_into_existing(
+    (processor, content_type): (&str, &str),
+    body: &[u8],
+    key: &str,
+    (how, existing): (Existing, usize),
+    budget: usize,
+) -> (Measured, Transaction) {
+    let mut tx = prepared(processor, content_type, Some(budget), "SecArgumentsLimit 100000");
+    for _ in 0..existing {
+        match how {
+            Existing::Query => tx.add_get_argument(key, "v"),
+            Existing::Post => tx.add_post_argument(key, "v"),
+        }
+    }
+    let measured = measure_body(&mut tx, body, false);
+    (measured, tx)
+}
+
+#[test]
+fn json_and_multipart_values_are_charged_for_growing_a_list_the_query_or_body_filled_before() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let json = b"{\"a\":1}".to_vec();
+    let multipart = b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--b--\r\n".to_vec();
+    let processors = [
+        (("json", "application/json"), "json.a", json),
+        (("multipart", "multipart/form-data; boundary=b"), "a", multipart),
+    ];
+    let budget = 16 * 1024;
+    for (kind, key, body) in &processors {
+        for how in [Existing::Query, Existing::Post] {
+            // 1,024 values fill the list exactly, so one more grows it by a quarter: tens of kilobytes the budget
+            // does not have. 1,000 leave room, and the value costs only what it allocates.
+            for (existing, grows) in [(4, true), (16, true), (1024, true), (1000, false)] {
+                let label = format!("{} into {existing} values from {how:?}", kind.0);
+                let (measured, tx) = measure_into_existing(*kind, body, key, (how, existing), budget);
+                let args = match tx.collection(RuleVariable::Args) {
+                    Some(VariableCollection::Map(map)) => map.value_count(),
+                    _ => 0,
+                };
+                eprintln!(
+                    "{label}: peak {}, error {}, ARGS {args}",
+                    measured.peak_chunks, measured.errored
+                );
+                // What the budget allows beyond the engine's copies of the body is the 16 KiB and a little slack.
+                assert!(
+                    measured.peak_chunks <= 2 * body.len() + budget + 4096,
+                    "{label}: the peak {} is over the {budget} byte budget",
+                    measured.peak_chunks
+                );
+                if existing == 1024 {
+                    assert!(measured.errored, "{label}: the growth is refused, not made");
+                    assert_eq!(args, existing, "{label}: nothing was added");
+                }
+                if !grows {
+                    assert!(!measured.errored, "{label}: a spare slot costs only the value");
+                    assert_eq!(args, existing + 1, "{label}");
+                }
+            }
+        }
     }
 }

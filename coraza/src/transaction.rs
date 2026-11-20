@@ -1345,7 +1345,16 @@ impl Transaction {
             &self.tx,
             &self.matched_vars,
         ];
-        let singles = [&self.request_body, &self.response_body];
+        // The messages of body processor errors, which a body can make as long as the name or value that is quoted
+        // in them: they are kept for as long as the transaction is.
+        let singles = [
+            &self.request_body,
+            &self.response_body,
+            &self.reqbody_error_msg,
+            &self.reqbody_processor_error_msg,
+            &self.res_body_error_msg,
+            &self.res_body_processor_error_msg,
+        ];
         let dynamic_pm_bytes = self
             .dynamic_pm_matcher
             .lock()

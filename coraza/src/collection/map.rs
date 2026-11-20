@@ -337,6 +337,17 @@ impl KeyValue {
 /// Bytes of one value's entry in its key's list.
 pub(crate) const VALUE_ENTRY_BYTES: usize = size_of::<KeyValue>();
 
+/// The capacity a value list of `len` values and `capacity` slots grows to when one more is added to it, as
+/// [`push_grown`] grows it.
+pub(crate) fn grown_list_capacity(len: usize, capacity: usize) -> usize {
+    if len >= EXACT_GROWTH_FROM {
+        len.saturating_add(len / 4)
+    } else {
+        // `Vec`'s amortized growth: double, and never fewer than four slots for an entry this small.
+        capacity.saturating_mul(2).max(len.saturating_add(1)).max(4)
+    }
+}
+
 /// The length from which a value vector grows by a quarter instead of doubling, see [`push_grown`].
 const EXACT_GROWTH_FROM: usize = 1024;
 
@@ -748,13 +759,14 @@ impl Map {
         if len < capacity {
             return Some(0);
         }
-        let grown = if len >= EXACT_GROWTH_FROM {
-            len.saturating_add(len / 4)
-        } else {
-            // `Vec`'s amortized growth: double, and never fewer than four slots for an entry this small.
-            capacity.saturating_mul(2).max(len.saturating_add(1)).max(4)
-        };
+        let grown = grown_list_capacity(len, capacity);
         Some(allocation_bytes(grown.saturating_mul(VALUE_ENTRY_BYTES)))
+    }
+
+    /// The length and capacity of `key`'s value list, or `None` when the map does not hold the key.
+    pub(crate) fn value_list_shape(&self, key: &[u8]) -> Option<(usize, usize)> {
+        let values = self.data.get(self.lookup_key(key).as_ref())?;
+        Some((values.len(), values.capacity()))
     }
 
     /// Number of distinct keys.
