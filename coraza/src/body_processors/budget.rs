@@ -23,6 +23,7 @@
 
 use crate::collection::{
     ALLOCATION_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
+    allocation_bytes, grown_list_capacity,
 };
 
 /// The words every error a body processor reports for the memory budget has in it.
@@ -113,11 +114,6 @@ pub(crate) fn map_insert_cost(key: &[u8], value_len: usize) -> usize {
     insert_cost(map_key_bytes(key), value_len)
 }
 
-/// The bytes one argument costs once it is in `ARGS_POST` and `ARGS`, taking its key as new to both.
-pub(crate) fn argument_cost(key: &[u8], value_len: usize) -> usize {
-    map_insert_cost(key, value_len).saturating_mul(2)
-}
-
 /// The bytes a value costs in a map that already holds its key, beside the growth of the key's list
 /// (`list_growth`, see [`crate::collection::Map::value_list_growth_bytes`], none while the list has a free slot):
 /// the allocation of the value and its own spelling of the key, which only a differing one or an invalid one
@@ -129,8 +125,9 @@ pub(crate) fn repeated_insert_cost(key: &[u8], value_len: usize, list_growth: us
         .saturating_add(value_len)
 }
 
-/// [`argument_cost`] knowing, for each of the two maps, the growth its list for the key needs, or `None` when it
-/// does not hold the key yet. A form with a field repeated for every value is the case it is for.
+/// The bytes one argument costs once it is in `ARGS_POST` and `ARGS`, knowing, for each of the two maps, the growth its
+/// list for the key needs, or `None` when it does not hold the key yet. A form with a field repeated for every value is
+/// the case it is for.
 pub(crate) fn argument_cost_in(key: &[u8], value_len: usize, in_post: Option<usize>, in_args: Option<usize>) -> usize {
     let cost = |growth: Option<usize>| match growth {
         Some(growth) => repeated_insert_cost(key, value_len, growth),
@@ -139,33 +136,82 @@ pub(crate) fn argument_cost_in(key: &[u8], value_len: usize, in_post: Option<usi
     cost(in_post).saturating_add(cost(in_args))
 }
 
-/// The capacity a list of values has grown to once it holds `len`, which grows as [`crate::collection::Map`]
-/// grows its own: by doubling from four, and by a quarter from 1,024.
-fn list_capacity_for(len: usize) -> usize {
-    let mut capacity = 1_usize;
-    while capacity < len {
-        capacity = if capacity >= 1024 {
-            capacity.saturating_add(capacity / 4)
-        } else {
-            capacity.saturating_mul(2).max(4)
-        };
-    }
-    capacity
+/// How a list of values grows when it is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListGrowthPolicy {
+    /// A `Vec`'s: double, and never fewer than four slots for an entry this small.
+    Vec,
+    /// A [`crate::collection::Map`]'s value list: a `Vec`'s, and by a quarter from 1,024.
+    Map,
 }
 
-/// The bytes the list that holds `len` values of `element` bytes allocates when it grows to take one more, none
-/// while it has room: the new allocation, which the old one is held beside while the entries move.
-pub(crate) fn list_growth_bytes(len: usize, element: usize) -> usize {
-    let capacity = list_capacity_for(len);
-    if len < capacity {
+impl ListGrowthPolicy {
+    /// The capacity a full list of `len` values in `capacity` slots grows to.
+    fn grown(self, len: usize, capacity: usize) -> usize {
+        match self {
+            Self::Map => grown_list_capacity(len, capacity),
+            Self::Vec => capacity.saturating_mul(2).max(len.saturating_add(1)).max(4),
+        }
+    }
+}
+
+/// What taking one more value costs a list that is full: the allocation of the grown list, which is held beside the
+/// old one while the values move, and the old one, which is freed once they have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ListGrowth {
+    /// Bytes of the grown list's allocation, none while the list has room.
+    pub(crate) grown: usize,
+    /// Bytes of the old allocation that is freed by the growth and that the budget had been charged for.
+    pub(crate) freed: usize,
+}
+
+/// The growth of a list that holds `len` values in `capacity` slots when it takes one more, after `added` more have
+/// been added to it, none while it has room. `element` is the size of a slot.
+///
+/// This works from the capacity a list really has, and not from the one a budget would have given it. The
+/// allocation the list starts as is one the budget has charged when `charged` says so, which is for a list the
+/// walk makes and not for one that was there before; every one the growths after it make is charged by their own.
+pub(crate) fn list_growth(
+    (len, capacity): (usize, usize),
+    added: usize,
+    element: usize,
+    policy: ListGrowthPolicy,
+    charged: bool,
+) -> ListGrowth {
+    let (mut len, mut capacity, mut left) = (len, capacity.max(len), added);
+    let mut charged = charged;
+    // Each step fills the slots there are and grows once, so the steps are as few as the growths.
+    loop {
+        let room = capacity.saturating_sub(len);
+        if left < room {
+            return ListGrowth::default();
+        }
+        left = left.saturating_sub(room);
+        len = capacity;
+        let grown = policy.grown(len, capacity);
+        if left == 0 {
+            return ListGrowth {
+                grown: allocation_bytes(grown.saturating_mul(element)),
+                freed: if charged {
+                    allocation_bytes(capacity.saturating_mul(element))
+                } else {
+                    0
+                },
+            };
+        }
+        capacity = grown;
+        charged = true;
+    }
+}
+
+/// The bytes the key of a value that is added to a map that holds it already takes, which is its own spelling
+/// when that differs from the key the map files it under (a name with a capital, or one that is not UTF-8) and
+/// nothing when it is the same, as the value then points to the map's key.
+pub(crate) fn spelling_bytes(key: &[u8]) -> usize {
+    if key.iter().all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase()) {
         return 0;
     }
-    let grown = if capacity >= 1024 {
-        capacity.saturating_add(capacity / 4)
-    } else {
-        capacity.saturating_mul(2).max(4)
-    };
-    crate::collection::allocation_bytes(grown.saturating_mul(element))
+    (map_key_bytes(key) / KEY_COPIES_PER_INSERT).saturating_add(2 * ALLOCATION_OVERHEAD_BYTES)
 }
 
 /// The bytes the decoded name and value of a pair occupy while it is inserted, at most the raw pair's bytes, plus

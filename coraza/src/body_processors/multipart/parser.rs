@@ -58,6 +58,23 @@ pub(super) enum ParseError {
     Budget,
 }
 
+/// How much of a header line or delimiter line a failure quotes when the parser has a memory budget: the message
+/// is kept, and stored more than once, long after the buffers it was made from are given back.
+const QUOTED_EXCERPT_BYTES: usize = 256;
+
+/// `text` cut to [`QUOTED_EXCERPT_BYTES`] at a character boundary, with a marker when something was cut.
+fn bounded_text(mut text: String) -> String {
+    if text.len() > QUOTED_EXCERPT_BYTES {
+        let mut end = QUOTED_EXCERPT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
+}
+
 /// What the host's memory budget stopping the parser says.
 const BUDGET_MESSAGE: &str = "body memory budget exceeded";
 
@@ -78,6 +95,18 @@ impl std::fmt::Display for ParseError {
 }
 
 impl ParseError {
+    /// This failure with the line it quotes cut to a short excerpt, for a parse that has a memory budget. The
+    /// header parse reserves what it takes while it runs, which does not cover the message that outlives it.
+    pub(super) fn bounded(self) -> Self {
+        match self {
+            Self::MalformedHeaderLine(line) => Self::MalformedHeaderLine(bounded_text(line)),
+            Self::MissingColon(line) => Self::MissingColon(bounded_text(line)),
+            Self::InitialLine(line) => Self::InitialLine(bounded_text(line)),
+            Self::UnexpectedLine(line) => Self::UnexpectedLine(bounded_text(line)),
+            other => other,
+        }
+    }
+
     /// Render this failure the way Go's `mime/multipart` reports it, when it has an
     /// equivalent there. Go returns these strings from `NextPart` unchanged, so they
     /// reach `REQBODY_PROCESSOR_ERROR_MSG`.
@@ -252,6 +281,9 @@ pub(super) struct MultipartParser<'a> {
     truncated: bool,
     /// What the parts it reads may still hold, charged as each is read.
     memory: Cell<MemoryBudget>,
+    /// Set when a body cut by the limit ended the parse before its closing delimiter, so that parts may follow
+    /// the last one read.
+    cut_open: Cell<bool>,
 }
 
 impl<'a> MultipartParser<'a> {
@@ -267,6 +299,7 @@ impl<'a> MultipartParser<'a> {
             data,
             truncated: false,
             memory: Cell::new(MemoryBudget::default()),
+            cut_open: Cell::new(false),
         }
     }
 
@@ -279,6 +312,16 @@ impl<'a> MultipartParser<'a> {
     /// What is left of the budget after the parts read so far.
     pub(super) fn memory_left(&self) -> MemoryBudget {
         self.memory.get()
+    }
+
+    /// Whether the parse has a memory budget, which is when what it quotes in an error is an excerpt.
+    fn is_bounded(&self) -> bool {
+        self.memory.get().is_limited()
+    }
+
+    /// Whether the parse of a body cut by the limit stopped before the closing delimiter, with no error.
+    pub(super) fn cut_open(&self) -> bool {
+        self.cut_open.get()
     }
 
     /// Takes `bytes` from the budget, or fails with the budget error and takes nothing.
@@ -401,6 +444,7 @@ impl<'a> MultipartParser<'a> {
             // A body cut by the limit can end before any complete delimiter; Go's
             // `NextPart` wraps that `io.EOF` and the processor keeps zero parts.
             return if self.truncated {
+                self.cut_open.set(true);
                 Ok(())
             } else {
                 Err(ParseError::Parse("no boundary found".to_owned()))
@@ -444,6 +488,7 @@ impl<'a> MultipartParser<'a> {
                 // A body that ends right after a delimiter line is not truncated: Go's
                 // `NextPart` reports a plain `io.EOF` and the processor ends without a
                 // strict error.
+                self.cut_open.set(self.truncated);
                 return Ok(());
             }
             let (part_end, boundary_start) = match find_next_boundary(remaining, &boundary_marker, &boundary_table, nl)
@@ -453,6 +498,7 @@ impl<'a> MultipartParser<'a> {
                     // Go reads this last part until the limit's `io.ErrUnexpectedEOF`,
                     // trims the partial delimiter it stopped on, and keeps the part.
                     self.read_part(parts, remaining, &mut total_header_bytes, cut)?;
+                    self.cut_open.set(true);
                     return Ok(());
                 },
                 None => {
@@ -492,7 +538,7 @@ impl<'a> MultipartParser<'a> {
 
             // Go reports a bad delimiter line only after the part before it was read, so
             // the strict error follows a published part.
-            let delimiter = delimiter_kind(self.data, boundary_marker_pos, &boundary_marker, nl)?;
+            let delimiter = delimiter_kind(self.data, boundary_marker_pos, &boundary_marker, nl, self.is_bounded())?;
             if matches!(delimiter, Delimiter::Final) {
                 closed = true;
                 break;
@@ -1293,7 +1339,16 @@ fn closing_marker_at_eof(tail: &[u8]) -> bool {
 ///
 /// A line that is no delimiter under `nl` is one Go reports as
 /// `multipart: expecting a new Part; got line "<line>"`, quoted as sent.
-fn delimiter_kind(data: &[u8], marker_start: usize, marker: &[u8], nl: &[u8]) -> Result<Delimiter, ParseError> {
+///
+/// With `bounded`, only the first bytes of a long delimiter line are quoted, as the whole of it would be allocated
+/// beyond what the host's budget reserved.
+fn delimiter_kind(
+    data: &[u8],
+    marker_start: usize,
+    marker: &[u8],
+    nl: &[u8],
+    bounded: bool,
+) -> Result<Delimiter, ParseError> {
     let after_marker = marker_start.saturating_add(marker.len());
     let tail = data.get(after_marker..).unwrap_or_default();
     if skip_lwsp_slice(tail).starts_with(nl) {
@@ -1311,9 +1366,14 @@ fn delimiter_kind(data: &[u8], marker_start: usize, marker: &[u8], nl: &[u8]) ->
         .iter()
         .position(|&byte| byte == b'\n')
         .map_or(line.len(), |index| index.saturating_add(1));
-    Err(ParseError::UnexpectedLine(quoted(
-        line.get(..line_len).unwrap_or_default(),
-    )))
+    let line = line.get(..line_len).unwrap_or_default();
+    let line = if bounded {
+        line.get(..QUOTED_EXCERPT_BYTES.saturating_add(1).min(line.len()))
+            .unwrap_or(line)
+    } else {
+        line
+    };
+    Err(ParseError::UnexpectedLine(quoted(line)))
 }
 
 /// `bytes` without its leading spaces and tabs.
