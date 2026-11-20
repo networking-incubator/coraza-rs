@@ -395,6 +395,21 @@ fn lower_bytes(key: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The bytes of the lowercase copy that a case-insensitive map makes of `key` while it looks the key up or files it
+/// (see [`Map::lookup_scratch_bytes`]), none for a key that is its own lowercase form. A folded character can take
+/// more bytes than the one it came from, so the copy of a name that is not ASCII can outgrow the vector sized for
+/// it: that vector doubles, and the old one is held beside the new while the bytes move, three times its size.
+pub(crate) fn fold_scratch_bytes(key: &[u8]) -> usize {
+    if !key.iter().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+        return 0;
+    }
+    if key.is_ascii() {
+        allocation_bytes(key.len())
+    } else {
+        allocation_bytes(key.len()).saturating_add(allocation_bytes(key.len().saturating_mul(2)))
+    }
+}
+
 /// Appends `text` to `out`, lower-cased the way Go folds collection keys.
 fn push_lowercase(out: &mut Vec<u8>, text: &str) {
     // Go's `strings.ToLower` is the simple mapping, not Rust's full one, so both the
@@ -763,6 +778,54 @@ impl Map {
         Some(allocation_bytes(grown.saturating_mul(VALUE_ENTRY_BYTES)))
     }
 
+    /// The bytes the lowercase copy of `key` takes while a lookup or an insertion works with it: a case-insensitive
+    /// map folds a name with a capital or a non-ASCII byte into a vector that lives as long as the call, and a
+    /// folded character can take more bytes than the one it came from, which can double the vector. None when the
+    /// key is looked up as it is.
+    pub(crate) fn lookup_scratch_bytes(&self, key: &[u8]) -> usize {
+        if self.case_sensitive {
+            0
+        } else {
+            fold_scratch_bytes(key)
+        }
+    }
+
+    /// The capacity the table of keys has once `added` more keys than it holds are in it: what it has, or the
+    /// capacity the map grows to for them.
+    pub(crate) fn key_table_capacity_after(&self, added: usize) -> usize {
+        let capacity = self.data.capacity();
+        let len = self.data.len().saturating_add(added);
+        if len <= capacity {
+            capacity
+        } else {
+            index_capacity_for(len).max(capacity)
+        }
+    }
+
+    /// What adding one key that the map does not hold takes from its table: the grown table, which is held beside
+    /// the old one while the entries move, and the old one, which is freed after. Nothing while the table has room.
+    pub(crate) fn new_key_table_growth(&self) -> TableGrowth {
+        let capacity = self.data.capacity();
+        let grown = self.key_table_capacity_after(1);
+        if grown == capacity {
+            return TableGrowth::default();
+        }
+        TableGrowth {
+            grown: map_capacity_bytes(grown),
+            freed: map_capacity_bytes(capacity),
+        }
+    }
+
+    /// The capacity of the table of keys.
+    pub(crate) fn key_table_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Whether the map holds `key` (folded, in a case-insensitive map).
+    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
+        self.data.contains_key(self.lookup_key(key).as_ref())
+    }
+
     /// The length and capacity of `key`'s value list, or `None` when the map does not hold the key.
     pub(crate) fn value_list_shape(&self, key: &[u8]) -> Option<(usize, usize)> {
         let values = self.data.get(self.lookup_key(key).as_ref())?;
@@ -901,9 +964,19 @@ pub(crate) fn index_capacity_for(len: usize) -> usize {
     if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 }
 }
 
-/// Estimated bytes of the allocations of a map of values for `len` distinct keys, once it has grown to hold them.
-pub(crate) fn map_table_bytes(len: usize) -> usize {
-    index_table_bytes::<(Key, Vec<KeyValue>)>(index_capacity_for(len))
+/// Estimated bytes of the allocations of a map of values whose table has `capacity` entries.
+pub(crate) fn map_capacity_bytes(capacity: usize) -> usize {
+    index_table_bytes::<(Key, Vec<KeyValue>)>(capacity)
+}
+
+/// What the table of a map takes to grow for one more key: the bytes of the grown table, held beside the old one
+/// while the entries move, and the bytes of the old one, freed once they have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TableGrowth {
+    /// Bytes of the grown table, none while the table has room.
+    pub(crate) grown: usize,
+    /// Bytes of the old table, which the growth frees.
+    pub(crate) freed: usize,
 }
 
 /// Estimated bytes of the entry vector for `capacity` entries.
@@ -1592,5 +1665,50 @@ mod tests {
         // Case-insensitive lookup returns both values
         let values = map.get("CONTENT-TYPE");
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn a_new_keys_table_growth_is_what_the_table_really_grows_by() {
+        use super::{Map, TableGrowth, map_capacity_bytes};
+        use crate::types::RuleVariable;
+
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        for index in 0..2_000 {
+            let growth = map.new_key_table_growth();
+            let capacity = map.key_table_capacity();
+            map.add(&format!("key{index}"), "v");
+            if growth == TableGrowth::default() {
+                assert_eq!(map.key_table_capacity(), capacity, "key {index} fits the table");
+            } else {
+                assert_eq!(growth.freed, map_capacity_bytes(capacity), "key {index}");
+                assert_eq!(
+                    growth.grown,
+                    map_capacity_bytes(map.key_table_capacity()),
+                    "key {index}"
+                );
+                assert!(map.key_table_capacity() > capacity);
+            }
+            assert_eq!(map.key_table_capacity_after(0), map.key_table_capacity());
+        }
+        // What a later key will find, for a walk that adds several before they are filed.
+        assert!(map.key_table_capacity_after(5_000) >= map.len() + 5_000);
+        assert!(map.contains_key(b"key7") && !map.contains_key(b"absent"));
+    }
+
+    #[test]
+    fn the_lowercase_copy_of_a_name_is_charged_only_where_a_map_makes_one() {
+        use super::{Map, fold_scratch_bytes};
+        use crate::types::RuleVariable;
+
+        let insensitive = Map::new(RuleVariable::Args);
+        let sensitive = Map::new_case_sensitive(RuleVariable::Args);
+        assert_eq!(insensitive.lookup_scratch_bytes(b"lower"), 0);
+        assert!(insensitive.lookup_scratch_bytes(b"Upper") >= 5);
+        assert!(
+            insensitive.lookup_scratch_bytes("é".as_bytes()) >= 2,
+            "a name that is not ASCII is folded"
+        );
+        assert_eq!(sensitive.lookup_scratch_bytes(b"Upper"), 0);
+        assert_eq!(fold_scratch_bytes(b"Upper"), insensitive.lookup_scratch_bytes(b"Upper"));
     }
 }

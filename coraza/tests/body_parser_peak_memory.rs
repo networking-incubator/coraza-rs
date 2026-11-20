@@ -29,6 +29,7 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    fmt::Write as _,
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering::SeqCst},
@@ -1194,4 +1195,232 @@ fn json_and_multipart_values_are_charged_for_growing_a_list_the_query_or_body_fi
             }
         }
     }
+}
+
+/// The smallest budget that `body` is admitted under, by bisection, with what it measures at that budget.
+fn smallest_admitting_budget(case: &Boundary) -> (usize, Measured) {
+    let length = case.body.len();
+    let (mut low, mut high) = (0_usize, 1_000 * length.max(1_000));
+    assert!(
+        !run_boundary(case, high).errored,
+        "{}: a huge budget admits it",
+        case.label
+    );
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if run_boundary(case, middle).errored {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (high, run_boundary(case, high))
+}
+
+#[test]
+fn the_budget_that_admits_a_body_covers_its_peak_exactly_for_the_shapes_that_hid_a_copy_or_a_growth() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let upper_key = |processor, content_type, body: Vec<u8>, copies| Boundary {
+        label: processor,
+        processor,
+        content_type,
+        configuration: "",
+        body,
+        request_xml: false,
+        copies,
+    };
+    let mut form = vec![b'A'; 256 * 1024];
+    form.extend_from_slice(b"=1");
+    let mut json = b"{\"".to_vec();
+    json.extend(std::iter::repeat_n(b'A', 64 * 1024));
+    json.extend_from_slice(b"\":1}");
+    let mut multipart = b"--b\r\nContent-Disposition: form-data; name=\"".to_vec();
+    multipart.extend(std::iter::repeat_n(b'A', 64 * 1024));
+    multipart.extend_from_slice(b"\"\r\n\r\n1\r\n--b--\r\n");
+    // `Ⱥ` takes two bytes and its lowercase form three, so the lowercase copy outgrows the vector sized for the
+    // name, which doubles beside the old one.
+    let mut expanding = "Ⱥ".repeat(64 * 1024).into_bytes();
+    expanding.extend_from_slice(b"=1");
+    let cases = [
+        Boundary {
+            label: "urlencoded, a name whose lowercase form is longer",
+            ..upper_key("urlencoded", "application/x-www-form-urlencoded", expanding, 2)
+        },
+        // The decoded pair is alive while it is inserted, and a name with a capital is looked up through a lowercase
+        // copy of it: neither was charged.
+        upper_key("urlencoded", "application/x-www-form-urlencoded", form, 2),
+        upper_key("json", "application/json", json, 2),
+        upper_key("multipart", "multipart/form-data; boundary=b", multipart, 1),
+        // 513 values take the list of `/*` past 512 slots, which grows to 1,024 beside the old one.
+        Boundary {
+            label: "xml, one past a full list",
+            processor: "xml",
+            content_type: "text/xml",
+            configuration: "",
+            body: format!("<r>{}</r>", "<i>1</i>".repeat(513)).into_bytes(),
+            request_xml: true,
+            copies: 1,
+        },
+    ];
+    for case in &cases {
+        let (budget, admitted) = smallest_admitting_budget(case);
+        let length = case.body.len();
+        eprintln!(
+            "{}: body {length}, smallest budget {budget}, peak {}",
+            case.label, admitted.peak_chunks
+        );
+        assert!(!admitted.errored && admitted.values > 0, "{}", case.label);
+        // No slack: what the processor allocates beyond the engine's copies of the body is what it was charged.
+        assert!(
+            admitted.peak_chunks <= case.copies * length + budget,
+            "{}: the peak {} passes the {budget} the budget allowed beside {} copies of {length} bytes",
+            case.label,
+            admitted.peak_chunks,
+            case.copies
+        );
+    }
+}
+
+/// A transaction whose `ARGS` already holds `keys` distinct query arguments, which fills the table of keys when
+/// `keys` is what a table of that size holds.
+fn prepared_with_query(processor: &str, content_type: &str, budget: usize, keys: usize) -> Transaction {
+    let mut tx = prepared(processor, content_type, Some(budget), "SecArgumentsLimit 100000");
+    for index in 0..keys {
+        tx.add_get_argument(format!("q{index}"), "v");
+    }
+    tx
+}
+
+#[test]
+fn a_new_key_in_a_full_table_of_arguments_is_charged_for_the_table_that_replaces_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    // 896 keys fill the table of a map exactly: one more makes a table twice as big, beside the old one.
+    let keys = 896;
+    let cases = [
+        ("json", "application/json", b"{\"new\":1}".to_vec()),
+        ("urlencoded", "application/x-www-form-urlencoded", b"new=1".to_vec()),
+        (
+            "multipart",
+            "multipart/form-data; boundary=b",
+            b"--b\r\nContent-Disposition: form-data; name=\"new\"\r\n\r\n1\r\n--b--\r\n".to_vec(),
+        ),
+    ];
+    for (processor, content_type, body) in &cases {
+        let small = 16 * 1024;
+        let mut tx = prepared_with_query(processor, content_type, small, keys);
+        let before = tx.body_memory_bytes();
+        let refused = measure_body(&mut tx, body, false);
+        assert!(refused.errored, "{processor}: a table that does not fit is not made");
+        assert_eq!(refused.values, 0, "{processor}: and nothing is added");
+        assert!(
+            tx.body_memory_bytes().saturating_sub(before) <= small,
+            "{processor}: the retained growth stays within the budget"
+        );
+
+        // The budget that admits it covers the growth of the table, and the peak stays within it.
+        let (mut low, mut high) = (small, 1024 * 1024);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            let mut tx = prepared_with_query(processor, content_type, middle, keys);
+            if measure_body(&mut tx, body, false).errored {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        let mut tx = prepared_with_query(processor, content_type, high, keys);
+        let before = tx.body_memory_bytes();
+        let admitted = measure_body(&mut tx, body, false);
+        eprintln!(
+            "{processor}: smallest budget {high}, peak {}, retained growth {}",
+            admitted.peak_chunks,
+            tx.body_memory_bytes().saturating_sub(before)
+        );
+        assert!(!admitted.errored && admitted.values == 1, "{processor}");
+        assert!(
+            admitted.peak_chunks <= body.len() + high,
+            "{processor}: the peak {} passes the {high} byte budget",
+            admitted.peak_chunks
+        );
+        assert!(
+            tx.body_memory_bytes().saturating_sub(before) <= high,
+            "{processor}: the retained growth passes the budget"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_lowercase_name_is_not_charged_a_spelling_the_map_shares() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = "k".repeat(4096);
+    let case = Boundary {
+        label: "urlencoded, a 4 KiB name twice",
+        processor: "urlencoded",
+        content_type: "application/x-www-form-urlencoded",
+        configuration: "",
+        body: format!("{key}=1&{key}=2").into_bytes(),
+        request_xml: false,
+        copies: 2,
+    };
+    let (budget, admitted) = smallest_admitting_budget(&case);
+    let grown = admitted.peak_chunks.saturating_sub(case.copies * case.body.len());
+    eprintln!(
+        "{}: smallest budget {budget}, peak above the copies {grown}",
+        case.label
+    );
+    assert_eq!(admitted.values, 2, "both values reach ARGS_POST");
+    // The second value shares the key the first made in each map. Charging it a spelling of its own, 4 KiB in each
+    // of the two maps, put the budget above twice what the heap grows by.
+    assert!(
+        budget < 2 * grown,
+        "a budget of {budget} for {grown} bytes of growth charges a copy that is not made"
+    );
+}
+
+/// A multipart body of `count` uploads, each under its own name.
+fn uploads(count: usize) -> Vec<u8> {
+    let mut body = String::new();
+    for index in 0..count {
+        write!(
+            body,
+            "--b\r\nContent-Disposition: form-data; name=\"f{index}\"; filename=\"x{index}.txt\"\r\n\r\nx\r\n"
+        )
+        .unwrap();
+    }
+    body.push_str("--b--\r\n");
+    body.into_bytes()
+}
+
+#[test]
+fn the_paths_of_the_temporary_uploads_a_transaction_keeps_are_part_of_its_estimate() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    // Long paths, so that the copy kept for cleanup, beside the one in `FILES_TMPNAMES`, is most of what is held.
+    let directory = tempfile::tempdir().unwrap();
+    let mut path = directory.path().to_path_buf();
+    for _ in 0..3 {
+        path.push("d".repeat(250));
+    }
+    std::fs::create_dir_all(&path).unwrap();
+    let mut parser = Parser::new();
+    parser
+        .from_string(
+            "SecRequestBodyAccess On\nSecRequestBodyLimit 134217728\nSecUploadFileLimit 1000\n\
+             SecAction \"id:1,phase:1,ctl:requestBodyProcessor=MULTIPART,pass,nolog\"",
+        )
+        .unwrap();
+    parser.config_mut().upload_dir = path.to_string_lossy().into_owned();
+    let waf = parser.into_waf().unwrap();
+    let mut tx = waf.new_transaction_with_id("measured");
+    tx.add_request_header("Content-Type", "multipart/form-data; boundary=b");
+    tx.process_request_headers();
+    let measured = measure_body(&mut tx, &uploads(1000), false);
+    assert!(!measured.errored, "{}", measured.message);
+    // `assert_accounting_is_conservative` with the slack of a few variables only: the copies of 1,000 paths of
+    // 800 bytes are far more than that.
+    assert!(
+        measured.live_chunks <= measured.retained + 16 * 1024,
+        "the transaction holds {} bytes but estimates {}",
+        measured.live_chunks,
+        measured.retained
+    );
 }

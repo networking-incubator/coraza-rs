@@ -158,7 +158,7 @@ impl Transaction {
             match parsed.error {
                 Some(message) => {
                     self.log_body_processor_error(false, "JSON", &message);
-                    self.note_body_processor_error(false, &message);
+                    self.note_body_processor_error(false, parsed.memory_stopped);
                     self.res_body_error.set("1");
                     self.res_body_error_msg.set(format!("JSON: {message}"));
                     self.res_body_processor_error.set("1");

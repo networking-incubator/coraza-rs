@@ -189,6 +189,11 @@ impl<'a> Decoder<'a> {
         self.reserve(bytes)
     }
 
+    /// Gives back `bytes` that [`Decoder::charge`] reserved beyond what a stored value keeps.
+    pub(super) fn release(&mut self, bytes: usize) {
+        self.memory.refund(bytes);
+    }
+
     /// Reserves `bytes` of the host's memory budget, which is a no-op without one.
     fn reserve(&mut self, bytes: usize) -> Result<(), DecodeError> {
         if self.memory.charge(bytes) {
@@ -269,17 +274,17 @@ impl<'a> Decoder<'a> {
     ///
     /// If the input is malformed as Go's decoder reads it, with `Strict` off, or ends
     /// within a token or an element.
-    pub(super) fn token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
-        let token = self.next_checked_token(attribute);
+    pub(super) fn token(&mut self, sink: &mut dyn super::Sink) -> Result<Option<Token>, DecodeError> {
+        let token = self.next_checked_token(sink);
         self.release_scratch();
         token
     }
 
     /// [`Decoder::token`], before the scratch it reserved is given back.
-    fn next_checked_token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
+    fn next_checked_token(&mut self, sink: &mut dyn super::Sink) -> Result<Option<Token>, DecodeError> {
         let token = match self.next_token.take() {
             Some(token) => token,
-            None => match self.raw_token(attribute)? {
+            None => match self.raw_token(sink)? {
                 Some(token) => token,
                 None if self.open.is_empty() => return Ok(None),
                 None => return Err(DecodeError::UnexpectedEof { line: self.line }),
@@ -353,7 +358,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The next token as written (Go's `rawToken`), or `None` at the end of the input.
-    fn raw_token(&mut self, attribute: &mut dyn FnMut(String)) -> Result<Option<Token>, DecodeError> {
+    fn raw_token(&mut self, sink: &mut dyn super::Sink) -> Result<Option<Token>, DecodeError> {
         if let Some(name) = self.pending_end.take() {
             // The name is a token now, which holds it until the token ends and gives its scratch back.
             self.scratch = self.scratch.saturating_add(std::mem::take(&mut self.pending_charged));
@@ -402,7 +407,7 @@ impl<'a> Decoder<'a> {
             },
             _ => {
                 self.ungetc();
-                self.start_tag(attribute)?
+                self.start_tag(sink)?
             },
         };
         Ok(Some(token))
@@ -595,10 +600,10 @@ impl<'a> Decoder<'a> {
     /// (not `Strict`).
     ///
     /// A single start tag can hold as many attributes as the body has bytes, so each value is charged as it is
-    /// read and handed to `emit` at once, instead of waiting in a list beside the collection it joins. A tag that
+    /// read and handed to the sink at once, instead of waiting in a list beside the collection it joins. A tag that
     /// does not complete leaves them with the caller, who is told how many by [`Decoder::unfinished_attributes`]
     /// and drops them, as a token that was never returned never had them.
-    fn start_tag(&mut self, emit: &mut dyn FnMut(String)) -> Result<Token, DecodeError> {
+    fn start_tag(&mut self, sink: &mut dyn super::Sink) -> Result<Token, DecodeError> {
         let name = self
             .nsname()?
             .ok_or_else(|| self.syntax_error("expected element name after <"))?;
@@ -631,9 +636,11 @@ impl<'a> Decoder<'a> {
                 attribute.local
             };
             self.release_scratch_to(mark);
-            self.charge(super::value_cost(value.len()))?;
+            let cost = sink.attribute_cost(value.len());
+            self.charge(cost.charge)?;
             self.tag_attributes = self.tag_attributes.saturating_add(1);
-            emit(value);
+            sink.attribute(value);
+            self.release(cost.release);
         }
         self.tag_attributes = 0;
         Ok(Token::Start { name })

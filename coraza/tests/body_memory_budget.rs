@@ -819,3 +819,66 @@ fn a_member_past_the_argument_limit_ends_the_json_walk_as_one_even_when_the_budg
     let (limit_reached, errored, _) = outcome(&format!("{{\"a\":1,\"c\\n{big}\":3}}"), Some(20_000));
     assert!(!limit_reached && errored);
 }
+
+#[test]
+fn a_body_that_ends_at_the_limit_after_a_delimiter_is_not_cut_and_one_byte_more_is() {
+    let content_type = "multipart/form-data; boundary=b";
+    // A field, then a delimiter line that is not the closing one: the body ends where the limit does.
+    let body = "--b\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n--b\r\n";
+    assert_eq!(body.len(), 57);
+    let partial = |limit: usize| {
+        waf_rejecting_uploads(&format!(
+            "SecRequestBodyLimit {limit}\nSecRequestBodyLimitAction ProcessPartial"
+        ))
+    };
+    // Nothing was discarded, so no part can be hiding past the end: the ban has nothing to refuse.
+    assert_eq!(
+        status_of(&partial(body.len()), content_type, body.as_bytes()),
+        (None, false, false)
+    );
+    // One byte over the limit is cut, and what was cut could be a file.
+    assert_eq!(
+        status_of(&partial(body.len() - 1), content_type, body.as_bytes()),
+        (Some(413), false, true)
+    );
+}
+
+#[test]
+fn only_a_processor_that_stopped_for_the_budget_says_so_whatever_the_body_quotes() {
+    let waf = waf("");
+    // A declaration that quotes the words of the budget's own message, with no budget set.
+    let spoof = b"<?xml version=\"x body memory budget x\"?><r/>";
+    let mut tx = request(&waf, "text/xml", None);
+    tx.process_request_body(spoof);
+    assert!(request_body_errored(&tx), "the declaration is a syntax error");
+    assert!(
+        tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
+            .is_some_and(|message| message.contains("body memory budget")),
+        "and the message quotes it"
+    );
+    assert!(!tx.request_body_stopped_by_memory_budget());
+
+    // The same under a budget that is not what stopped it.
+    let mut tx = request(&waf, "text/xml", Some(1 << 20));
+    tx.process_request_body(spoof);
+    assert!(request_body_errored(&tx));
+    assert!(!tx.request_body_stopped_by_memory_budget());
+
+    // And a stop for the budget is still reported, by each processor.
+    let xml: String = format!("<r>{}</r>", "<i>1</i>".repeat(2000));
+    let json = format!("[{}1]", "1,".repeat(2000));
+    let form = pairs(2000);
+    let multipart = fields_then(2000, "--b--\r\n");
+    let cases: [(&str, &[u8]); 4] = [
+        ("text/xml", xml.as_bytes()),
+        ("application/json", json.as_bytes()),
+        ("application/x-www-form-urlencoded", &form),
+        ("multipart/form-data; boundary=b", multipart.as_bytes()),
+    ];
+    for (content_type, body) in cases {
+        let mut tx = request(&waf, content_type, Some(20_000));
+        tx.process_request_body(body);
+        assert!(request_body_errored(&tx), "{content_type}");
+        assert!(tx.request_body_stopped_by_memory_budget(), "{content_type}");
+    }
+}
