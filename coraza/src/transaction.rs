@@ -1367,10 +1367,20 @@ impl Transaction {
             .chain([
                 self.request_body_buffer.allocated_bytes(),
                 self.response_body_buffer.allocated_bytes(),
+                self.uploaded_paths_bytes(),
                 dynamic_pm_bytes,
                 self.matched_rules_memory_bytes(),
             ])
             .fold(0_usize, usize::saturating_add)
+    }
+
+    /// The bytes of the paths of the temporary uploads kept for cleanup: the list that holds them and each path's own
+    /// buffer.
+    fn uploaded_paths_bytes(&self) -> usize {
+        self.uploaded_paths.iter().fold(
+            self.uploaded_paths.capacity().saturating_mul(size_of::<PathBuf>()),
+            |total, path| total.saturating_add(path.capacity()),
+        )
     }
 
     /// Limit what the body processors may retain for one body, in the units [`Transaction::body_memory_bytes`]
@@ -1407,11 +1417,10 @@ impl Transaction {
         self.computed.body_budget_stopped[1]
     }
 
-    /// Records that a body processor reported `message`, which says so if the memory budget stopped it.
-    pub(crate) fn note_body_processor_error(&mut self, request: bool, message: &str) {
-        if message.contains(crate::body_processors::budget::BUDGET_ERROR_PHRASE)
-            && let Some(stopped) = self.computed.body_budget_stopped.get_mut(usize::from(!request))
-        {
+    /// Records that a body processor reported an error, and whether it stopped for the memory budget, which only the
+    /// processor can say: the text of an error can quote the body.
+    pub(crate) fn note_body_processor_error(&mut self, request: bool, budget_stopped: bool) {
+        if budget_stopped && let Some(stopped) = self.computed.body_budget_stopped.get_mut(usize::from(!request)) {
             *stopped = true;
         }
     }
@@ -6993,6 +7002,25 @@ payload\r\n\
             !std::path::Path::new(&path).exists(),
             "a panic must not leak the temporary upload"
         );
+    }
+
+    #[test]
+    fn body_memory_bytes_counts_the_paths_of_the_temporary_uploads_kept_for_cleanup() {
+        let mut tx = Transaction::new("upload-paths");
+        let before = tx.body_memory_bytes();
+        for index in 0..10 {
+            tx.uploaded_paths
+                .push(std::path::PathBuf::from(format!("{}{index}", "d".repeat(499))));
+        }
+        let expected = tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>()
+            + tx.uploaded_paths
+                .iter()
+                .map(std::path::PathBuf::capacity)
+                .sum::<usize>();
+        assert!(expected >= 10 * 500, "the paths are long enough to tell");
+        assert_eq!(tx.body_memory_bytes() - before, expected);
+        tx.uploaded_paths.clear();
+        assert!(tx.body_memory_bytes() - before <= tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>());
     }
 
     #[test]

@@ -134,6 +134,11 @@ impl ParseError {
         }
     }
 
+    /// Whether this is the host's memory budget stopping the parser.
+    pub(super) const fn is_budget(&self) -> bool {
+        matches!(self, Self::Budget)
+    }
+
     /// Whether Go's reader would report this failure too, which sets `MULTIPART_STRICT_ERROR`: the host's memory
     /// budget is not one of its errors.
     pub(super) const fn is_strict(&self) -> bool {

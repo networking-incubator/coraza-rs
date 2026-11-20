@@ -25,19 +25,33 @@ mod tables;
 
 use decoder::{Decoder, Token};
 
-use crate::{body_processors::budget::MemoryBudget, collection::Map};
+use crate::{
+    body_processors::budget::{ListGrowthPolicy, MemoryBudget, list_growth},
+    collection::{Map, VALUE_ENTRY_BYTES, allocation_bytes},
+};
 
-/// Bytes charged to a host's memory budget for each value beyond its text: the entry in the collection, with the
-/// growth slack of the vector that holds it (a vector being grown holds its old and new buffers at once), the
-/// allocation overhead of the text.
+/// Bytes charged to a host's memory budget for each value beyond its text when the values go to a plain list, as in
+/// the tests below: the entry, with the growth slack of the vector that holds it, and the allocation overhead of
+/// the text. The collection charges from the shape of its own lists instead, see [`CollectionSink`].
 ///
 /// Without a host budget nothing bounds the output, as in Go Coraza: a document is never refused for having many
 /// values.
+#[cfg(test)]
 const VALUE_OVERHEAD_BYTES: usize = 128;
 
-/// The budget charge for one value of `len` bytes, which is read into one string and moved into the collection.
+/// The budget charge for one value of `len` bytes that goes to a plain list.
+#[cfg(test)]
 pub(super) fn value_cost(len: usize) -> usize {
     VALUE_OVERHEAD_BYTES.saturating_add(len)
+}
+
+/// What taking one more value costs the budget: `charge` before the value is stored, which holds the grown list
+/// beside the old one, and `release` once it is, when the old one is freed.
+pub(super) struct ValueCost {
+    /// Bytes to reserve before the value is stored.
+    pub(super) charge: usize,
+    /// Bytes to give back after it is.
+    pub(super) release: usize,
 }
 
 /// The `REQUEST_XML` key of attribute values.
@@ -48,6 +62,12 @@ const TEXT_KEY: &[u8] = b"/*";
 
 /// Where the parser puts the values it reads, in document order.
 trait Sink {
+    /// What an attribute value of `len` bytes costs once it is stored, and while it is.
+    fn attribute_cost(&mut self, len: usize) -> ValueCost;
+
+    /// What a text segment of `len` bytes costs, as for [`Sink::attribute_cost`].
+    fn text_cost(&mut self, len: usize) -> ValueCost;
+
     /// An attribute value.
     fn attribute(&mut self, value: String);
 
@@ -68,6 +88,9 @@ struct CollectionSink<'a> {
     text_before: usize,
     /// Attribute values this parse added.
     attributes_added: usize,
+    /// Whether this parse has made the list of `//@*` and of `/*`, or grown it, so that what it was charged for is
+    /// the list there is, which a growth gives back.
+    lists_charged: [bool; 2],
 }
 
 impl<'a> CollectionSink<'a> {
@@ -77,7 +100,40 @@ impl<'a> CollectionSink<'a> {
             attributes_before: map.values(ATTRIBUTE_KEY).count(),
             text_before: map.values(TEXT_KEY).count(),
             attributes_added: 0,
+            lists_charged: [false; 2],
             map,
+        }
+    }
+
+    /// What one more value of `len` bytes under `key` costs, from the lists the collection has now: the value, and
+    /// the growth of the list when it is full, or the key, its list and the growth of the table of keys when it is
+    /// new. `slot` is the key's place in `lists_charged`.
+    fn cost(&mut self, key: &[u8], slot: usize, len: usize) -> ValueCost {
+        let value = allocation_bytes(len);
+        let Some(shape) = self.map.value_list_shape(key) else {
+            let table = self.map.new_key_table_growth();
+            if let Some(charged) = self.lists_charged.get_mut(slot) {
+                *charged = true;
+            }
+            return ValueCost {
+                charge: value
+                    .saturating_add(allocation_bytes(key.len()))
+                    // The one-element list the key starts with.
+                    .saturating_add(allocation_bytes(VALUE_ENTRY_BYTES))
+                    .saturating_add(table.grown),
+                release: table.freed,
+            };
+        };
+        let charged = self.lists_charged.get(slot).copied().unwrap_or(true);
+        let growth = list_growth(shape, 0, VALUE_ENTRY_BYTES, ListGrowthPolicy::Map, charged);
+        if growth.grown > 0
+            && let Some(charged) = self.lists_charged.get_mut(slot)
+        {
+            *charged = true;
+        }
+        ValueCost {
+            charge: value.saturating_add(growth.grown),
+            release: growth.freed,
         }
     }
 
@@ -95,6 +151,14 @@ impl<'a> CollectionSink<'a> {
 }
 
 impl Sink for CollectionSink<'_> {
+    fn attribute_cost(&mut self, len: usize) -> ValueCost {
+        self.cost(ATTRIBUTE_KEY, 0, len)
+    }
+
+    fn text_cost(&mut self, len: usize) -> ValueCost {
+        self.cost(TEXT_KEY, 1, len)
+    }
+
     fn attribute(&mut self, value: String) {
         self.map.add_owned(ATTRIBUTE_KEY, value.into_bytes());
         self.attributes_added = self.attributes_added.saturating_add(1);
@@ -152,14 +216,16 @@ pub(crate) fn parse_into(body: &[u8], memory: MemoryBudget, collection: &mut Map
 fn read(xml: &[u8], memory: MemoryBudget, sink: &mut impl Sink) -> Result<Option<String>, decoder::DecodeError> {
     let mut decoder = Decoder::new(xml).with_memory_budget(memory);
     loop {
-        match decoder.token(&mut |value| sink.attribute(value)) {
+        match decoder.token(sink) {
             Ok(Some(Token::CharData(text))) => {
                 let text = trimmed(text);
                 if !text.is_empty() {
-                    if let Err(error) = decoder.charge(value_cost(text.len())) {
+                    let cost = sink.text_cost(text.len());
+                    if let Err(error) = decoder.charge(cost.charge) {
                         return Ok(Some(error.to_string()));
                     }
                     sink.text(text);
+                    decoder.release(cost.release);
                 }
             },
             Ok(Some(Token::Start { .. } | Token::End(_) | Token::Other)) => {},
@@ -191,6 +257,17 @@ struct Document {
 
 #[cfg(test)]
 impl Sink for Document {
+    fn attribute_cost(&mut self, len: usize) -> ValueCost {
+        ValueCost {
+            charge: value_cost(len),
+            release: 0,
+        }
+    }
+
+    fn text_cost(&mut self, len: usize) -> ValueCost {
+        self.attribute_cost(len)
+    }
+
     fn attribute(&mut self, value: String) {
         self.attribute_values.push(value);
     }

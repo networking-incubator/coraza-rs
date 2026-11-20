@@ -70,6 +70,17 @@ pub(crate) struct ParseFailure {
     /// Whether the parser stopped in a body that is multipart, so that parts past the stop were not looked at.
     /// A body that is not multipart has none.
     pub(crate) parts_unread: bool,
+    /// What stopped the parser.
+    pub(crate) cause: FailureCause,
+}
+
+/// What stopped a multipart parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureCause {
+    /// The body is not what it should be, or hit one of the parser's own limits.
+    Malformed,
+    /// The host's memory budget.
+    MemoryBudget,
 }
 
 /// Parse a multipart body using the boundary in its content type.
@@ -100,6 +111,7 @@ pub(crate) fn parse<'a>(
                     message: error.to_owned(),
                     strict: true,
                     parts_unread: true,
+                    cause: FailureCause::Malformed,
                 }),
                 false,
             );
@@ -115,6 +127,7 @@ pub(crate) fn parse<'a>(
                 message: "not a multipart body".to_owned(),
                 strict: false,
                 parts_unread: false,
+                cause: FailureCause::Malformed,
             }),
             false,
         );
@@ -135,6 +148,11 @@ pub(crate) fn parse<'a>(
     let bounded = reading.is_limited();
     let failure = error.map(|error| ParseFailure {
         strict: error.is_strict(),
+        cause: if error.is_budget() {
+            FailureCause::MemoryBudget
+        } else {
+            FailureCause::Malformed
+        },
         // The line a failure quotes is cut short under a budget, as the message is kept long after the parse.
         message: if bounded { error.bounded() } else { error }.go_message(),
         parts_unread: true,

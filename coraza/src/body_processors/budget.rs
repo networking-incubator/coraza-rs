@@ -22,12 +22,9 @@
 //! would later count for it, so that the budget and the authoritative accounting agree.
 
 use crate::collection::{
-    ALLOCATION_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE,
-    allocation_bytes, grown_list_capacity,
+    ALLOCATION_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, Map,
+    TableGrowth, allocation_bytes, fold_scratch_bytes, grown_list_capacity,
 };
-
-/// The words every error a body processor reports for the memory budget has in it.
-pub(crate) const BUDGET_ERROR_PHRASE: &str = "body memory budget";
 
 /// What a body processor may still retain, or no limit at all.
 ///
@@ -117,12 +114,37 @@ pub(crate) fn map_insert_cost(key: &[u8], value_len: usize) -> usize {
 /// The bytes a value costs in a map that already holds its key, beside the growth of the key's list
 /// (`list_growth`, see [`crate::collection::Map::value_list_growth_bytes`], none while the list has a free slot):
 /// the allocation of the value and its own spelling of the key, which only a differing one or an invalid one
-/// allocates.
+/// allocates (see [`spelling_bytes`]): a key the map already holds in the same spelling is shared.
 pub(crate) fn repeated_insert_cost(key: &[u8], value_len: usize, list_growth: usize) -> usize {
     list_growth
-        .saturating_add(2 * ALLOCATION_OVERHEAD_BYTES)
-        .saturating_add(map_key_bytes(key) / KEY_COPIES_PER_INSERT)
+        .saturating_add(ALLOCATION_OVERHEAD_BYTES)
+        .saturating_add(spelling_bytes(key))
         .saturating_add(value_len)
+}
+
+/// What the tables of `maps` take to grow for a key that is new to those that do not hold it yet: the grown tables,
+/// which are held beside the old ones while the entries move, and the old ones, which are freed after. This works
+/// from the capacities the maps really have, which a query string may have filled before the body was read.
+pub(crate) fn new_key_table_growth(maps: &[&Map], key: &[u8]) -> TableGrowth {
+    maps.iter()
+        .filter(|map| !map.contains_key(key))
+        .fold(TableGrowth::default(), |sum, map| {
+            let growth = map.new_key_table_growth();
+            TableGrowth {
+                grown: sum.grown.saturating_add(growth.grown),
+                freed: sum.freed.saturating_add(growth.freed),
+            }
+        })
+}
+
+/// The largest lowercase copy any of `maps` makes of `key`, which only one of them holds at a time.
+///
+/// With no maps to ask, which is a walk that publishes nowhere yet, it is the copy a case-insensitive one would make.
+pub(crate) fn lookup_scratch_bytes(maps: &[&Map], key: &[u8]) -> usize {
+    if maps.is_empty() {
+        return fold_scratch_bytes(key);
+    }
+    maps.iter().map(|map| map.lookup_scratch_bytes(key)).max().unwrap_or(0)
 }
 
 /// The bytes one argument costs once it is in `ARGS_POST` and `ARGS`, knowing, for each of the two maps, the growth its
