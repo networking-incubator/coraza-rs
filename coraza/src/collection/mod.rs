@@ -45,7 +45,7 @@ pub(crate) use map::keys_scanned;
 pub(crate) use map::{
     ALLOCATION_OVERHEAD_BYTES, FIRST_INSERT_OVERHEAD_BYTES, Growth, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT,
     KEY_RETAINED_BYTES_PER_BYTE, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes, grown_list_capacity,
-    index_capacity_for, index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
+    index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
 };
 pub use single::Single;
 

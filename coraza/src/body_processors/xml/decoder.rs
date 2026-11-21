@@ -10,7 +10,7 @@ use std::fmt;
 
 use super::tables::{AUTO_CLOSE, FIRST, HTML_ENTITIES, SECOND};
 use crate::{
-    body_processors::budget::MemoryBudget,
+    body_processors::budget::{self, MemoryBudget},
     collection::{ALLOCATION_OVERHEAD_BYTES, Growth},
 };
 
@@ -221,24 +221,37 @@ impl<'a> Decoder<'a> {
         self.scratch = mark;
     }
 
+    /// What to reserve for a buffer about to be read: nothing without a budget, as it then grows while it is filled,
+    /// and with one `bound`, the most it can take, charged as scratch first.
+    fn scratch_for(&mut self, bound: impl FnOnce(&Self) -> usize) -> Result<usize, DecodeError> {
+        if !self.is_limited() {
+            return Ok(0);
+        }
+        let bound = bound(self);
+        self.scratch(bound.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
+        Ok(bound)
+    }
+
     /// The length of the input from the offset to the first byte `stop` accepts, or to its end.
     fn run_len(&self, stop: impl Fn(u8) -> bool) -> usize {
         let rest = self.input.get(self.offset..).unwrap_or_default();
         rest.iter().position(|&b| stop(b)).unwrap_or(rest.len())
     }
 
+    /// The length of the input from the offset through the first `end`, or to its end.
+    fn through(&self, end: &[u8]) -> usize {
+        let rest = self.input.get(self.offset..).unwrap_or_default();
+        memchr::memmem::find(rest, end).map_or(rest.len(), |at| at.saturating_add(end.len()))
+    }
+
     /// The most bytes the text read up to `end` can take: the input up to its end, which references and line
     /// ends only shorten.
     fn text_bound(&self, end: TextEnd) -> usize {
+        let rest = self.input.get(self.offset..).unwrap_or_default();
         match end {
-            TextEnd::Markup => self.run_len(|b| b == b'<'),
-            TextEnd::Quote(quote) => self.run_len(|b| b == quote || b == b'<'),
-            TextEnd::Cdata => {
-                let rest = self.input.get(self.offset..).unwrap_or_default();
-                rest.windows(3)
-                    .position(|window| window == b"]]>")
-                    .map_or(rest.len(), |at| at.saturating_add(3))
-            },
+            TextEnd::Markup => memchr::memchr(b'<', rest).unwrap_or(rest.len()),
+            TextEnd::Quote(quote) => memchr::memchr2(quote, b'<', rest).unwrap_or(rest.len()),
+            TextEnd::Cdata => self.through(b"]]>"),
         }
     }
 
@@ -401,14 +414,8 @@ impl<'a> Decoder<'a> {
         // Only the declaration's content is read, so any other instruction is skipped without buffering it.
         let keep = target == "xml";
         let mut content = Vec::new();
-        if keep && self.is_limited() {
-            let rest = self.input.get(self.offset..).unwrap_or_default();
-            let bound = rest
-                .windows(2)
-                .position(|window| window == b"?>")
-                .map_or(rest.len(), |at| at.saturating_add(2));
-            self.scratch(bound.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
-            content.reserve_exact(bound);
+        if keep {
+            content.reserve_exact(self.scratch_for(|decoder| decoder.through(b"?>"))?);
         }
         let mut previous = 0;
         loop {
@@ -469,16 +476,11 @@ impl<'a> Decoder<'a> {
     /// The message outlives the scratch the name was read in, and is stored more than once, so it cannot be the
     /// size of the input.
     fn shown<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
-        if !self.is_limited() || text.len() <= EXCERPT_BYTES {
-            return std::borrow::Cow::Borrowed(text);
+        if self.is_limited() {
+            budget::excerpt(text, EXCERPT_BYTES)
+        } else {
+            std::borrow::Cow::Borrowed(text)
         }
-        let mut end = EXCERPT_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut shown = text.get(..end).unwrap_or_default().to_owned();
-        shown.push_str("...");
-        std::borrow::Cow::Owned(shown)
     }
 
     /// `bytes` as text for an error message. Without a budget that is all of them, as Go quotes them. With one it is
@@ -637,11 +639,9 @@ impl<'a> Decoder<'a> {
         }
         self.ungetc();
         let mut value = String::new();
-        if self.is_limited() {
-            let run = self.run_len(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-')));
-            self.scratch(run.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
-            value.reserve_exact(run);
-        }
+        value.reserve_exact(self.scratch_for(|decoder| {
+            decoder.run_len(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-')))
+        })?);
         loop {
             let b = self.mustgetc()?;
             if b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-') {
@@ -660,13 +660,9 @@ impl<'a> Decoder<'a> {
     fn text(&mut self, end: TextEnd) -> Result<String, DecodeError> {
         let (mut b0, mut b1) = (0, 0);
         let mut text = Vec::new();
-        if self.is_limited() {
-            // The text cannot outgrow the input it is read from, so the buffer is sized once, and charged, instead
-            // of doubling past the budget on the way to a value the budget would then refuse.
-            let bound = self.text_bound(end);
-            self.scratch(bound.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
-            text.reserve_exact(bound);
-        }
+        // The text cannot outgrow the input it is read from, so under a budget the buffer is sized once, and charged,
+        // instead of doubling past the budget on the way to a value the budget would then refuse.
+        text.reserve_exact(self.scratch_for(|decoder| decoder.text_bound(end))?);
         loop {
             let Some(b) = self.getc() else {
                 if end == TextEnd::Cdata {
@@ -812,12 +808,8 @@ impl<'a> Decoder<'a> {
     /// If the bytes it reads as one aren't a valid XML name.
     fn name(&mut self) -> Result<Option<String>, DecodeError> {
         let mut name = Vec::new();
-        if self.is_limited() {
-            // Whatever the name is for, it is read whole before anything is known about it, so it is reserved first.
-            let run = self.run_len(|b| b.is_ascii() && !is_name_byte(b));
-            self.scratch(run.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
-            name.reserve_exact(run);
-        }
+        // Whatever the name is for, it is read whole before anything is known about it, so it is reserved first.
+        name.reserve_exact(self.scratch_for(|decoder| decoder.run_len(|b| b.is_ascii() && !is_name_byte(b)))?);
         if !self.read_name(&mut name)? {
             return Ok(None);
         }

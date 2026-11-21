@@ -21,8 +21,11 @@
 //! The absolute memory budget a connector can give the built-in body processors, as seen through the public API:
 //! what stops, what is kept, what is reported, and that nothing changes without one.
 
+mod common;
+
 use std::fmt::Write as _;
 
+use common::smallest_budget;
 use coraza::{
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
@@ -62,6 +65,17 @@ fn request(waf: &Waf, content_type: &str, budget: Option<usize>) -> Transaction 
     tx
 }
 
+/// A transaction that has read the headers of a JSON response to a request without a body, under `budget`.
+fn json_response(waf: &Waf, budget: Option<usize>) -> Transaction {
+    let mut tx = waf.new_transaction();
+    tx.process_request_headers();
+    tx.process_request_body(b"");
+    tx.add_response_header("Content-Type", "application/json");
+    tx.process_response_headers(200, "HTTP/1.1");
+    tx.set_body_memory_budget(budget);
+    tx
+}
+
 /// Whether `REQBODY_ERROR` and `REQBODY_PROCESSOR_ERROR` are both raised.
 fn request_body_errored(tx: &Transaction) -> bool {
     tx.get_variable(RuleVariable::ReqbodyError, None).as_deref() == Some("1")
@@ -77,21 +91,6 @@ fn values_of(tx: &Transaction, variable: RuleVariable) -> Vec<(String, String)> 
             .collect(),
         _ => Vec::new(),
     }
-}
-
-/// The smallest budget up to `high` that `admits`, by bisection.
-fn smallest_budget(mut high: usize, admits: impl Fn(usize) -> bool) -> usize {
-    assert!(admits(high), "a budget of {high} admits it");
-    let mut low = 0;
-    while low + 1 < high {
-        let middle = low + (high - low) / 2;
-        if admits(middle) {
-            high = middle;
-        } else {
-            low = middle;
-        }
-    }
-    high
 }
 
 /// `count` pairs `k0=v0&k1=v1...`.
@@ -452,12 +451,7 @@ fn a_response_body_stops_at_the_budget_and_reports_through_the_response_variable
     let leaves: Vec<String> = (0..2_000).map(|index| format!("\"k{index}\":\"v{index}\"")).collect();
     let body = format!("{{{}}}", leaves.join(",")).into_bytes();
     let respond = |budget: Option<usize>| {
-        let mut tx = waf.new_transaction();
-        tx.process_request_headers();
-        tx.process_request_body(b"");
-        tx.add_response_header("Content-Type", "application/json");
-        tx.process_response_headers(200, "HTTP/1.1");
-        tx.set_body_memory_budget(budget);
+        let mut tx = json_response(&waf, budget);
         let interruption = tx.process_response_body(&body);
         (tx, interruption)
     };
@@ -711,12 +705,7 @@ fn a_dense_json_array_is_refused_only_by_a_budget_near_what_it_holds_and_a_respo
         tx
     };
     let respond = |budget: usize, body: &str| {
-        let mut tx = waf.new_transaction();
-        tx.process_request_headers();
-        tx.process_request_body(b"");
-        tx.add_response_header("Content-Type", "application/json");
-        tx.process_response_headers(200, "HTTP/1.1");
-        tx.set_body_memory_budget(Some(budget));
+        let mut tx = json_response(&waf, Some(budget));
         tx.process_response_body(body.as_bytes());
         tx.get_variable(RuleVariable::ResBodyError, None).as_deref() == Some("1")
     };

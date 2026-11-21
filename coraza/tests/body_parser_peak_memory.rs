@@ -26,6 +26,8 @@
     reason = "a counting global allocator and fixed fixtures; the allocator only forwards to System"
 )]
 
+mod common;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     fmt::Write as _,
@@ -35,6 +37,7 @@ use std::{
     },
 };
 
+use common::smallest_budget;
 use coraza::{
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
@@ -239,21 +242,6 @@ fn measure_body(tx: &mut Transaction, body: &[u8], request_xml: bool) -> Measure
         strict,
         values,
     }
-}
-
-/// The smallest budget up to `high` that `admits`, by bisection.
-fn smallest_budget(mut high: usize, mut admits: impl FnMut(usize) -> bool) -> usize {
-    assert!(admits(high), "a budget of {high} admits it");
-    let mut low = 0;
-    while low + 1 < high {
-        let middle = low + (high - low) / 2;
-        if admits(middle) {
-            high = middle;
-        } else {
-            low = middle;
-        }
-    }
-    high
 }
 
 /// What the transaction's own accounting may be short of what it holds: its variables and error messages.

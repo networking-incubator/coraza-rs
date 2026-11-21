@@ -27,7 +27,10 @@
 use std::{cell::Cell, mem::size_of};
 
 use super::{is_token_name, media_type};
-use crate::{body_processors::budget::MemoryBudget, collection::ALLOCATION_OVERHEAD_BYTES};
+use crate::{
+    body_processors::budget::{self, MemoryBudget},
+    collection::ALLOCATION_OVERHEAD_BYTES,
+};
 
 /// What a parse asks before it copies a header block: whether the host's memory budget has room for it.
 type Reserve<'r> = &'r dyn Fn(&[u8]) -> Result<(), ParseError>;
@@ -62,19 +65,6 @@ pub(super) enum ParseError {
 /// is kept, and stored more than once, long after the buffers it was made from are given back.
 const QUOTED_EXCERPT_BYTES: usize = 256;
 
-/// `text` cut to [`QUOTED_EXCERPT_BYTES`] at a character boundary, with a marker when something was cut.
-fn bounded_text(mut text: String) -> String {
-    if text.len() > QUOTED_EXCERPT_BYTES {
-        let mut end = QUOTED_EXCERPT_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str("...");
-    }
-    text
-}
-
 /// What the host's memory budget stopping the parser says.
 const BUDGET_MESSAGE: &str = "body memory budget exceeded";
 
@@ -98,11 +88,12 @@ impl ParseError {
     /// This failure with the line it quotes cut to a short excerpt, for a parse that has a memory budget. The
     /// header parse reserves what it takes while it runs, which does not cover the message that outlives it.
     pub(super) fn bounded(self) -> Self {
+        let cut = |line: String| budget::excerpt(&line, QUOTED_EXCERPT_BYTES).into_owned();
         match self {
-            Self::MalformedHeaderLine(line) => Self::MalformedHeaderLine(bounded_text(line)),
-            Self::MissingColon(line) => Self::MissingColon(bounded_text(line)),
-            Self::InitialLine(line) => Self::InitialLine(bounded_text(line)),
-            Self::UnexpectedLine(line) => Self::UnexpectedLine(bounded_text(line)),
+            Self::MalformedHeaderLine(line) => Self::MalformedHeaderLine(cut(line)),
+            Self::MissingColon(line) => Self::MissingColon(cut(line)),
+            Self::InitialLine(line) => Self::InitialLine(cut(line)),
+            Self::UnexpectedLine(line) => Self::UnexpectedLine(cut(line)),
             other => other,
         }
     }

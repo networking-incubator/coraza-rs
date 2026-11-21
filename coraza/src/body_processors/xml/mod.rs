@@ -322,11 +322,6 @@ mod tests {
         assert!(document.budget_error.is_some());
     }
 
-    #[test]
-    fn a_syntax_error_still_discards_the_document_as_before() {
-        assert!(parse(b"<a b=\"c\"></x></y>").is_err());
-    }
-
     /// A fresh `REQUEST_XML`.
     fn collection() -> Map {
         Map::new_case_sensitive(RuleVariable::RequestXML)

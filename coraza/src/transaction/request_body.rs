@@ -39,7 +39,8 @@ use crate::{
     },
     collection::{
         ALLOCATION_OVERHEAD_BYTES, Growth, Map, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes,
-        grown_list_capacity, index_capacity_for, index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
+        grown_list_capacity, index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes,
+        vec_grown_capacity,
     },
     transformations::url_decode,
     types::{BodyLimitAction, RulePhase},
@@ -1204,8 +1205,8 @@ struct JsonFlattener<'m> {
     /// request, `RESPONSE_ARGS` for a response. A query string can have filled a list of them already.
     held: &'m [&'m Map],
     /// Values of paths that a case-insensitive collection files under another spelling, by that spelling: they
-    /// join the list of every path that folds alike. It is dropped when the walk ends.
-    folded: IndexMap<Vec<u8>, usize, ahash::RandomState>,
+    /// join the list of every path that folds alike. It is made for the first of them, and dropped when the walk ends.
+    folded: Option<IndexMap<Vec<u8>, usize, ahash::RandomState>>,
     /// The bytes `folded` holds.
     folded_bytes: usize,
     /// What has been charged for the collections' values, lists and keys, which they allocate only after the walk.
@@ -1278,7 +1279,7 @@ impl<'m> JsonFlattener<'m> {
             },
             path_charged: 0,
             held,
-            folded: IndexMap::with_hasher(ahash::RandomState::new()),
+            folded: None,
             folded_bytes: 0,
             unfilled: 0,
             transient: 0,
@@ -1480,7 +1481,11 @@ impl<'m> JsonFlattener<'m> {
         let lookup = self.held.first().map_or(Cow::Borrowed(key), |map| map.lookup_key(key));
         let spelled_apart = lookup.as_ref() != key;
         let walk_list = self.values.entries.get(key).map(Vec::len);
-        let others = self.folded.get(lookup.as_ref()).copied();
+        let others = self
+            .folded
+            .as_ref()
+            .and_then(|folded| folded.get(lookup.as_ref()))
+            .copied();
         // Values the walk has for that list already: those of the path spelled as it, and of the others.
         let walked = self
             .values
@@ -1558,13 +1563,14 @@ impl<'m> JsonFlattener<'m> {
             self.tables.advance(&mut self.scratch.memory, distinct, copies, new_to);
         }
         if spelled_apart {
-            if let Some(count) = self.folded.get_mut(lookup.as_ref()) {
+            let folded = self.folded.get_or_insert_with(IndexMap::default);
+            if let Some(count) = folded.get_mut(lookup.as_ref()) {
                 *count = count.saturating_add(1);
             } else {
                 let mut kept = lookup.into_owned();
                 // Kept at its length, which is what was counted for it.
                 kept.shrink_to_fit();
-                self.folded.insert(kept, 1);
+                folded.insert(kept, 1);
                 self.folded_bytes = self
                     .folded_bytes
                     .saturating_add(counted.grown)
@@ -1580,16 +1586,14 @@ impl<'m> JsonFlattener<'m> {
         if !new {
             return Growth::default();
         }
-        let (len, capacity) = (self.folded.len(), self.folded.capacity());
-        let table = index_table_bytes::<(Vec<u8>, usize)>;
-        let (grown, freed) = if len < capacity {
-            (0, 0)
-        } else {
-            (table(index_capacity_for(len.saturating_add(1))), table(capacity))
-        };
+        let (len, capacity) = self
+            .folded
+            .as_ref()
+            .map_or((0, 0), |folded| (folded.len(), folded.capacity()));
+        let table = index_growth::<(Vec<u8>, usize)>(len, capacity);
         Growth {
-            grown: allocation_bytes(lookup.len()).saturating_add(grown),
-            freed,
+            grown: allocation_bytes(lookup.len()).saturating_add(table.grown),
+            ..table
         }
     }
 
@@ -2343,7 +2347,6 @@ pub(super) fn read_json_body_within(
     mut memory: MemoryBudget,
     held: &[&Map],
 ) -> JsonBody {
-    let original = memory;
     let containers = if max_recursion == 0 {
         ContainerIndex::empty()
     } else {
@@ -2353,7 +2356,7 @@ pub(super) fn read_json_body_within(
                 return JsonBody {
                     arguments: JsonArguments::new(),
                     truncated: false,
-                    error: Some(memory_budget_message(original.limit())),
+                    error: Some(memory_budget_message(memory.limit())),
                     memory_stopped: true,
                 };
             },
