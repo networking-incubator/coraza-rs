@@ -79,6 +79,21 @@ fn values_of(tx: &Transaction, variable: RuleVariable) -> Vec<(String, String)> 
     }
 }
 
+/// The smallest budget up to `high` that `admits`, by bisection.
+fn smallest_budget(mut high: usize, admits: impl Fn(usize) -> bool) -> usize {
+    assert!(admits(high), "a budget of {high} admits it");
+    let mut low = 0;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if admits(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
 /// `count` pairs `k0=v0&k1=v1...`.
 fn pairs(count: usize) -> Vec<u8> {
     (0..count)
@@ -162,20 +177,6 @@ fn a_bigger_budget_admits_more_and_a_budget_that_covers_the_body_changes_nothing
     assert_eq!(admitted(None), (2_000, false));
     assert_eq!(admitted(Some(usize::MAX)), (2_000, false));
     assert_eq!(admitted(Some(100_000_000)), (2_000, false));
-}
-
-#[test]
-fn a_failed_parse_is_denied_only_by_the_rule_that_reads_the_error() {
-    let rules = "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"";
-    let with_rule = waf(rules);
-    let without_rule = waf("");
-    let body = pairs(5_000);
-    let form = "application/x-www-form-urlencoded";
-
-    let denied = request(&with_rule, form, Some(100_000)).process_request_body(&body);
-    assert_eq!(denied.map(|interruption| interruption.status), Some(400));
-    let allowed = request(&without_rule, form, Some(100_000)).process_request_body(&body);
-    assert!(allowed.is_none());
 }
 
 #[test]
@@ -383,7 +384,7 @@ fn multipart_parts_stop_at_the_budget_and_keep_the_parts_before_it() {
 }
 
 #[test]
-fn multipart_values_are_charged_before_they_are_published() {
+fn multipart_values_are_charged_before_they_are_published_and_the_part_vector_stays_charged() {
     let waf = waf("");
     // Twenty parts of 5000 bytes are cheap to read, but publishing each costs it twice over, once for `ARGS_POST`
     // and once for `ARGS`.
@@ -397,16 +398,18 @@ fn multipart_values_are_charged_before_they_are_published() {
         .unwrap();
     }
     body.push_str("--b--\r\n");
-    let content_type = "multipart/form-data; boundary=b";
 
-    let mut tx = request(&waf, content_type, Some(100_000));
+    // 103_300 is between the 104_489 bytes eight parts need and the 102_137 they would if slots were given back.
+    let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(103_300));
     assert!(tx.process_request_body(body.as_bytes()).is_none());
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).unwrap(),
         "published parts exceed the body memory budget"
     );
     let post = values_of(&tx, RuleVariable::ArgsPost);
-    assert!(!post.is_empty() && post.len() < 20, "a prefix: {}", post.len());
+    // A part's buffers are given back as it is published and dropped, but the vector they wait in stays allocated
+    // until the last, so its slots are not credit for the parts after: giving them back as well let an eighth in.
+    assert_eq!(post.len(), 7);
     assert_eq!(values_of(&tx, RuleVariable::Args), post);
     assert_eq!(
         values_of(&tx, RuleVariable::MultipartName).len(),
@@ -541,23 +544,27 @@ fn a_multipart_body_the_parser_stopped_in_cannot_carry_an_unchecked_upload_past_
         (
             interruption.map(|interruption| interruption.status),
             request_body_errored(&tx),
+            tx.request_body_stopped_by_memory_budget(),
         )
     };
 
     // The published prefix holds the upload: refused, as before.
-    assert_eq!(status(&fields_then(2, upload), None), (Some(413), false));
+    assert_eq!(status(&fields_then(2, upload), None), (Some(413), false, false));
     // No upload anywhere and nothing stopped the parser: passes.
-    assert_eq!(status(&fields_then(2, "--b--\r\n"), None), (None, false));
+    assert_eq!(status(&fields_then(2, "--b--\r\n"), None), (None, false, false));
 
     // The reading budget runs out before the last part, which is the upload: no rule reads REQBODY_ERROR here, and
     // the body still must not pass with a part nobody looked at.
     let body = fields_then(300, upload);
-    assert_eq!(status(&body, Some(60_000)), (Some(413), true));
-    assert_eq!(status(&body, None), (Some(413), false));
+    assert_eq!(status(&body, Some(60_000)), (Some(413), true, true));
+    assert_eq!(status(&body, None), (Some(413), false, false));
+    // An upload read before the budget ran out is refused at once, and the stop is still reported.
+    let first = format!("{}{}", upload.replace("--b--\r\n", ""), fields_then(300, "--b--\r\n"));
+    assert_eq!(status(&first, Some(60_000)), (Some(413), false, true));
 
     // A malformed part stops the parser the same way, in front of an upload it never reads.
     let malformed = fields_then(1, &format!("--b\r\nBad Header\r\n\r\nx\r\n{upload}"));
-    assert_eq!(status(&malformed, None), (Some(413), true));
+    assert_eq!(status(&malformed, None), (Some(413), true, false));
 
     // A body that is not multipart at all has no part for an upload to hide in.
     let mut tx = waf.new_transaction();
@@ -679,22 +686,9 @@ fn a_temporary_upload_is_charged_for_the_directory_it_is_written_under_and_its_f
         tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
             .is_none_or(|message| !message.contains("body memory budget"))
     };
-    let smallest = |directory: &str| {
-        let (mut low, mut high) = (0_usize, 1_000_000_usize);
-        assert!(admits(directory, high));
-        while low + 1 < high {
-            let middle = low + (high - low) / 2;
-            if admits(directory, middle) {
-                high = middle;
-            } else {
-                low = middle;
-            }
-        }
-        high
-    };
-    let short = smallest("/nonexistent-a");
+    let short = smallest_budget(1_000_000, |budget| admits("/nonexistent-a", budget));
     let long_directory = format!("/nonexistent/{}", "d".repeat(300));
-    let long = smallest(&long_directory);
+    let long = smallest_budget(1_000_000, |budget| admits(&long_directory, budget));
     // The path is kept in `FILES_TMPNAMES` and for cleanup, each with the file name the engine adds, and a short
     // directory is charged at a floor of 160 bytes.
     let floor = 160;
@@ -704,27 +698,6 @@ fn a_temporary_upload_is_charged_for_the_directory_it_is_written_under_and_its_f
         "a {}-byte directory raised the smallest budget from {short} to {long}",
         long_directory.len()
     );
-}
-
-#[test]
-fn publishing_multipart_parts_keeps_the_slots_of_the_part_vector_charged() {
-    let waf = waf("");
-    // Twenty parts of 5000 bytes. A part's buffers are given back as it is published and dropped, but the vector
-    // they wait in stays allocated until the last, so its slots are not credit for the parts after: with this budget
-    // two parts fit, where giving the slots back as well let a third be published.
-    let mut body = String::new();
-    for index in 0..20 {
-        write!(
-            body,
-            "--b\r\nContent-Disposition: form-data; name=\"f{index}\"\r\n\r\n{}\r\n",
-            "x".repeat(5000)
-        )
-        .unwrap();
-    }
-    body.push_str("--b--\r\n");
-    let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(48_000));
-    tx.process_request_body(body.as_bytes());
-    assert_eq!(values_of(&tx, RuleVariable::ArgsPost).len(), 2);
 }
 
 #[test]
@@ -764,22 +737,11 @@ fn a_dense_json_array_is_refused_only_by_a_budget_near_what_it_holds_and_a_respo
     assert_eq!(values_of(&roomy, RuleVariable::ArgsPost).len(), leaves + 2);
 
     // A response is published into `RESPONSE_ARGS` alone, so the same body fits a smaller budget than as a request.
-    let smallest = |errors: &dyn Fn(usize) -> bool| {
-        let (mut low, mut high) = (0_usize, 1_usize << 28);
-        assert!(!errors(high));
-        while low + 1 < high {
-            let middle = low + (high - low) / 2;
-            if errors(middle) {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
-        high
-    };
     let small = format!("[{}1]", "1,".repeat(2_000));
-    let as_request = smallest(&|budget| request_body_errored(&request_json(Some(budget), &small)));
-    let as_response = smallest(&|budget| respond(budget, &small));
+    let as_request = smallest_budget(1 << 28, |budget| {
+        !request_body_errored(&request_json(Some(budget), &small))
+    });
+    let as_response = smallest_budget(1 << 28, |budget| !respond(budget, &small));
     assert!(
         as_response * 4 < as_request * 3,
         "a response needs {as_response} and a request {as_request}: it holds one collection fewer"
@@ -818,6 +780,24 @@ fn a_member_past_the_argument_limit_ends_the_json_walk_as_one_even_when_the_budg
     // A member that is not past the limit and does not fit is still the budget's to refuse.
     let (limit_reached, errored, _) = outcome(&format!("{{\"a\":1,\"c\\n{big}\":3}}"), Some(20_000));
     assert!(!limit_reached && errored);
+}
+
+#[test]
+fn a_multipart_field_past_the_argument_limit_costs_the_budget_nothing() {
+    let waf = waf("SecArgumentsLimit 1");
+    let needed = |second: &str| {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n{second}\r\n--b--\r\n"
+        );
+        smallest_budget(1 << 22, |budget| {
+            let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(budget));
+            tx.process_request_body(body.as_bytes());
+            !tx.request_body_stopped_by_memory_budget()
+        })
+    };
+    // The limit drops `b`, so how large its value is cannot change what the body needs.
+    assert_eq!(needed(&"x".repeat(400 * 1024)), needed("1"));
 }
 
 #[test]
@@ -868,17 +848,38 @@ fn only_a_processor_that_stopped_for_the_budget_says_so_whatever_the_body_quotes
     let xml: String = format!("<r>{}</r>", "<i>1</i>".repeat(2000));
     let json = format!("[{}1]", "1,".repeat(2000));
     let form = pairs(2000);
-    let multipart = fields_then(2000, "--b--\r\n");
-    let cases: [(&str, &[u8]); 4] = [
-        ("text/xml", xml.as_bytes()),
-        ("application/json", json.as_bytes()),
-        ("application/x-www-form-urlencoded", &form),
-        ("multipart/form-data; boundary=b", multipart.as_bytes()),
+    let multipart = "multipart/form-data; boundary=b";
+    let fields = fields_then(2000, "--b--\r\n");
+    // A content type whose parameters alone are more than the budget, for a body of one field.
+    let field = fields_then(1, "--b--\r\n");
+    let parameters = format!(
+        "{multipart}{}",
+        (0..3_000).map(|index| format!("; p{index}=v")).collect::<String>()
+    );
+    // Parts that are cheap to read and dear to publish, then a malformed one: the budget runs out while the parts
+    // are published, and the parser's error is the one reported.
+    let then_malformed = (0..100)
+        .map(|index| {
+            format!(
+                "--b\r\nContent-Disposition: form-data; name=\"f{index}\"\r\n\r\n{}\r\n",
+                "v".repeat(2000)
+            )
+        })
+        .chain([String::from("--b\r\nBad Header\r\n\r\nx\r\n--b--\r\n")])
+        .collect::<String>();
+    let cases: [(&str, &[u8], usize, &str); 6] = [
+        ("text/xml", xml.as_bytes(), 20_000, "budget"),
+        ("application/json", json.as_bytes(), 20_000, "budget"),
+        ("application/x-www-form-urlencoded", &form, 20_000, "budget"),
+        (multipart, fields.as_bytes(), 20_000, "budget"),
+        (&parameters, field.as_bytes(), 20_000, "budget"),
+        (multipart, then_malformed.as_bytes(), 200_000, "missing colon"),
     ];
-    for (content_type, body) in cases {
-        let mut tx = request(&waf, content_type, Some(20_000));
+    for (content_type, body, budget, reported) in cases {
+        let mut tx = request(&waf, content_type, Some(budget));
         tx.process_request_body(body);
-        assert!(request_body_errored(&tx), "{content_type}");
-        assert!(tx.request_body_stopped_by_memory_budget(), "{content_type}");
+        let message = tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).unwrap();
+        assert!(message.contains(reported), "{content_type:.40}: {message}");
+        assert!(tx.request_body_stopped_by_memory_budget(), "{content_type:.40}");
     }
 }

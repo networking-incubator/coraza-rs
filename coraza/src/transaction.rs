@@ -1417,9 +1417,8 @@ impl Transaction {
         self.computed.body_budget_stopped[1]
     }
 
-    /// Records that a body processor reported an error, and whether it stopped for the memory budget, which only the
-    /// processor can say: the text of an error can quote the body.
-    pub(crate) fn note_body_processor_error(&mut self, request: bool, budget_stopped: bool) {
+    /// Records a stop for the memory budget when `budget_stopped` says so: an error's text can quote the body.
+    pub(crate) fn note_budget_stop(&mut self, request: bool, budget_stopped: bool) {
         if budget_stopped && let Some(stopped) = self.computed.body_budget_stopped.get_mut(usize::from(!request)) {
             *stopped = true;
         }

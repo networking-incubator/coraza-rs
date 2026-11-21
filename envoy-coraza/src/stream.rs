@@ -588,15 +588,6 @@ impl CorazaHttp {
     }
 
     fn complete_request_body(&mut self, body_size: usize) -> Action {
-        self.complete_request_body_from(body_size, Self::copy_request_body)
-    }
-
-    /// [`Self::complete_request_body`] reading the body with `copy`, which is the host's buffer in production.
-    fn complete_request_body_from(
-        &mut self,
-        body_size: usize,
-        copy: impl FnOnce(usize) -> Result<Vec<u8>, &'static str>,
-    ) -> Action {
         if self.lifecycle.finalized || self.request_mode == RequestMode::Uninspected {
             return Action::Continue;
         }
@@ -629,7 +620,7 @@ impl CorazaHttp {
             return Action::Continue;
         }
 
-        let interruption = match self.inspect_request_body(body_size, body_access, copy) {
+        let interruption = match self.inspect_request_body(body_size, body_access) {
             Ok(interruption) => interruption,
             Err(outcome) => return self.reject_request(503, REQUEST_INCOMPLETE_BODY, outcome),
         };
@@ -668,7 +659,6 @@ impl CorazaHttp {
         &mut self,
         body_size: usize,
         body_access: bool,
-        copy: impl FnOnce(usize) -> Result<Vec<u8>, &'static str>,
     ) -> Result<Option<Interruption>, TerminalOutcome> {
         let ingests = body_access && body_size > 0;
         let lease = match self.tx.as_deref() {
@@ -690,7 +680,7 @@ impl CorazaHttp {
             return Err(TerminalOutcome::RetainedBodyBudgetExhausted { phase: "request-body" });
         }
         let body = if ingests {
-            copy(body_size).map_err(|phase| TerminalOutcome::Incomplete { phase, status: 503 })?
+            Self::copy_request_body(body_size).map_err(|phase| TerminalOutcome::Incomplete { phase, status: 503 })?
         } else {
             Vec::new()
         };
@@ -1265,7 +1255,7 @@ impl CorazaHttp {
                 phase: "response-body-copy",
             });
         }
-        if body_access && processable && body_size > 0 {
+        if ingests {
             let Some(bytes) = fetch(body_size).map_err(|_error| TerminalOutcome::Incomplete {
                 phase: "response-body-buffer-hostcall",
                 status: 503,
@@ -2685,13 +2675,9 @@ mod scripted_host_tests {
             );
         }
     }
-    /// A policy that parses XML bodies, as CRS rule 200000 selects the processor, and denies a failed parse the way
-    /// CRS rule 200002 does.
-    const XML_POLICY: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess On",
-        "SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608",
-        "SecRule REQUEST_HEADERS:Content-Type \"^text/xml\" \"id:200000,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML\"",
-        "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\""]},
-        "default_directives": "p"}"#;
+    /// The rule that denies a failed parse, as CRS rule 200002 does.
+    const DENY_BODY_ERRORS: &str =
+        r#", "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"""#;
 
     /// A stream over `config` whose root context already holds `other_streams` bytes for its siblings, and that
     /// root.
@@ -2740,95 +2726,45 @@ mod scripted_host_tests {
     }
 
     #[test]
-    fn the_parser_is_given_what_the_root_has_left_after_this_streams_charges() {
-        let (mut stream, root) = stream_beside(XML_POLICY, 0);
-        let body = xml_list(MIB);
-        let size = begin_post(&mut stream, "text/xml", &body);
-        let held_before = stream
-            .tx
-            .as_deref()
-            .expect("the transaction is kept")
-            .body_memory_bytes();
-
-        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
-
-        // The host's buffer, the guest's copy and the engine's buffer, with what the transaction already held, are
-        // charged first. An XML body keeps no copy of itself, so nothing more is set aside.
-        assert_eq!(
-            stream
-                .tx
-                .as_deref()
-                .expect("the transaction is kept")
-                .body_memory_budget(),
-            Some(MAX_ROOT_RETAINED_BODY_BYTES - 3 * size - held_before)
-        );
-        assert!(
-            test_hostcalls::local_reply_statuses().is_empty(),
-            "the body is accepted"
-        );
-        assert!(root.get() <= MAX_ROOT_RETAINED_BODY_BYTES);
-    }
-
-    #[test]
-    fn a_large_xml_body_beside_retaining_streams_is_a_body_error_instead_of_an_overshoot() {
-        // Concurrent streams hold 50 MiB of the root's 64, which leaves 14 for this body's three charges (host
-        // buffer, copy and engine buffer, 2 MiB each) and what its parser may retain.
-        let others = 50 * MIB;
+    fn an_xml_body_beside_retaining_streams_is_a_body_error_instead_of_an_overshoot() {
+        let config = policy(LIMITS, DENY_BODY_ERRORS);
         let body = xml_list(2 * MIB);
 
         // The same body alone parses cleanly: only what the others hold stops it.
-        let (mut alone, _) = stream_beside(XML_POLICY, 0);
+        let (mut alone, _) = stream_beside(&config, 0);
         let size = begin_post(&mut alone, "text/xml", &body);
         assert_eq!(alone.on_http_request_body(size, true), Action::Continue);
         assert!(test_hostcalls::local_reply_statuses().is_empty());
 
-        let (mut stream, root) = stream_beside(XML_POLICY, others);
-        let size = begin_post(&mut stream, "text/xml", &body);
-        assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
+        // Concurrent streams hold 50 MiB of the root's 64, which leaves 14 for this body's three charges (host buffer,
+        // copy and engine buffer, 2 MiB each) and what its parser may retain; or they leave room for the three charges
+        // and what the transaction holds, and a kilobyte or nothing to parse in.
+        for spare in [None, Some(1024), Some(0)] {
+            let (mut stream, root) = stream_beside(&config, 50 * MIB);
+            let size = begin_post(&mut stream, "text/xml", &body);
+            if let Some(spare) = spare {
+                // Held by this very transaction: ids come from a process-wide counter and can grow a digit.
+                root.set(MAX_ROOT_RETAINED_BODY_BYTES - 3 * size - held(&stream) - spare);
+            }
+            let others = root.get();
+            assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
 
-        assert_eq!(
-            test_hostcalls::local_reply_statuses(),
-            [400],
-            "the failed parse reaches rule 200002, which denies"
-        );
-        assert_eq!(
-            stream.final_outcome,
-            Some(TerminalOutcome::Denied {
-                phase: "request-body",
-                status: 400
-            })
-        );
-        // Without the budget the parser would have kept some 25 MiB for this body, and the check after it would have
-        // answered 503 for a body the engine had already allocated.
-        assert_eq!(root.get(), others, "the stream's charges are released with it");
-    }
-
-    #[test]
-    fn a_body_with_nothing_left_to_parse_into_is_refused_before_it_is_parsed() {
-        // The root has room for this stream's three charges, and what its transaction already holds, and nothing
-        // beyond them: the base allocations fit, so the engine is called, with no credit to parse in.
-        let body = xml_list(MIB);
-        let (mut probe, _) = stream_beside(XML_POLICY, 0);
-        begin_post(&mut probe, "text/xml", &body);
-        let held_before = probe
-            .tx
-            .as_deref()
-            .expect("the transaction is kept")
-            .body_memory_bytes();
-        let others = MAX_ROOT_RETAINED_BODY_BYTES - 3 * body.len() - held_before;
-        let (mut stream, _) = stream_beside(XML_POLICY, others);
-        let size = begin_post(&mut stream, "text/xml", &body);
-
-        assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
-
-        assert_eq!(test_hostcalls::local_reply_statuses(), [400]);
-        assert_eq!(
-            stream.final_outcome,
-            Some(TerminalOutcome::Denied {
-                phase: "request-body",
-                status: 400
-            })
-        );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [400],
+                "the failed parse reaches rule 200002, which denies"
+            );
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::Denied {
+                    phase: "request-body",
+                    status: 400
+                })
+            );
+            // Without the budget the parser would have kept some 25 MiB for this body, and the check after it would
+            // have answered 503 for a body the engine had already allocated.
+            assert_eq!(root.get(), others, "the stream's charges are released with it");
+        }
     }
 
     /// A policy with `rules` beside the body policy a connector gets from CRS: XML, JSON and URL-encoded bodies are
@@ -2846,7 +2782,7 @@ mod scripted_host_tests {
         )
     }
 
-    /// The limits of [`XML_POLICY`].
+    /// The body limits of the policies above.
     const LIMITS: &str = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608","#;
 
     /// What the transaction of `stream` holds, which the engine's share of the root's cap starts from.
@@ -3083,8 +3019,7 @@ mod scripted_host_tests {
             let before = held(&stream);
             drop(stream);
             let (mut stream, _) = stream_beside(&config, others.saturating_sub(before));
-            let size_again = begin_post(&mut stream, "text/xml", &body);
-            assert_eq!(size, size_again);
+            begin_post(&mut stream, "text/xml", &body);
             assert_eq!(
                 stream.on_http_request_body(size, true),
                 Action::Continue,

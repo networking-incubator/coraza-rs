@@ -237,11 +237,6 @@ impl Spelling {
         }
     }
 
-    /// Whether this is `key`, given the map key it is filed under.
-    fn is(&self, key: &[u8], map_key: &Key) -> bool {
-        self.as_bytes(map_key) == key
-    }
-
     /// Bytes held by this spelling's allocations.
     fn allocated_bytes(&self) -> usize {
         match self {
@@ -319,7 +314,7 @@ impl KeyValue {
 
     /// Replaces the key and value, reusing their buffers.
     fn replace(&mut self, key: &[u8], map_key: &Key, value: &[u8]) {
-        if !self.spelling.is(key, map_key) {
+        if self.spelling.as_bytes(map_key) != key {
             self.spelling = Spelling::new(key, map_key.as_bytes());
         }
         self.value.clear();
@@ -343,9 +338,13 @@ pub(crate) fn grown_list_capacity(len: usize, capacity: usize) -> usize {
     if len >= EXACT_GROWTH_FROM {
         len.saturating_add(len / 4)
     } else {
-        // `Vec`'s amortized growth: double, and never fewer than four slots for an entry this small.
-        capacity.saturating_mul(2).max(len.saturating_add(1)).max(4)
+        vec_grown_capacity(len, capacity)
     }
+}
+
+/// The capacity a `Vec` of small entries grows to when it is full: double, and never fewer than four slots.
+pub(crate) fn vec_grown_capacity(len: usize, capacity: usize) -> usize {
+    capacity.saturating_mul(2).max(len.saturating_add(1)).max(4)
 }
 
 /// The length from which a value vector grows by a quarter instead of doubling, see [`push_grown`].
@@ -445,7 +444,7 @@ impl Map {
 
     /// The key `key` is stored under: as it is in a case-sensitive map, lowercase otherwise.
     /// Borrowed when that is `key` itself, which spares lookups an allocation.
-    fn lookup_key<'k>(&self, key: &'k [u8]) -> Cow<'k, [u8]> {
+    pub(crate) fn lookup_key<'k>(&self, key: &'k [u8]) -> Cow<'k, [u8]> {
         if self.case_sensitive || !key.iter().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
             Cow::Borrowed(key)
         } else {
@@ -762,22 +761,6 @@ impl Map {
         }
     }
 
-    /// The bytes the allocation of `key`'s value list asks for when the next value does not fit it: the grown
-    /// list, which the old one is still beside while it is copied. None when the list has a free slot, or when
-    /// the key is new and its list is made by the insertion itself.
-    ///
-    /// This follows [`push_grown`], so a list that was full before any budget saw it is charged as one that
-    /// the budget filled.
-    pub(crate) fn value_list_growth_bytes(&self, key: &[u8]) -> Option<usize> {
-        let values = self.data.get(self.lookup_key(key).as_ref())?;
-        let (len, capacity) = (values.len(), values.capacity());
-        if len < capacity {
-            return Some(0);
-        }
-        let grown = grown_list_capacity(len, capacity);
-        Some(allocation_bytes(grown.saturating_mul(VALUE_ENTRY_BYTES)))
-    }
-
     /// The bytes the lowercase copy of `key` takes while a lookup or an insertion works with it: a case-insensitive
     /// map folds a name with a capital or a non-ASCII byte into a vector that lives as long as the call, and a
     /// folded character can take more bytes than the one it came from, which can double the vector. None when the
@@ -790,28 +773,15 @@ impl Map {
         }
     }
 
-    /// The capacity the table of keys has once `added` more keys than it holds are in it: what it has, or the
-    /// capacity the map grows to for them.
-    pub(crate) fn key_table_capacity_after(&self, added: usize) -> usize {
-        let capacity = self.data.capacity();
-        let len = self.data.len().saturating_add(added);
-        if len <= capacity {
-            capacity
-        } else {
-            index_capacity_for(len).max(capacity)
+    /// What adding one key that the map does not hold takes from its table: the grown table, held beside the old
+    /// one while the entries move, and the old one, freed after. Nothing while the table has room.
+    pub(crate) fn new_key_table_growth(&self) -> Growth {
+        let (len, capacity) = (self.data.len(), self.data.capacity());
+        if len < capacity {
+            return Growth::default();
         }
-    }
-
-    /// What adding one key that the map does not hold takes from its table: the grown table, which is held beside
-    /// the old one while the entries move, and the old one, which is freed after. Nothing while the table has room.
-    pub(crate) fn new_key_table_growth(&self) -> TableGrowth {
-        let capacity = self.data.capacity();
-        let grown = self.key_table_capacity_after(1);
-        if grown == capacity {
-            return TableGrowth::default();
-        }
-        TableGrowth {
-            grown: map_capacity_bytes(grown),
+        Growth {
+            grown: map_capacity_bytes(index_capacity_for(len.saturating_add(1)).max(capacity)),
             freed: map_capacity_bytes(capacity),
         }
     }
@@ -821,14 +791,10 @@ impl Map {
         self.data.capacity()
     }
 
-    /// Whether the map holds `key` (folded, in a case-insensitive map).
-    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
-        self.data.contains_key(self.lookup_key(key).as_ref())
-    }
-
-    /// The length and capacity of `key`'s value list, or `None` when the map does not hold the key.
-    pub(crate) fn value_list_shape(&self, key: &[u8]) -> Option<(usize, usize)> {
-        let values = self.data.get(self.lookup_key(key).as_ref())?;
+    /// The length and capacity of the value list of `lookup`, a key as [`Map::lookup_key`] files it, or `None` when
+    /// the map does not hold it.
+    pub(crate) fn value_list_shape(&self, lookup: &[u8]) -> Option<(usize, usize)> {
+        let values = self.data.get(lookup)?;
         Some((values.len(), values.capacity()))
     }
 
@@ -969,14 +935,54 @@ pub(crate) fn map_capacity_bytes(capacity: usize) -> usize {
     index_table_bytes::<(Key, Vec<KeyValue>)>(capacity)
 }
 
-/// What the table of a map takes to grow for one more key: the bytes of the grown table, held beside the old one
-/// while the entries move, and the bytes of the old one, freed once they have.
+/// What one change takes from a memory budget: `grown`, charged before it is made, which holds a list or table
+/// that grows beside the one it replaces, and `freed`, given back once it is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TableGrowth {
-    /// Bytes of the grown table, none while the table has room.
+pub(crate) struct Growth {
+    /// Bytes to charge before the change.
     pub(crate) grown: usize,
-    /// Bytes of the old table, which the growth frees.
+    /// Bytes of `grown` to give back after it.
     pub(crate) freed: usize,
+}
+
+impl Growth {
+    /// Both changes together.
+    pub(crate) fn plus(self, other: Self) -> Self {
+        Self {
+            grown: self.grown.saturating_add(other.grown),
+            freed: self.freed.saturating_add(other.freed),
+        }
+    }
+}
+
+/// What a map allocates for the key of one more value, which it files under `lookup` (see [`Map::lookup_key`]):
+/// the value's own spelling when it is not `lookup`, and `lookup` itself when the key is `new` to the map.
+pub(crate) fn key_bytes(key: &[u8], lookup: &[u8], new: bool) -> Growth {
+    let none = Growth::default();
+    let spelling = if key == lookup { none } else { stored_key_bytes(key) };
+    let stored = if new { stored_key_bytes(lookup) } else { none };
+    spelling.plus(stored)
+}
+
+/// What a stored copy of `key` allocates: its text, or for bytes that are not UTF-8 those bytes and their lossy
+/// text, which keeps three bytes for each at most but is built in a buffer that doubles to four times the key beside
+/// the one it replaces, before the bytes are copied. What the build holds beyond the stored key is freed after it.
+fn stored_key_bytes(key: &[u8]) -> Growth {
+    if std::str::from_utf8(key).is_ok() {
+        return Growth {
+            grown: allocation_bytes(key.len()),
+            freed: 0,
+        };
+    }
+    let retained = allocation_bytes(size_of::<ByteKey>())
+        .saturating_add(allocation_bytes(key.len()))
+        .saturating_add(allocation_bytes(key.len().saturating_mul(3)));
+    let built =
+        allocation_bytes(key.len().saturating_mul(4)).saturating_add(allocation_bytes(key.len().saturating_mul(2)));
+    Growth {
+        grown: retained.max(built),
+        freed: built.saturating_sub(retained),
+    }
 }
 
 /// Estimated bytes of the entry vector for `capacity` entries.
@@ -1669,7 +1675,7 @@ mod tests {
 
     #[test]
     fn a_new_keys_table_growth_is_what_the_table_really_grows_by() {
-        use super::{Map, TableGrowth, map_capacity_bytes};
+        use super::{Growth, Map, map_capacity_bytes};
         use crate::types::RuleVariable;
 
         let mut map = Map::new_case_sensitive(RuleVariable::Args);
@@ -1677,7 +1683,7 @@ mod tests {
             let growth = map.new_key_table_growth();
             let capacity = map.key_table_capacity();
             map.add(&format!("key{index}"), "v");
-            if growth == TableGrowth::default() {
+            if growth == Growth::default() {
                 assert_eq!(map.key_table_capacity(), capacity, "key {index} fits the table");
             } else {
                 assert_eq!(growth.freed, map_capacity_bytes(capacity), "key {index}");
@@ -1688,11 +1694,7 @@ mod tests {
                 );
                 assert!(map.key_table_capacity() > capacity);
             }
-            assert_eq!(map.key_table_capacity_after(0), map.key_table_capacity());
         }
-        // What a later key will find, for a walk that adds several before they are filed.
-        assert!(map.key_table_capacity_after(5_000) >= map.len() + 5_000);
-        assert!(map.contains_key(b"key7") && !map.contains_key(b"absent"));
     }
 
     #[test]

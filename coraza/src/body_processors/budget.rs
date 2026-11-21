@@ -22,8 +22,8 @@
 //! would later count for it, so that the budget and the authoritative accounting agree.
 
 use crate::collection::{
-    ALLOCATION_OVERHEAD_BYTES, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, Map,
-    TableGrowth, allocation_bytes, fold_scratch_bytes, grown_list_capacity,
+    Growth, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, Map, VALUE_ENTRY_BYTES,
+    allocation_bytes, grown_list_capacity, key_bytes,
 };
 
 /// What a body processor may still retain, or no limit at all.
@@ -85,8 +85,8 @@ impl MemoryBudget {
     }
 }
 
-/// The bytes of a name that a map keeps: the lookup key and, in a case-insensitive map, the original beside each
-/// value, each up to four times as large when the name is not valid UTF-8 (its lossy text view is held too).
+/// The bytes of a name that a case-insensitive map may keep for one value: the lookup key and the original beside
+/// the value, each up to four times as large when the name is not valid UTF-8 (its lossy text view is held too).
 ///
 /// This reads the name, so callers use it only when a budget is set.
 pub(crate) fn map_key_bytes(key: &[u8]) -> usize {
@@ -106,142 +106,63 @@ pub(crate) fn insert_cost(key_bytes: usize, value_len: usize) -> usize {
         .saturating_add(value_len)
 }
 
-/// [`insert_cost`] of a value under `key`.
-pub(crate) fn map_insert_cost(key: &[u8], value_len: usize) -> usize {
-    insert_cost(map_key_bytes(key), value_len)
-}
-
-/// The bytes a value costs in a map that already holds its key, beside the growth of the key's list
-/// (`list_growth`, see [`crate::collection::Map::value_list_growth_bytes`], none while the list has a free slot):
-/// the allocation of the value and its own spelling of the key, which only a differing one or an invalid one
-/// allocates (see [`spelling_bytes`]): a key the map already holds in the same spelling is shared.
-pub(crate) fn repeated_insert_cost(key: &[u8], value_len: usize, list_growth: usize) -> usize {
-    list_growth
-        .saturating_add(ALLOCATION_OVERHEAD_BYTES)
-        .saturating_add(spelling_bytes(key))
-        .saturating_add(value_len)
-}
-
-/// What the tables of `maps` take to grow for a key that is new to those that do not hold it yet: the grown tables,
-/// which are held beside the old ones while the entries move, and the old ones, which are freed after. This works
-/// from the capacities the maps really have, which a query string may have filled before the body was read.
-pub(crate) fn new_key_table_growth(maps: &[&Map], key: &[u8]) -> TableGrowth {
-    maps.iter()
-        .filter(|map| !map.contains_key(key))
-        .fold(TableGrowth::default(), |sum, map| {
-            let growth = map.new_key_table_growth();
-            TableGrowth {
-                grown: sum.grown.saturating_add(growth.grown),
-                freed: sum.freed.saturating_add(growth.freed),
+/// What one more value of `value_len` bytes under `key` takes from each of `maps`, together. A map that holds the
+/// key adds the value, its spelling of the key when that is not the map's, and the growth of a full list; one that
+/// does not adds the value, the key, the list it starts and the growth of a full table of keys.
+pub(crate) fn insert_growth(maps: &[&Map], key: &[u8], value_len: usize) -> Growth {
+    let value = Growth {
+        grown: allocation_bytes(value_len),
+        freed: 0,
+    };
+    maps.iter().fold(Growth::default(), |sum, map| {
+        let lookup = map.lookup_key(key);
+        let shape = map.value_list_shape(&lookup);
+        let growth = if let Some(shape) = shape {
+            list_growth(shape, 0, VALUE_ENTRY_BYTES, grown_list_capacity)
+        } else {
+            let table = map.new_key_table_growth();
+            Growth {
+                grown: table.grown.saturating_add(allocation_bytes(VALUE_ENTRY_BYTES)),
+                ..table
             }
-        })
+        };
+        let stored = key_bytes(key, &lookup, shape.is_none());
+        sum.plus(value).plus(growth).plus(stored)
+    })
 }
 
 /// The largest lowercase copy any of `maps` makes of `key`, which only one of them holds at a time.
-///
-/// With no maps to ask, which is a walk that publishes nowhere yet, it is the copy a case-insensitive one would make.
 pub(crate) fn lookup_scratch_bytes(maps: &[&Map], key: &[u8]) -> usize {
-    if maps.is_empty() {
-        return fold_scratch_bytes(key);
-    }
     maps.iter().map(|map| map.lookup_scratch_bytes(key)).max().unwrap_or(0)
 }
 
-/// The bytes one argument costs once it is in `ARGS_POST` and `ARGS`, knowing, for each of the two maps, the growth its
-/// list for the key needs, or `None` when it does not hold the key yet. A form with a field repeated for every value is
-/// the case it is for.
-pub(crate) fn argument_cost_in(key: &[u8], value_len: usize, in_post: Option<usize>, in_args: Option<usize>) -> usize {
-    let cost = |growth: Option<usize>| match growth {
-        Some(growth) => repeated_insert_cost(key, value_len, growth),
-        None => map_insert_cost(key, value_len),
-    };
-    cost(in_post).saturating_add(cost(in_args))
-}
-
-/// How a list of values grows when it is full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListGrowthPolicy {
-    /// A `Vec`'s: double, and never fewer than four slots for an entry this small.
-    Vec,
-    /// A [`crate::collection::Map`]'s value list: a `Vec`'s, and by a quarter from 1,024.
-    Map,
-}
-
-impl ListGrowthPolicy {
-    /// The capacity a full list of `len` values in `capacity` slots grows to.
-    fn grown(self, len: usize, capacity: usize) -> usize {
-        match self {
-            Self::Map => grown_list_capacity(len, capacity),
-            Self::Vec => capacity.saturating_mul(2).max(len.saturating_add(1)).max(4),
-        }
-    }
-}
-
-/// What taking one more value costs a list that is full: the allocation of the grown list, which is held beside the
-/// old one while the values move, and the old one, which is freed once they have.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ListGrowth {
-    /// Bytes of the grown list's allocation, none while the list has room.
-    pub(crate) grown: usize,
-    /// Bytes of the old allocation that is freed by the growth and that the budget had been charged for.
-    pub(crate) freed: usize,
-}
-
-/// The growth of a list that holds `len` values in `capacity` slots when it takes one more, after `added` more have
-/// been added to it, none while it has room. `element` is the size of a slot.
-///
-/// This works from the capacity a list really has, and not from the one a budget would have given it. The
-/// allocation the list starts as is one the budget has charged when `charged` says so, which is for a list the
-/// walk makes and not for one that was there before; every one the growths after it make is charged by their own.
+/// The growth of a list of `element`-byte slots that holds `len` values in `capacity` slots when it takes one more,
+/// after `added` more have been added to it, none while it has room: the grown allocation, and the one it replaces.
+/// `grow` is the capacity a full list grows to.
 pub(crate) fn list_growth(
     (len, capacity): (usize, usize),
     added: usize,
     element: usize,
-    policy: ListGrowthPolicy,
-    charged: bool,
-) -> ListGrowth {
+    grow: fn(usize, usize) -> usize,
+) -> Growth {
     let (mut len, mut capacity, mut left) = (len, capacity.max(len), added);
-    let mut charged = charged;
     // Each step fills the slots there are and grows once, so the steps are as few as the growths.
     loop {
         let room = capacity.saturating_sub(len);
         if left < room {
-            return ListGrowth::default();
+            return Growth::default();
         }
         left = left.saturating_sub(room);
         len = capacity;
-        let grown = policy.grown(len, capacity);
+        let grown = grow(len, capacity);
         if left == 0 {
-            return ListGrowth {
+            return Growth {
                 grown: allocation_bytes(grown.saturating_mul(element)),
-                freed: if charged {
-                    allocation_bytes(capacity.saturating_mul(element))
-                } else {
-                    0
-                },
+                freed: allocation_bytes(capacity.saturating_mul(element)),
             };
         }
         capacity = grown;
-        charged = true;
     }
-}
-
-/// The bytes the key of a value that is added to a map that holds it already takes, which is its own spelling
-/// when that differs from the key the map files it under (a name with a capital, or one that is not UTF-8) and
-/// nothing when it is the same, as the value then points to the map's key.
-pub(crate) fn spelling_bytes(key: &[u8]) -> usize {
-    if key.iter().all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase()) {
-        return 0;
-    }
-    (map_key_bytes(key) / KEY_COPIES_PER_INSERT).saturating_add(2 * ALLOCATION_OVERHEAD_BYTES)
-}
-
-/// The bytes the decoded name and value of a pair occupy while it is inserted, at most the raw pair's bytes, plus
-/// the allocation overhead of each.
-pub(crate) fn decode_scratch_cost(raw_key_len: usize, raw_value_len: usize) -> usize {
-    raw_key_len
-        .saturating_add(raw_value_len)
-        .saturating_add(2 * ALLOCATION_OVERHEAD_BYTES)
 }
 
 #[cfg(test)]
@@ -265,15 +186,45 @@ mod tests {
 
     #[test]
     fn a_key_is_charged_twice_over_and_four_times_that_when_it_is_not_utf8() {
-        use super::{map_key_bytes, repeated_insert_cost};
+        use super::{insert_cost, map_key_bytes};
         assert_eq!(map_key_bytes(b"abc"), 6);
         // Each invalid byte is held as itself and as a three-byte U+FFFD in the text view.
         assert_eq!(map_key_bytes(b"\xff\xff\xff"), 24);
         assert_eq!(map_key_bytes(b""), 0);
-        // A repeated key costs less than a new one, as the entry and not the table is added.
-        assert!(repeated_insert_cost(b"k", 1, 0) < super::map_insert_cost(b"k", 1));
         // Arithmetic that would overflow saturates instead of wrapping into a small charge.
-        assert_eq!(super::insert_cost(usize::MAX, usize::MAX), usize::MAX);
-        assert_eq!(super::argument_cost_in(b"k", usize::MAX, None, None), usize::MAX);
+        assert_eq!(insert_cost(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn an_insertion_is_charged_what_the_map_allocates_for_it() {
+        use super::insert_growth;
+        use crate::{collection::Map, types::RuleVariable};
+
+        // Repeated keys that share the map's spelling or keep their own, lowercase forms that are longer, and keys
+        // that are not UTF-8, until their lists grow by a quarter.
+        let keys: [&[u8]; 8] = [
+            b"a",
+            b"A",
+            "\u{e9}".as_bytes(),
+            "\u{c9}".as_bytes(),
+            "\u{23a}".as_bytes(),
+            b"",
+            b"k\xff",
+            b"K\xff",
+        ];
+        for mut map in [
+            Map::new(RuleVariable::Args),
+            Map::new_case_sensitive(RuleVariable::Args),
+        ] {
+            for round in 0..1_500 {
+                for key in keys {
+                    let growth = insert_growth(&[&map], key, round % 3);
+                    let before = map.allocated_bytes();
+                    map.add_bytes(key, b"xy".get(..round % 3).unwrap_or_default());
+                    let added = map.allocated_bytes() - before;
+                    assert_eq!(added, growth.grown - growth.freed, "{key:?} after {round}");
+                }
+            }
+        }
     }
 }
