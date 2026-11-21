@@ -1493,15 +1493,14 @@ impl<'m> JsonFlattener<'m> {
         // A list that grows is held beside the one it replaces, which is freed after: only the new one stays charged,
         // and the largest old one, which is held beside the finished lists when the collections are filled. A key's
         // text is built in a buffer that is freed alike.
-        let mut walk_growth = Growth::default();
-        if let Some(values) = walk_list {
-            walk_growth = budget::list_growth(
+        let walk_growth = walk_list.map_or_else(Growth::default, |values| {
+            budget::list_growth(
                 (1, 1),
                 values.saturating_sub(1),
                 size_of::<Vec<u8>>(),
                 vec_grown_capacity,
-            );
-        }
+            )
+        });
         let (mut collections, mut largest) = (Growth::default(), 0_usize);
         let mut add = |growth: Growth| {
             collections = collections.plus(growth);
@@ -1541,8 +1540,7 @@ impl<'m> JsonFlattener<'m> {
                 .saturating_add(allocation_bytes(size_of::<Vec<u8>>()))
                 .saturating_add(self.tables.growth(distinct, copies, new_to));
         }
-        // `folded`, and the old allocation of the walk's list while it grows, are held only during the walk, before the
-        // collections allocate what they were charged: what that does not cover is reserved.
+        // Reserve what `folded` and the walk list's old allocation take beyond `unfilled`.
         let counted = self.folded_growth(&lookup, spelled_apart && others.is_none());
         let unfilled = self.unfilled.saturating_add(filled);
         let walking = self
