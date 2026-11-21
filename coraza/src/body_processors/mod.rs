@@ -463,6 +463,7 @@ impl BodyProcessorOutput {
     }
 }
 
+pub(crate) mod budget;
 pub(crate) mod multipart;
 pub(crate) mod xml;
 

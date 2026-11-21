@@ -22,16 +22,25 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     io::Write as _,
     path::{Path, PathBuf},
 };
+
+use indexmap::IndexMap;
 
 use super::{Interruption, Transaction, body_buffer::BodyBuffer, variables::BodyProcessor};
 use crate::{
     body_processors::{
         BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, BodyProcessorFile,
-        BodyProcessorOptions, BodyProcessorOutput, multipart, truncate_custom_body_text, xml,
+        BodyProcessorOptions, BodyProcessorOutput, budget,
+        budget::MemoryBudget,
+        multipart::{self, FailureCause},
+        truncate_custom_body_text, xml,
+    },
+    collection::{
+        ALLOCATION_OVERHEAD_BYTES, Growth, Map, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes,
+        grown_list_capacity, index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes,
+        vec_grown_capacity,
     },
     transformations::url_decode,
     types::{BodyLimitAction, RulePhase},
@@ -139,6 +148,14 @@ impl Transaction {
         }
 
         self.run_phase(RulePhase::RequestBody);
+        if self.computed.unchecked_multipart_upload {
+            self.computed.unchecked_multipart_upload = false;
+            if self.interruption.is_none() {
+                self.multipart_strict_error.set("1");
+                self.inbound_data_error.set("1");
+                self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
+            }
+        }
         self.interruption.clone()
     }
 
@@ -166,87 +183,158 @@ impl Transaction {
                 // Check each raw pair against the limit before decoding it, so pairs past
                 // the limit are never decoded or allocated.
                 let mut count = self.args_post.value_count();
-                for (key, value) in split_urlencoded(body) {
+                let mut memory = self.memory_budget();
+                for (raw_key, raw_value) in split_urlencoded(body) {
                     if !self.within_argument_limit(count) {
                         break;
                     }
-                    let (key, value) = decode_pair(key, value);
+                    // The decoded pair, no longer than the raw one, is charged before it is decoded.
+                    let scratch = raw_key
+                        .len()
+                        .saturating_add(raw_value.len())
+                        .saturating_add(2 * ALLOCATION_OVERHEAD_BYTES);
+                    if !memory.charge(scratch) {
+                        self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
+                        break;
+                    }
+                    let (key, value) = decode_pair(raw_key, raw_value);
+                    let mut transient = scratch;
+                    if memory.is_limited() {
+                        let destinations = [&self.args_post, &self.args];
+                        // The lowercase copy a lookup makes of a name with a capital is charged before it is made.
+                        let fold = budget::lookup_scratch_bytes(&destinations, &key);
+                        if !memory.charge(fold) {
+                            self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
+                            break;
+                        }
+                        let growth = budget::insert_growth(&destinations, &key, value.len());
+                        if !memory.charge(growth.grown) {
+                            self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
+                            break;
+                        }
+                        transient = transient.saturating_add(fold).saturating_add(growth.freed);
+                    }
                     self.insert_post_argument(&key, &value);
+                    // The decoded pair, the copy and what a growth replaced are gone once the pair is in.
+                    memory.refund(transient);
                     count = count.saturating_add(1);
                 }
             },
             BodyProcessor::Multipart => {
-                if let Err(message) = self.process_multipart_body(body, partial) {
-                    self.log_body_processor_error(true, "MULTIPART", &message);
-                    self.reqbody_error.set("1");
-                    self.reqbody_error_msg.set(format!("MULTIPART: {message}"));
-                    self.reqbody_processor_error.set("1");
-                    self.reqbody_processor_error_msg.set(message);
+                if let Err(message) = self.process_multipart_body(body, partial, truncated) {
+                    // A stop for the budget was noted when it happened, whichever error is reported.
+                    self.report_body_error(true, "MULTIPART", message, false);
                 }
             },
             BodyProcessor::Json => {
                 // Arguments are published before the error is checked so a valid
                 // prefix stays inspectable; see Go Coraza `json.go:34-62`.
-                let parsed = read_json_body(
+                let parsed = read_json_body_within(
                     body,
                     self.config.request_body_json_depth_limit,
                     self.config.argument_limit,
+                    self.memory_budget(),
+                    &[&self.args_post, &self.args],
                 );
                 publish_json_arguments(self, &parsed.arguments, false);
                 if parsed.truncated {
                     self.arguments_limit_reached.set("1");
                 }
                 match parsed.error {
-                    Some(message) => {
-                        self.log_body_processor_error(true, "JSON", &message);
-                        self.reqbody_error.set("1");
-                        self.reqbody_error_msg.set(format!("JSON: {message}"));
-                        self.reqbody_processor_error.set("1");
-                        self.reqbody_processor_error_msg.set(message);
-                    },
+                    Some(message) => self.report_body_error(true, "JSON", message, parsed.memory_stopped),
                     None => self.set_tx_variable("json_request_body", body),
                 }
             },
-            BodyProcessor::Xml => match xml::parse(body) {
-                Ok(document) => {
-                    for value in document.attribute_values {
-                        self.request_xml.add("//@*", value);
-                    }
-                    for value in document.text {
-                        self.request_xml.add("/*", value);
-                    }
-                },
-                Err(message) => {
-                    self.log_body_processor_error(true, "XML", &message);
+            BodyProcessor::Xml => {
+                let (error, budget_stopped) = match xml::parse_into(body, self.memory_budget(), &mut self.request_xml) {
+                    // The parser stopped for the budget, which is what a message it returns instead of an error says.
+                    Ok(budget_error) => (budget_error, true),
                     // Go stores the processor's own error unchanged, which for XML is
                     // `encoding/xml`'s `XML syntax error on line N: ...`
-                    // (`internal/corazawaf/transaction.go:1780-1786`, v3.8.1).
-                    self.reqbody_error.set("1");
-                    self.reqbody_error_msg.set(format!("XML: {message}"));
-                    self.reqbody_processor_error.set("1");
-                    self.reqbody_processor_error_msg.set(message);
-                },
+                    // (`internal/corazawaf/transaction.go:1780-1786`, v3.8.1). Its text quotes the document, so it
+                    // says nothing about the budget.
+                    Err(message) => (Some(message), false),
+                };
+                if let Some(message) = error {
+                    self.report_body_error(true, "XML", message, budget_stopped);
+                }
             },
         }
     }
 
-    /// Populate multipart fields, metadata, and temporary upload files.
-    fn process_multipart_body(&mut self, body: &[u8], truncated: bool) -> Result<(), String> {
-        let content_type = self.request_headers.first("content-type").unwrap_or_default().to_vec();
-        let (parts, failure) = multipart::parse(&content_type, body, truncated);
-        let reject_uploads = self.config.reject_multipart_file_uploads
+    /// Report a request or response body processor that failed or stopped early through `REQBODY_ERROR` or
+    /// `RES_BODY_ERROR` and their companions. `budget_stopped` is the processor's own word that it stopped for the
+    /// memory budget.
+    pub(super) fn report_body_error(&mut self, request: bool, processor: &str, message: String, budget_stopped: bool) {
+        self.log_body_processor_error(request, processor, &message);
+        self.note_budget_stop(request, budget_stopped);
+        let tagged = format!("{processor}: {message}");
+        if request {
+            self.reqbody_error.set("1");
+            self.reqbody_error_msg.set(tagged);
+            self.reqbody_processor_error.set("1");
+            self.reqbody_processor_error_msg.set(message);
+        } else {
+            self.res_body_error.set("1");
+            self.res_body_error_msg.set(tagged);
+            self.res_body_processor_error.set("1");
+            self.res_body_processor_error_msg.set(message);
+        }
+    }
+
+    /// Applies the host's ban on file uploads to a multipart body, where the policy has one. Returns whether the
+    /// parts that were read hold an upload, or `None` when that has interrupted the transaction.
+    fn ban_multipart_uploads(
+        &mut self,
+        parts: &[multipart::Part<'_>],
+        failure: Option<&multipart::ParseFailure>,
+        cut_open: bool,
+    ) -> Option<bool> {
+        let published_upload = self.config.reject_multipart_file_uploads
             && parts.iter().any(|part| {
                 part.filename.as_deref().is_some_and(|name| !name.is_empty())
                     || part.alt_filename.as_deref().is_some_and(|name| !name.is_empty())
             });
-        if reject_uploads {
+        if published_upload {
             self.multipart_strict_error.set("1");
             self.inbound_data_error.set("1");
             self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
             if self.interruption.is_some() {
-                return Ok(());
+                return None;
             }
         }
+        // A parser that stopped before the end of the body has not looked at what follows its last part, and a
+        // file part could be there. Where uploads are refused such a body cannot be let through on the strength
+        // of the parts that were read, so it is refused as one with an upload once the rules of the body phase had
+        // their say: the stop is a body error that a rule may deny with its own status, and the ban must not depend
+        // on there being one. A body that was not multipart at all has no parts for an upload to hide in.
+        // A body that a `ProcessPartial` limit cut before its closing delimiter is the same without a failure to
+        // say so: what the limit discarded could be a file, and it ends the parse as no error.
+        let parts_unread = failure.is_some_and(|failure| failure.strict || failure.cause == FailureCause::MemoryBudget);
+        if self.config.reject_multipart_file_uploads && !published_upload && (cut_open || parts_unread) {
+            self.computed.unchecked_multipart_upload = true;
+        }
+        Some(published_upload)
+    }
+
+    /// Populate multipart fields, metadata, and temporary upload files.
+    ///
+    /// `partial` is how the parser reads a body that reached the limit, as Go's does; `discarded` is whether bytes
+    /// really were left out, which is what the ban on uploads depends on. A stop for the memory budget is noted as
+    /// it happens, whatever error or interruption follows it.
+    fn process_multipart_body(&mut self, body: &[u8], partial: bool, discarded: bool) -> Result<(), String> {
+        let mut memory = self.memory_budget();
+        let content_type = self.request_headers.first("content-type").unwrap_or_default();
+        let (parts, failure, cut_open) = multipart::parse(content_type, body, partial, &mut memory);
+        let parse_stopped = failure
+            .as_ref()
+            .is_some_and(|failure| failure.cause == FailureCause::MemoryBudget);
+        self.note_budget_stop(true, parse_stopped);
+        // A body that ends exactly at the limit is read as cut by it, but nothing of it was left out, so no part
+        // can be hiding past its end.
+        let Some(reject_uploads) = self.ban_multipart_uploads(&parts, failure.as_ref(), cut_open && discarded) else {
+            return Ok(());
+        };
         // Go's `NextPart` loop sets the strict error as soon as a part fails, but it
         // has already published the parts before it (`internal/bodyprocessors/multipart.go:52-70`,
         // v3.8.1), so publishing continues here and the error is reported afterwards.
@@ -256,7 +344,37 @@ impl Transaction {
         let mut total_size = 0_u64;
         let mut file_count = self.uploaded_paths.len();
 
+        let mut budget_error = None;
+        // What the part just published held, freed when it is dropped; its slot is not, as the vector outlives it.
+        let mut release_previous = 0_usize;
+        // The bytes a temporary upload's path takes, worked out once and only when a file needs one.
+        let mut upload_path_bytes = None;
         for part in parts {
+            memory.refund(release_previous);
+            // Everything the part adds is charged before any of it is, so a part that does not fit adds nothing.
+            let upload_dir = &self.config.upload_dir;
+            let destinations = [&self.args_post, &self.args];
+            if memory.is_limited() {
+                // The lowercase copy a lookup makes of a name with a capital is charged before it is made, once: the
+                // metadata collections fold it whatever `ARGS` does, and each holds its copy alone.
+                let lookup = fold_scratch_bytes(&part.name);
+                if !memory.charge(lookup) {
+                    self.note_budget_stop(true, true);
+                    budget_error = Some(MULTIPART_MEMORY_BUDGET_ERROR.to_owned());
+                    break;
+                }
+                // The test `add_post_argument` makes: a field past the argument limit is dropped, and costs nothing.
+                let admitted = self.args_post.value_count() < self.config.argument_limit;
+                let cost = multipart_publish_cost(&part, destinations, admitted, || {
+                    *upload_path_bytes.get_or_insert_with(|| upload_path_bytes_of(upload_dir))
+                });
+                if !memory.charge(cost.grown) {
+                    self.note_budget_stop(true, true);
+                    budget_error = Some(MULTIPART_MEMORY_BUDGET_ERROR.to_owned());
+                    break;
+                }
+                release_previous = part.owned_bytes().saturating_add(lookup).saturating_add(cost.freed);
+            }
             if part.repeats_header {
                 self.multipart_duplicate_part_header.set("1");
                 self.multipart_strict_error.set("1");
@@ -266,31 +384,11 @@ impl Transaction {
                 self.multipart_strict_error.set("1");
             }
 
-            for (name, value) in &part.headers {
-                // Go Coraza v3.8.1 `multipart.go:70` stores the header value's raw bytes;
-                // a lossy text view would make distinct invalid-UTF-8 values equal.
-                let mut header = multipart::canonical_header_name(name).into_bytes();
-                header.extend_from_slice(b": ");
-                header.extend_from_slice(value);
-                self.multipart_part_headers.add_bytes(&part.name, header);
-            }
-            self.multipart_name.add_bytes(&part.name, &part.name);
-            // Go publishes only non-empty filenames, while a `filename*` that decoded to
-            // nothing still contributes its charset and language
-            // (`internal/bodyprocessors/multipart.go:88-105`, v3.8.1).
+            self.publish_part_metadata(&part);
+            // Go publishes only non-empty filenames, while a `filename*` that decoded to nothing still contributes
+            // its charset and language (`internal/bodyprocessors/multipart.go:88-105`, v3.8.1).
             let filename = part.filename.as_deref().filter(|filename| !filename.is_empty());
             let alt_filename = part.alt_filename.as_deref().filter(|filename| !filename.is_empty());
-            if let Some(filename) = filename {
-                self.multipart_filename.add_bytes(&part.name, filename);
-            }
-            if let Some(filename) = alt_filename {
-                self.multipart_filename.add_bytes(&part.name, filename);
-            }
-            if let Some(encoding) = &part.filename_encoding {
-                self.multipart_filename_charset.add_bytes(&part.name, &encoding.charset);
-                self.multipart_filename_language
-                    .add_bytes(&part.name, &encoding.language);
-            }
             if part.malformed_filename {
                 self.multipart_strict_error.set("1");
             }
@@ -342,7 +440,32 @@ impl Transaction {
         self.files_combined_size.set(total_size.to_string());
         match failure {
             Some(failure) => Err(failure.message),
-            None => Ok(()),
+            None => budget_error.map_or(Ok(()), Err),
+        }
+    }
+
+    /// Publishes a multipart part's headers, name, filenames and the charset and language of its `filename*`.
+    fn publish_part_metadata(&mut self, part: &multipart::Part<'_>) {
+        for (name, value) in &part.headers {
+            // Go Coraza v3.8.1 `multipart.go:70` stores the header value's raw bytes;
+            // a lossy text view would make distinct invalid-UTF-8 values equal.
+            let mut header = multipart::canonical_header_name(name).into_bytes();
+            header.extend_from_slice(b": ");
+            header.extend_from_slice(value);
+            self.multipart_part_headers.add_bytes(&part.name, header);
+        }
+        self.multipart_name.add_bytes(&part.name, &part.name);
+        for filename in [part.filename.as_deref(), part.alt_filename.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|filename| !filename.is_empty())
+        {
+            self.multipart_filename.add_bytes(&part.name, filename);
+        }
+        if let Some(encoding) = &part.filename_encoding {
+            self.multipart_filename_charset.add_bytes(&part.name, &encoding.charset);
+            self.multipart_filename_language
+                .add_bytes(&part.name, &encoding.language);
         }
     }
 
@@ -370,6 +493,85 @@ impl Transaction {
         });
         self.reqbody_processor
             .set(truncate_custom_body_text(&name.to_ascii_uppercase()));
+    }
+}
+
+/// The error reported when a body would take its processor past the memory budget the host set.
+const MEMORY_BUDGET_ERROR: &str = "parsed arguments exceed the body memory budget";
+
+/// The error reported when the parts of a multipart body would take it past the memory budget the host set.
+const MULTIPART_MEMORY_BUDGET_ERROR: &str = "published parts exceed the body memory budget";
+
+/// The bytes the path of one temporary upload takes: the directory the file is written under, which is the one
+/// [`upload_directory`] resolves and not the configured text, as the lossy text `FILES_TMPNAMES` keeps of it, and
+/// the file name added to it. A host that has no directory writes no file, so the least a path is charged stands.
+fn upload_path_bytes_of(configured: &str) -> usize {
+    /// The file name `tempfile` appends to the directory is a fixed-length random one.
+    const TEMP_NAME_BYTES: usize = 32;
+    /// The least a path is charged: a default directory and a file name.
+    const TEMP_PATH_BYTES: usize = 128 + TEMP_NAME_BYTES;
+
+    upload_directory(configured)
+        .map_or(0, |dir| dir.to_string_lossy().len().saturating_add(TEMP_NAME_BYTES))
+        .max(TEMP_PATH_BYTES)
+}
+
+/// What publishing `part` costs the budget. Every metadata entry and header text is charged conservatively; a field
+/// is charged exactly what [`budget::insert_growth`] says for `destinations`, `ARGS_POST` and `ARGS`, when `admitted`
+/// says the argument limit lets it in. That call and the collections the name is filed in make lowercase copies of
+/// it, which the caller charges first.
+/// `upload_path_bytes` gives the bytes of a temporary upload's path, asked for only when the part is a file.
+fn multipart_publish_cost(
+    part: &multipart::Part<'_>,
+    destinations: [&Map; 2],
+    admitted: bool,
+    upload_path_bytes: impl FnOnce() -> usize,
+) -> Growth {
+    /// Longest decimal rendering of a `u64`, the value in `FILES_SIZES`.
+    const SIZE_TEXT_BYTES: usize = 20;
+    let name_key = budget::map_key_bytes(&part.name);
+    let mut cost = 0_usize;
+    for (name, value) in &part.headers {
+        // `Name: value`, built, then stored.
+        let header = name.len().saturating_add(2).saturating_add(value.len());
+        cost = cost
+            .saturating_add(budget::insert_cost(name_key, header))
+            .saturating_add(header);
+    }
+    cost = cost.saturating_add(budget::insert_cost(name_key, part.name.len()));
+    let filenames = [part.filename.as_deref(), part.alt_filename.as_deref()];
+    // Every collection that is given a filename looks it up through a copy of its own, one at a time: the largest of
+    // the filenames the part publishes is held.
+    let mut fold = 0;
+    for filename in filenames.into_iter().flatten().filter(|filename| !filename.is_empty()) {
+        fold = fold.max(fold_scratch_bytes(filename));
+        cost = cost
+            .saturating_add(budget::insert_cost(name_key, filename.len()))
+            .saturating_add(budget::insert_cost(0, filename.len()))
+            .saturating_add(budget::insert_cost(budget::map_key_bytes(filename), SIZE_TEXT_BYTES));
+    }
+    if let Some(encoding) = &part.filename_encoding {
+        cost = cost
+            .saturating_add(budget::insert_cost(name_key, encoding.charset.len()))
+            .saturating_add(budget::insert_cost(name_key, encoding.language.len()));
+    }
+    let is_file = filenames.into_iter().flatten().any(|filename| !filename.is_empty());
+    let mut field = Growth::default();
+    if is_file {
+        let path = upload_path_bytes();
+        cost = cost
+            .saturating_add(budget::insert_cost(0, part.name.len()))
+            // The path in `FILES_TMPNAMES`, and the one kept for cleanup with its slot in a list that may have
+            // doubled.
+            .saturating_add(budget::insert_cost(0, path))
+            .saturating_add(path)
+            .saturating_add(2 * size_of::<PathBuf>());
+    } else if admitted {
+        field = budget::insert_growth(&destinations, &part.name, part.data.len());
+    }
+    Growth {
+        grown: cost.saturating_add(fold).saturating_add(field.grown),
+        freed: fold.saturating_add(field.freed),
     }
 }
 
@@ -512,22 +714,7 @@ fn record_custom_body_processor_error(tx: &mut Transaction, direction: BodyDirec
         BodyDirection::Request => truncate_custom_body_text(&tx.reqbody_processor.get()),
         BodyDirection::Response => truncate_custom_body_text(&tx.res_body_processor.get()),
     };
-    let message = truncate_custom_body_text(message);
-    tx.log_body_processor_error(request, &processor_name, &message);
-    match direction {
-        BodyDirection::Request => {
-            tx.reqbody_error.set("1");
-            tx.reqbody_error_msg.set(format!("{processor_name}: {message}"));
-            tx.reqbody_processor_error.set("1");
-            tx.reqbody_processor_error_msg.set(message);
-        },
-        BodyDirection::Response => {
-            tx.res_body_error.set("1");
-            tx.res_body_error_msg.set(format!("{processor_name}: {message}"));
-            tx.res_body_processor_error.set("1");
-            tx.res_body_processor_error_msg.set(message);
-        },
-    }
+    tx.report_body_error(request, &processor_name, truncate_custom_body_text(message), false);
 }
 
 /// Create the selected custom processor once, on the first body-processing call.
@@ -641,7 +828,8 @@ pub(super) fn decode_pair(key: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// `SecArgumentsLimit` counts entries, not bytes, and the flattened key is the
 /// full path rewritten for every leaf, so memory grows with depth times leaves
 /// while the entry count grows only with leaves. Go Coraza uses the same factor
-/// (`internal/bodyprocessors/json.go:113`); see the comment there.
+/// (`internal/bodyprocessors/json.go:113`); see the comment there. It is the only limit without a host
+/// memory budget: what the transaction holds beyond it, the copies and the entries, is for that budget to bound.
 const FLATTEN_BYTES_FACTOR: usize = 8;
 
 /// Keeps small bodies unaffected, where a few long keys can legitimately
@@ -655,6 +843,8 @@ enum JsonFlattenError {
     Recursion,
     /// The flattened form outgrew its byte budget.
     Budget,
+    /// Flattening, or the scratch it works in, would outgrow the memory budget the host set.
+    Memory,
 }
 
 /// A JSON body flattened the way Go Coraza's `readJSON` does.
@@ -665,6 +855,8 @@ pub(super) struct JsonBody {
     pub(super) truncated: bool,
     /// The parser error message, after any best-effort arguments were collected.
     pub(super) error: Option<String>,
+    /// Whether the host's memory budget is why the walk stopped, which `error` then says.
+    pub(super) memory_stopped: bool,
 }
 
 /// Flattened arguments in first-discovery order.
@@ -675,43 +867,33 @@ pub(super) struct JsonBody {
 /// results and audit argument order. Entries are kept in a vector instead;
 /// the map only indexes a path to its row.
 pub(super) struct JsonArguments {
-    /// Paths in first-discovery order, with each path's values in discovery order.
-    entries: Vec<JsonArgument>,
-    /// Row of each path in `entries`.
-    rows: HashMap<Vec<u8>, usize>,
+    /// Each path with its values in discovery order, in first-discovery order.
+    ///
+    /// The path is held once: the index map is both the order and the row lookup.
+    entries: IndexMap<Vec<u8>, Vec<Vec<u8>>, ahash::RandomState>,
 }
-
-/// One flattened path with its values, in discovery order.
-type JsonArgument = (Vec<u8>, Vec<Vec<u8>>);
 
 impl JsonArguments {
     /// Create an empty set of arguments.
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            rows: HashMap::new(),
+            entries: IndexMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
     /// Append `value` under `key`, creating the row on first discovery.
     fn push(&mut self, key: &[u8], value: Vec<u8>) {
-        if let Some(row) = self.rows.get(key).copied()
-            && let Some((_, values)) = self.entries.get_mut(row)
-        {
+        if let Some(values) = self.entries.get_mut(key) {
             values.push(value);
             return;
         }
-        let row = self.entries.len();
-        let key = key.to_vec();
-        self.rows.insert(key.clone(), row);
-        self.entries.push((key, vec![value]));
+        self.entries.insert(key.to_vec(), vec![value]);
     }
 
     /// Values stored under `key`, in discovery order.
     #[cfg(test)]
     pub(super) fn get(&self, key: &[u8]) -> Option<&[Vec<u8>]> {
-        let row = self.rows.get(key).copied()?;
-        self.entries.get(row).map(|(_, values)| values.as_slice())
+        self.entries.get(key).map(Vec::as_slice)
     }
 
     /// Paths and values in first-discovery order.
@@ -842,7 +1024,7 @@ impl<'a> JsonChildScanner<'a> {
     }
 
     /// The next child, with its key, in document order.
-    fn next(&mut self, containers: &ContainerIndex) -> Option<(JsonKey<'a>, JsonValue<'a>)> {
+    fn next(&mut self, containers: &ContainerIndex, scratch: &mut JsonScratch) -> Option<(JsonKey<'a>, JsonValue<'a>)> {
         if let Some(single) = self.single.take() {
             return Some((JsonKey::Index(0), single));
         }
@@ -860,14 +1042,17 @@ impl<'a> JsonChildScanner<'a> {
                     return None;
                 }
                 let content = raw.get(key_start + 1..end.checked_sub(1)?).unwrap_or_default();
-                let name = if escaped {
+                let name = if escaped && scratch.materialize {
+                    if !scratch.reserve_unescaped(content.len()) {
+                        return None;
+                    }
                     Cow::Owned(unescape_json_string(content))
                 } else {
                     Cow::Borrowed(content)
                 };
                 self.offset = end;
                 self.skip_separators(raw);
-                let (end, value) = parse_any_value(raw, self.offset, self.base, containers)?;
+                let (end, value) = parse_any_value(raw, self.offset, self.base, containers, scratch)?;
                 // gjson's ForEach advances one more byte after each pair.
                 self.offset = end.saturating_add(1);
                 return Some((JsonKey::Name(name), value));
@@ -876,7 +1061,7 @@ impl<'a> JsonChildScanner<'a> {
         self.skip_separators(raw);
         let index = self.index;
         self.index += 1;
-        let (end, value) = parse_any_value(raw, self.offset, self.base, containers)?;
+        let (end, value) = parse_any_value(raw, self.offset, self.base, containers, scratch)?;
         // gjson's ForEach advances one more byte after each element.
         self.offset = end.saturating_add(1);
         Some((JsonKey::Index(index), value))
@@ -907,8 +1092,99 @@ struct JsonFrame<'a> {
     array_len: usize,
 }
 
+/// What the host's memory budget has left, and the transient buffers charged to it that the walk gives back after
+/// each entry.
+struct JsonScratch {
+    /// The budget; unlimited unless the host set one.
+    memory: MemoryBudget,
+    /// Transient bytes charged since the last entry ended.
+    pending: usize,
+    /// Set when a charge was refused, which ends the walk: the scanners that charge report it as the end of the
+    /// input, and the walk reads this to tell the two apart.
+    exhausted: bool,
+    /// Whether the scanners unescape the strings they read. The walk turns it off once the argument limit is
+    /// full, when all it asks of them is whether another member exists, which is not worth the buffer.
+    materialize: bool,
+}
+
+impl JsonScratch {
+    /// Reserves the buffer an escaped string unescapes into, which is as long as the string at most.
+    fn reserve_unescaped(&mut self, escaped_len: usize) -> bool {
+        if !self.memory.is_limited() {
+            return true;
+        }
+        let bytes = escaped_len.saturating_add(ALLOCATION_OVERHEAD_BYTES);
+        if self.memory.charge(bytes) {
+            self.pending = self.pending.saturating_add(bytes);
+            true
+        } else {
+            self.exhausted = true;
+            false
+        }
+    }
+
+    /// Gives back the transient bytes of the entry that ended.
+    fn release(&mut self) {
+        self.memory.refund(self.pending);
+        self.pending = 0;
+    }
+}
+
+impl TableLedger {
+    /// A ledger for a walk published into `held`, whose tables are as they are before the walk.
+    fn new(held: &[&Map]) -> Self {
+        let mut ledger = Self::default();
+        for (target, map) in ledger.targets.iter_mut().zip(held) {
+            target.base_len = map.len();
+            target.capacity = map.key_table_capacity();
+        }
+        ledger
+    }
+
+    /// What the tables grow by when a path that makes `distinct` of them is added, and is new to the targets that
+    /// `new_to` flags: the grown tables, each held beside its old one while the entries move. Nothing for a table
+    /// that has room.
+    fn growth(&self, distinct: usize, copies: usize, new_to: [bool; MAX_TARGETS]) -> usize {
+        let walk = if index_capacity_for(distinct) > self.walk_capacity {
+            JsonFlattener::walk_table_bytes(distinct)
+        } else {
+            0
+        };
+        self.targets
+            .iter()
+            .zip(new_to)
+            .take(copies)
+            .filter(|(_, new)| *new)
+            .filter_map(|(target, _)| target.grown_capacity())
+            .fold(walk, |sum, capacity| sum.saturating_add(map_capacity_bytes(capacity)))
+    }
+
+    /// Records that the tables hold the path now, once the growth that [`TableLedger::growth`] reported was
+    /// charged: what the old tables were charged is given back, but for the previous generation of each
+    /// collection's table.
+    fn advance(&mut self, memory: &mut MemoryBudget, distinct: usize, copies: usize, new_to: [bool; MAX_TARGETS]) {
+        let capacity = index_capacity_for(distinct);
+        if capacity > self.walk_capacity {
+            memory.refund(self.walk);
+            self.walk = JsonFlattener::walk_table_bytes(distinct);
+            self.walk_capacity = capacity;
+        }
+        for (target, new) in self.targets.iter_mut().zip(new_to).take(copies) {
+            if !new {
+                continue;
+            }
+            if let Some(capacity) = target.grown_capacity() {
+                memory.refund(target.charged[0]);
+                target.charged = [target.charged[1], map_capacity_bytes(capacity)];
+                target.capacity = capacity;
+            }
+            target.added = target.added.saturating_add(1);
+        }
+    }
+}
+
 /// The state of one gjson-compatible flattening walk.
-struct JsonFlattener {
+struct JsonFlattener<'m> {
     /// Flattened paths and their values, in discovery order.
     values: JsonArguments,
     /// Bytes retained in `values` so far.
@@ -921,12 +1197,95 @@ struct JsonFlattener {
     argument_limit: usize,
     /// Maximum key and value bytes the flattened form may retain.
     byte_budget: usize,
+    /// The host's memory budget and the walk's transient charges to it.
+    scratch: JsonScratch,
+    /// Bytes of the path buffer already charged: its high-water mark, as it keeps its capacity.
+    path_charged: usize,
+    /// The collections each entry is published into as they are before the walk: `ARGS_POST` and `ARGS` for a
+    /// request, `RESPONSE_ARGS` for a response. A query string can have filled a list of them already.
+    held: &'m [&'m Map],
+    /// Values of paths that a case-insensitive collection files under another spelling, by that spelling: they
+    /// join the list of every path that folds alike. It is made for the first of them, and dropped when the walk ends.
+    folded: Option<IndexMap<Vec<u8>, usize, ahash::RandomState>>,
+    /// The bytes `folded` holds.
+    folded_bytes: usize,
+    /// What has been charged for the collections' values, lists and keys, which they allocate only after the walk.
+    unfilled: usize,
+    /// What has been charged for the old allocation of a list while it grows, or the buffer a key's text is built in,
+    /// the most of them: they are not held together, so one is reserved for every growth. It also covers what
+    /// `folded`, and the old allocation of the walk's list while it grows, take beyond `unfilled`.
+    transient: usize,
+    /// The capacity the stack of open containers has been charged for.
+    frames_charged: usize,
+    /// The largest lowercase copy of a path that a collection has made so far, which is charged once: they are not
+    /// held together.
+    fold_charged: usize,
+    /// What the tables of the walk's list and of the collections hold, charged as the number of distinct paths
+    /// grows into a bigger one.
+    tables: TableLedger,
 }
 
-impl JsonFlattener {
-    /// Start a walk with the given caps.
-    fn new(argument_limit: usize, byte_budget: usize) -> Self {
+/// The hash tables the walk's list and the collections it feeds grow, charged as the number of distinct paths takes
+/// them past their capacity.
+///
+/// A table that is full is replaced by one about twice as big, and both are held while its entries are moved. The
+/// walk's list grows while it walks, so its old table is given back at once; the collections grow when the entries
+/// are published, after the walk, and the old table of the last growth must have been charged by then, so the
+/// previous generation stays charged and the ones before it are given back.
+#[derive(Default)]
+struct TableLedger {
+    /// The capacity the walk's table has grown to.
+    walk_capacity: usize,
+    /// What the walk's list was charged for its table.
+    walk: usize,
+    /// The collections the entries are published into.
+    targets: [TargetTable; MAX_TARGETS],
+}
+
+/// The most collections a walk is published into: `ARGS_POST` and `ARGS`.
+const MAX_TARGETS: usize = 2;
+
+/// One collection's table of keys as the walk grows it, starting from the table the collection has.
+#[derive(Default, Clone, Copy)]
+struct TargetTable {
+    /// Keys the collection held before the walk.
+    base_len: usize,
+    /// The capacity of its table: what it had, or what the walk has charged it growing to.
+    capacity: usize,
+    /// Keys the walk has added that the collection did not hold.
+    added: usize,
+    /// What the table was charged in the previous and in the current generation.
+    charged: [usize; 2],
+}
+
+impl TargetTable {
+    /// The capacity the table grows to when one more key is added, none while it has room.
+    fn grown_capacity(&self) -> Option<usize> {
+        let keys = self.base_len.saturating_add(self.added).saturating_add(1);
+        (keys > self.capacity).then(|| index_capacity_for(keys))
+    }
+}
+
+impl<'m> JsonFlattener<'m> {
+    /// Start a walk with the given caps, for entries published into `held`.
+    fn new(argument_limit: usize, byte_budget: usize, memory: MemoryBudget, held: &'m [&'m Map]) -> Self {
+        let held = held.get(..MAX_TARGETS).unwrap_or(held);
         Self {
+            scratch: JsonScratch {
+                memory,
+                pending: 0,
+                exhausted: false,
+                materialize: true,
+            },
+            path_charged: 0,
+            held,
+            folded: None,
+            folded_bytes: 0,
+            unfilled: 0,
+            transient: 0,
+            frames_charged: 0,
+            fold_charged: 0,
+            tables: TableLedger::new(held),
             values: JsonArguments::new(),
             used_bytes: 0,
             argument_count: 0,
@@ -946,6 +1305,11 @@ impl JsonFlattener {
         if max_recursion == 0 {
             return Err(JsonFlattenError::Recursion);
         }
+        if self.scratch.exhausted {
+            // The root was a string that did not fit the scratch to unescape it in.
+            return Err(JsonFlattenError::Memory);
+        }
+        self.reserve_frames(0)?;
         let mut path = b"json".to_vec();
         let mut frames: Vec<JsonFrame<'a>> = vec![JsonFrame {
             scanner: JsonChildScanner::new(root),
@@ -956,12 +1320,19 @@ impl JsonFlattener {
         }];
         let mut truncated = false;
         loop {
+            // With the argument limit full all that matters is whether another member follows, and that is read
+            // without unescaping it: a member the scratch could not hold must still end the walk as one past the limit.
+            let capped = self.argument_limit > 0 && self.argument_count >= self.argument_limit;
+            self.scratch.materialize = !capped;
             let next = match frames.last_mut() {
-                Some(frame) => frame.scanner.next(containers),
+                Some(frame) => frame.scanner.next(containers, &mut self.scratch),
                 None => return Ok(truncated),
             };
             match next {
                 None => {
+                    if self.scratch.exhausted {
+                        return Err(JsonFlattenError::Memory);
+                    }
                     let Some(frame) = frames.pop() else {
                         return Ok(truncated);
                     };
@@ -985,6 +1356,7 @@ impl JsonFlattener {
                         return Ok(true);
                     }
                     self.flatten_item(&mut frames, &mut path, key, value)?;
+                    self.scratch.release();
                 },
             }
         }
@@ -1012,6 +1384,13 @@ impl JsonFlattener {
         };
         let depth_remaining = frame.depth_remaining;
         let previous_len = path.len();
+        // The path keeps the capacity it grew to, which doubles: charge what it adds to its high-water mark twice.
+        // An index is at most twenty digits.
+        let growth = match &key {
+            JsonKey::Name(name) => name.len(),
+            JsonKey::Index(_) => 20,
+        };
+        self.reserve_path(previous_len.saturating_add(1).saturating_add(growth))?;
         path.push(b'.');
         match key {
             JsonKey::Name(name) => path.extend_from_slice(name.as_ref()),
@@ -1026,6 +1405,7 @@ impl JsonFlattener {
                 if depth == 0 {
                     return Err(JsonFlattenError::Recursion);
                 }
+                self.reserve_frames(frames.len())?;
                 frames.push(JsonFrame {
                     scanner: JsonChildScanner::container(raw, base),
                     base_len: path.len(),
@@ -1045,12 +1425,191 @@ impl JsonFlattener {
         Ok(())
     }
 
+    /// Reserves path buffer room for a path of `len` bytes, beyond what the buffer has had so far.
+    fn reserve_path(&mut self, len: usize) -> Result<(), JsonFlattenError> {
+        if len > self.path_charged {
+            let growth = len - self.path_charged;
+            if !self.scratch.memory.charge(growth.saturating_mul(2)) {
+                return Err(JsonFlattenError::Memory);
+            }
+            self.path_charged = len;
+        }
+        Ok(())
+    }
+
+    /// Reserves the stack of open containers room for one more when it holds `len`, before it grows: a vector that is
+    /// full is replaced by one twice as big, and both are held while the frames are moved.
+    fn reserve_frames(&mut self, len: usize) -> Result<(), JsonFlattenError> {
+        if !self.scratch.memory.is_limited() || len < self.frames_charged {
+            return Ok(());
+        }
+        // The vector starts with its one frame, and grows to four at least.
+        let capacity = if len == 0 { 1 } else { len.saturating_mul(2).max(4) };
+        let bytes = allocation_bytes(capacity.saturating_mul(size_of::<JsonFrame<'_>>()));
+        if !self.scratch.memory.charge(bytes) {
+            return Err(JsonFlattenError::Memory);
+        }
+        // The old buffer is freed once the frames are moved, which is when the entry ends.
+        let old = allocation_bytes(self.frames_charged.saturating_mul(size_of::<JsonFrame<'_>>()));
+        self.scratch.pending = self.scratch.pending.saturating_add(old);
+        self.frames_charged = capacity;
+        Ok(())
+    }
+
+    /// Reserves the memory budget for one entry: its row in the walk's list, and its rows in each collection it is
+    /// published into, each with its key and value. Nothing is reserved unless all of it fits.
+    ///
+    /// The tables that hold the rows grow by doubling, which is charged when a new path takes a table past its
+    /// capacity (see [`TableLedger`]); what an entry adds beyond that is its own allocations. A value added to a
+    /// list a collection has, or will have from the walk's earlier values, adds the list's growth when it is full.
+    fn reserve_entry(&mut self, key: &[u8], value_len: usize) -> Result<(), JsonFlattenError> {
+        if !self.scratch.memory.is_limited() {
+            return Ok(());
+        }
+        let copies = self.held.len();
+        // A collection that files a path with a capital in it makes a lowercase copy of it for every lookup, which
+        // is charged, once and at its largest, before the first lookup.
+        let fold = budget::lookup_scratch_bytes(self.held, key);
+        if fold > self.fold_charged {
+            if !self.scratch.memory.charge(fold - self.fold_charged) {
+                return Err(JsonFlattenError::Memory);
+            }
+            self.fold_charged = fold;
+        }
+        // The key the collections file the path under, which they fold alike: `ARGS_POST` and `ARGS` follow one
+        // setting. Paths spelled apart from it share its list.
+        let lookup = self.held.first().map_or(Cow::Borrowed(key), |map| map.lookup_key(key));
+        let spelled_apart = lookup.as_ref() != key;
+        let walk_list = self.values.entries.get(key).map(Vec::len);
+        let others = self
+            .folded
+            .as_ref()
+            .and_then(|folded| folded.get(lookup.as_ref()))
+            .copied();
+        // Values the walk has for that list already: those of the path spelled as it, and of the others.
+        let walked = self
+            .values
+            .entries
+            .get(lookup.as_ref())
+            .map_or(0, Vec::len)
+            .saturating_add(others.unwrap_or(0));
+        // The value is copied for the walk's list and for each collection.
+        let value = allocation_bytes(value_len);
+        // A list that grows is held beside the one it replaces, which is freed after: only the new one stays charged,
+        // and the largest old one, which is held beside the finished lists when the collections are filled. A key's
+        // text is built in a buffer that is freed alike.
+        let walk_growth = walk_list.map_or_else(Growth::default, |values| {
+            budget::list_growth(
+                (1, 1),
+                values.saturating_sub(1),
+                size_of::<Vec<u8>>(),
+                vec_grown_capacity,
+            )
+        });
+        let (mut collections, mut largest) = (Growth::default(), 0_usize);
+        let mut add = |growth: Growth| {
+            collections = collections.plus(growth);
+            largest = largest.max(growth.freed);
+        };
+        // Collections the path is new to, whose tables of keys take it.
+        let mut new_to = [false; MAX_TARGETS];
+        for (map, new) in self.held.iter().zip(new_to.iter_mut()) {
+            add(match map.value_list_shape(&lookup) {
+                Some(shape) => budget::list_growth(shape, walked, VALUE_ENTRY_BYTES, grown_list_capacity),
+                // The list the walk's first value makes, which the following ones are added to.
+                None if walked > 0 => budget::list_growth((1, 1), walked - 1, VALUE_ENTRY_BYTES, grown_list_capacity),
+                None => {
+                    *new = true;
+                    Growth {
+                        grown: allocation_bytes(VALUE_ENTRY_BYTES),
+                        freed: 0,
+                    }
+                },
+            });
+            add(key_bytes(key, &lookup, *new));
+        }
+        // What the collections are charged: a copy of the value each, and their lists and keys.
+        let filled = value
+            .saturating_mul(copies)
+            .saturating_add(collections.grown)
+            .saturating_sub(collections.freed);
+        let mut bytes = value
+            .saturating_add(walk_growth.grown)
+            .saturating_sub(walk_growth.freed)
+            .saturating_add(filled);
+        let distinct = self.values.entries.len().saturating_add(1);
+        if walk_list.is_none() {
+            bytes = bytes
+                .saturating_add(allocation_bytes(key.len()))
+                // The one-element value list of the walk.
+                .saturating_add(allocation_bytes(size_of::<Vec<u8>>()))
+                .saturating_add(self.tables.growth(distinct, copies, new_to));
+        }
+        // Reserve what `folded` and the walk list's old allocation take beyond `unfilled`.
+        let counted = self.folded_growth(&lookup, spelled_apart && others.is_none());
+        let unfilled = self.unfilled.saturating_add(filled);
+        let walking = self
+            .folded_bytes
+            .saturating_add(counted.grown)
+            .saturating_add(walk_growth.freed)
+            .saturating_sub(unfilled);
+        let reserved = largest.max(walking).saturating_sub(self.transient);
+        if !self.scratch.memory.charge(bytes.saturating_add(reserved)) {
+            return Err(JsonFlattenError::Memory);
+        }
+        self.transient = self.transient.saturating_add(reserved);
+        self.unfilled = unfilled;
+        if walk_list.is_none() {
+            self.tables.advance(&mut self.scratch.memory, distinct, copies, new_to);
+        }
+        if spelled_apart {
+            let folded = self.folded.get_or_insert_with(IndexMap::default);
+            if let Some(count) = folded.get_mut(lookup.as_ref()) {
+                *count = count.saturating_add(1);
+            } else {
+                let mut kept = lookup.into_owned();
+                // Kept at its length, which is what was counted for it.
+                kept.shrink_to_fit();
+                folded.insert(kept, 1);
+                self.folded_bytes = self
+                    .folded_bytes
+                    .saturating_add(counted.grown)
+                    .saturating_sub(counted.freed);
+            }
+        }
+        Ok(())
+    }
+
+    /// What counting a path under `lookup` in [`JsonFlattener::folded`] takes when it is `new` there: a copy of the
+    /// key, and a full table's growth.
+    fn folded_growth(&self, lookup: &[u8], new: bool) -> Growth {
+        if !new {
+            return Growth::default();
+        }
+        let (len, capacity) = self
+            .folded
+            .as_ref()
+            .map_or((0, 0), |folded| (folded.len(), folded.capacity()));
+        let table = index_growth::<(Vec<u8>, usize)>(len, capacity);
+        Growth {
+            grown: allocation_bytes(lookup.len()).saturating_add(table.grown),
+            ..table
+        }
+    }
+
+    /// The bytes of the table of the walk's list holding `distinct` paths.
+    fn walk_table_bytes(distinct: usize) -> usize {
+        index_table_bytes::<(Vec<u8>, Vec<Vec<u8>>)>(index_capacity_for(distinct))
+    }
+
     /// Retain one flattened entry, enforcing the byte budget.
     fn record(&mut self, key: &[u8], value: &[u8]) -> Result<(), JsonFlattenError> {
         let used = self.used_bytes.saturating_add(key.len()).saturating_add(value.len());
         if used > self.byte_budget {
             return Err(JsonFlattenError::Budget);
         }
+        // Only a host's memory budget bounds what the entry costs beyond Go's raw budget above.
+        self.reserve_entry(key, value.len())?;
         self.used_bytes = used;
         self.values.push(key, value.to_vec());
         Ok(())
@@ -1151,7 +1710,20 @@ struct ContainerIndex {
 
 impl ContainerIndex {
     /// Build an index from `input`, capturing containers up to `max_recursion + 1`.
-    fn build(input: &[u8], max_recursion: usize) -> Self {
+    ///
+    /// Each row, and each level of the stack the index is built with, is charged to `memory` before it is stored.
+    /// There is no partial index to walk with: a body that outgrows the budget is refused whole.
+    ///
+    /// # Errors
+    ///
+    /// [`JsonFlattenError::Memory`] when the index would outgrow `memory`.
+    fn build(input: &[u8], max_recursion: usize, memory: &mut MemoryBudget) -> Result<Self, JsonFlattenError> {
+        /// What one row costs: two offsets, in vectors that may hold a quarter or more spare and, while one grows,
+        /// its old buffer as well.
+        const ROW_BYTES: usize = 3 * 2 * size_of::<usize>();
+        /// What one level of the stack costs, with the same slack.
+        const LEVEL_BYTES: usize = 3 * size_of::<usize>() * 2;
+
         /// One container still open while the index is built.
         struct Open {
             /// Absolute offset of the opening bracket.
@@ -1168,6 +1740,7 @@ impl ContainerIndex {
             ends: Vec::new(),
         };
         let mut open: Vec<Open> = Vec::new();
+        let mut levels_charged = 0_usize;
         // Opens past `capture_depth`; their closes are absorbed here so the
         // captured stack stays bounded however deep the input nests.
         let mut deeper = 0_usize;
@@ -1179,6 +1752,9 @@ impl ContainerIndex {
                     if let Some(top) = open.last_mut()
                         && top.row.is_none()
                     {
+                        if !memory.charge(ROW_BYTES) {
+                            return Err(JsonFlattenError::Memory);
+                        }
                         top.row = Some(index.starts.len());
                         index.starts.push(top.start);
                         index.ends.push(0);
@@ -1188,6 +1764,12 @@ impl ContainerIndex {
                     } else if open.len() == capture_depth {
                         deeper = 1;
                     } else {
+                        if open.len() >= levels_charged {
+                            if !memory.charge(LEVEL_BYTES) {
+                                return Err(JsonFlattenError::Memory);
+                            }
+                            levels_charged = open.len().saturating_add(1);
+                        }
                         open.push(Open {
                             start: position,
                             row: None,
@@ -1209,14 +1791,16 @@ impl ContainerIndex {
                 _ => position += 1,
             }
         }
-        for container in open {
+        for container in &open {
             if let Some(row) = container.row
                 && let Some(end) = index.ends.get_mut(row)
             {
                 *end = input.len();
             }
         }
-        index
+        // The stack is dropped with the build; a refused build ends the walk, and its budget with it.
+        memory.refund(levels_charged.saturating_mul(LEVEL_BYTES));
+        Ok(index)
     }
 
     /// An index with no entries.
@@ -1318,6 +1902,7 @@ fn parse_any_value<'a>(
     start: usize,
     base: usize,
     containers: &ContainerIndex,
+    scratch: &mut JsonScratch,
 ) -> Option<(usize, JsonValue<'a>)> {
     let mut index = start;
     while let Some(&byte) = input.get(index) {
@@ -1341,7 +1926,10 @@ fn parse_any_value<'a>(
                 return None;
             }
             let content = input.get(index + 1..end.checked_sub(1)?).unwrap_or_default();
-            let value = if escaped {
+            let value = if escaped && scratch.materialize {
+                if !scratch.reserve_unescaped(content.len()) {
+                    return None;
+                }
                 Cow::Owned(unescape_json_string(content))
             } else {
                 Cow::Borrowed(content)
@@ -1373,7 +1961,7 @@ fn parse_any_value<'a>(
 }
 
 /// Parses the single value gjson's `Parse` reads at the start of the input.
-fn parse_json_root(input: &[u8]) -> Option<JsonValue<'_>> {
+fn parse_json_root<'a>(input: &'a [u8], scratch: &mut JsonScratch) -> Option<JsonValue<'a>> {
     let mut index = 0_usize;
     while let Some(&byte) = input.get(index) {
         match byte {
@@ -1403,15 +1991,22 @@ fn parse_json_root(input: &[u8]) -> Option<JsonValue<'_>> {
                 let (_, raw) = scan_literal(input, index);
                 return Some(JsonValue::False(raw));
             },
-            b'"' => return Some(JsonValue::String(scan_root_string(input, index))),
+            b'"' => return scan_root_string(input, index, scratch).map(JsonValue::String),
             _ => return None,
         }
     }
     None
 }
 
-/// Reads the string gjson's `Parse` returns for a document that is one string.
-fn scan_root_string(input: &[u8], start: usize) -> Cow<'_, [u8]> {
+/// Reads the string gjson's `Parse` returns for a document that is one string, or `None` when the buffer it
+/// unescapes into does not fit `scratch`: the buffer is as long as the string and reserved before it is made, and a
+/// string with no escape is borrowed.
+fn scan_root_string<'a>(input: &'a [u8], start: usize, scratch: &mut JsonScratch) -> Option<Cow<'a, [u8]>> {
+    let mut unescaped = |content: &'a [u8]| {
+        scratch
+            .reserve_unescaped(content.len())
+            .then(|| Cow::Owned(unescape_json_string(content)))
+    };
     let mut index = start + 1;
     while let Some(&byte) = input.get(index) {
         if byte > b'\\' {
@@ -1419,7 +2014,7 @@ fn scan_root_string(input: &[u8], start: usize) -> Cow<'_, [u8]> {
             continue;
         }
         if byte == b'"' {
-            return Cow::Borrowed(input.get(start + 1..index).unwrap_or_default());
+            return Some(Cow::Borrowed(input.get(start + 1..index).unwrap_or_default()));
         }
         if byte == b'\\' {
             index += 1;
@@ -1429,15 +2024,15 @@ fn scan_root_string(input: &[u8], start: usize) -> Cow<'_, [u8]> {
                     continue;
                 }
                 if escaped == b'"' && !is_escaped_quote(input, index, 1) {
-                    return Cow::Owned(unescape_json_string(input.get(start + 1..index).unwrap_or_default()));
+                    return unescaped(input.get(start + 1..index).unwrap_or_default());
                 }
                 index += 1;
             }
-            return Cow::Owned(unescape_json_string(input.get(start + 1..).unwrap_or_default()));
+            return unescaped(input.get(start + 1..).unwrap_or_default());
         }
         index += 1;
     }
-    Cow::Borrowed(input.get(start + 1..).unwrap_or_default())
+    Some(Cow::Borrowed(input.get(start + 1..).unwrap_or_default()))
 }
 
 /// Parses the first four hexadecimal digits as Go's `runeit` does.
@@ -1742,25 +2337,65 @@ fn scan_valid_literal(input: &[u8], index: usize, literal: &[u8]) -> Option<usiz
 ///
 /// The walk runs before validation so a valid prefix still populates arguments
 /// on a best-effort basis (`internal/bodyprocessors/json.go:141-179`).
-pub(super) fn read_json_body(body: &[u8], max_recursion: usize, argument_limit: usize) -> JsonBody {
+///
+/// With a memory budget, the container index, the walk's scratch and every entry it keeps are charged to it
+/// before they are allocated, and the walk stops, with the entries before that point, when one would not fit.
+pub(super) fn read_json_body_within(
+    body: &[u8],
+    max_recursion: usize,
+    argument_limit: usize,
+    mut memory: MemoryBudget,
+    held: &[&Map],
+) -> JsonBody {
     let containers = if max_recursion == 0 {
         ContainerIndex::empty()
     } else {
-        ContainerIndex::build(body, max_recursion)
+        match ContainerIndex::build(body, max_recursion, &mut memory) {
+            Ok(containers) => containers,
+            Err(_) => {
+                return JsonBody {
+                    arguments: JsonArguments::new(),
+                    truncated: false,
+                    error: Some(memory_budget_message(memory.limit())),
+                    memory_stopped: true,
+                };
+            },
+        }
     };
-    read_json_with_index(body, max_recursion, argument_limit, &containers)
+    read_json_budgeted(body, max_recursion, argument_limit, &containers, memory, held)
 }
 
-/// Flatten with the given container index; an empty index scans every container.
-fn read_json_with_index(
+/// [`read_json_body_within`] without a memory budget, which is what the engine does by default.
+#[cfg(test)]
+pub(super) fn read_json_body(body: &[u8], max_recursion: usize, argument_limit: usize) -> JsonBody {
+    read_json_body_within(body, max_recursion, argument_limit, MemoryBudget::default(), &[])
+}
+
+/// The error for a JSON body that outgrew the host's memory budget.
+fn memory_budget_message(limit: usize) -> String {
+    format!("flattened form exceeds the {limit} byte body memory budget")
+}
+
+/// Flatten with the given container index, which an empty one makes scan every container, under the host's memory
+/// budget with the index already charged to it, for a walk whose entries are published into `held`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the limits, the index and the budget are all explicit, as for the readers above"
+)]
+fn read_json_budgeted(
     body: &[u8],
     max_recursion: usize,
     argument_limit: usize,
     containers: &ContainerIndex,
+    memory: MemoryBudget,
+    held: &[&Map],
 ) -> JsonBody {
     let byte_budget = body.len().saturating_mul(FLATTEN_BYTES_FACTOR).max(FLATTEN_BYTES_FLOOR);
-    let mut flattener = JsonFlattener::new(argument_limit, byte_budget);
-    let (truncated, error) = match flattener.flatten(parse_json_root(body), max_recursion, containers) {
+    let mut flattener = JsonFlattener::new(argument_limit, byte_budget, memory, held);
+    // A document that is one string with an escape unescapes it into a buffer, which is reserved first.
+    let root = parse_json_root(body, &mut flattener.scratch);
+    let walked = flattener.flatten(root, max_recursion, containers);
+    let (truncated, error) = match walked {
         Ok(truncated) => (truncated, json_error_after_walk(body, max_recursion)),
         Err(JsonFlattenError::Recursion) => (
             false,
@@ -1773,11 +2408,13 @@ fn read_json_with_index(
                 body.len()
             )),
         ),
+        Err(JsonFlattenError::Memory) => (false, Some(memory_budget_message(flattener.scratch.memory.limit()))),
     };
     JsonBody {
         arguments: flattener.values,
         truncated,
         error,
+        memory_stopped: walked == Err(JsonFlattenError::Memory),
     }
 }
 
@@ -1971,6 +2608,20 @@ PAYLOAD\r\n\
         #[cfg(not(target_os = "wasi"))]
         assert!(super::upload_directory("").is_some());
         assert_eq!(super::upload_directory("/tmp/uploads"), Some("/tmp/uploads".into()));
+    }
+
+    #[test]
+    fn an_upload_path_is_charged_from_the_resolved_directory() {
+        // A relative directory is written under the current directory, so that is the path that is retained.
+        let resolved = std::path::absolute("relative").unwrap();
+        assert!(super::upload_path_bytes_of("relative") >= resolved.to_string_lossy().len() + 32);
+        let long = format!("/{}", "d".repeat(400));
+        assert_eq!(super::upload_path_bytes_of(&long), 401 + 32);
+        assert_eq!(
+            super::upload_path_bytes_of("/tmp"),
+            160,
+            "a short directory is charged the floor"
+        );
     }
 
     #[test]
@@ -2606,7 +3257,11 @@ two\r\n\
 
 #[cfg(test)]
 mod json_tests {
-    use super::{ContainerIndex, JsonBody, json_nesting_exceeds_limit, read_json_body, read_json_with_index};
+    use super::{
+        ContainerIndex, JsonBody, JsonFlattener, json_nesting_exceeds_limit, read_json_body, read_json_body_within,
+        read_json_budgeted,
+    };
+    use crate::{body_processors::budget::MemoryBudget, collection::Map, types::RuleVariable};
 
     /// Tokens for the deterministic malformed-document generator.
     const TOKENS: [&[u8]; 16] = [
@@ -2663,6 +3318,21 @@ mod json_tests {
             }
         });
         keys
+    }
+
+    #[test]
+    fn the_stack_an_index_is_built_with_is_given_back_once_it_is_dropped() {
+        // A chain of arrays holds a row for each container that holds another, and the stack of open ones, which
+        // is gone when the build ends, was charged a level for each. Only the rows stay charged.
+        let depth = 1_000_usize;
+        let body = [vec![b'['; depth], vec![b']'; depth]].concat();
+        let mut memory = MemoryBudget::new(Some(1 << 20));
+        let built = ContainerIndex::build(&body, 10_000, &mut memory);
+        assert!(built.is_ok());
+        let index = built.unwrap_or_else(|_| ContainerIndex::empty());
+        assert_eq!(index.starts.len(), depth - 1);
+        let row = 3 * 2 * size_of::<usize>();
+        assert_eq!(memory.remaining(), Some((1 << 20) - (depth - 1) * row));
     }
 
     fn nested_objects(depth: usize) -> Vec<u8> {
@@ -2743,7 +3413,14 @@ mod json_tests {
         for body in bodies {
             for (depth, limit) in [(1024, 1000), (3, 5), (0, 0)] {
                 let indexed = read_json_body(&body, depth, limit);
-                let scanned = read_json_with_index(&body, depth, limit, &ContainerIndex::empty());
+                let scanned = read_json_budgeted(
+                    &body,
+                    depth,
+                    limit,
+                    &ContainerIndex::empty(),
+                    MemoryBudget::default(),
+                    &[],
+                );
                 assert_eq!(snapshot(&indexed), snapshot(&scanned));
                 assert_eq!(indexed.truncated, scanned.truncated);
                 assert_eq!(indexed.error, scanned.error);
@@ -2805,6 +3482,96 @@ mod json_tests {
             assert_eq!(parsed.truncated, truncated);
             assert_eq!(total_values(&parsed), expected_values);
         }
+    }
+
+    #[test]
+    fn without_a_host_budget_only_gos_raw_budget_refuses_a_body() {
+        // Go's budget is 8x the body (4096 at least) of the key and value bytes the walk keeps. This transaction
+        // adds no limit of its own beyond it: a body is refused exactly when Go would refuse it, whatever the
+        // copies it goes on to make, so a valid long-key document is never an error the engine invents.
+        let digits = |n: usize| n.to_string().len();
+        for key_len in [1_usize, 10, 100, 300, 660, 1000, 5000] {
+            for leaves in [1_usize, 2, 5, 12, 20, 50, 100, 500] {
+                let key = "k".repeat(key_len);
+                let mut body = format!("{{\"{key}\":[").into_bytes();
+                body.extend(std::iter::repeat_n(*b"1,", leaves - 1).flatten());
+                body.extend_from_slice(b"1]}");
+
+                // `json.<key>.<index>` and the value `1` for each leaf, then the array's length entry.
+                let kept: usize = (0..leaves)
+                    .map(|index| 4 + 1 + key_len + 1 + digits(index) + 1)
+                    .sum::<usize>()
+                    + (4 + 1 + key_len)
+                    + digits(leaves);
+                let budget = (8 * body.len()).max(4096);
+                let parsed = read_json_body(&body, 10_000, 0);
+                let message = parsed.error.clone().unwrap_or_default();
+                assert_eq!(
+                    message.starts_with("flattened form exceeds the"),
+                    kept > budget,
+                    "{key_len} byte key over {leaves} leaves: {kept} kept bytes against {budget}: {message}"
+                );
+                assert!(!message.contains("retained"), "{message}");
+                if kept <= budget {
+                    assert_eq!(parsed.error, None);
+                    assert_eq!(total_values(&parsed), leaves + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_utf8_key_is_charged_its_bytes_and_every_lossy_copy_the_collections_keep() {
+        let (post, args) = (Map::new(RuleVariable::ArgsPost), Map::new(RuleVariable::Args));
+        // The smallest budget under which the walk is not stopped for memory (the body itself is not valid JSON
+        // when its key is not UTF-8, which is reported after the walk and is not the budget's concern).
+        let smallest = |body: &[u8]| {
+            let stopped = |budget: usize| {
+                read_json_body_within(body, 10_000, 0, MemoryBudget::new(Some(budget)), &[&post, &args])
+                    .error
+                    .is_some_and(|message| message.contains("body memory budget"))
+            };
+            let (mut low, mut high) = (0_usize, 1 << 24);
+            assert!(!stopped(high));
+            while low + 1 < high {
+                let middle = low + (high - low) / 2;
+                if stopped(middle) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            high
+        };
+        let key_len = 300_usize;
+        let ascii = [&b"{\""[..], &vec![b'k'; key_len], b"\":1}"].concat();
+        // Each 0xC3 is not a character alone: one byte in the key, three in its U+FFFD text view.
+        let invalid = [&b"{\""[..], &vec![0xC3; key_len], b"\":1}"].concat();
+        let (ascii_cost, invalid_cost) = (smallest(&ascii), smallest(&invalid));
+        // The flattened key once, and in each of `ARGS_POST` and `ARGS` its bytes and its text view: the key is its
+        // own lowercase form, so the value shares it.
+        let held_by_invalid_key = key_len * (1 + 2 * (1 + 3));
+        assert!(
+            invalid_cost >= held_by_invalid_key,
+            "{invalid_cost} bytes do not cover the {held_by_invalid_key} the key is held in"
+        );
+        assert!(
+            invalid_cost >= ascii_cost + 2 * 3 * key_len,
+            "an invalid key ({invalid_cost}) costs its text views more than a valid one ({ascii_cost})"
+        );
+        // A key as long as can be asked about does not wrap the arithmetic around.
+        let held = [&post, &args];
+        let mut flattener = JsonFlattener::new(0, usize::MAX, MemoryBudget::new(Some(usize::MAX)), &held);
+        assert!(flattener.reserve_entry(&vec![0xC3; 1024], usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_dense_array_is_not_limited_beyond_gos_budget() {
+        // The densest ordinary body: single-digit numbers, a leaf per two bytes.
+        let body = format!("[{}1]", "1,".repeat(200_000));
+        let parsed = read_json_body(body.as_bytes(), 10_000, 0);
+        assert_eq!(parsed.error, None);
+        assert_eq!(total_values(&parsed), 200_002);
     }
 
     #[test]

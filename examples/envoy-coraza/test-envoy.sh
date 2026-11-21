@@ -456,13 +456,22 @@ fi
 # to abort the WASI plugin in std::env::temp_dir() before the part was published.
 printf '%b' '--X\r\nContent-Disposition: form-data; name="name"\r\n\r\nAlice\r\n--X--\r\n' \
     >"$temp_dir/multipart-field"
-status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+# The default policy's 32-byte ProcessPartial limit would cut this body, and a cut multipart body is refused
+# where uploads are not accepted (below), so it goes to the policy that has a limit it fits in.
+status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
     --header 'content-type: multipart/form-data; boundary=X' \
     --data-binary "@$temp_dir/multipart-field" 'http://127.0.0.1:10001/greet?name=test')
 check_status 200 "$status" 'field-only multipart'
 if envoy_logs | grep --quiet --fixed-strings 'not supported by WASI yet'; then
     fail 'field-only multipart aborted in the WASI temporary-directory path'
 fi
+
+# A multipart body that ProcessPartial cut before its closing delimiter could hide a file in the bytes that were
+# discarded, and this host does not accept uploads: it is refused, whatever the prefix shows.
+status=$(request "$temp_dir/response" \
+    --header 'content-type: multipart/form-data; boundary=X' \
+    --data-binary "@$temp_dir/multipart-field" 'http://127.0.0.1:10001/greet?name=test')
+check_status 413 "$status" 'multipart body cut by the body limit'
 
 # Every build embeds @recommended-conf, which the recommended.local policy loads
 # before its own SQLi rule.

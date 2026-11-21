@@ -52,7 +52,7 @@ use crate::{
         AuditFile, AuditLog, AuditLogCallback, AuditLogger, AuditMessage, AuditMessageData, AuditProducer,
         AuditRequest, AuditResponse, AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
-    body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory},
+    body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, budget::MemoryBudget},
     collection::{Map, MatchData, Single},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
@@ -123,6 +123,24 @@ struct ComputedVariables {
     time_year: Single,
     /// Custom processors are boxed here so built-in transactions do not grow.
     custom_body_processors: Option<Box<CustomBodyProcessors>>,
+    /// The memory a body processor may retain, set by a connector; here for the same reason.
+    body_memory_budget: Option<usize>,
+    /// Whether a request and a response body processor stopped on that budget.
+    body_budget_stopped: [bool; 2],
+    /// Whether a multipart parser stopped before the end of a body where uploads are refused, which leaves parts it
+    /// did not read: the refusal follows the rules of the body phase, which may name the failure first.
+    unchecked_multipart_upload: bool,
+}
+
+/// When a body processor makes the copy of a body that is kept beside the engine's buffer, if it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyCopy {
+    /// The processor keeps no copy.
+    None,
+    /// The copy is made before the body is parsed, so it is held while the parser works.
+    BeforeParsing,
+    /// The copy is made once the body has been parsed, when what the parser built is already held.
+    AfterParsing,
 }
 
 /// A disruptive action selected by a matching rule.
@@ -663,6 +681,9 @@ impl TransactionInner {
         self.computed.duration.set("0");
         self.computed.uri_parse_error.set("0");
         self.computed.custom_body_processors = None;
+        self.computed.body_memory_budget = None;
+        self.computed.body_budget_stopped = [false; 2];
+        self.computed.unchecked_multipart_upload = false;
     }
 
     /// Estimate all dynamic capacity retained by a pooled transaction state.
@@ -1051,6 +1072,9 @@ impl Transaction {
                 time_wday: text(RuleVariable::TimeWday, at.weekday.to_string()),
                 time_year: text(RuleVariable::TimeYear, at.year.to_string()),
                 custom_body_processors: None,
+                body_memory_budget: None,
+                body_budget_stopped: [false; 2],
+                unchecked_multipart_upload: false,
             }),
             request_method: Single::new(RuleVariable::RequestMethod),
             request_protocol: Single::new(RuleVariable::RequestProtocol),
@@ -1321,7 +1345,16 @@ impl Transaction {
             &self.tx,
             &self.matched_vars,
         ];
-        let singles = [&self.request_body, &self.response_body];
+        // The messages of body processor errors, which a body can make as long as the name or value that is quoted
+        // in them: they are kept for as long as the transaction is.
+        let singles = [
+            &self.request_body,
+            &self.response_body,
+            &self.reqbody_error_msg,
+            &self.reqbody_processor_error_msg,
+            &self.res_body_error_msg,
+            &self.res_body_processor_error_msg,
+        ];
         let dynamic_pm_bytes = self
             .dynamic_pm_matcher
             .lock()
@@ -1334,10 +1367,103 @@ impl Transaction {
             .chain([
                 self.request_body_buffer.allocated_bytes(),
                 self.response_body_buffer.allocated_bytes(),
+                self.uploaded_paths_bytes(),
                 dynamic_pm_bytes,
                 self.matched_rules_memory_bytes(),
             ])
             .fold(0_usize, usize::saturating_add)
+    }
+
+    /// The bytes of the paths of the temporary uploads kept for cleanup: the list that holds them and each path's own
+    /// buffer.
+    fn uploaded_paths_bytes(&self) -> usize {
+        self.uploaded_paths.iter().fold(
+            self.uploaded_paths.capacity().saturating_mul(size_of::<PathBuf>()),
+            |total, path| total.saturating_add(path.capacity()),
+        )
+    }
+
+    /// Limit what the body processors may retain for one body, in the units [`Transaction::body_memory_bytes`]
+    /// counts, or remove the limit with `None`, which is the default.
+    ///
+    /// Without a budget the built-in processors refuse what Go Coraza refuses and nothing more (the JSON
+    /// flattener's raw limit of eight times the body, the argument limit, the multipart part and header limits),
+    /// which a host with a fixed memory ceiling may not be able to afford: what a body makes them hold beyond the
+    /// body is many times its size. With a budget set the XML, JSON, URL-encoded and multipart processors charge,
+    /// before allocating it, everything a body makes them hold: the parsed values with the entries that keep them,
+    /// and the scratch they parse in. When a body would take them past the budget they stop and keep what they accepted
+    /// until then, and report it the way any body processor error is reported: `REQBODY_ERROR`,
+    /// `REQBODY_PROCESSOR_ERROR` and its message (`RES_BODY_*` for a response) are set, and the transaction is
+    /// not interrupted, so a rule such as 200002 decides what happens. The budget applies to each call of
+    /// [`Transaction::process_request_body`] and [`Transaction::process_response_body`] made after it is set, and
+    /// is a limit on that call's output alone: set it to what the host can still spare beyond what the
+    /// transaction already holds, and read [`Transaction::body_memory_bytes`] afterwards for what it does
+    /// hold. Custom body processors are unaffected: they have the byte budget of the body limit.
+    ///
+    /// It never loosens the processors' own limits: the stricter applies.
+    pub fn set_body_memory_budget(&mut self, bytes: Option<usize>) {
+        self.computed.body_memory_budget = bytes;
+    }
+
+    /// Whether the request body processor stopped before the end of the body because it would have gone past the
+    /// budget set by [`Transaction::set_body_memory_budget`]. The body was inspected only as far as it got, which a
+    /// host that reports whether it saw the whole body must not call complete.
+    pub fn request_body_stopped_by_memory_budget(&self) -> bool {
+        self.computed.body_budget_stopped[0]
+    }
+
+    /// [`Transaction::request_body_stopped_by_memory_budget`] for the response body.
+    pub fn response_body_stopped_by_memory_budget(&self) -> bool {
+        self.computed.body_budget_stopped[1]
+    }
+
+    /// Records a stop for the memory budget when `budget_stopped` says so: an error's text can quote the body.
+    pub(crate) fn note_budget_stop(&mut self, request: bool, budget_stopped: bool) {
+        if budget_stopped && let Some(stopped) = self.computed.body_budget_stopped.get_mut(usize::from(!request)) {
+            *stopped = true;
+        }
+    }
+
+    /// Where the selected request body processor keeps a copy of the body beside the buffer the engine retains, so
+    /// that a host can set that memory aside for the copy: the raw body variable of a raw or URL-encoded body, or
+    /// the JSON text a parsed JSON body is kept as. Custom processors, which have their own budget, do not.
+    pub fn request_body_copy(&self) -> BodyCopy {
+        match self.request_body_processor {
+            Some(BodyProcessor::Raw | BodyProcessor::UrlEncoded) => BodyCopy::BeforeParsing,
+            Some(BodyProcessor::Json) => BodyCopy::AfterParsing,
+            // Forcing the body variable selects URL-encoded parsing when no processor was chosen.
+            None if self.force_request_body_variable && self.reqbody_processor.get_bytes().is_empty() => {
+                BodyCopy::BeforeParsing
+            },
+            Some(BodyProcessor::Xml | BodyProcessor::Multipart) | None => BodyCopy::None,
+        }
+    }
+
+    /// [`Transaction::request_body_copy`] for the response body: JSON is kept as text after it is parsed, and any
+    /// other body is stored whole in `RESPONSE_BODY`.
+    pub fn response_body_copy(&self) -> BodyCopy {
+        if self
+            .computed
+            .custom_body_processors
+            .as_ref()
+            .is_some_and(|processors| processors.response.is_some())
+        {
+            return BodyCopy::None;
+        }
+        match self.response_body_processor {
+            Some(BodyProcessor::Json) => BodyCopy::AfterParsing,
+            _ => BodyCopy::BeforeParsing,
+        }
+    }
+
+    /// The limit set by [`Transaction::set_body_memory_budget`], if any.
+    pub fn body_memory_budget(&self) -> Option<usize> {
+        self.computed.body_memory_budget
+    }
+
+    /// The budget as the body processors charge it.
+    pub(crate) fn memory_budget(&self) -> MemoryBudget {
+        MemoryBudget::new(self.computed.body_memory_budget)
     }
 
     /// Estimate backing storage copied into matched-rule results.
@@ -4879,6 +5005,51 @@ payload\r\n\
     }
 
     #[test]
+    fn xml_memory_budget_exhaustion_publishes_the_prefix_sets_the_error_and_does_not_interrupt() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\n\
+                 SecAction \"id:49,phase:1,ctl:requestBodyProcessor=XML,pass\"\n\
+                 SecRule XML:/* \"@streq first\" \"id:50,phase:2,setvar:TX.prefix_seen=1,pass\"\n\
+                 SecRule REQBODY_ERROR \"@eq 1\" \"id:200002,phase:2,t:none,log,deny,status:400\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("xml-budget");
+        tx.set_body_memory_budget(Some(4096));
+        tx.process_request_headers();
+
+        // A short document of one text value, then a flood of valueless attributes in one tag.
+        let mut body = b"<r><i>first</i><a".to_vec();
+        body.extend(std::iter::repeat_n(*b" b", 10_000).flatten());
+        body.extend_from_slice(b"></a></r>");
+        let interruption = tx.process_request_body(&body);
+
+        assert_eq!(tx.get_variable(RuleVariable::ReqbodyError, None).as_deref(), Some("1"));
+        assert_eq!(
+            tx.get_variable(RuleVariable::ReqbodyProcessorError, None).as_deref(),
+            Some("1")
+        );
+        let message = tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).unwrap();
+        assert_eq!(message, "XML: parsed XML exceeds the 4096 byte body memory budget");
+        assert_eq!(
+            tx.get_variable(RuleVariable::XML, Some("/*")).as_deref(),
+            Some("first"),
+            "the values accepted before the budget ran out are published"
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::TX, Some("prefix_seen")).as_deref(),
+            Some("1")
+        );
+        // The engine does not interrupt on its own; the recommended rule 200002 turns the error into a 400.
+        assert_eq!(
+            interruption.map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((200_002, 400))
+        );
+    }
+
+    #[test]
     fn xml_body_errors_are_exposed_and_phase_two_still_runs() {
         let mut parser = crate::seclang::Parser::new();
         parser
@@ -6830,6 +7001,25 @@ payload\r\n\
             !std::path::Path::new(&path).exists(),
             "a panic must not leak the temporary upload"
         );
+    }
+
+    #[test]
+    fn body_memory_bytes_counts_the_paths_of_the_temporary_uploads_kept_for_cleanup() {
+        let mut tx = Transaction::new("upload-paths");
+        let before = tx.body_memory_bytes();
+        for index in 0..10 {
+            tx.uploaded_paths
+                .push(std::path::PathBuf::from(format!("{}{index}", "d".repeat(499))));
+        }
+        let expected = tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>()
+            + tx.uploaded_paths
+                .iter()
+                .map(std::path::PathBuf::capacity)
+                .sum::<usize>();
+        assert!(expected >= 10 * 500, "the paths are long enough to tell");
+        assert_eq!(tx.body_memory_bytes() - before, expected);
+        tx.uploaded_paths.clear();
+        assert!(tx.body_memory_bytes() - before <= tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>());
     }
 
     #[test]

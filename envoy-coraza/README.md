@@ -66,6 +66,38 @@ even a bare `Include *`, so a wildcard after `SecRuleEngine On` cannot load its
 like any other configured file. The file uses one of the 1024 `rule_data` file
 slots and about 12 KiB of the 8 MiB total budget.
 
+## Body memory budget
+
+Each Proxy-Wasm root context allows its streams 64 MiB of retained body memory, and Wasm linear memory never
+shrinks, so what a body makes the engine allocate while it is parsed sticks to the VM. Before it parses a request or
+response body the filter therefore gives the engine what the root has left (`Transaction::set_body_memory_budget`),
+less what this stream already holds: the host's buffer and the guest's copy of the body, the engine's buffer (the
+prefix of the body that `SecRequestBodyLimit`/`SecResponseBodyLimit` retains, not all of what the host holds) with
+whatever the transaction held before the body (`ARGS`, `TX`, matched rules), and the copy of that prefix the processor
+keeps beside its parse: the raw body of a URL-encoded or raw body, the JSON text of a JSON body. XML and multipart
+bodies keep no such copy. A copy that is made before the parse and does not fit the root is refused with 503, as any
+retained-body overshoot is.
+
+The XML, JSON, URL-encoded and multipart processors charge their values, the entries that hold them and their
+scratch against the budget before allocating, and stop at it keeping what they accepted. What follows differs by
+direction:
+
+* **Request.** `REQBODY_ERROR` is set and nothing is interrupted by the engine, so a rule decides, as for any body
+  that does not parse: `@recommended-conf` rule 200002 answers 400. A policy without a rule that reads
+  `REQBODY_ERROR` lets the request through, but the stream's telemetry says the inspection was not complete
+  (`inspection_complete=false`, `inspection_reason=body_memory_budget_stopped`). Where the host refuses file
+  uploads, a multipart body that the parser stopped in, for the budget or because a part was malformed, or that
+  `SecRequestBodyLimitAction ProcessPartial` cut before its closing delimiter, is also refused with 413 after the
+  body-phase rules ran if none of them denied it, since the part it did not read, or the bytes the limit discarded,
+  could be an upload.
+* **Response.** `RES_BODY_ERROR` is set, but `@recommended-conf` has no rule for it: rule 200002 reads only
+  `REQBODY_ERROR`. The budget is a limit the connector imposes and not one of the policy's, so the connector itself
+  replaces a response whose parser stopped at it with 502, unless a rule denied it first. A response body that merely
+  does not parse (`RES_BODY_ERROR` for another reason) is left to the policy's rules, as before.
+
+The check after the parse stays the authority on what was retained and answers 503. Without a budget, which is the
+engine's default, the processors refuse only what Go Coraza refuses.
+
 ## Embedding the OWASP Core Rule Set
 
 `make build-envoy-wasm-crs` downloads the CRS release pinned in the tracked

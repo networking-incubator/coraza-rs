@@ -72,6 +72,57 @@ const _: () = assert!(
     "the value counter must fit the padding after the map's small fields"
 );
 
+/// The most a heap allocator keeps beyond the bytes asked for, for charging an allocation whose size is not
+/// known yet.
+///
+/// A small allocation costs far more than its payload: glibc rounds a request up to a 16-byte unit after an
+/// eight-byte header and never gives less than 32 bytes, and dlmalloc, which backs the WASI build, is only
+/// slightly smaller. Without this a million one-byte values would be reported as one megabyte while holding
+/// thirty-two.
+pub(crate) const ALLOCATION_OVERHEAD_BYTES: usize = 32;
+
+/// Bytes the allocation behind `capacity` occupies, none for an empty one: the chunk a request of that size is
+/// rounded up to, the worst of the allocators the engine runs on.
+pub(crate) const fn allocation_bytes(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let rounded = capacity.saturating_add(8).div_ceil(16).saturating_mul(16);
+    if rounded < 32 { 32 } else { rounded }
+}
+
+/// A key that is not valid UTF-8: its bytes, which stay authoritative, and the text view computed once for the
+/// text interfaces.
+#[derive(Debug, Clone)]
+struct ByteKey {
+    /// The key bytes, exactly as stored.
+    bytes: Box<[u8]>,
+    /// The text view, invalid UTF-8 replaced with U+FFFD.
+    lossy: String,
+}
+
+impl ByteKey {
+    /// Stores `bytes`, which are not valid UTF-8.
+    fn new(bytes: &[u8]) -> Self {
+        // The lossy text grows by pushing, which can leave up to twice the capacity it needs. Trim it so a key
+        // costs the raw bytes plus at most three bytes per invalid byte, which is what
+        // `KEY_RETAINED_BYTES_PER_BYTE` charges.
+        let mut lossy = String::from_utf8_lossy(bytes).into_owned();
+        lossy.shrink_to_fit();
+        Self {
+            bytes: bytes.into(),
+            lossy,
+        }
+    }
+
+    /// Bytes held by this key's allocations.
+    fn allocated_bytes(&self) -> usize {
+        allocation_bytes(size_of::<Self>())
+            .saturating_add(allocation_bytes(self.bytes.len()))
+            .saturating_add(allocation_bytes(self.lossy.capacity()))
+    }
+}
+
 /// A stored key.
 ///
 /// Keys that arrived as text stay `Text`, so the common path keeps a single allocation and a
@@ -81,29 +132,16 @@ const _: () = assert!(
 enum Key {
     /// A valid UTF-8 key, with its original casing.
     Text(String),
-    /// A byte key that is not valid UTF-8, with its lossy text view.
-    Bytes {
-        /// The key bytes, exactly as stored.
-        bytes: Box<[u8]>,
-        /// The text view, invalid UTF-8 replaced with U+FFFD.
-        lossy: String,
-    },
+    /// A byte key that is not valid UTF-8. Boxed so every key stays three words: this is rare.
+    Bytes(Box<ByteKey>),
 }
 
 impl Key {
     /// Stores `bytes`, keeping their exact spelling.
     fn from_slice(bytes: &[u8]) -> Self {
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            return Self::Text(text.to_owned());
-        }
-        // The lossy text grows by pushing, which can leave up to twice the capacity it needs. Trim it so a key
-        // costs the raw bytes plus at most three bytes per invalid byte, which is what
-        // `KEY_RETAINED_BYTES_PER_BYTE` charges.
-        let mut lossy = String::from_utf8_lossy(bytes).into_owned();
-        lossy.shrink_to_fit();
-        Self::Bytes {
-            bytes: bytes.into(),
-            lossy,
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::Text(text.to_owned()),
+            Err(_) => Self::Bytes(Box::new(ByteKey::new(bytes))),
         }
     }
 
@@ -111,7 +149,7 @@ impl Key {
     fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Text(text) => text.as_bytes(),
-            Self::Bytes { bytes, .. } => bytes,
+            Self::Bytes(key) => &key.bytes,
         }
     }
 
@@ -119,15 +157,15 @@ impl Key {
     fn text(&self) -> &str {
         match self {
             Self::Text(text) => text,
-            Self::Bytes { lossy, .. } => lossy,
+            Self::Bytes(key) => &key.lossy,
         }
     }
 
     /// Bytes held by this key's string or byte backing allocations.
     fn allocated_bytes(&self) -> usize {
         match self {
-            Self::Text(text) => text.capacity(),
-            Self::Bytes { bytes, lossy } => bytes.len().saturating_add(lossy.capacity()),
+            Self::Text(text) => allocation_bytes(text.capacity()),
+            Self::Bytes(key) => key.allocated_bytes(),
         }
     }
 }
@@ -152,24 +190,100 @@ impl std::borrow::Borrow<[u8]> for Key {
     }
 }
 
+/// The original spelling of the key a value was added under, kept beside the value.
+///
+/// A value almost always carries the same bytes as the key its map files it under (always, in a case-sensitive
+/// map), and a repeated key such as `/*` or an array's path is added once per value, so storing the spelling
+/// again for each one made keys cost as much as the data. `Text("")` therefore means "the map key": an empty
+/// key spells itself, so the empty string cannot also be a differing spelling. Only a case-insensitive map's
+/// differently cased key, or one with invalid bytes, is stored, and it is the only case that allocates.
+///
+/// The two variants share the niche of the text's pointer, so this is two words.
+#[derive(Debug, Clone)]
+enum Spelling {
+    /// A valid UTF-8 spelling that differs from the map key, or `""` for the map key itself.
+    Text(Box<str>),
+    /// A spelling that is not valid UTF-8, and differs from the map key.
+    Bytes(Box<ByteKey>),
+}
+
+impl Spelling {
+    /// The spelling of `key` under a map key of `map_key` bytes.
+    fn new(key: &[u8], map_key: &[u8]) -> Self {
+        if key == map_key {
+            return Self::default();
+        }
+        match std::str::from_utf8(key) {
+            Ok(text) => Self::Text(text.into()),
+            Err(_) => Self::Bytes(Box::new(ByteKey::new(key))),
+        }
+    }
+
+    /// The key bytes, `map_key` when this value shares it.
+    fn as_bytes<'a>(&'a self, map_key: &'a Key) -> &'a [u8] {
+        match self {
+            Self::Text(text) if text.is_empty() => map_key.as_bytes(),
+            Self::Text(text) => text.as_bytes(),
+            Self::Bytes(key) => &key.bytes,
+        }
+    }
+
+    /// The text view, invalid UTF-8 replaced with U+FFFD.
+    fn text<'a>(&'a self, map_key: &'a Key) -> &'a str {
+        match self {
+            Self::Text(text) if text.is_empty() => map_key.text(),
+            Self::Text(text) => text,
+            Self::Bytes(key) => &key.lossy,
+        }
+    }
+
+    /// Bytes held by this spelling's allocations.
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Text(text) => allocation_bytes(text.len()),
+            Self::Bytes(key) => key.allocated_bytes(),
+        }
+    }
+}
+
+impl Default for Spelling {
+    /// The map key itself.
+    fn default() -> Self {
+        Self::Text(Box::default())
+    }
+}
+
+// Both must stay small: a `KeyValue` is allocated per value, and a million-value body holds a million of them.
+const _: () = assert!(size_of::<Key>() == 3 * size_of::<usize>(), "a key is three words");
+const _: () = assert!(
+    size_of::<Spelling>() == 2 * size_of::<usize>(),
+    "a spelling is a pointer and a length, the other variant fits in the niche"
+);
+
 /// Internal storage for a key-value pair.
 ///
 /// Preserves the original key bytes and casing even when the map is case-insensitive. Values
-/// are read and written as bytes; only this type knows how they are stored.
+/// are read and written as bytes; only this type knows how they are stored. The key is the map's own unless
+/// it differs, see [`Spelling`], so resolving it takes the key the pair is filed under.
 #[derive(Debug, Clone)]
 struct KeyValue {
-    /// Original key (with original casing)
-    key: Key,
+    /// Original key (with original casing), unless it is the map key.
+    spelling: Spelling,
     /// Value
     value: Vec<u8>,
 }
 
 impl KeyValue {
-    /// Creates a stored key/value pair.
-    fn new(key: Key, value: &[u8]) -> Self {
+    /// Creates a stored key/value pair filed under `map_key`.
+    fn new(key: &[u8], map_key: &[u8], value: &[u8]) -> Self {
+        Self::owned(key, map_key, Self::stored(value))
+    }
+
+    /// Creates a stored key/value pair that takes `value` without copying it.
+    fn owned(key: &[u8], map_key: &[u8], value: Vec<u8>) -> Self {
         Self {
-            key,
-            value: Self::stored(value),
+            spelling: Spelling::new(key, map_key),
+            value,
         }
     }
 
@@ -183,19 +297,69 @@ impl KeyValue {
         &self.value
     }
 
+    /// The key bytes, given the key this pair is filed under.
+    fn key_bytes<'a>(&'a self, map_key: &'a Key) -> &'a [u8] {
+        self.spelling.as_bytes(map_key)
+    }
+
+    /// The key text, given the key this pair is filed under.
+    fn key_text<'a>(&'a self, map_key: &'a Key) -> &'a str {
+        self.spelling.text(map_key)
+    }
+
     /// The value as text, invalid UTF-8 replaced with U+FFFD.
     fn text(&self) -> Cow<'_, str> {
         text_of(self.value())
     }
 
     /// Replaces the key and value, reusing their buffers.
-    fn replace(&mut self, key: &[u8], value: &[u8]) {
-        if self.key.as_bytes() != key {
-            self.key = Key::from_slice(key);
+    fn replace(&mut self, key: &[u8], map_key: &Key, value: &[u8]) {
+        if self.spelling.as_bytes(map_key) != key {
+            self.spelling = Spelling::new(key, map_key.as_bytes());
         }
         self.value.clear();
         self.value.extend_from_slice(value);
     }
+
+    /// Bytes held by this pair's allocations.
+    fn allocated_bytes(&self) -> usize {
+        self.spelling
+            .allocated_bytes()
+            .saturating_add(allocation_bytes(self.value.capacity()))
+    }
+}
+
+/// Bytes of one value's entry in its key's list.
+pub(crate) const VALUE_ENTRY_BYTES: usize = size_of::<KeyValue>();
+
+/// The capacity a value list of `len` values and `capacity` slots grows to when one more is added to it, as
+/// [`push_grown`] grows it.
+pub(crate) fn grown_list_capacity(len: usize, capacity: usize) -> usize {
+    if len >= EXACT_GROWTH_FROM {
+        len.saturating_add(len / 4)
+    } else {
+        vec_grown_capacity(len, capacity)
+    }
+}
+
+/// The capacity a `Vec` of small entries grows to when it is full: double, and never fewer than four slots.
+pub(crate) fn vec_grown_capacity(len: usize, capacity: usize) -> usize {
+    capacity.saturating_mul(2).max(len.saturating_add(1)).max(4)
+}
+
+/// The length from which a value vector grows by a quarter instead of doubling, see [`push_grown`].
+const EXACT_GROWTH_FROM: usize = 1024;
+
+/// Appends `kv`, growing a long vector by a quarter rather than doubling it.
+///
+/// A key that repeats, such as `REQUEST_XML`'s `/*`, can hold millions of values, and a vector that doubles keeps
+/// up to twice what it uses, which at a 40-byte entry is the larger part of what a flood of tiny values costs. The
+/// shorter vectors headers and arguments make double as `Vec` does.
+fn push_grown(values: &mut Vec<KeyValue>, kv: KeyValue) {
+    if values.len() == values.capacity() && values.len() >= EXACT_GROWTH_FROM {
+        values.reserve_exact(values.len() / 4);
+    }
+    values.push(kv);
 }
 
 /// A value count as the counter's type.
@@ -227,6 +391,21 @@ fn lower_bytes(key: &[u8]) -> Vec<u8> {
                 rest = rest.get(end..).unwrap_or_default();
             },
         }
+    }
+}
+
+/// The bytes of the lowercase copy that a case-insensitive map makes of `key` while it looks the key up or files it
+/// (see [`Map::lookup_scratch_bytes`]), none for a key that is its own lowercase form. A folded character can take
+/// more bytes than the one it came from, so the copy of a name that is not ASCII can outgrow the vector sized for
+/// it: that vector doubles, and the old one is held beside the new while the bytes move, three times its size.
+pub(crate) fn fold_scratch_bytes(key: &[u8]) -> usize {
+    if !key.iter().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+        return 0;
+    }
+    if key.is_ascii() {
+        allocation_bytes(key.len())
+    } else {
+        allocation_bytes(key.len()).saturating_add(allocation_bytes(key.len().saturating_mul(2)))
     }
 }
 
@@ -265,7 +444,7 @@ impl Map {
 
     /// The key `key` is stored under: as it is in a case-sensitive map, lowercase otherwise.
     /// Borrowed when that is `key` itself, which spares lookups an allocation.
-    fn lookup_key<'k>(&self, key: &'k [u8]) -> Cow<'k, [u8]> {
+    pub(crate) fn lookup_key<'k>(&self, key: &'k [u8]) -> Cow<'k, [u8]> {
         if self.case_sensitive || !key.iter().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
             Cow::Borrowed(key)
         } else {
@@ -283,23 +462,30 @@ impl Map {
     /// replaced with U+FFFD. Distinct byte keys still yield one entry each, so no entry is
     /// merged or dropped; `Map::iter_bytes` gives the key bytes.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
-        self.data.values().flatten().map(|kv| (kv.key.text(), kv.value()))
+        self.data
+            .iter()
+            .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_text(map_key), kv.value())))
     }
 
     /// Every key, exactly as stored, and value, in insertion order.
     #[cfg(test)]
     pub(crate) fn iter_bytes(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
-        self.data.values().flatten().map(|kv| (kv.key.as_bytes(), kv.value()))
+        self.data
+            .iter()
+            .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_bytes(map_key), kv.value())))
     }
 
     /// Every key and value with its stable map-entry/value position.
     pub(crate) fn iter_bytes_indexed(&self) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
-        self.data.iter().enumerate().flat_map(|(entry_index, (_, values))| {
-            values
-                .iter()
-                .enumerate()
-                .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
-        })
+        self.data
+            .iter()
+            .enumerate()
+            .flat_map(|(entry_index, (map_key, values))| {
+                values
+                    .iter()
+                    .enumerate()
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
+            })
     }
 
     /// The keys and values stored under `key` (whatever its case, in a case-insensitive map).
@@ -308,10 +494,9 @@ impl Map {
     pub fn iter_key(&self, key: impl AsRef<[u8]>) -> impl Iterator<Item = (&str, &[u8])> + '_ {
         let lookup = self.lookup_key(key.as_ref());
         self.data
-            .get(lookup.as_ref())
+            .get_key_value(lookup.as_ref())
             .into_iter()
-            .flatten()
-            .map(|kv| (kv.key.text(), kv.value()))
+            .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_text(map_key), kv.value())))
     }
 
     /// Values under a folded key with their stable map-entry/value position.
@@ -320,11 +505,11 @@ impl Map {
         self.data
             .get_full(lookup.as_ref())
             .into_iter()
-            .flat_map(|(entry_index, _, values)| {
+            .flat_map(|(entry_index, map_key, values)| {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
             })
     }
 
@@ -335,10 +520,9 @@ impl Map {
     #[cfg(test)]
     pub(crate) fn iter_key_exact(&self, key: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         self.data
-            .get(key)
+            .get_key_value(key)
             .into_iter()
-            .flatten()
-            .map(|kv| (kv.key.as_bytes(), kv.value()))
+            .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_bytes(map_key), kv.value())))
     }
 
     /// Values under an exact key with their stable map-entry/value position.
@@ -346,19 +530,19 @@ impl Map {
         self.data
             .get_full(key)
             .into_iter()
-            .flat_map(|(entry_index, _, values)| {
+            .flat_map(|(entry_index, map_key, values)| {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
             })
     }
 
     /// Return one selected value by its stable map-entry/value position.
     pub(crate) fn value_at(&self, entry_index: usize, value_index: usize, names: bool) -> Option<(&[u8], &[u8])> {
-        let (_, values) = self.data.get_index(entry_index)?;
+        let (map_key, values) = self.data.get_index(entry_index)?;
         let value = values.get(value_index)?;
-        let key = value.key.as_bytes();
+        let key = value.key_bytes(map_key);
         Some((key, if names { key } else { value.value() }))
     }
 
@@ -370,8 +554,7 @@ impl Map {
         self.data
             .iter()
             .filter(|(lookup_key, _)| regex.is_match(lookup_key.text()))
-            .flat_map(|(_, values)| values)
-            .map(|kv| (kv.key.text(), kv.value()))
+            .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_text(map_key), kv.value())))
     }
 
     /// Keys and values matching `regex`, with stable map-entry/value positions.
@@ -383,11 +566,11 @@ impl Map {
             .iter()
             .enumerate()
             .filter(move |(_, (lookup_key, _))| regex.is_match(lookup_key.text()))
-            .flat_map(|(entry_index, (_, values))| {
+            .flat_map(|(entry_index, (map_key, values))| {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key.as_bytes(), kv.value()))
+                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
             })
     }
 
@@ -435,14 +618,58 @@ impl Map {
     pub(crate) fn add_bytes(&mut self, key: &[u8], value: impl AsRef<[u8]>) {
         let value = value.as_ref();
         let lookup = self.lookup_key(key);
-        let kv = KeyValue::new(Key::from_slice(key), value);
-        match self.data.get_mut(lookup.as_ref()) {
-            Some(values) => values.push(kv),
+        let kv = KeyValue::new(key, lookup.as_ref(), value);
+        self.push_value(&lookup, kv);
+    }
+
+    /// Appends `value`, which the map takes without copying, to the values of the exact key bytes.
+    ///
+    /// The buffer is trimmed to its length first, so that a value read into a growing buffer does not keep the
+    /// growth.
+    pub(crate) fn add_owned(&mut self, key: &[u8], mut value: Vec<u8>) {
+        value.shrink_to_fit();
+        let lookup = self.lookup_key(key);
+        let kv = KeyValue::owned(key, lookup.as_ref(), value);
+        self.push_value(&lookup, kv);
+    }
+
+    /// Files `kv` under the map key `lookup`, creating the key if it is new.
+    fn push_value(&mut self, lookup: &[u8], kv: KeyValue) {
+        match self.data.get_mut(lookup) {
+            Some(values) => push_grown(values, kv),
             None => {
-                self.data.insert(Key::from_slice(lookup.as_ref()), vec![kv]);
+                self.data.insert(Key::from_slice(lookup), vec![kv]);
             },
         }
         self.values = self.values.saturating_add(1);
+    }
+
+    /// Keeps the first `keep` values of `key` and drops the rest, removing the key if none stay.
+    pub(crate) fn truncate_values(&mut self, key: &[u8], keep: usize) {
+        let lookup = self.lookup_key(key);
+        if keep == 0 {
+            if let Some(removed) = self.data.shift_remove(lookup.as_ref()) {
+                self.values = self.values.saturating_sub(count_of(removed.len()));
+            }
+        } else if let Some(values) = self.data.get_mut(lookup.as_ref()) {
+            let dropped = values.len().saturating_sub(keep);
+            values.truncate(keep);
+            values.shrink_to_fit();
+            self.values = self.values.saturating_sub(count_of(dropped));
+        }
+    }
+
+    /// Moves `key` to just before `other` in insertion order if it comes after it; nothing changes if either is
+    /// absent. It restores the order values were meant to be inserted in when they were added as they were read.
+    pub(crate) fn order_before(&mut self, key: &[u8], other: &[u8]) {
+        let (key, other) = (self.lookup_key(key), self.lookup_key(other));
+        if let (Some(from), Some(to)) = (
+            self.data.get_index_of(key.as_ref()),
+            self.data.get_index_of(other.as_ref()),
+        ) && from > to
+        {
+            self.data.move_index(from, to);
+        }
     }
 
     /// Replaces the values of `key`, which keeps its position in insertion order if it is
@@ -452,7 +679,7 @@ impl Map {
         let lookup = self.lookup_key(key);
         let key_values: Vec<KeyValue> = values
             .into_iter()
-            .map(|value| KeyValue::new(Key::from_slice(key), value.as_ref()))
+            .map(|value| KeyValue::new(key, lookup.as_ref(), value.as_ref()))
             .collect();
         let added = key_values.len();
         if let Some(replaced) = self.data.insert(Key::from_slice(lookup.as_ref()), key_values) {
@@ -473,19 +700,19 @@ impl Map {
         let lookup = self.lookup_key(key);
         let value = value.as_ref();
 
-        match self.data.get_mut(lookup.as_ref()) {
-            Some(values) => match values.get_mut(index) {
+        match self.data.get_full_mut(lookup.as_ref()) {
+            Some((_, map_key, values)) => match values.get_mut(index) {
                 // Rewritten in its buffers: RULE's values are set this way for every rule evaluated
-                Some(entry) => entry.replace(key, value),
+                Some(entry) => entry.replace(key, map_key, value),
                 None => {
-                    values.push(KeyValue::new(Key::from_slice(key), value));
+                    push_grown(values, KeyValue::new(key, lookup.as_ref(), value));
                     self.values = self.values.saturating_add(1);
                 },
             },
             None => {
                 self.data.insert(
                     Key::from_slice(lookup.as_ref()),
-                    vec![KeyValue::new(Key::from_slice(key), value)],
+                    vec![KeyValue::new(key, lookup.as_ref(), value)],
                 );
                 self.values = self.values.saturating_add(1);
             },
@@ -532,6 +759,35 @@ impl Map {
             self.data = IndexMap::with_hasher(ahash::RandomState::new());
             self.values = 0;
         }
+    }
+
+    /// The bytes the lowercase copy of `key` takes while a lookup or an insertion works with it: a case-insensitive
+    /// map folds a name with a capital or a non-ASCII byte into a vector that lives as long as the call, and a
+    /// folded character can take more bytes than the one it came from, which can double the vector. None when the
+    /// key is looked up as it is.
+    pub(crate) fn lookup_scratch_bytes(&self, key: &[u8]) -> usize {
+        if self.case_sensitive {
+            0
+        } else {
+            fold_scratch_bytes(key)
+        }
+    }
+
+    /// What adding one key that the map does not hold takes from its table, see [`index_growth`].
+    pub(crate) fn new_key_table_growth(&self) -> Growth {
+        index_growth::<(Key, Vec<KeyValue>)>(self.data.len(), self.data.capacity())
+    }
+
+    /// The capacity of the table of keys.
+    pub(crate) fn key_table_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// The length and capacity of the value list of `lookup`, a key as [`Map::lookup_key`] files it, or `None` when
+    /// the map does not hold it.
+    pub(crate) fn value_list_shape(&self, lookup: &[u8]) -> Option<(usize, usize)> {
+        let values = self.data.get(lookup)?;
+        Some((values.len(), values.capacity()))
     }
 
     /// Number of distinct keys.
@@ -587,11 +843,11 @@ impl Map {
         let mut total = index_table_bytes::<(Key, Vec<KeyValue>)>(self.data.capacity());
         for (key, values) in &self.data {
             total = total.saturating_add(key.allocated_bytes());
-            total = total.saturating_add(values.capacity().saturating_mul(size_of::<KeyValue>()));
+            total = total.saturating_add(allocation_bytes(
+                values.capacity().saturating_mul(size_of::<KeyValue>()),
+            ));
             for value in values {
-                total = total
-                    .saturating_add(value.key.allocated_bytes())
-                    .saturating_add(value.value.capacity());
+                total = total.saturating_add(value.allocated_bytes());
             }
         }
         total
@@ -616,14 +872,21 @@ pub(crate) const KEY_COPIES_PER_INSERT: usize = 2;
 /// `insert_overhead_bounds_the_measured_growth` test checks against [`Map::allocated_bytes`].
 pub(crate) const INSERT_OVERHEAD_BYTES: usize = 2
     * (size_of::<(Key, Vec<KeyValue>)>() + 3 * size_of::<usize>() + 5 * (size_of::<usize>() + 1))
-    + 2 * size_of::<KeyValue>();
+    + 2 * size_of::<KeyValue>()
+    + ALLOCATIONS_PER_INSERT * ALLOCATION_OVERHEAD_BYTES;
+
+/// Allocations one inserted value can make that [`ALLOCATION_OVERHEAD_BYTES`] is charged on: the new key, its
+/// value vector, the spelling beside the value, and the value itself, which the entry vector's growth also
+/// allocates once more.
+const ALLOCATIONS_PER_INSERT: usize = 5;
 
 /// One-time worst-case bytes a map allocates when its first entry is inserted, beyond the steady
 /// [`INSERT_OVERHEAD_BYTES`] share: the vector and hash index start at four entries, and a new key's value
 /// vector starts at four values.
 pub(crate) const FIRST_INSERT_OVERHEAD_BYTES: usize = 4
     * (size_of::<(Key, Vec<KeyValue>)>() + 3 * size_of::<usize>() + 2 * (size_of::<usize>() + 1))
-    + 4 * size_of::<KeyValue>();
+    + 4 * size_of::<KeyValue>()
+    + 2 * ALLOCATION_OVERHEAD_BYTES;
 
 /// Estimated bytes of an `IndexMap`'s backing allocations for `capacity` entries.
 ///
@@ -632,11 +895,99 @@ pub(crate) const FIRST_INSERT_OVERHEAD_BYTES: usize = 4
 /// entry vector is sized from the capacity and the index is rounded up to a power of two,
 /// which over-counts rather than under-counts. Neither allocation shrinks on removal, so a
 /// cleared map keeps its cost.
-fn index_table_bytes<T>(capacity: usize) -> usize {
+pub(crate) fn index_table_bytes<T>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
     }
     index_entries_bytes::<T>(capacity).saturating_add(index_buckets_bytes(capacity))
+}
+
+/// What adding one entry to an `IndexMap` of `T` entries that holds `len` in `capacity` takes from its table: the
+/// grown table, held beside the old one while the entries move, and the old one, freed after. Nothing while the
+/// table has room.
+pub(crate) fn index_growth<T>(len: usize, capacity: usize) -> Growth {
+    if len < capacity {
+        return Growth::default();
+    }
+    Growth {
+        grown: index_table_bytes::<T>(index_capacity_for(len.saturating_add(1)).max(capacity)),
+        freed: index_table_bytes::<T>(capacity),
+    }
+}
+
+/// The capacity an `IndexMap` has grown to once it holds `len` entries: the hash index's, which the entry vector
+/// follows. Its buckets are the power of two that keeps the load at or under seven eighths, four at least, and
+/// a table below eight buckets holds one entry fewer than it has.
+pub(crate) fn index_capacity_for(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let buckets = if len < 4 {
+        4
+    } else if len < 8 {
+        8
+    } else {
+        len.saturating_mul(8)
+            .div_ceil(7)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+    };
+    if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 }
+}
+
+/// Estimated bytes of the allocations of a map of values whose table has `capacity` entries.
+pub(crate) fn map_capacity_bytes(capacity: usize) -> usize {
+    index_table_bytes::<(Key, Vec<KeyValue>)>(capacity)
+}
+
+/// What one change takes from a memory budget: `grown`, charged before it is made, which holds a list or table
+/// that grows beside the one it replaces, and `freed`, given back once it is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Growth {
+    /// Bytes to charge before the change.
+    pub(crate) grown: usize,
+    /// Bytes of `grown` to give back after it.
+    pub(crate) freed: usize,
+}
+
+impl Growth {
+    /// Both changes together.
+    pub(crate) fn plus(self, other: Self) -> Self {
+        Self {
+            grown: self.grown.saturating_add(other.grown),
+            freed: self.freed.saturating_add(other.freed),
+        }
+    }
+}
+
+/// What a map allocates for the key of one more value, which it files under `lookup` (see [`Map::lookup_key`]):
+/// the value's own spelling when it is not `lookup`, and `lookup` itself when the key is `new` to the map.
+pub(crate) fn key_bytes(key: &[u8], lookup: &[u8], new: bool) -> Growth {
+    let none = Growth::default();
+    let spelling = if key == lookup { none } else { stored_key_bytes(key) };
+    let stored = if new { stored_key_bytes(lookup) } else { none };
+    spelling.plus(stored)
+}
+
+/// What a stored copy of `key` allocates: its text, or for bytes that are not UTF-8 those bytes and their lossy
+/// text, which keeps three bytes for each at most but is built in a buffer that doubles to four times the key beside
+/// the one it replaces, before the bytes are copied. What the build holds beyond the stored key is freed after it.
+fn stored_key_bytes(key: &[u8]) -> Growth {
+    if std::str::from_utf8(key).is_ok() {
+        return Growth {
+            grown: allocation_bytes(key.len()),
+            freed: 0,
+        };
+    }
+    let retained = allocation_bytes(size_of::<ByteKey>())
+        .saturating_add(allocation_bytes(key.len()))
+        .saturating_add(allocation_bytes(key.len().saturating_mul(3)));
+    let built =
+        allocation_bytes(key.len().saturating_mul(4)).saturating_add(allocation_bytes(key.len().saturating_mul(2)));
+    Growth {
+        grown: retained.max(built),
+        freed: built.saturating_sub(retained),
+    }
 }
 
 /// Estimated bytes of the entry vector for `capacity` entries.
@@ -683,9 +1034,9 @@ pub(crate) fn keys_scanned() -> usize {
 impl std::fmt::Display for Map {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}:", self.name())?;
-        for values in self.data.values() {
+        for (map_key, values) in &self.data {
             if let Some(first) = values.first() {
-                write!(f, "    {}: ", first.key.text())?;
+                write!(f, "    {}: ", first.key_text(map_key))?;
                 for (i, kv) in values.iter().enumerate() {
                     if i > 0 {
                         write!(f, ",")?;
@@ -700,6 +1051,7 @@ impl std::fmt::Display for Map {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "map tests use fixed fixtures")]
 mod tests {
     use super::{index_buckets_bytes, index_entries_bytes, index_table_bytes};
 
@@ -1070,6 +1422,182 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_value_keeps_its_own_spelling_of_the_key_it_shares_with_the_map() {
+        let mut map = Map::new(RuleVariable::RequestHeaders);
+        map.add("User-Agent", "a");
+        map.add("user-agent", "b");
+        map.add("USER-AGENT", "c");
+        map.add("User-Agent", "d");
+
+        // Each value reports the spelling it arrived with, in insertion order, whatever the map filed it under.
+        let spellings: Vec<&str> = map.iter().map(|(key, _)| key).collect();
+        assert_eq!(spellings, ["User-Agent", "user-agent", "USER-AGENT", "User-Agent"]);
+        let bytes: Vec<&[u8]> = map.iter_bytes().map(|(key, _)| key).collect();
+        assert_eq!(bytes, [&b"User-Agent"[..], b"user-agent", b"USER-AGENT", b"User-Agent"]);
+        let values: Vec<&[u8]> = map.iter_key("uSeR-aGeNt").map(|(_, value)| value).collect();
+        assert_eq!(values, [&b"a"[..], b"b", b"c", b"d"]);
+        // The entries are keyed by the lower-case form, as before.
+        assert_eq!(map.entries().keys().collect::<Vec<_>>(), ["user-agent"]);
+        assert_eq!(map.value_at(0, 2, true), Some((&b"USER-AGENT"[..], &b"USER-AGENT"[..])));
+        assert_eq!(map.value_at(0, 1, false), Some((&b"user-agent"[..], &b"b"[..])));
+        let indexed: Vec<&[u8]> = map.iter_bytes_indexed().map(|(_, _, key, _)| key).collect();
+        assert_eq!(indexed, bytes);
+        let regex = Regex::new("^user-agent$").unwrap();
+        let matched: Vec<&str> = map.iter_regex(&regex).map(|(key, _)| key).collect();
+        assert_eq!(
+            matched, spellings,
+            "a regex selects on the map key and reports each spelling"
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_costs_less_than_its_own_length_per_value() {
+        // The value's key is the map's own, so a long key repeated for every value is stored once.
+        let key = "k".repeat(200);
+        let mut map = Map::new_case_sensitive(RuleVariable::ArgsPost);
+        for _ in 0..1000 {
+            map.add(&key, "v");
+        }
+        assert_eq!(map.value_count(), 1000);
+        assert!(
+            map.allocated_bytes() < 1000 * key.len(),
+            "{} bytes for 1000 values of a {} byte key",
+            map.allocated_bytes(),
+            key.len()
+        );
+        // And what is stored is still reported per value.
+        assert!(map.iter().all(|(k, v)| k == key && v == b"v"));
+        assert_eq!(map.iter_bytes().count(), 1000);
+    }
+
+    #[test]
+    fn a_differing_invalid_spelling_keeps_its_bytes_and_a_shared_one_keeps_the_map_keys() {
+        let mut map = Map::new(RuleVariable::RequestHeaders);
+        map.add_bytes(b"X\xff", "upper");
+        map.add_bytes(b"x\xff", "lower");
+        map.add_bytes(b"X\xff", "upper again");
+
+        let bytes: Vec<&[u8]> = map.iter_bytes().map(|(key, _)| key).collect();
+        assert_eq!(bytes, [&b"X\xff"[..], b"x\xff", b"X\xff"]);
+        let text: Vec<&str> = map.iter().map(|(key, _)| key).collect();
+        assert_eq!(text, ["X\u{fffd}", "x\u{fffd}", "X\u{fffd}"]);
+        assert_eq!(map.len(), 1, "one folded key");
+        assert_eq!(map.values(b"X\xFF").count(), 3, "lookups fold the valid bytes only");
+
+        let mut exact = Map::new_case_sensitive(RuleVariable::Args);
+        exact.add_bytes(b"a\xff", "1");
+        exact.add_bytes(b"a\xff", "2");
+        exact.add_bytes(b"a\xfe", "3");
+        let bytes: Vec<&[u8]> = exact.iter_bytes().map(|(key, _)| key).collect();
+        assert_eq!(bytes, [&b"a\xff"[..], b"a\xff", b"a\xfe"]);
+        assert_eq!(exact.iter().count(), 3);
+        assert_eq!(exact.iter_key_exact(b"a\xff").count(), 2);
+        assert_eq!(exact.value_at(0, 1, true), Some((&b"a\xff"[..], &b"a\xff"[..])));
+    }
+
+    #[test]
+    fn rewriting_a_value_in_place_replaces_its_spelling_when_it_differs() {
+        let mut map = Map::new(RuleVariable::Rule);
+        map.set_index("Foo", 0, "1");
+        assert_eq!(map.iter().next(), Some(("Foo", &b"1"[..])));
+        map.set_index("foo", 0, "2");
+        assert_eq!(map.iter().next(), Some(("foo", &b"2"[..])));
+        map.set_index("FOO", 0, "3");
+        assert_eq!(map.iter().next(), Some(("FOO", &b"3"[..])));
+        map.set_index("foo", 0, "4");
+        assert_eq!(map.iter().collect::<Vec<_>>(), [("foo", &b"4"[..])]);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn an_owned_value_is_taken_and_trimmed_to_its_length() {
+        let mut map = Map::new_case_sensitive(RuleVariable::RequestXML);
+        let mut value = Vec::with_capacity(4096);
+        value.extend_from_slice(b"abc");
+        map.add_owned(b"/*", value);
+        map.add_owned(b"/*", b"def".to_vec());
+
+        assert_eq!(map.values("/*").collect::<Vec<_>>(), [b"abc".as_slice(), b"def"]);
+        assert_eq!(map.value_count(), 2);
+        assert!(
+            map.allocated_bytes() < 1024,
+            "the spare capacity was not kept: {}",
+            map.allocated_bytes()
+        );
+    }
+
+    #[test]
+    fn truncating_values_keeps_the_prefix_and_the_count() {
+        let mut map = Map::new_case_sensitive(RuleVariable::RequestXML);
+        for value in ["a", "b", "c", "d"] {
+            map.add("k", value);
+        }
+        map.add("other", "x");
+        map.truncate_values(b"k", 2);
+        assert_eq!(map.values("k").collect::<Vec<_>>(), [b"a".as_slice(), b"b"]);
+        assert_count(&map, 3);
+        map.truncate_values(b"k", 5);
+        assert_count(&map, 3);
+        map.truncate_values(b"missing", 0);
+        assert_count(&map, 3);
+        map.truncate_values(b"k", 0);
+        assert!(map.values("k").next().is_none());
+        assert_eq!(map.len(), 1, "a key left with no values is removed");
+        assert_count(&map, 1);
+    }
+
+    #[test]
+    fn a_key_is_moved_before_another_only_when_it_comes_after_it() {
+        let mut map = Map::new_case_sensitive(RuleVariable::RequestXML);
+        map.add("first", "1");
+        map.add("/*", "text");
+        map.add("//@*", "attribute");
+        map.add("last", "9");
+        map.order_before(b"//@*", b"/*");
+        let keys: Vec<&str> = map.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["first", "//@*", "/*", "last"]);
+
+        // Already in order, or absent: nothing moves.
+        map.order_before(b"//@*", b"/*");
+        map.order_before(b"missing", b"/*");
+        map.order_before(b"first", b"missing");
+        let keys: Vec<&str> = map.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["first", "//@*", "/*", "last"]);
+        assert_count(&map, 4);
+    }
+
+    #[test]
+    fn long_value_lists_grow_by_a_quarter_and_short_ones_double() {
+        let mut map = Map::new_case_sensitive(RuleVariable::ArgsPost);
+        for _ in 0..5000_usize {
+            map.add("k", "v");
+            let values = map.data.get(&b"k"[..]).unwrap();
+            let (len, capacity) = (values.len(), values.capacity());
+            if len < 1024 {
+                assert!(capacity <= 2 * len.max(4), "{len} values in room for {capacity}");
+            } else {
+                assert!(
+                    capacity * 4 <= len * 5 + 4,
+                    "{len} values in room for {capacity}, more than a quarter spare"
+                );
+            }
+        }
+        assert_count(&map, 5000);
+    }
+
+    #[test]
+    fn allocations_are_charged_the_chunk_a_malloc_rounds_them_up_to() {
+        use super::allocation_bytes;
+        for (capacity, chunk) in [(0, 0), (1, 32), (24, 32), (25, 48), (40, 48), (41, 64), (1000, 1008)] {
+            assert_eq!(allocation_bytes(capacity), chunk, "a request of {capacity}");
+        }
+        // A one-byte value is held in thirty-two: counting its capacity alone undercounts it.
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add("k", "v");
+        assert!(map.allocated_bytes() >= 32 + 32 + size_of::<KeyValue>());
+    }
+
     /// The maintained total must equal the values actually stored after every mutation.
     #[track_caller]
     fn assert_count(map: &Map, expected: usize) {
@@ -1148,5 +1676,46 @@ mod tests {
         // Case-insensitive lookup returns both values
         let values = map.get("CONTENT-TYPE");
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn a_new_keys_table_growth_is_what_the_table_really_grows_by() {
+        use super::{Growth, Map, map_capacity_bytes};
+        use crate::types::RuleVariable;
+
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        for index in 0..2_000 {
+            let growth = map.new_key_table_growth();
+            let capacity = map.key_table_capacity();
+            map.add(&format!("key{index}"), "v");
+            if growth == Growth::default() {
+                assert_eq!(map.key_table_capacity(), capacity, "key {index} fits the table");
+            } else {
+                assert_eq!(growth.freed, map_capacity_bytes(capacity), "key {index}");
+                assert_eq!(
+                    growth.grown,
+                    map_capacity_bytes(map.key_table_capacity()),
+                    "key {index}"
+                );
+                assert!(map.key_table_capacity() > capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn the_lowercase_copy_of_a_name_is_charged_only_where_a_map_makes_one() {
+        use super::{Map, fold_scratch_bytes};
+        use crate::types::RuleVariable;
+
+        let insensitive = Map::new(RuleVariable::Args);
+        let sensitive = Map::new_case_sensitive(RuleVariable::Args);
+        assert_eq!(insensitive.lookup_scratch_bytes(b"lower"), 0);
+        assert!(insensitive.lookup_scratch_bytes(b"Upper") >= 5);
+        assert!(
+            insensitive.lookup_scratch_bytes("é".as_bytes()) >= 2,
+            "a name that is not ASCII is folded"
+        );
+        assert_eq!(sensitive.lookup_scratch_bytes(b"Upper"), 0);
+        assert_eq!(fold_scratch_bytes(b"Upper"), insensitive.lookup_scratch_bytes(b"Upper"));
     }
 }

@@ -27,7 +27,7 @@ use std::{
 };
 
 use coraza::{
-    transaction::{Interruption, Transaction},
+    transaction::{BodyCopy, Interruption, Transaction},
     types::RuleEngineStatus,
 };
 use proxy_wasm::{
@@ -83,6 +83,8 @@ pub(crate) enum TerminalOutcome {
     BodyTooLarge { phase: &'static str, status: u16 },
     /// Coraza processed the configured prefix and allowed the request to continue.
     BodyPartiallyInspected { phase: &'static str },
+    /// A body processor stopped at the memory budget the root left it, so only what it had parsed was inspected.
+    BodyMemoryBudgetStopped { phase: &'static str },
     /// The per-root retained-body cap was exhausted.
     RetainedBodyBudgetExhausted { phase: &'static str },
     /// A callback sequence or host response made inspection impossible.
@@ -105,6 +107,7 @@ impl TerminalOutcome {
             Self::Incomplete { .. } => "incomplete",
             Self::BodyTooLarge { .. } => "body_too_large",
             Self::BodyPartiallyInspected { .. } => "body_partially_inspected",
+            Self::BodyMemoryBudgetStopped { .. } => "body_memory_budget_stopped",
             Self::RetainedBodyBudgetExhausted { .. } => "retained_body_budget_exhausted",
             Self::InvalidLifecycle { .. } => "invalid_lifecycle",
             Self::InvalidAuthority { .. } => "invalid_authority",
@@ -118,7 +121,9 @@ impl TerminalOutcome {
             Self::UnmatchedAuthority | Self::EngineOff => "uninspected",
             Self::Unsupported(_) => "unsupported",
             Self::Denied { .. } => "denied",
-            Self::Incomplete { .. } | Self::BodyPartiallyInspected { .. } => "incomplete",
+            Self::Incomplete { .. } | Self::BodyPartiallyInspected { .. } | Self::BodyMemoryBudgetStopped { .. } => {
+                "incomplete"
+            },
             Self::BodyTooLarge { .. }
             | Self::RetainedBodyBudgetExhausted { .. }
             | Self::InvalidLifecycle { .. }
@@ -133,6 +138,7 @@ impl TerminalOutcome {
         matches!(
             self,
             Self::Incomplete { .. }
+                | Self::BodyMemoryBudgetStopped { .. }
                 | Self::BodyTooLarge { .. }
                 | Self::RetainedBodyBudgetExhausted { .. }
                 | Self::InvalidLifecycle { .. }
@@ -312,6 +318,9 @@ pub(crate) struct CorazaHttp {
     telemetry_publish_failed: bool,
     request_body_truncated: bool,
     response_body_truncated: bool,
+    /// Whether a body processor stopped at the memory budget with no rule denying, so the body was only partly
+    /// inspected.
+    body_inspection_stopped: bool,
     request_mode: RequestMode,
     request_method: String,
     request_protocol: String,
@@ -344,6 +353,7 @@ impl CorazaHttp {
             telemetry_publish_failed: false,
             request_body_truncated: false,
             response_body_truncated: false,
+            body_inspection_stopped: false,
             request_mode: RequestMode::Inspect,
             request_method: String::new(),
             request_protocol: String::new(),
@@ -631,6 +641,17 @@ impl CorazaHttp {
             self.outcome
                 .get_or_insert(TerminalOutcome::BodyPartiallyInspected { phase: "request-body" });
         }
+        // The policy let it through, as its rules decide, but only what the parser got to was inspected, and the
+        // telemetry must not say the request was inspected whole.
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.request_body_stopped_by_memory_budget())
+        {
+            self.body_inspection_stopped = true;
+            self.outcome
+                .get_or_insert(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" });
+        }
         Action::Continue
     }
 
@@ -639,21 +660,36 @@ impl CorazaHttp {
         body_size: usize,
         body_access: bool,
     ) -> Result<Option<Interruption>, TerminalOutcome> {
+        let ingests = body_access && body_size > 0;
+        let lease = match self.tx.as_deref() {
+            Some(tx) => BodyLease::new(
+                ingests,
+                body_size,
+                tx.request_body_limit(),
+                tx.request_body_copy(),
+                tx.body_memory_bytes(),
+            ),
+            None => BodyLease::default(),
+        };
         self.request_host_bytes = body_size;
-        if body_access && body_size > 0 {
+        if ingests {
             self.request_copy_bytes = body_size;
-            self.request_engine_bytes = body_size;
         }
+        self.request_engine_bytes = lease.engine_before_parsing;
         if !self.update_accounting() {
             return Err(TerminalOutcome::RetainedBodyBudgetExhausted { phase: "request-body" });
         }
-        let body = if body_access && body_size > 0 {
+        let body = if ingests {
             Self::copy_request_body(body_size).map_err(|phase| TerminalOutcome::Incomplete { phase, status: 503 })?
         } else {
             Vec::new()
         };
+        let budget = self.parse_budget(lease.after_parsing);
         let diagnostics_before = self.diagnostic_count();
-        let interruption = self.tx.as_deref_mut().and_then(|tx| tx.process_request_body(&body));
+        let interruption = self.tx.as_deref_mut().and_then(|tx| {
+            tx.set_body_memory_budget(Some(budget));
+            tx.process_request_body(&body)
+        });
         self.mark_diagnostic_change(diagnostics_before);
         drop(body);
         self.request_host_bytes = 0;
@@ -1151,7 +1187,8 @@ impl CorazaHttp {
             .tx
             .as_deref()
             .is_some_and(Transaction::is_response_body_processable);
-        let interruption = match self.inspect_response_body(body_size, body_access, processable) {
+        let fetch = |size| hostcalls::get_buffer(BufferType::HttpResponseBody, 0, size);
+        let interruption = match self.inspect_response_body(body_size, body_access, processable, fetch) {
             Ok(interruption) => interruption,
             Err(outcome) => return self.reject_response(503, RESPONSE_INCOMPLETE_BODY, outcome),
         };
@@ -1168,6 +1205,20 @@ impl CorazaHttp {
             let result = self.replace_interruption(&interruption, body_size);
             return self.response_mutation_action(result);
         }
+        // The budget is the connector's own limit, not a policy's: a response its parser stopped in has been inspected
+        // only in part, and no rule need read `RES_BODY_ERROR` (the recommended configuration's reads only
+        // `REQBODY_ERROR`), so it is not forwarded as if it had been inspected.
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.response_body_stopped_by_memory_budget())
+        {
+            return self.reject_response(
+                502,
+                RESPONSE_INCOMPLETE_BODY,
+                TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" },
+            );
+        }
         if self.tx.as_ref().is_some_and(|tx| tx.response_body_stats().truncated) {
             self.outcome
                 .get_or_insert(TerminalOutcome::BodyPartiallyInspected { phase: "response-body" });
@@ -1181,23 +1232,33 @@ impl CorazaHttp {
         body_size: usize,
         body_access: bool,
         processable: bool,
+        fetch: impl FnOnce(usize) -> Result<Option<Vec<u8>>, Status>,
     ) -> Result<Option<Interruption>, TerminalOutcome> {
         let mut body = Vec::new();
-        if body_access && processable && body_size > 0 {
+        let ingests = body_access && processable && body_size > 0;
+        let lease = match self.tx.as_deref() {
+            Some(tx) => BodyLease::new(
+                ingests,
+                body_size,
+                tx.response_body_limit(),
+                tx.response_body_copy(),
+                self.response_engine_memory_bytes(),
+            ),
+            None => BodyLease::default(),
+        };
+        if ingests {
             self.response_copy_bytes = body_size;
-            self.response_engine_bytes = body_size;
         }
+        self.response_engine_bytes = lease.engine_before_parsing;
         if !self.update_accounting() {
             return Err(TerminalOutcome::RetainedBodyBudgetExhausted {
                 phase: "response-body-copy",
             });
         }
-        if body_access && processable && body_size > 0 {
-            let Some(bytes) = hostcalls::get_buffer(BufferType::HttpResponseBody, 0, body_size).map_err(|_error| {
-                TerminalOutcome::Incomplete {
-                    phase: "response-body-buffer-hostcall",
-                    status: 503,
-                }
+        if ingests {
+            let Some(bytes) = fetch(body_size).map_err(|_error| TerminalOutcome::Incomplete {
+                phase: "response-body-buffer-hostcall",
+                status: 503,
             })?
             else {
                 return Err(TerminalOutcome::Incomplete {
@@ -1213,8 +1274,12 @@ impl CorazaHttp {
             }
             body = bytes;
         }
+        let budget = self.parse_budget(lease.after_parsing);
         let diagnostics_before = self.diagnostic_count();
-        let interruption = self.tx.as_deref_mut().and_then(|tx| tx.process_response_body(&body));
+        let interruption = self.tx.as_deref_mut().and_then(|tx| {
+            tx.set_body_memory_budget(Some(budget));
+            tx.process_response_body(&body)
+        });
         self.mark_diagnostic_change(diagnostics_before);
         drop(body);
         self.response_host_bytes = 0;
@@ -1420,7 +1485,9 @@ impl CorazaHttp {
             final_outcome,
             TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
         ) && !self.request_body_truncated
-            && !self.response_body_truncated;
+            && !self.response_body_truncated
+            // A rule that denied has decided on what it saw; a body that was let through has not been seen whole.
+            && !(self.body_inspection_stopped && final_outcome == TerminalOutcome::Completed);
         let reason = if self.finalization_result == FinalizationResult::Failed {
             "finalization_error"
         } else {
@@ -1488,6 +1555,18 @@ impl CorazaHttp {
             .as_deref()
             .map_or(0, Transaction::body_memory_bytes)
             .saturating_sub(self.request_engine_bytes)
+    }
+
+    /// What the engine may retain while it parses a body: whatever the root has left once this stream's own charges are
+    /// in (the host's buffer, the guest's copy, and the engine's buffer with what the transaction already held, and
+    /// the copy the processor makes before it parses), less `after_parsing`, the copy it makes once it is done.
+    /// Streams that retain bytes concurrently have already taken theirs out of the root, so the peak of this parse and
+    /// theirs together cannot pass [`MAX_ROOT_RETAINED_BODY_BYTES`]. Charging after the parse stays the authority on
+    /// what was kept.
+    fn parse_budget(&self, after_parsing: usize) -> usize {
+        MAX_ROOT_RETAINED_BODY_BYTES
+            .saturating_sub(self.root_retained_bytes.get())
+            .saturating_sub(after_parsing)
     }
 
     fn update_accounting(&mut self) -> bool {
@@ -1578,6 +1657,37 @@ impl Drop for CorazaHttp {
         }
         self.tx.take();
         self.release_accounting();
+    }
+}
+
+/// What the engine holds for a body before it parses it, in the units the root's retained-body cap counts.
+///
+/// The engine retains the prefix of the body its limit allows, not all of what the host holds, and a processor
+/// keeps a copy of that prefix only if it is one that stores the raw body (see [`BodyCopy`]).
+#[derive(Debug, Default)]
+struct BodyLease {
+    /// The engine's share while it parses: what the transaction already held, the prefix of the body its buffer
+    /// retains, and a copy of that prefix made first.
+    engine_before_parsing: usize,
+    /// The copy of that prefix made after the parse, which the parse must leave room for.
+    after_parsing: usize,
+}
+
+impl BodyLease {
+    /// The lease for a body of `body_size` bytes under `limit`, when `ingests` says the engine takes it, beside the
+    /// `existing` bytes the transaction holds.
+    fn new(ingests: bool, body_size: usize, limit: i64, copy: BodyCopy, existing: usize) -> Self {
+        let prefix = if ingests {
+            usize::try_from(limit).map_or(body_size, |limit| body_size.min(limit))
+        } else {
+            0
+        };
+        Self {
+            engine_before_parsing: existing
+                .saturating_add(prefix)
+                .saturating_add(if copy == BodyCopy::BeforeParsing { prefix } else { 0 }),
+            after_parsing: if copy == BodyCopy::AfterParsing { prefix } else { 0 },
+        }
     }
 }
 
@@ -1859,6 +1969,7 @@ fn log_debug(message: &str) {
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
+    use coraza::types::RuleVariable;
     use proxy_wasm::types::{Action, Status};
 
     use super::{
@@ -1977,6 +2088,56 @@ mod tests {
             retained_before,
             "later body callbacks add no retained bytes"
         );
+    }
+
+    #[test]
+    fn a_response_body_is_parsed_within_what_the_root_has_left() {
+        let config = Config::parse(
+            br#"{"directives_map":{"p":["SecRuleEngine On","SecResponseBodyAccess On","SecResponseBodyMimeType application/json","SecResponseBodyLimit 1048576","SecRule RESPONSE_CONTENT_TYPE \"^application/json\" \"id:200001,phase:3,t:none,pass,nolog,ctl:responseBodyProcessor=JSON\""]},"default_directives":"p"}"#,
+        )
+        .expect("the response policy is valid");
+        let generation = Rc::new(Generation::compile(config).expect("the policy compiles"));
+        let policy = generation
+            .select("example.test")
+            .expect("the default policy is selected");
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri("/", "GET", "HTTP/1.1");
+        transaction.process_request_headers();
+        assert!(transaction.process_request_body(b"").is_none());
+        transaction.add_response_header("content-type", b"application/json");
+        assert!(transaction.process_response_headers(200, "HTTP/1.1").is_none());
+        let already_held = transaction.body_memory_bytes();
+
+        // Three quarters of a megabyte of nested arrays: its container index alone is charged some 7 MiB, which is
+        // more than the root has left.
+        let mut body = b"[".to_vec();
+        body.extend(b"[[]],".repeat(150_000));
+        body.extend_from_slice(b"[]]");
+        let others = 58 * 1024 * 1024;
+        let root = Rc::new(Cell::new(others));
+        let mut stream = CorazaHttp::new(Some(generation), Rc::clone(&root));
+        stream.tx = Some(Box::new(transaction));
+
+        let size = body.len();
+        stream.response_host_bytes = size;
+        let outcome = stream.inspect_response_body(size, true, true, move |_| Ok(Some(body)));
+
+        assert!(
+            matches!(outcome, Ok(None)),
+            "a body error does not interrupt by itself: {outcome:?}"
+        );
+        let tx = stream.tx.as_deref().expect("the transaction is retained");
+        assert_eq!(
+            tx.body_memory_budget(),
+            Some(MAX_ROOT_RETAINED_BODY_BYTES - others - 4 * size - already_held),
+            "the parser got what the root had left after this response's charges and what the transaction held"
+        );
+        assert_eq!(
+            tx.get_variable(RuleVariable::ResBodyError, None).as_deref(),
+            Some("1"),
+            "the parse stopped at the budget and reported it"
+        );
+        assert!(others + tx.body_memory_bytes() <= MAX_ROOT_RETAINED_BODY_BYTES);
     }
 
     #[test]
@@ -2288,17 +2449,18 @@ mod scripted_host_tests {
         types::{Action, Status},
     };
 
-    use super::{CorazaHttp, TerminalOutcome};
+    use super::{CorazaHttp, TerminalOutcome, MAX_ROOT_RETAINED_BODY_BYTES};
     use crate::{config::Config, policy::Generation, test_hostcalls};
+
+    /// One mebibyte.
+    const MIB: usize = 1024 * 1024;
 
     /// Denies the source address 1.2.3.4 and nothing else.
     const DENY_SOURCE: &str = r#"SecRule REMOTE_ADDR \"@ipMatch 1.2.3.4\" \"id:200,phase:1,deny,status:403\""#;
 
     /// A stream pinned to the generation `config` compiles to.
     fn stream(config: &str) -> CorazaHttp {
-        let config = Config::parse(config.as_bytes()).expect("configuration is valid");
-        let generation = Generation::compile(config).expect("policy compiles");
-        CorazaHttp::new(Some(Rc::new(generation)), Rc::new(Cell::new(0)))
+        stream_beside(config, 0).0
     }
 
     /// A stream whose default policy denies source address 1.2.3.4.
@@ -2318,12 +2480,17 @@ mod scripted_host_tests {
             (":path", b"/"),
         ];
         test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        headers.len()
+    }
+
+    /// Scripts the properties of a connection from 1.2.3.4:5555 to 10.0.0.1:8080 over HTTP/1.1.
+    fn script_connection_properties() {
         test_hostcalls::set_property("request.protocol", b"HTTP/1.1");
         test_hostcalls::set_property("source.address", b"1.2.3.4:5555");
         test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
         test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
         test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
-        headers.len()
     }
 
     /// The policy an `authority` request over `scheme` selects.
@@ -2496,5 +2663,375 @@ mod scripted_host_tests {
                 "{property} is not consulted: the IP rule decides"
             );
         }
+    }
+    /// The rule that denies a failed parse, as CRS rule 200002 does.
+    const DENY_BODY_ERRORS: &str =
+        r#", "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"""#;
+
+    /// A stream over `config` whose root context already holds `other_streams` bytes for its siblings, and that
+    /// root.
+    fn stream_beside(config: &str, other_streams: usize) -> (CorazaHttp, Rc<Cell<usize>>) {
+        let config = Config::parse(config.as_bytes()).expect("configuration is valid");
+        let generation = Generation::compile(config).expect("policy compiles");
+        let root = Rc::new(Cell::new(other_streams));
+        (CorazaHttp::new(Some(Rc::new(generation)), Rc::clone(&root)), root)
+    }
+
+    /// Scripts a POST of `body` to the host, and runs the stream through its request headers; returns the body size.
+    fn begin_post(stream: &mut CorazaHttp, content_type: &str, body: &[u8]) -> usize {
+        test_hostcalls::reset();
+        let length = body.len().to_string();
+        let headers: [(&str, &[u8]); 6] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", b"/"),
+            ("content-type", content_type.as_bytes()),
+            ("content-length", length.as_bytes()),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        test_hostcalls::set_request_body(body);
+        assert_eq!(
+            stream.on_http_request_headers(headers.len(), false),
+            Action::Pause,
+            "the headers wait for the body"
+        );
+        body.len()
+    }
+
+    /// A dense XML list of `size` bytes, the densest ordinary body.
+    fn xml_list(size: usize) -> Vec<u8> {
+        let mut body = b"<r>".to_vec();
+        while body.len() < size - 4 {
+            body.extend_from_slice(b"<i>1</i>");
+        }
+        body.extend_from_slice(b"</r>");
+        body
+    }
+
+    #[test]
+    fn an_xml_body_beside_retaining_streams_is_a_body_error_instead_of_an_overshoot() {
+        let config = policy(LIMITS, DENY_BODY_ERRORS);
+        let body = xml_list(2 * MIB);
+
+        // The same body alone parses cleanly: only what the others hold stops it.
+        let (mut alone, _) = stream_beside(&config, 0);
+        let size = begin_post(&mut alone, "text/xml", &body);
+        assert_eq!(alone.on_http_request_body(size, true), Action::Continue);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+
+        // Concurrent streams hold 50 MiB of the root's 64, which leaves 14 for this body's three charges (host buffer,
+        // copy and engine buffer, 2 MiB each) and what its parser may retain; or they leave room for the three charges
+        // and what the transaction holds, and a kilobyte or nothing to parse in.
+        for spare in [None, Some(1024), Some(0)] {
+            let (mut stream, root) = stream_beside(&config, 50 * MIB);
+            let size = begin_post(&mut stream, "text/xml", &body);
+            if let Some(spare) = spare {
+                // Held by this very transaction: ids come from a process-wide counter and can grow a digit.
+                root.set(MAX_ROOT_RETAINED_BODY_BYTES - 3 * size - held(&stream) - spare);
+            }
+            let others = root.get();
+            assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
+
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [400],
+                "the failed parse reaches rule 200002, which denies"
+            );
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::Denied {
+                    phase: "request-body",
+                    status: 400
+                })
+            );
+            // Without the budget the parser would have kept some 25 MiB for this body, and the check after it would
+            // have answered 503 for a body the engine had already allocated.
+            assert_eq!(root.get(), others, "the stream's charges are released with it");
+        }
+    }
+
+    /// A policy with `rules` beside the body policy a connector gets from CRS: XML, JSON and URL-encoded bodies are
+    /// parsed as their content types select, and nothing reads `REQBODY_ERROR`, unless `rules` does.
+    fn policy(limits: &str, rules: &str) -> String {
+        format!(
+            r#"{{"directives_map": {{"p": ["SecRuleEngine On", "SecRequestBodyAccess On", "SecResponseBodyAccess On",
+            "SecResponseBodyMimeType application/json", "SecResponseBodyLimit 1048576", {limits}
+            "SecRule REQUEST_HEADERS:Content-Type \"^text/xml\" \"id:200000,phase:1,t:none,pass,nolog,ctl:requestBodyProcessor=XML\"",
+            "SecRule REQUEST_HEADERS:Content-Type \"^application/json\" \"id:200001,phase:1,t:none,pass,nolog,ctl:requestBodyProcessor=JSON\"",
+            "SecRule REQUEST_HEADERS:Content-Type \"^application/x-www-form-urlencoded\" \"id:200006,phase:1,t:none,pass,nolog,ctl:requestBodyProcessor=URLENCODED\"",
+            "SecRule RESPONSE_CONTENT_TYPE \"^application/json\" \"id:200007,phase:3,t:none,pass,nolog,ctl:responseBodyProcessor=JSON\""
+            {rules}]}},
+            "default_directives": "p", "enable_filter_state_logs": true}}"#
+        )
+    }
+
+    /// The body limits of the policies above.
+    const LIMITS: &str = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608","#;
+
+    /// What the transaction of `stream` holds, which the engine's share of the root's cap starts from.
+    fn held(stream: &CorazaHttp) -> usize {
+        stream
+            .tx
+            .as_deref()
+            .expect("the transaction is kept")
+            .body_memory_bytes()
+    }
+
+    /// The memory budget the parser of the request body of `stream` was given.
+    fn parser_budget(stream: &CorazaHttp) -> Option<usize> {
+        stream
+            .tx
+            .as_deref()
+            .expect("the transaction is kept")
+            .body_memory_budget()
+    }
+
+    /// A URL-encoded body of `size` bytes: one long value.
+    fn pairs_of(size: usize) -> Vec<u8> {
+        let mut body = b"a=".to_vec();
+        body.resize(size, b'b');
+        body
+    }
+
+    #[test]
+    fn the_engine_is_leased_the_copies_its_processor_makes_and_not_those_it_does_not() {
+        let size = MIB;
+        let cases: [(&str, &[u8], usize); 3] = [
+            // An XML body keeps no copy of itself.
+            ("text/xml", &xml_list(size), 3),
+            // A URL-encoded one stores the raw body in `REQUEST_BODY` before it parses, which the lease holds beside
+            // the buffer, and the JSON text of a JSON body is kept once it is parsed, which the parser leaves room
+            // for.
+            ("application/x-www-form-urlencoded", &pairs_of(size), 4),
+            ("application/json", br#"{"a":1}"#, 0),
+        ];
+        for (content_type, body, copies) in cases {
+            let (mut stream, root) = stream_beside(&policy(LIMITS, ""), 0);
+            let size = begin_post(&mut stream, content_type, body);
+            let before = held(&stream);
+            assert_eq!(
+                stream.on_http_request_body(size, true),
+                Action::Continue,
+                "{content_type}"
+            );
+            let expected = if copies == 0 {
+                // The JSON text copy is as long as the body, which here is tiny.
+                MAX_ROOT_RETAINED_BODY_BYTES - 4 * size - before
+            } else {
+                MAX_ROOT_RETAINED_BODY_BYTES - copies * size - before
+            };
+            assert_eq!(parser_budget(&stream), Some(expected), "{content_type}");
+            assert!(root.get() <= MAX_ROOT_RETAINED_BODY_BYTES);
+        }
+    }
+
+    #[test]
+    fn what_the_transaction_already_holds_is_taken_out_of_the_parsers_budget() {
+        let body = xml_list(MIB);
+        let budget = |rules: &str| {
+            let (mut stream, _) = stream_beside(&policy(LIMITS, rules), 0);
+            let size = begin_post(&mut stream, "text/xml", &body);
+            assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+            parser_budget(&stream).expect("the parser was given a budget")
+        };
+        let plain = budget("");
+        // A rule of phase 1 that leaves half a megabyte in `TX`, as CRS's initialisation does in smaller amounts.
+        let held_in_tx = 512 * 1024;
+        let inflating = format!(
+            r#", "SecAction \"id:1,phase:1,pass,nolog,setvar:'tx.held={}'\"""#,
+            "x".repeat(held_in_tx)
+        );
+        let inflated = budget(&inflating);
+        assert!(
+            plain - inflated >= held_in_tx,
+            "the parser had {plain} bytes, and {inflated} with {held_in_tx} bytes held in TX"
+        );
+    }
+
+    #[test]
+    fn a_body_the_engine_keeps_a_prefix_of_is_leased_the_prefix_and_not_the_whole_of_what_the_host_holds() {
+        const LIMIT: usize = 8 * MIB;
+        let limits = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608", "SecRequestBodyLimitAction ProcessPartial","#;
+        // The host holds 16 MiB and the engine retains 8: with the host's buffer and the guest's copy that is 40 MiB,
+        // where charging the whole body three times and a fourth for a copy asked for 64 and left nothing to parse.
+        let body = xml_list(2 * LIMIT - 64);
+        let (mut stream, _) = stream_beside(&policy(limits, ""), 0);
+        let size = begin_post(&mut stream, "text/xml", &body);
+        let before = held(&stream);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+        assert_eq!(
+            parser_budget(&stream),
+            Some(MAX_ROOT_RETAINED_BODY_BYTES - 2 * size - LIMIT - before)
+        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+
+        // A URL-encoded body of the same size also holds a copy of the 8 MiB prefix while it parses.
+        let body = pairs_of(2 * LIMIT - 64);
+        let (mut stream, _) = stream_beside(&policy(limits, ""), 0);
+        let size = begin_post(&mut stream, "application/x-www-form-urlencoded", &body);
+        let before = held(&stream);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+        assert_eq!(
+            parser_budget(&stream),
+            Some(MAX_ROOT_RETAINED_BODY_BYTES - 2 * size - 2 * LIMIT - before)
+        );
+    }
+
+    #[test]
+    fn a_urlencoded_body_whose_extra_copy_does_not_fit_is_refused_before_the_engine_copies_it() {
+        let body = pairs_of(2 * MIB);
+        let probe_policy = policy(LIMITS, "");
+        let xml = xml_list(2 * MIB);
+        let (mut probe, _) = stream_beside(&probe_policy, 0);
+        begin_post(&mut probe, "text/xml", &xml);
+        let before = held(&probe);
+
+        // The host's buffer, the guest's copy and the engine's buffer fit with a mebibyte to spare, and the copy the
+        // URL-encoded parser makes of the body first (two) does not.
+        let others = MAX_ROOT_RETAINED_BODY_BYTES - 3 * body.len() - before - MIB;
+        let (mut stream, root) = stream_beside(&probe_policy, others);
+        let size = begin_post(&mut stream, "application/x-www-form-urlencoded", &body);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [503]);
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::RetainedBodyBudgetExhausted { phase: "request-body" })
+        );
+        assert_eq!(root.get(), others);
+
+        // The same bytes with a processor that keeps no copy go to the engine, with nothing to parse in.
+        let (mut stream, _) = stream_beside(&probe_policy, others);
+        let size = begin_post(&mut stream, "text/xml", &xml);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+        let left = parser_budget(&stream).expect("the parser was given a budget");
+        assert!(
+            left.abs_diff(MIB) < 4096,
+            "a mebibyte, less what the transaction held in between: {left}"
+        );
+    }
+
+    /// Runs the response of `stream`, whose request has been completed, with `body` as JSON, and returns what the
+    /// filter answered.
+    fn respond(stream: &mut CorazaHttp, body: &[u8]) -> Action {
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"application/json")]);
+        test_hostcalls::set_response_body(body);
+        assert_eq!(stream.on_http_response_headers(2, false), Action::Pause);
+        stream.on_http_response_body(body.len(), true)
+    }
+
+    /// A stream whose GET request is complete, beside streams that hold `others` bytes of the root.
+    fn get_beside(config: &str, others: usize) -> CorazaHttp {
+        let (mut stream, _) = stream_beside(config, others);
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        stream
+    }
+
+    /// A dense JSON array of about `size` bytes.
+    fn json_list(size: usize) -> Vec<u8> {
+        let mut body = b"[".to_vec();
+        while body.len() < size {
+            body.extend_from_slice(b"1,");
+        }
+        body.push(b'1');
+        body.push(b']');
+        body
+    }
+
+    #[test]
+    fn a_response_the_budget_stopped_the_parser_in_is_not_forwarded_as_inspected_but_an_ordinary_body_error_is() {
+        let body = json_list(200 * 1024);
+        let config = policy(LIMITS, "");
+        // The root leaves the response parser a few kilobytes, which a body of 100,000 values does not fit.
+        let probe = get_beside(&config, 0);
+        let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - held(&probe) - 16 * 1024;
+        let mut stream = get_beside(&config, others);
+        assert_eq!(respond(&mut stream, &body), Action::Continue);
+
+        assert_eq!(
+            test_hostcalls::response_replacement_statuses(),
+            ["502"],
+            "the response is replaced, as the connector does for a response it cannot inspect"
+        );
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" })
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+            Some("body_memory_budget_stopped")
+        );
+
+        // The same body with room to parse in is forwarded, and a body that is not JSON is a body error that the
+        // policy's rules decide, as they always did: nothing is replaced.
+        for (others, body) in [(0, body.clone()), (0, b"[1,".to_vec())] {
+            let mut stream = get_beside(&config, others);
+            assert_eq!(respond(&mut stream, &body), Action::Continue);
+            assert!(test_hostcalls::response_replacement_statuses().is_empty(), "{body:?}");
+            assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
+                Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_the_budget_stopped_the_parser_in_and_no_rule_denied_is_not_reported_as_inspected_whole() {
+        let body = xml_list(MIB);
+        let config = policy(LIMITS, "");
+        let finish = |others: usize| {
+            let (mut stream, _) = stream_beside(&config, 0);
+            let size = begin_post(&mut stream, "text/xml", &body);
+            let before = held(&stream);
+            drop(stream);
+            let (mut stream, _) = stream_beside(&config, others.saturating_sub(before));
+            begin_post(&mut stream, "text/xml", &body);
+            assert_eq!(
+                stream.on_http_request_body(size, true),
+                Action::Continue,
+                "no rule denies the error"
+            );
+            assert!(test_hostcalls::local_reply_statuses().is_empty());
+            let stopped = stream
+                .tx
+                .as_deref()
+                .is_some_and(coraza::transaction::Transaction::request_body_stopped_by_memory_budget);
+            test_hostcalls::set_response_headers(&[(":status", b"200")]);
+            assert_eq!(stream.on_http_response_headers(1, true), Action::Continue);
+            (
+                stopped,
+                test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete"),
+                test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason"),
+                test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome"),
+            )
+        };
+        // Room for the three charges and a few kilobytes: the parser gets that far and no further.
+        let tight = MAX_ROOT_RETAINED_BODY_BYTES - 3 * body.len() - 8 * 1024;
+        assert_eq!(
+            finish(tight),
+            (
+                true,
+                Some("false".to_owned()),
+                Some("body_memory_budget_stopped".to_owned()),
+                Some("completed".to_owned())
+            ),
+            "the request was let through as the policy decided, and the telemetry says it was partly inspected"
+        );
+        assert_eq!(
+            finish(0),
+            (
+                false,
+                Some("true".to_owned()),
+                Some("complete".to_owned()),
+                Some("completed".to_owned())
+            )
+        );
     }
 }
