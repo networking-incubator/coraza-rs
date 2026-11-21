@@ -11,7 +11,7 @@ use std::fmt;
 use super::tables::{AUTO_CLOSE, FIRST, HTML_ENTITIES, SECOND};
 use crate::{
     body_processors::budget::{self, MemoryBudget},
-    collection::{ALLOCATION_OVERHEAD_BYTES, Growth},
+    collection::{ALLOCATION_OVERHEAD_BYTES, Growth, allocation_bytes},
 };
 
 /// An element's name as written: `prefix:local`, or `local` alone
@@ -200,9 +200,22 @@ impl<'a> Decoder<'a> {
         self.memory.is_limited()
     }
 
-    /// What `cost` says a value takes, asked only when there is a budget to charge it to.
-    pub(super) fn cost(&self, cost: impl FnOnce() -> Growth) -> Growth {
-        if self.is_limited() { cost() } else { Growth::default() }
+    /// What storing `value` takes, asked only when there is a budget to charge it to: what `cost` says for its length,
+    /// and the buffer it was read into, which is held beside the copy of its length the collection trims it to.
+    pub(super) fn cost(&self, value: &String, cost: impl FnOnce(usize) -> Growth) -> Growth {
+        if !self.is_limited() {
+            return Growth::default();
+        }
+        let read_into = allocation_bytes(value.capacity());
+        let read_into = if read_into > allocation_bytes(value.len()) {
+            read_into
+        } else {
+            0
+        };
+        cost(value.len()).plus(Growth {
+            grown: read_into,
+            freed: read_into,
+        })
     }
 
     /// Reserves `bytes` for a buffer the decoder is about to fill. It stays reserved until
@@ -293,7 +306,13 @@ impl<'a> Decoder<'a> {
                 // Nothing else bounds how deep a document nests, and each level is held until it closes: its entry
                 // in the stack, which keeps its capacity, and its names.
                 if self.open.len() >= self.open_charged {
-                    self.reserve(2 * size_of::<Open>())?;
+                    // Two entries a level pay for the grown stack, the first allocation's four at level one; the old
+                    // one beside it while it grows is covered by `name_bytes` of the levels below, their tokens gone.
+                    self.reserve(match self.open_charged {
+                        0 => allocation_bytes(4 * size_of::<Open>()),
+                        1 => 0,
+                        _ => 2 * size_of::<Open>(),
+                    })?;
                     self.open_charged = self.open.len().saturating_add(1);
                 }
                 self.open_name_bytes = self.open_name_bytes.saturating_add(name_bytes(&name));
@@ -616,7 +635,7 @@ impl<'a> Decoder<'a> {
                 attribute.local
             };
             self.release_scratch_to(mark);
-            let cost = self.cost(|| sink.attribute_cost(value.len()));
+            let cost = self.cost(&value, |len| sink.attribute_cost(len));
             self.reserve(cost.grown)?;
             self.tag_attributes = self.tag_attributes.saturating_add(1);
             sink.attribute(value);
@@ -626,7 +645,7 @@ impl<'a> Decoder<'a> {
         Ok(Token::Start { name })
     }
 
-    /// How many attribute values the start tag the input ended in had handed over before it ended.
+    /// How many attribute values the start tag the input or the budget ended in had handed over before it ended.
     pub(super) const fn unfinished_attributes(&self) -> usize {
         self.tag_attributes
     }
@@ -699,12 +718,7 @@ impl<'a> Decoder<'a> {
             }
             (b0, b1) = (b1, b);
         }
-        let mut value = self.characters(text)?;
-        if self.is_limited() {
-            // The value is kept: drop what its references and line ends saved.
-            value.shrink_to_fit();
-        }
-        Ok(value)
+        self.characters(text)
     }
 
     /// Reads an entity or character reference, after its `&`, onto `text`: what it stands

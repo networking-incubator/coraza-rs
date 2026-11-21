@@ -95,6 +95,9 @@ direction:
   replaces a response whose parser stopped at it with 502, unless a rule denied it first. A response body that merely
   does not parse (`RES_BODY_ERROR` for another reason) is left to the policy's rules, as before.
 
+The budget covers the body processors only. What rules allocate after the parse (macro expansion, matched values,
+`TX` updates) is not charged in advance, so the check after the phase is what bounds it.
+
 The check after the parse stays the authority on what was retained and answers 503. Without a budget, which is the
 engine's default, the processors refuse only what Go Coraza refuses.
 

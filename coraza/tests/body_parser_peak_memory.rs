@@ -48,7 +48,7 @@ use coraza::{
 ///
 /// `CURRENT` and `PEAK` count the bytes the program asked for. `CHUNKS` and `PEAK_CHUNKS` model what a request
 /// holds in the worst allocator it can run on: every allocation is charged the chunk a malloc rounds it up to (a
-/// header and 16-byte units, 32 at least), and growing one counts the old chunk and the new together at the
+/// header and 16-byte units, 32 at least), and resizing one counts the old chunk and the new together at the
 /// moment of the copy, as the WASI allocator that the connector runs on may have to.
 struct Counting;
 
@@ -103,9 +103,11 @@ unsafe impl GlobalAlloc for Counting {
                 CURRENT.fetch_sub(layout.size() - new_size, SeqCst);
             }
             let (old, new) = (chunk(layout.size()), chunk(new_size));
-            if new > old {
-                // Both chunks are live while the contents are copied.
+            // Both chunks are live while the contents are copied, which an allocator may do to shrink one too.
+            if new != old {
                 PEAK_CHUNKS.fetch_max(CHUNKS.load(SeqCst) + new, SeqCst);
+            }
+            if new > old {
                 CHUNKS.fetch_add(new - old, SeqCst);
             } else {
                 CHUNKS.fetch_sub(old - new, SeqCst);
@@ -151,6 +153,8 @@ struct Case {
     content_type: String,
     /// Extra configuration, such as a larger argument limit.
     configuration: &'static str,
+    /// Whether `ARGS` and its kin keep the case of their keys.
+    case_sensitive: bool,
     /// The body.
     body: Vec<u8>,
 }
@@ -168,6 +172,7 @@ fn case(label: &'static str, processor: &'static str, configuration: &'static st
         processor,
         content_type: content_type.to_owned(),
         configuration,
+        case_sensitive: false,
         body,
     }
 }
@@ -183,6 +188,7 @@ impl Case {
 /// A transaction that has read the headers of `case`'s request, under `budget`.
 fn prepared(case: &Case, budget: Option<usize>) -> Transaction {
     let mut parser = Parser::new();
+    parser.config_mut().case_sensitive_args_keys = case.case_sensitive;
     parser
         .from_string(&format!(
             "SecRequestBodyAccess On\nSecRequestBodyLimit 134217728\n{}\n\
@@ -245,7 +251,7 @@ fn measure_body(tx: &mut Transaction, body: &[u8], request_xml: bool) -> Measure
 }
 
 /// What the transaction's own accounting may be short of what it holds: its variables and error messages.
-const ACCOUNTING_SLACK: usize = 64 * 1024;
+const ACCOUNTING_SLACK: usize = 4 * 1024;
 
 /// The estimate the connector's retained-body check is built on must cover what the transaction holds, the
 /// allocator's chunks included, or that check admits more than it means to.
@@ -440,6 +446,13 @@ fn without_a_budget_nothing_but_gos_own_limit_is_refused_and_accounting_covers_w
             "",
             format!("[{}1]", "1,".repeat(MIB / 4)).into_bytes(),
         ),
+        // A rule that matches every value keeps a copy of each in the transaction's matched rules.
+        case(
+            "urlencoded, every value matched",
+            "urlencoded",
+            "SecRule ARGS_POST \"@unconditionalMatch\" \"id:2,phase:2,pass,nolog\"",
+            vec!["a=1"; 1000].join("&").into_bytes(),
+        ),
     ];
     for case in &ordinary {
         let measured = measure(case, None);
@@ -581,6 +594,7 @@ fn a_budget_that_is_not_reached_changes_nothing() {
 }
 
 /// Bodies of every processor and of the shapes that once hid a copy or a growth from the budget.
+#[expect(clippy::too_many_lines, reason = "one entry per body shape")]
 fn admitted_cases() -> Vec<Case> {
     let field = b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--b--\r\n".to_vec();
     let long_boundary = "b".repeat(4090);
@@ -602,6 +616,13 @@ fn admitted_cases() -> Vec<Case> {
             "xml",
             "",
             repeated(b"<r>", b"<a b c d e f g h/>", 60_000, b"</r>"),
+        ),
+        // References shorten the text below the buffer it was read into, which is trimmed to it when it is stored.
+        case(
+            "xml, one escaped text node",
+            "xml",
+            "",
+            repeated(b"<r>", b"&amp;", 250_000, b"</r>"),
         ),
         // 513 values take the list of `/*` past 512 slots, which grows to 1,024 beside the old one.
         case(
@@ -691,23 +712,28 @@ fn admitted_cases() -> Vec<Case> {
     ]
 }
 
+/// The smallest budget up to `high` that admits `case`, which must cover its peak with no slack: what the processor
+/// allocates beyond the engine's copies of the body is what it was charged. Also what the heap grew by beyond those
+/// copies, and the measurement at that budget.
+fn smallest_admitting(case: &Case, high: usize) -> (usize, usize, Measured) {
+    let budget = smallest_budget(high, |budget| !measure(case, Some(budget)).errored);
+    let admitted = measure(case, Some(budget));
+    let copies = case.copies(&admitted) * chunk(case.body.len());
+    assert!(
+        admitted.peak_chunks <= copies + budget,
+        "{}: the peak {} passes the {budget} the budget allowed beside {copies} bytes of copies of the body",
+        case.label,
+        admitted.peak_chunks
+    );
+    (budget, admitted.peak_chunks.saturating_sub(copies), admitted)
+}
+
 #[test]
 fn the_smallest_budget_that_admits_a_body_covers_its_peak() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     for case in &admitted_cases() {
-        let length = case.body.len();
-        let budget = smallest_budget(1 << 30, |budget| !measure(case, Some(budget)).errored);
-        let admitted = measure(case, Some(budget));
-        let copies = case.copies(&admitted);
+        let (budget, grown, admitted) = smallest_admitting(case, 1 << 30);
         assert!(admitted.values > 0, "{}: {}", case.label, admitted.message);
-        // No slack: what the processor allocates beyond the engine's copies of the body is what it was charged.
-        assert!(
-            admitted.peak_chunks <= copies * length + budget,
-            "{}: the peak {} passes the {budget} the budget allowed beside {copies} copies of {length} bytes",
-            case.label,
-            admitted.peak_chunks
-        );
-        let grown = admitted.peak_chunks.saturating_sub(copies * length);
         assert!(
             budget <= 4 * grown.max(1),
             "{}: a budget of {budget} for {grown} bytes of growth is wasteful",
@@ -751,6 +777,24 @@ fn a_multipart_header_block_is_reserved_before_it_is_parsed_and_a_budget_stop_is
 }
 
 #[test]
+fn the_parts_of_a_multipart_body_are_charged_what_they_hold_while_they_wait() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    // A thousand uploads, each part with a list of headers, its names and a filename.
+    let case = case("multipart", "multipart", "SecUploadFileLimit 0", uploads(1000));
+    // The smallest budget that reads them all holds them all, then runs out while they are published.
+    let budget = smallest_budget(1 << 30, |budget| {
+        !measure(&case, Some(budget)).message.starts_with("malformed multipart")
+    });
+    let measured = measure(&case, Some(budget));
+    assert_eq!(measured.message, "published parts exceed the body memory budget");
+    assert!(
+        measured.peak_chunks <= case.body.len() + budget,
+        "the peak {} passes the {budget} byte budget",
+        measured.peak_chunks
+    );
+}
+
+#[test]
 fn xml_names_are_reserved_before_they_are_read_and_a_tags_name_stays_reserved_to_its_end() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let name_in_tag = format!("<{} a=\"x\" b=\"{}\"/>", "n".repeat(MIB), "v".repeat(5 * MIB / 2));
@@ -791,6 +835,32 @@ fn xml_names_are_reserved_before_they_are_read_and_a_tags_name_stays_reserved_to
             measured.peak_chunks
         );
     }
+}
+
+#[test]
+fn a_start_tag_the_budget_stops_in_keeps_none_of_its_attributes_and_takes_them_back_in_place() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    // A thousand values leave `//@*` spare slots, then a tag's first attribute fits and its second does not.
+    let body = |value: usize| {
+        let tags = "<a x=\"1\"/>".repeat(1000);
+        case(
+            "xml",
+            "xml",
+            "",
+            format!("<r>{tags}<b y=\"1\" z=\"{}\"/></r>", "x".repeat(value)).into_bytes(),
+        )
+    };
+    let budget = smallest_budget(1 << 30, |budget| !measure(&body(1), Some(budget)).errored);
+    let stopped = body(100_000);
+    let measured = measure(&stopped, Some(budget));
+    assert!(measured.errored, "{}", measured.message);
+    assert_eq!(measured.values, 1000, "the tag that was never read whole keeps none");
+    // Trimming the list it took them back from would copy the thousand values beside it.
+    assert!(
+        measured.peak_chunks <= stopped.body.len() + budget,
+        "the peak {} passes the {budget} byte budget",
+        measured.peak_chunks
+    );
 }
 
 #[test]
@@ -1106,63 +1176,84 @@ fn a_new_key_in_a_full_table_of_arguments_is_charged_for_the_table_that_replaces
 }
 
 #[test]
-fn a_repeated_name_is_charged_what_its_collections_allocate_for_it() {
+fn a_name_is_charged_what_its_collections_allocate_for_it() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let long = "k".repeat(4096);
     let lowercase = format!("{}=1", "\u{e9}".repeat(16));
+    let form = |label, case_sensitive, body: String| Case {
+        case_sensitive,
+        ..case(label, "urlencoded", "SecArgumentsLimit 100000", body.into_bytes())
+    };
     let cases = [
         // The second value shares the key the first made in each collection.
-        ("a 4 KiB name twice", false, format!("{long}=1&{long}=2")),
+        form("a 4 KiB name twice", false, format!("{long}=1&{long}=2")),
         // A case-sensitive collection keeps one copy of a name, its map key, which every value shares.
-        (
+        form(
             "a 600 KiB name in case-sensitive collections",
             true,
             format!("{}=1", "k".repeat(600 * 1024)),
         ),
         // A name that is not UTF-8 keeps a lossy text, whose buffer doubles beside the old one while it is built.
-        (
+        form(
             "a name that is not UTF-8 in case-sensitive collections",
             true,
             format!("{}=1", "%FF".repeat(16 * 1024)),
         ),
         // A name that is its own lowercase form is filed under itself, whatever its bytes.
-        (
+        form(
             "a lowercase name that is not ASCII, repeated",
             false,
             vec![lowercase.as_str(); 2000].join("&"),
         ),
         // A list that grows gives back the one it replaced.
-        ("a thousand values of one name", false, vec!["a=1"; 1000].join("&")),
+        form("a thousand values of one name", false, vec!["a=1"; 1000].join("&")),
+        // Distinct names grow the tables of keys, which are charged as large as they are allocated.
+        form(
+            "two thousand names",
+            false,
+            (0..2000).map(|i| format!("a{i}=1")).collect::<Vec<_>>().join("&"),
+        ),
+        case(
+            "two thousand JSON names",
+            "json",
+            "SecArgumentsLimit 100000",
+            format!(
+                "{{{}}}",
+                (0..2000).map(|i| format!("\"a{i}\":1")).collect::<Vec<_>>().join(",")
+            )
+            .into_bytes(),
+        ),
+        case(
+            "a thousand fields of distinct names",
+            "multipart",
+            "SecArgumentsLimit 100000",
+            format!(
+                "{}--b--\r\n",
+                (0..1000)
+                    .map(|i| format!("--b\r\nContent-Disposition: form-data; name=\"a{i}\"\r\n\r\n1\r\n"))
+                    .collect::<String>()
+            )
+            .into_bytes(),
+        ),
+        // A field is filed under its name in the collections of its part's metadata as well.
+        case(
+            "a thousand fields of one name",
+            "multipart",
+            "SecArgumentsLimit 100000",
+            format!(
+                "{}--b--\r\n",
+                "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n".repeat(1000)
+            )
+            .into_bytes(),
+        ),
     ];
-    for (label, case_sensitive, body) in cases {
-        let transaction = |budget: usize| {
-            let mut parser = Parser::new();
-            parser.config_mut().case_sensitive_args_keys = case_sensitive;
-            parser
-                .from_string(
-                    "SecRequestBodyAccess On\nSecRequestBodyLimit 134217728\nSecArgumentsLimit 100000\n\
-                     SecAction \"id:1,phase:1,ctl:requestBodyProcessor=URLENCODED,pass,nolog\"",
-                )
-                .unwrap();
-            let mut tx = parser.into_waf().unwrap().new_transaction_with_id("measured");
-            tx.set_body_memory_budget(Some(budget));
-            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
-            tx.process_request_headers();
-            tx
-        };
-        let budget = smallest_budget(1_000 * body.len(), |budget| {
-            !measure_body(&mut transaction(budget), body.as_bytes(), false).errored
-        });
-        let admitted = measure_body(&mut transaction(budget), body.as_bytes(), false);
-        let grown = admitted.peak_chunks.saturating_sub(2 * body.len());
-        assert!(
-            admitted.peak_chunks <= 2 * body.len() + budget,
-            "{label}: the peak passes the budget"
-        );
-        // The growths of both collections are charged before either is made, which is all a budget adds.
+    for case in &cases {
+        let (budget, grown, _) = smallest_admitting(case, 1_000 * case.body.len());
+        // The growths of the collections are charged before any is made, which is all a budget adds.
         assert!(
             budget <= grown + grown / 4,
-            "{label}: a budget of {budget} for {grown} bytes of growth charges what is not allocated"
+            "{}: a budget of {budget} for {grown} bytes of growth charges what is not allocated",
+            case.label
         );
     }
 }
@@ -1227,12 +1318,41 @@ fn the_paths_of_the_temporary_uploads_a_transaction_keeps_are_part_of_its_estima
     tx.process_request_headers();
     let measured = measure_body(&mut tx, &uploads(1000), false);
     assert!(!measured.errored, "{}", measured.message);
-    // `assert_accounting_is_conservative` with the slack of a few variables only: the copies of 1,000 paths of
-    // 800 bytes are far more than that.
-    assert!(
-        measured.live_chunks <= measured.retained + 16 * 1024,
-        "the transaction holds {} bytes but estimates {}",
-        measured.live_chunks,
-        measured.retained
-    );
+    assert_accounting_is_conservative("1,000 uploads", &measured);
+}
+
+#[test]
+fn a_full_tx_table_is_estimated_as_held_when_a_key_is_rewritten_or_most_are_removed() {
+    // 1,792 keys fill a table of 2,048 buckets, the eleven capture keys a transaction starts with among them.
+    const FULL: usize = 1_792;
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let removals: Vec<_> = (5..FULL).map(|index| format!("setvar:!tx.k{index}")).collect();
+    let mut parser = Parser::new();
+    parser
+        .from_string(&format!("SecAction \"id:1,phase:1,pass,nolog,{}\"", removals.join(",")))
+        .unwrap();
+    let waf = parser.into_waf().unwrap();
+    let keys = |tx: &Transaction| match tx.collection(RuleVariable::TX) {
+        Some(VariableCollection::Map(map)) => map.len(),
+        _ => 0,
+    };
+    let rewrite: fn(&mut Transaction) = |tx| tx.set_tx_variable("k0", "2");
+    let remove: fn(&mut Transaction) = |tx| {
+        tx.process_request_headers();
+    };
+    for (label, step) in [("rewritten", rewrite), ("removed", remove)] {
+        let mut tx = waf.new_transaction_with_id("measured");
+        let (chunks, estimate) = (CHUNKS.load(SeqCst), tx.body_memory_bytes());
+        let mut index = 0;
+        while keys(&tx) < FULL {
+            tx.set_tx_variable(&format!("k{index}"), "1");
+            index += 1;
+        }
+        step(&mut tx);
+        let (held, estimated) = (CHUNKS.load(SeqCst), tx.body_memory_bytes());
+        assert!(
+            held + estimate <= chunks + estimated + ACCOUNTING_SLACK,
+            "{label}: the transaction went from {chunks} to {held} bytes but estimates {estimate} to {estimated}"
+        );
+    }
 }

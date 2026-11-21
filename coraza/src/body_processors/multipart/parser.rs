@@ -24,12 +24,12 @@
 //! This implementation follows the Go stdlib mime/multipart closely
 //! for maximum compatibility.
 
-use std::{cell::Cell, mem::size_of};
+use std::{cell::Cell, collections::LinkedList, mem::size_of};
 
 use super::{is_token_name, media_type};
 use crate::{
     body_processors::budget::{self, MemoryBudget},
-    collection::ALLOCATION_OVERHEAD_BYTES,
+    collection::{ALLOCATION_OVERHEAD_BYTES, allocation_bytes},
 };
 
 /// What a parse asks before it copies a header block: whether the host's memory budget has room for it.
@@ -146,7 +146,7 @@ pub(crate) struct FilenameEncoding {
 pub(crate) type Headers = Vec<(String, Vec<u8>)>;
 
 /// A single part in a multipart message
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "these flags report independent Coraza multipart conditions"
@@ -183,35 +183,32 @@ pub(crate) struct Part<'a> {
 }
 
 impl Part<'_> {
-    /// Bytes the part's own buffers hold beyond the body it borrows: its names, and each header's name and value
-    /// with the entry that holds them, all by the capacity the buffers keep, which a decoded name can leave well
-    /// above its length. They are freed when the part is dropped.
+    /// The filename and the `filename*` the part publishes, each unless it is empty.
+    pub(crate) fn published_filenames(&self) -> [Option<&[u8]>; 2] {
+        [self.filename.as_deref(), self.alt_filename.as_deref()].map(|name| name.filter(|name| !name.is_empty()))
+    }
+
+    /// Bytes the part holds until it is dropped: its node in the list the parser returns (the part and two links),
+    /// and its own buffers beyond the body it borrows: its names, and its list of headers with each one's name and
+    /// value, all by the capacity the buffers keep, which a decoded name can leave well above its length.
     pub(crate) fn owned_bytes(&self) -> usize {
-        /// One header: the entry in the part's list, and the allocation overhead of its name and value.
-        const HEADER_ENTRY_BYTES: usize = size_of::<(String, Vec<u8>)>() + 2 * ALLOCATION_OVERHEAD_BYTES;
-        let optional = |bytes: &Option<Vec<u8>>| bytes.as_ref().map_or(0, Vec::capacity);
+        let optional = |bytes: &Option<Vec<u8>>| bytes.as_ref().map_or(0, |bytes| allocation_bytes(bytes.capacity()));
         let encoding = self.filename_encoding.as_ref().map_or(0, |encoding| {
-            encoding.charset.capacity().saturating_add(encoding.language.capacity())
+            allocation_bytes(encoding.charset.capacity()).saturating_add(allocation_bytes(encoding.language.capacity()))
         });
+        let list = allocation_bytes(self.headers.capacity().saturating_mul(size_of::<(String, Vec<u8>)>()));
         self.headers
             .iter()
-            .fold(0_usize, |total, (name, value)| {
+            .fold(list, |total, (name, value)| {
                 total
-                    .saturating_add(HEADER_ENTRY_BYTES)
-                    .saturating_add(name.capacity())
-                    .saturating_add(value.capacity())
+                    .saturating_add(allocation_bytes(name.capacity()))
+                    .saturating_add(allocation_bytes(value.capacity()))
             })
-            .saturating_add(self.name.capacity())
+            .saturating_add(allocation_bytes(self.name.capacity()))
             .saturating_add(optional(&self.filename))
             .saturating_add(optional(&self.alt_filename))
             .saturating_add(encoding)
-            .saturating_add(5 * ALLOCATION_OVERHEAD_BYTES)
-    }
-
-    /// Bytes this part holds while it waits in its vector: [`Part::owned_bytes`], and its slot with the vector's
-    /// growth slack, which the vector keeps until it is dropped, however many of its parts have been taken out.
-    fn retained_bytes(&self) -> usize {
-        size_of::<Self>().saturating_mul(2).saturating_add(self.owned_bytes())
+            .saturating_add(allocation_bytes(size_of::<Self>() + 2 * size_of::<usize>()))
     }
 }
 
@@ -325,11 +322,11 @@ impl<'a> MultipartParser<'a> {
     }
 
     /// Reads the part in `data` into `parts`, with [`header_parse_cost`] reserved while its headers are parsed and
-    /// the part, charged what it keeps, is built. A part that does not fit leaves the parts before it in `parts`.
+    /// the part, charged what it holds, is built. A part that does not fit leaves the parts before it in `parts`.
     /// `truncated` carries the delimiter markers of a part a body limit cut, whose partial delimiter is trimmed.
     fn read_part(
         &self,
-        parts: &mut Vec<Part<'a>>,
+        parts: &mut LinkedList<Part<'a>>,
         data: &'a [u8],
         total_header_bytes: &mut usize,
         truncated: Option<(&[u8], &[u8])>,
@@ -356,13 +353,13 @@ impl<'a> MultipartParser<'a> {
                 part.data = trim_truncated_part_data(part.data, dash_boundary, nl_boundary);
             }
             if self.is_bounded() {
-                self.reserve(part.retained_bytes())?;
+                self.reserve(part.owned_bytes())?;
             }
             Ok(Some(part))
         });
         self.release(held.get());
         if let Some(part) = kept? {
-            parts.push(part);
+            parts.push_back(part);
         }
         Ok(())
     }
@@ -381,8 +378,8 @@ impl<'a> MultipartParser<'a> {
     /// Returns the parts read before parsing stopped, and why it stopped: Go's
     /// `NextPart` loop publishes each part as it reads it, so an error on a later
     /// part must not discard the parts before it.
-    pub(super) fn parse(&self) -> (Vec<Part<'a>>, Option<ParseError>) {
-        let mut parts = Vec::new();
+    pub(super) fn parse(&self) -> (LinkedList<Part<'a>>, Option<ParseError>) {
+        let mut parts = LinkedList::new();
         let error = self.collect_parts(&mut parts).err();
         (parts, error)
     }
@@ -393,12 +390,12 @@ impl<'a> MultipartParser<'a> {
     fn parse_ok(&self) -> Result<Vec<Part<'a>>, ParseError> {
         match self.parse() {
             (_parts, Some(error)) => Err(error),
-            (parts, None) => Ok(parts),
+            (parts, None) => Ok(parts.into_iter().collect()),
         }
     }
 
     /// Append every part to `parts`, returning why parsing stopped.
-    fn collect_parts(&self, parts: &mut Vec<Part<'a>>) -> Result<(), ParseError> {
+    fn collect_parts(&self, parts: &mut LinkedList<Part<'a>>) -> Result<(), ParseError> {
         if self.boundary.is_empty() {
             return Err(ParseError::Parse("boundary is empty".to_owned()));
         }
@@ -1766,38 +1763,33 @@ Content-Disposition: form-data; name=\"q\"\r\n\
         let (parts, error) = MultipartParser::new("b", b"--b\r\n\r\npartial").truncated(true).parse();
         assert!(error.is_none());
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"partial");
+        assert_eq!(parts.front().unwrap().data, b"partial");
 
         // Without the limit the same body is incomplete: the part is still kept, and
         // the missing final boundary is reported after it.
         let (parts, error) = MultipartParser::new("b", b"--b\r\n\r\npartial").parse();
         assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"partial");
+        assert_eq!(parts.front().unwrap().data, b"partial");
     }
 
     #[test]
     fn a_decoded_filename_is_charged_for_the_capacity_it_keeps() {
         // `%41` decodes to one byte but the buffer was sized for the three it came in.
-        let body = b"--b\r\nContent-Disposition: form-data; name=\"f\"; filename*=UTF-8''%41%41%41%41%41%41%41%41\r\n\r\nx\r\n--b--\r\n";
+        let body = b"--b\r\nContent-Disposition: form-data; name=\"f\"; filename*=UTF-8''%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41%41\r\n\r\nx\r\n--b--\r\n";
         let (parts, error) = MultipartParser::new("b", body).parse();
         assert!(error.is_none());
-        let part = parts.first().unwrap();
+        let mut part = parts.into_iter().next().unwrap();
         let filename = part.filename.as_ref().unwrap();
-        assert_eq!(filename.as_slice(), b"AAAAAAAA");
-        assert!(
-            filename.capacity() >= 24,
-            "the buffer keeps the encoded size: {}",
-            filename.capacity()
-        );
-        // What the part holds beyond that is its name, a header and the fixed allocations.
-        let mut shrunk = part.clone();
-        shrunk.filename.as_mut().unwrap().shrink_to_fit();
-        assert!(
-            part.owned_bytes() >= shrunk.owned_bytes() + filename.capacity() - filename.len(),
-            "{} against {}",
-            part.owned_bytes(),
-            shrunk.owned_bytes()
+        assert_eq!(filename.as_slice(), b"AAAAAAAAAAAAAAAA");
+        let capacity = filename.capacity();
+        assert!(capacity >= 48, "the buffer keeps the encoded size: {capacity}");
+        // The allocation that keeps it is a larger one than its length needs.
+        let kept = part.owned_bytes();
+        part.filename.as_mut().unwrap().shrink_to_fit();
+        assert_eq!(
+            kept - part.owned_bytes(),
+            allocation_bytes(capacity) - allocation_bytes(16)
         );
     }
 
@@ -2046,8 +2038,8 @@ P\r\n\
 --b--\r\n";
         let (parts, error) = MultipartParser::new("b", body).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().name.as_slice(), b"ok");
-        assert_eq!(parts.first().unwrap().data, b"GOOD");
+        assert_eq!(parts.front().unwrap().name.as_slice(), b"ok");
+        assert_eq!(parts.front().unwrap().data, b"GOOD");
         assert!(matches!(error, Some(ParseError::MissingColon(_))), "{error:?}");
     }
 
@@ -2329,7 +2321,7 @@ more\r\n\
 --b--";
         let (parts, error) = MultipartParser::new("b", body).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"v");
+        assert_eq!(parts.front().unwrap().data, b"v");
         let error = error.expect("the delimiter line must be reported");
         assert_eq!(
             error.go_message(),
@@ -2356,7 +2348,7 @@ more\r\n\
         let crlf_then_lf = b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\none\r\n--b\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--b--\r\n";
         let (parts, error) = MultipartParser::new("b", crlf_then_lf).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"one");
+        assert_eq!(parts.front().unwrap().data, b"one");
         let error = error.expect("the LF delimiter must be reported");
         assert_eq!(
             error.go_message(),
@@ -2366,7 +2358,7 @@ more\r\n\
         let lf_then_crlf = b"--b\nContent-Disposition: form-data; name=\"a\"\n\none\n--b\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--b--\r\n";
         let (parts, error) = MultipartParser::new("b", lf_then_crlf).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"one");
+        assert_eq!(parts.front().unwrap().data, b"one");
         let error = error.expect("the CRLF delimiter must be reported");
         assert_eq!(
             error.go_message(),
@@ -2512,7 +2504,7 @@ more\r\n\
 
         let (parts, error) = MultipartParser::new("b", &body).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().name.as_slice(), b"ok");
+        assert_eq!(parts.front().unwrap().name.as_slice(), b"ok");
         assert!(matches!(error, Some(ParseError::Limit(_))));
     }
 
@@ -2547,7 +2539,7 @@ more\r\n\
             b"--b\r\n".as_slice(),
         ] {
             let (parts, error) = MultipartParser::new("b", body).parse();
-            assert!(parts.is_empty() || parts.first().is_some_and(|part| part.data == b"v"));
+            assert!(parts.is_empty() || parts.front().is_some_and(|part| part.data == b"v"));
             assert!(error.is_none(), "{error:?}");
         }
     }
@@ -2559,8 +2551,8 @@ more\r\n\
         let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nattack";
         let (parts, error) = MultipartParser::new("b", body).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().name.as_slice(), b"q");
-        assert_eq!(parts.first().unwrap().data, b"attack");
+        assert_eq!(parts.front().unwrap().name.as_slice(), b"q");
+        assert_eq!(parts.front().unwrap().data, b"attack");
         assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
     }
 
@@ -2569,7 +2561,7 @@ more\r\n\
         let body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nattack\r\n--";
         let (parts, error) = MultipartParser::new("b", body).parse();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts.first().unwrap().data, b"attack");
+        assert_eq!(parts.front().unwrap().data, b"attack");
         assert!(matches!(error, Some(ParseError::Parse(message)) if message == "missing final boundary"));
     }
 

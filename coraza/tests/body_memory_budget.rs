@@ -348,15 +348,7 @@ fn without_a_budget_no_valid_body_is_an_error_that_go_would_not_report() {
 #[test]
 fn multipart_parts_stop_at_the_budget_and_keep_the_parts_before_it() {
     let waf = waf("");
-    let mut body = String::new();
-    for index in 0..300 {
-        write!(
-            body,
-            "--b\r\nContent-Disposition: form-data; name=\"f{index}\"\r\n\r\nvalue{index}\r\n"
-        )
-        .unwrap();
-    }
-    body.push_str("--b--\r\n");
+    let body = fields_then(300, "--b--\r\n");
     let content_type = "multipart/form-data; boundary=b";
 
     let mut unlimited = request(&waf, content_type, None);
@@ -364,7 +356,7 @@ fn multipart_parts_stop_at_the_budget_and_keep_the_parts_before_it() {
     assert!(!request_body_errored(&unlimited));
     assert_eq!(values_of(&unlimited, RuleVariable::ArgsPost).len(), 300);
 
-    // Reading the parts may hold half the budget, and the parts that did not fit are never read.
+    // Reading the parts stops at the budget, and the parts that did not fit are never read.
     let mut tx = request(&waf, content_type, Some(60_000));
     assert!(tx.process_request_body(body.as_bytes()).is_none());
     assert!(request_body_errored(&tx));
@@ -383,7 +375,26 @@ fn multipart_parts_stop_at_the_budget_and_keep_the_parts_before_it() {
 }
 
 #[test]
-fn multipart_values_are_charged_before_they_are_published_and_the_part_vector_stays_charged() {
+fn a_bigger_budget_never_publishes_fewer_multipart_parts() {
+    let waf = waf("");
+    let body = fields_then(300, "--b--\r\n");
+    // Parts read hold memory while they wait, so a budget that reads more of them must not leave less for publishing.
+    let mut published = 0;
+    for budget in (0..=400_000).step_by(4_000) {
+        let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(budget));
+        tx.process_request_body(body.as_bytes());
+        let fields = values_of(&tx, RuleVariable::ArgsPost).len();
+        assert!(
+            fields >= published,
+            "{budget} bytes publish {fields} fields, a smaller budget {published}"
+        );
+        published = fields;
+    }
+    assert_eq!(published, 300);
+}
+
+#[test]
+fn multipart_values_are_charged_before_they_are_published() {
     let waf = waf("");
     // Twenty parts of 5000 bytes are cheap to read, but publishing each costs it twice over, once for `ARGS_POST`
     // and once for `ARGS`.
@@ -398,17 +409,15 @@ fn multipart_values_are_charged_before_they_are_published_and_the_part_vector_st
     }
     body.push_str("--b--\r\n");
 
-    // 103_300 is between the 104_489 bytes eight parts need and the 102_137 they would if slots were given back.
-    let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(103_300));
+    // 98_000 is between the 89_872 bytes eight parts need and the 98_320 nine do.
+    let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(98_000));
     assert!(tx.process_request_body(body.as_bytes()).is_none());
     assert_eq!(
         tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None).unwrap(),
         "published parts exceed the body memory budget"
     );
     let post = values_of(&tx, RuleVariable::ArgsPost);
-    // A part's buffers are given back as it is published and dropped, but the vector they wait in stays allocated
-    // until the last, so its slots are not credit for the parts after: giving them back as well let an eighth in.
-    assert_eq!(post.len(), 7);
+    assert_eq!(post.len(), 8);
     assert_eq!(values_of(&tx, RuleVariable::Args), post);
     assert_eq!(
         values_of(&tx, RuleVariable::MultipartName).len(),
@@ -654,8 +663,7 @@ fn error_messages_quote_an_excerpt_under_a_budget_and_all_of_it_without_one() {
 }
 
 #[test]
-fn a_temporary_upload_is_charged_for_the_directory_it_is_written_under_and_its_file_name() {
-    // Thirty uploads, admitted or not by the budget: nothing is written, so what is observed is the charge.
+fn a_temporary_upload_is_charged_for_its_path_only_when_it_is_written() {
     let mut body = String::new();
     for index in 0..30 {
         write!(
@@ -665,32 +673,31 @@ fn a_temporary_upload_is_charged_for_the_directory_it_is_written_under_and_its_f
         .unwrap();
     }
     body.push_str("--b--\r\n");
-    let admits = |directory: &str, budget: usize| {
+    // The smallest budget that admits the thirty uploads with up to `limit` of them written under `directory`.
+    let needed = |directory: &str, limit: usize| {
         let mut parser = Parser::new();
         parser.from_string("SecRequestBodyAccess On").unwrap();
         parser.config_mut().upload_dir = directory.to_owned();
-        // Past the limit nothing is written, but every upload is still published and charged.
-        parser.config_mut().upload_file_limit = 0;
+        parser.config_mut().upload_file_limit = limit;
         let waf = parser.into_waf().unwrap();
-        let mut tx = waf.new_transaction();
-        tx.set_body_memory_budget(Some(budget));
-        tx.add_request_header("Content-Type", "multipart/form-data; boundary=b");
-        tx.process_request_headers();
-        tx.process_request_body(body.as_bytes());
-        tx.get_variable(RuleVariable::ReqbodyProcessorErrorMsg, None)
-            .is_none_or(|message| !message.contains("body memory budget"))
+        smallest_budget(1_000_000, |budget| {
+            let mut tx = request(&waf, "multipart/form-data; boundary=b", Some(budget));
+            tx.process_request_body(body.as_bytes());
+            !tx.request_body_stopped_by_memory_budget()
+        })
     };
-    let short = smallest_budget(1_000_000, |budget| admits("/nonexistent-a", budget));
+    // Past the limit every upload is still published, but none is written, so its directory costs nothing.
     let long_directory = format!("/nonexistent/{}", "d".repeat(300));
-    let long = smallest_budget(1_000_000, |budget| admits(&long_directory, budget));
-    // The path is kept in `FILES_TMPNAMES` and for cleanup, each with the file name the engine adds, and a short
-    // directory is charged at a floor of 160 bytes.
-    let floor = 160;
-    let path = long_directory.len() + 32;
+    assert_eq!(needed("/nonexistent-a", 0), needed(&long_directory, 0));
+    // A file written keeps its path in `FILES_TMPNAMES` and for cleanup, each with the file name the engine adds.
+    let directory = tempfile::tempdir().unwrap();
+    let (short, long) = (directory.path(), directory.path().join("d".repeat(200)));
+    std::fs::create_dir(&long).unwrap();
+    let longer = long.as_os_str().len() - short.as_os_str().len();
+    let (short_need, long_need) = (needed(short.to_str().unwrap(), 30), needed(long.to_str().unwrap(), 30));
     assert!(
-        long >= short + 29 * 2 * (path - floor),
-        "a {}-byte directory raised the smallest budget from {short} to {long}",
-        long_directory.len()
+        long_need >= short_need + 29 * 2 * longer,
+        "a directory {longer} bytes longer raised the smallest budget from {short_need} to {long_need}"
     );
 }
 

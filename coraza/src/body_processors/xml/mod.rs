@@ -65,7 +65,7 @@ trait Sink {
     /// A non-empty text segment, trimmed.
     fn text(&mut self, value: String);
 
-    /// Takes back the last `count` attribute values, which belonged to a start tag the input ended in.
+    /// Takes back the last `count` attribute values, which belonged to a start tag the input or the budget ended in.
     fn discard_attributes(&mut self, count: usize);
 }
 
@@ -175,7 +175,7 @@ fn read(xml: &[u8], memory: MemoryBudget, sink: &mut impl Sink) -> Result<Option
             Ok(Some(Token::CharData(text))) => {
                 let text = trimmed(text);
                 if !text.is_empty() {
-                    let cost = decoder.cost(|| sink.text_cost(text.len()));
+                    let cost = decoder.cost(&text, |len| sink.text_cost(len));
                     if let Err(error) = decoder.reserve(cost.grown) {
                         return Ok(Some(error.to_string()));
                     }
@@ -191,6 +191,8 @@ fn read(xml: &[u8], memory: MemoryBudget, sink: &mut impl Sink) -> Result<Option
                 return Ok(None);
             },
             Err(error @ decoder::DecodeError::MemoryBudget { .. }) => {
+                // Nor are those of one the budget ended in.
+                sink.discard_attributes(decoder.unfinished_attributes());
                 return Ok(Some(error.to_string()));
             },
             Err(error) => return Err(error),
@@ -308,18 +310,6 @@ mod tests {
             one_less.budget_error.as_deref(),
             Some(format!("parsed XML exceeds the {} byte body memory budget", needed - 1).as_str())
         );
-    }
-
-    #[test]
-    fn an_attribute_flood_in_one_tag_keeps_the_values_the_budget_admitted() {
-        let mut body = b"<r".to_vec();
-        body.extend(std::iter::repeat_n(*b" b", 10_000).flatten());
-        body.extend_from_slice(b"></r>");
-        let document = Document::read(&body, MemoryBudget::new(Some(10 * value_cost(1)))).unwrap();
-        let kept = document.attribute_values.len();
-        assert!((1..10).contains(&kept), "the values read before it ran out: {kept}");
-        assert!(document.attribute_values.iter().all(|value| value == "b"));
-        assert!(document.budget_error.is_some());
     }
 
     /// A fresh `REQUEST_XML`.

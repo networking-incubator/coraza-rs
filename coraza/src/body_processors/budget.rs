@@ -23,10 +23,7 @@
 
 use std::borrow::Cow;
 
-use crate::collection::{
-    Growth, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, Map, VALUE_ENTRY_BYTES,
-    allocation_bytes, grown_list_capacity, key_bytes,
-};
+use crate::collection::{Growth, Map, VALUE_ENTRY_BYTES, allocation_bytes, grown_list_capacity, key_bytes};
 
 /// What a body processor may still retain, or no limit at all.
 ///
@@ -60,6 +57,7 @@ impl MemoryBudget {
     }
 
     /// Bytes left, `None` when unlimited.
+    #[cfg(test)]
     pub(crate) const fn remaining(&self) -> Option<usize> {
         self.remaining
     }
@@ -98,50 +96,77 @@ pub(crate) fn excerpt(text: &str, max: usize) -> Cow<'_, str> {
     Cow::Owned(cut)
 }
 
-/// The bytes of a name that a case-insensitive map may keep for one value: the lookup key and the original beside
-/// the value, each up to four times as large when the name is not valid UTF-8 (its lossy text view is held too).
-///
-/// This reads the name, so callers use it only when a budget is set.
-pub(crate) fn map_key_bytes(key: &[u8]) -> usize {
-    let per_byte = if std::str::from_utf8(key).is_ok() {
-        1
-    } else {
-        KEY_RETAINED_BYTES_PER_BYTE
-    };
-    key.len().saturating_mul(per_byte).saturating_mul(KEY_COPIES_PER_INSERT)
-}
-
-/// The bytes one value costs in one map, whether its key is new or repeated: the map's own overhead, which
-/// `Map`'s tests check against the measured growth, plus `key_bytes` (see [`map_key_bytes`]) and the value.
-pub(crate) fn insert_cost(key_bytes: usize, value_len: usize) -> usize {
-    INSERT_OVERHEAD_BYTES
-        .saturating_add(key_bytes)
-        .saturating_add(value_len)
-}
-
-/// What one more value of `value_len` bytes under `key` takes from each of `maps`, together. A map that holds the
-/// key adds the value, its spelling of the key when that is not the map's, and the growth of a full list; one that
-/// does not adds the value, the key, the list it starts and the growth of a full table of keys.
+/// What one more value of `value_len` bytes under `key` takes from each of `maps`, together (see [`values_growth`]).
 pub(crate) fn insert_growth(maps: &[&Map], key: &[u8], value_len: usize) -> Growth {
-    let value = Growth {
-        grown: allocation_bytes(value_len),
-        freed: 0,
-    };
     maps.iter().fold(Growth::default(), |sum, map| {
-        let lookup = map.lookup_key(key);
-        let shape = map.value_list_shape(&lookup);
-        let growth = if let Some(shape) = shape {
-            list_growth(shape, 0, VALUE_ENTRY_BYTES, grown_list_capacity)
-        } else {
-            let table = map.new_key_table_growth();
-            Growth {
-                grown: table.grown.saturating_add(allocation_bytes(VALUE_ENTRY_BYTES)),
-                ..table
-            }
-        };
-        let stored = key_bytes(key, &lookup, shape.is_none());
-        sum.plus(value).plus(growth).plus(stored)
+        sum.plus(values_growth(map, key, [value_len]))
     })
+}
+
+/// What `map` allocates for values of the lengths `lens` added under `key` in turn.
+pub(crate) fn values_growth(map: &Map, key: &[u8], lens: impl IntoIterator<Item = usize>) -> Growth {
+    let lookup = map.lookup_key(key);
+    let shape = map.value_list_shape(&lookup);
+    let spelling = key_bytes(key, &lookup, false);
+    lens.into_iter()
+        .enumerate()
+        .fold(Growth::default(), |sum, (added, len)| {
+            let growth = match value_list_growth(shape, added) {
+                (_, true) => new_key_growth(map, key, &lookup, 0),
+                (list, false) => list.plus(spelling),
+            };
+            sum.plus(growth).plus(Growth {
+                grown: allocation_bytes(len),
+                freed: 0,
+            })
+        })
+}
+
+/// What `Map::set_index` at index 0 allocates in `map` for each of `keys` in turn, rewriting a filed key in place.
+pub(crate) fn first_values_growth<'k>(map: &Map, keys: impl IntoIterator<Item = &'k [u8]>, value_len: usize) -> Growth {
+    let (mut new_keys, mut last_new) = (0, None);
+    keys.into_iter().fold(Growth::default(), |sum, key| {
+        let lookup = map.lookup_key(key);
+        // Filed like the last new key, told without a second lowercase copy, as one copy is charged.
+        let repeat = last_new.is_some_and(|new| map.files_under(new, &lookup));
+        let growth = if repeat || map.value_list_shape(&lookup).is_some() {
+            key_bytes(key, &lookup, false)
+        } else {
+            new_keys += 1;
+            last_new = Some(key);
+            new_key_growth(map, key, &lookup, new_keys - 1)
+        };
+        sum.plus(growth).plus(Growth {
+            grown: allocation_bytes(value_len),
+            freed: 0,
+        })
+    })
+}
+
+/// What a key `map` does not hold takes for its first value besides the value: the key, the list of one it starts, and
+/// the growth of a full table after `earlier` other keys new to it.
+fn new_key_growth(map: &Map, key: &[u8], lookup: &[u8], earlier: usize) -> Growth {
+    map.new_key_table_growth(earlier)
+        .plus(LIST_OF_ONE)
+        .plus(key_bytes(key, lookup, true))
+}
+
+/// The list of one value that a key's first value starts.
+const LIST_OF_ONE: Growth = Growth {
+    grown: allocation_bytes(VALUE_ENTRY_BYTES),
+    freed: 0,
+};
+
+/// What one more value takes from the list of its key's values that a map holds in `shape` (`None` when it holds no
+/// list for the key) after `added` more were added to it, and whether it is the key's first value: that one starts a
+/// list of one, which the next ones are added to.
+pub(crate) fn value_list_growth(shape: Option<(usize, usize)>, added: usize) -> (Growth, bool) {
+    let grow = |shape, added| list_growth(shape, added, VALUE_ENTRY_BYTES, grown_list_capacity);
+    match shape {
+        Some(shape) => (grow(shape, added), false),
+        None if added == 0 => (LIST_OF_ONE, true),
+        None => (grow((1, 1), added - 1), false),
+    }
 }
 
 /// The largest lowercase copy any of `maps` makes of `key`, which only one of them holds at a time.
@@ -198,17 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_charged_twice_over_and_four_times_that_when_it_is_not_utf8() {
-        use super::{insert_cost, map_key_bytes};
-        assert_eq!(map_key_bytes(b"abc"), 6);
-        // Each invalid byte is held as itself and as a three-byte U+FFFD in the text view.
-        assert_eq!(map_key_bytes(b"\xff\xff\xff"), 24);
-        assert_eq!(map_key_bytes(b""), 0);
-        // Arithmetic that would overflow saturates instead of wrapping into a small charge.
-        assert_eq!(insert_cost(usize::MAX, usize::MAX), usize::MAX);
-    }
-
-    #[test]
     fn an_excerpt_is_cut_at_a_character_boundary_and_marked() {
         use super::excerpt;
         assert!(matches!(excerpt("abc", 3), std::borrow::Cow::Borrowed("abc")));
@@ -218,8 +232,8 @@ mod tests {
     }
 
     #[test]
-    fn an_insertion_is_charged_what_the_map_allocates_for_it() {
-        use super::insert_growth;
+    fn values_are_charged_what_the_map_allocates_for_them() {
+        use super::values_growth;
         use crate::{collection::Map, types::RuleVariable};
 
         // Repeated keys that share the map's spelling or keep their own, lowercase forms that are longer, and keys
@@ -234,19 +248,69 @@ mod tests {
             b"k\xff",
             b"K\xff",
         ];
+        let three: [&[u8]; 3] = [b"", b"x", b"xy"];
         for mut map in [
             Map::new(RuleVariable::Args),
             Map::new_case_sensitive(RuleVariable::Args),
         ] {
             for round in 0..1_500 {
                 for key in keys {
-                    let growth = insert_growth(&[&map], key, round % 3);
+                    // One to three values at a time.
+                    let values = three.get(..=round % 3).unwrap_or_default();
+                    let growth = values_growth(&map, key, values.iter().map(|value| value.len()));
                     let before = map.allocated_bytes();
-                    map.add_bytes(key, b"xy".get(..round % 3).unwrap_or_default());
+                    for value in values {
+                        map.add_bytes(key, value);
+                    }
                     let added = map.allocated_bytes() - before;
                     assert_eq!(added, growth.grown - growth.freed, "{key:?} after {round}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn first_values_set_in_turn_are_charged_what_the_map_allocates_for_them() {
+        use super::first_values_growth;
+        use crate::{collection::Map, types::RuleVariable};
+
+        // Each round a new name, then one new every other round, so either can be the one the table grows for.
+        let mut map = Map::new(RuleVariable::FilesSizes);
+        for round in 0..1_000_usize {
+            let names = [format!("new{round}"), format!("Held{}", round / 2)];
+            let growth = first_values_growth(&map, names.iter().map(String::as_bytes), 20);
+            let before = map.allocated_bytes();
+            for name in &names {
+                map.set_index(name, 0, round.to_string());
+            }
+            let (added, charged) = (map.allocated_bytes() - before, growth.grown - growth.freed);
+            // A held name is charged a new value and spelling, which its rewrite in place does not need.
+            assert!(
+                added <= charged && charged <= added + 64,
+                "{names:?}: {added} allocated, {charged} charged"
+            );
+        }
+
+        // A `filename` and a `filename*` that fold alike are one key, which the second rewrites in place, whichever
+        // needs a lowercase copy, and two keys otherwise (`ß` has no simple lowercase form).
+        for names in [
+            [b"A.TXT".as_slice(), b"a.txt"],
+            [b"a.txt", b"A.TXT"],
+            [b"Q1.txt", b"q1.TXT"],
+            ["\u{c9}.TXT".as_bytes(), "\u{e9}.txt".as_bytes()],
+            [b"k\xff.txt", b"K\xff.TXT"],
+            [b"SS.txt", "\u{df}.txt".as_bytes()],
+        ] {
+            let mut map = Map::new(RuleVariable::FilesSizes);
+            let growth = first_values_growth(&map, names, 20);
+            for name in names {
+                map.set_index(name, 0, "1");
+            }
+            let (added, charged) = (map.allocated_bytes(), growth.grown - growth.freed);
+            assert!(
+                added <= charged && charged <= added + 64,
+                "{names:?}: {added} allocated, {charged} charged"
+            );
         }
     }
 }

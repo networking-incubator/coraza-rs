@@ -53,7 +53,7 @@ use crate::{
         AuditRequest, AuditResponse, AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
     body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, budget::MemoryBudget},
-    collection::{Map, MatchData, Single},
+    collection::{Map, MatchData, Single, allocation_bytes},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
     operators::{DynamicPmMatcher, Macro, Outputs},
@@ -1378,8 +1378,8 @@ impl Transaction {
     /// buffer.
     fn uploaded_paths_bytes(&self) -> usize {
         self.uploaded_paths.iter().fold(
-            self.uploaded_paths.capacity().saturating_mul(size_of::<PathBuf>()),
-            |total, path| total.saturating_add(path.capacity()),
+            allocation_bytes(self.uploaded_paths.capacity().saturating_mul(size_of::<PathBuf>())),
+            |total, path| total.saturating_add(allocation_bytes(path.capacity())),
         )
     }
 
@@ -1469,27 +1469,27 @@ impl Transaction {
     /// Estimate backing storage copied into matched-rule results.
     fn matched_rules_memory_bytes(&self) -> usize {
         self.matched_rules.iter().fold(
-            self.matched_rules.capacity().saturating_mul(size_of::<MatchedRule>()),
+            allocation_bytes(self.matched_rules.capacity().saturating_mul(size_of::<MatchedRule>())),
             |total, rule| {
                 let strings = [
-                    rule.rule.raw.capacity(),
-                    rule.rule.tags.iter().map(String::capacity).sum(),
-                    rule.client_ip.capacity(),
-                    rule.server_ip.capacity(),
-                    rule.uri.capacity(),
-                    rule.transaction_id.capacity(),
+                    allocation_bytes(rule.rule.raw.capacity()),
+                    rule.rule.tags.iter().map(|tag| allocation_bytes(tag.capacity())).sum(),
+                    allocation_bytes(rule.client_ip.capacity()),
+                    allocation_bytes(rule.server_ip.capacity()),
+                    allocation_bytes(rule.uri.capacity()),
+                    allocation_bytes(rule.transaction_id.capacity()),
                     rule.matches.iter().fold(0_usize, |size, matched| {
-                        size.saturating_add(matched.key.capacity())
-                            .saturating_add(matched.value.capacity())
-                            .saturating_add(matched.message.capacity())
-                            .saturating_add(matched.data.capacity())
+                        size.saturating_add(allocation_bytes(matched.key.capacity()))
+                            .saturating_add(allocation_bytes(matched.value.capacity()))
+                            .saturating_add(allocation_bytes(matched.message.capacity()))
+                            .saturating_add(allocation_bytes(matched.data.capacity()))
                     }),
                 ]
                 .into_iter()
                 .fold(0_usize, usize::saturating_add);
-                total
-                    .saturating_add(strings)
-                    .saturating_add(rule.matches.capacity().saturating_mul(size_of::<MatchData>()))
+                total.saturating_add(strings).saturating_add(allocation_bytes(
+                    rule.matches.capacity().saturating_mul(size_of::<MatchData>()),
+                ))
             },
         )
     }
@@ -7011,15 +7011,11 @@ payload\r\n\
             tx.uploaded_paths
                 .push(std::path::PathBuf::from(format!("{}{index}", "d".repeat(499))));
         }
-        let expected = tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>()
-            + tx.uploaded_paths
-                .iter()
-                .map(std::path::PathBuf::capacity)
-                .sum::<usize>();
+        let expected = tx.uploaded_paths_bytes();
         assert!(expected >= 10 * 500, "the paths are long enough to tell");
         assert_eq!(tx.body_memory_bytes() - before, expected);
         tx.uploaded_paths.clear();
-        assert!(tx.body_memory_bytes() - before <= tx.uploaded_paths.capacity() * size_of::<std::path::PathBuf>());
+        assert!(tx.body_memory_bytes() - before < 10 * 500, "only the list is left");
     }
 
     #[test]
