@@ -67,9 +67,6 @@ pub(crate) struct ParseFailure {
     /// a body that is not multipart at all
     /// (`internal/bodyprocessors/multipart.go:22-34`, v3.8.1).
     pub(crate) strict: bool,
-    /// Whether the parser stopped in a body that is multipart, so that parts past the stop were not looked at.
-    /// A body that is not multipart has none.
-    pub(crate) parts_unread: bool,
     /// What stopped the parser.
     pub(crate) cause: FailureCause,
 }
@@ -95,8 +92,34 @@ pub(crate) enum FailureCause {
 ///
 /// The parts it returns are charged to `memory`, and reading stops, as for any other parse failure, when
 /// they would take more than half of what it has left. The caller gives each part's
-/// [`Part::retained_bytes`] back as it drops the part.
+/// [`Part::owned_bytes`] back as it drops the part.
 pub(crate) fn parse<'a>(
+    content_type: &[u8],
+    body: &'a [u8],
+    truncated: bool,
+    memory: &mut MemoryBudget,
+) -> (Vec<Part<'a>>, Option<ParseFailure>, bool) {
+    // The parsed media type and the parser's boundary markers are held while it reads: charged from the header.
+    let setup = if memory.is_limited() {
+        parser::setup_cost(content_type)
+    } else {
+        0
+    };
+    if !memory.charge(setup) {
+        let failure = ParseFailure {
+            message: parser::ParseError::Budget.go_message(),
+            strict: false,
+            cause: FailureCause::MemoryBudget,
+        };
+        return (Vec::new(), Some(failure), false);
+    }
+    let parsed = parse_charged(content_type, body, truncated, memory);
+    memory.refund(setup);
+    parsed
+}
+
+/// [`parse`] once what its setup holds is charged to `memory`.
+fn parse_charged<'a>(
     content_type: &[u8],
     body: &'a [u8],
     truncated: bool,
@@ -110,7 +133,6 @@ pub(crate) fn parse<'a>(
                 Some(ParseFailure {
                     message: error.to_owned(),
                     strict: true,
-                    parts_unread: true,
                     cause: FailureCause::Malformed,
                 }),
                 false,
@@ -126,7 +148,6 @@ pub(crate) fn parse<'a>(
             Some(ParseFailure {
                 message: "not a multipart body".to_owned(),
                 strict: false,
-                parts_unread: false,
                 cause: FailureCause::Malformed,
             }),
             false,
@@ -147,7 +168,8 @@ pub(crate) fn parse<'a>(
     }
     let bounded = reading.is_limited();
     let failure = error.map(|error| ParseFailure {
-        strict: error.is_strict(),
+        // The host's memory budget is not one of Go's reader errors.
+        strict: !error.is_budget(),
         cause: if error.is_budget() {
             FailureCause::MemoryBudget
         } else {
@@ -155,7 +177,6 @@ pub(crate) fn parse<'a>(
         },
         // The line a failure quotes is cut short under a budget, as the message is kept long after the parse.
         message: if bounded { error.bounded() } else { error }.go_message(),
-        parts_unread: true,
     });
     (parts, failure, parser.cut_open())
 }

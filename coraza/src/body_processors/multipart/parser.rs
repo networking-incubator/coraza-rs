@@ -138,12 +138,6 @@ impl ParseError {
     pub(super) const fn is_budget(&self) -> bool {
         matches!(self, Self::Budget)
     }
-
-    /// Whether Go's reader would report this failure too, which sets `MULTIPART_STRICT_ERROR`: the host's memory
-    /// budget is not one of its errors.
-    pub(super) const fn is_strict(&self) -> bool {
-        !matches!(self, Self::Budget)
-    }
 }
 
 impl std::error::Error for ParseError {}
@@ -198,12 +192,6 @@ pub(crate) struct Part<'a> {
 }
 
 impl Part<'_> {
-    /// Bytes of the slot the part takes in the vector it waits in, with the growth slack of that vector. The vector
-    /// keeps them until it is dropped, however many of its parts have been taken out.
-    pub(crate) const fn slot_bytes() -> usize {
-        size_of::<Self>().saturating_mul(2)
-    }
-
     /// Bytes the part's own buffers hold beyond the body it borrows: its names, and each header's name and value
     /// with the entry that holds them, all by the capacity the buffers keep, which a decoded name can leave well
     /// above its length. They are freed when the part is dropped.
@@ -229,9 +217,10 @@ impl Part<'_> {
             .saturating_add(5 * ALLOCATION_OVERHEAD_BYTES)
     }
 
-    /// Bytes this part holds while it waits in its vector: [`Part::slot_bytes`] and [`Part::owned_bytes`].
-    pub(crate) fn retained_bytes(&self) -> usize {
-        Self::slot_bytes().saturating_add(self.owned_bytes())
+    /// Bytes this part holds while it waits in its vector: [`Part::owned_bytes`], and its slot with the vector's
+    /// growth slack, which the vector keeps until it is dropped, however many of its parts have been taken out.
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_mul(2).saturating_add(self.owned_bytes())
     }
 }
 
@@ -344,15 +333,9 @@ impl<'a> MultipartParser<'a> {
         self.memory.set(memory);
     }
 
-    /// Reads the part in `data` into `parts`, with the memory it takes reserved before it is allocated.
-    ///
-    /// The parse copies the header block and every parameter of the disposition, which the header limits bound
-    /// but not by what the host has left, so it reserves what [`header_parse_cost`] bounds first and gives that
-    /// back once the part is built. The part itself is then charged at what it keeps, while that reservation is
-    /// still held, so the peak is covered. A part that does not fit leaves the parts before it in `parts`.
-    ///
-    /// `truncated` carries the delimiter markers of a part a body limit cut, which is read as far as it goes and
-    /// has its partial delimiter trimmed.
+    /// Reads the part in `data` into `parts`, with [`header_parse_cost`] reserved while its headers are parsed and
+    /// the part, charged what it keeps, is built. A part that does not fit leaves the parts before it in `parts`.
+    /// `truncated` carries the delimiter markers of a part a body limit cut, whose partial delimiter is trimmed.
     fn read_part(
         &self,
         parts: &mut Vec<Part<'a>>,
@@ -362,7 +345,7 @@ impl<'a> MultipartParser<'a> {
     ) -> Result<(), ParseError> {
         let held = Cell::new(0_usize);
         let reserve = |block: &[u8]| {
-            if !self.memory.get().is_limited() {
+            if !self.is_bounded() {
                 return Ok(());
             }
             let cost = header_parse_cost(block);
@@ -381,7 +364,9 @@ impl<'a> MultipartParser<'a> {
             if let Some((dash_boundary, nl_boundary)) = truncated {
                 part.data = trim_truncated_part_data(part.data, dash_boundary, nl_boundary);
             }
-            self.reserve(part.retained_bytes())?;
+            if self.is_bounded() {
+                self.reserve(part.retained_bytes())?;
+            }
             Ok(Some(part))
         });
         self.release(held.get());
@@ -612,6 +597,15 @@ fn trim_truncated_part_data<'a>(data: &'a [u8], dash_boundary: &[u8], nl_boundar
         return data.get(..newline).unwrap_or_default();
     }
     data
+}
+
+/// What reading a body holds besides its parts, from the `Content-Type` it is read with: the media type, parsed as
+/// [`header_parse_cost`] bounds a part's disposition, and the parser's copy of the boundary with the two markers and
+/// the prefix table built from it.
+pub(super) fn setup_cost(content_type: &[u8]) -> usize {
+    header_parse_cost(content_type)
+        .saturating_add(content_type.len().saturating_mul(3 + size_of::<usize>()))
+        .saturating_add(4 * ALLOCATION_OVERHEAD_BYTES)
 }
 
 /// The most the parse of a header block can hold at once, for the host's budget to reserve before it starts.
@@ -1814,7 +1808,6 @@ Content-Disposition: form-data; name=\"q\"\r\n\
             part.owned_bytes(),
             shrunk.owned_bytes()
         );
-        assert_eq!(part.retained_bytes(), Part::slot_bytes() + part.owned_bytes());
     }
 
     #[test]

@@ -9,7 +9,10 @@
 use std::fmt;
 
 use super::tables::{AUTO_CLOSE, FIRST, HTML_ENTITIES, SECOND};
-use crate::{body_processors::budget::MemoryBudget, collection::ALLOCATION_OVERHEAD_BYTES};
+use crate::{
+    body_processors::budget::MemoryBudget,
+    collection::{ALLOCATION_OVERHEAD_BYTES, Growth},
+};
 
 /// An element's name as written: `prefix:local`, or `local` alone
 #[derive(Debug, Clone)]
@@ -152,8 +155,9 @@ fn name_bytes(name: &Name) -> usize {
 const EXCERPT_BYTES: usize = 64;
 
 impl<'a> Decoder<'a> {
-    /// Create a decoder over an XML document.
-    pub(super) fn new(input: &'a [u8]) -> Self {
+    /// Create a decoder over an XML document that holds what it reads within the host's `memory` budget: it reads
+    /// ahead to size what it is about to allocate, and charges that first. An unlimited budget changes nothing.
+    pub(super) fn new(input: &'a [u8], memory: MemoryBudget) -> Self {
         Self {
             input,
             offset: 0,
@@ -162,7 +166,7 @@ impl<'a> Decoder<'a> {
             pending_end: None,
             pending_charged: 0,
             next_token: None,
-            memory: MemoryBudget::default(),
+            memory,
             open_charged: 0,
             scratch: 0,
             tag_attributes: 0,
@@ -171,31 +175,17 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Limits everything this decoder holds, values and its own scratch, to the host's `memory` budget.
-    ///
-    /// The decoder reads ahead to size what it is about to allocate, and charges that first, so a body of any
-    /// shape stops it before it goes past the budget. An unlimited budget leaves it as it was.
-    pub(super) fn with_memory_budget(mut self, memory: MemoryBudget) -> Self {
-        self.memory = memory;
-        self
-    }
-
-    /// Reserves `bytes` of the memory budget for a value about to be kept, which is a no-op without a budget.
-    ///
-    /// # Errors
-    ///
-    /// [`DecodeError::MemoryBudget`] when the budget cannot cover it. The budget is not reduced then.
-    pub(super) fn charge(&mut self, bytes: usize) -> Result<(), DecodeError> {
-        self.reserve(bytes)
-    }
-
-    /// Gives back `bytes` that [`Decoder::charge`] reserved beyond what a stored value keeps.
+    /// Gives back `bytes` that [`Decoder::reserve`] reserved beyond what a stored value keeps.
     pub(super) fn release(&mut self, bytes: usize) {
         self.memory.refund(bytes);
     }
 
     /// Reserves `bytes` of the host's memory budget, which is a no-op without one.
-    fn reserve(&mut self, bytes: usize) -> Result<(), DecodeError> {
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::MemoryBudget`] when the budget cannot cover it. The budget is not reduced then.
+    pub(super) fn reserve(&mut self, bytes: usize) -> Result<(), DecodeError> {
         if self.memory.charge(bytes) {
             Ok(())
         } else {
@@ -210,43 +200,31 @@ impl<'a> Decoder<'a> {
         self.memory.is_limited()
     }
 
+    /// What `cost` says a value takes, asked only when there is a budget to charge it to.
+    pub(super) fn cost(&self, cost: impl FnOnce() -> Growth) -> Growth {
+        if self.is_limited() { cost() } else { Growth::default() }
+    }
+
     /// Reserves `bytes` for a buffer the decoder is about to fill. It stays reserved until
-    /// [`Decoder::release_scratch`], which every token does at its end.
+    /// [`Decoder::release_scratch_to`], which every token does at its end.
     fn scratch(&mut self, bytes: usize) -> Result<(), DecodeError> {
         self.reserve(bytes)?;
         self.scratch = self.scratch.saturating_add(bytes);
         Ok(())
     }
 
-    /// Gives back what [`Decoder::scratch`] reserved: the buffers it covered are gone, or are now values, which the
-    /// caller charges for itself.
-    fn release_scratch(&mut self) {
-        self.memory.refund(self.scratch);
-        self.scratch = 0;
-    }
-
-    /// Gives back what [`Decoder::scratch`] reserved since `mark`, a value [`Decoder::scratch_mark`] returned: one
-    /// part of a token, such as an attribute, is done with its buffers while the rest of the token still holds its own.
+    /// Gives back what [`Decoder::scratch`] reserved since the scratch was `mark`, all of it for `0`: the buffers it
+    /// covered are gone, or are now values, which the caller charges for itself.
     fn release_scratch_to(&mut self, mark: usize) {
         let release = self.scratch.saturating_sub(mark);
         self.memory.refund(release);
         self.scratch = mark;
     }
 
-    /// The scratch the token holds now, to give back what comes after it alone.
-    const fn scratch_mark(&self) -> usize {
-        self.scratch
-    }
-
     /// The length of the input from the offset to the first byte `stop` accepts, or to its end.
     fn run_len(&self, stop: impl Fn(u8) -> bool) -> usize {
         let rest = self.input.get(self.offset..).unwrap_or_default();
         rest.iter().position(|&b| stop(b)).unwrap_or(rest.len())
-    }
-
-    /// The length of the name that starts at the offset.
-    fn name_run(&self) -> usize {
-        self.run_len(|b| b.is_ascii() && !is_name_byte(b))
     }
 
     /// The most bytes the text read up to `end` can take: the input up to its end, which references and line
@@ -276,7 +254,7 @@ impl<'a> Decoder<'a> {
     /// within a token or an element.
     pub(super) fn token(&mut self, sink: &mut dyn super::Sink) -> Result<Option<Token>, DecodeError> {
         let token = self.next_checked_token(sink);
-        self.release_scratch();
+        self.release_scratch_to(0);
         token
     }
 
@@ -623,7 +601,7 @@ impl<'a> Decoder<'a> {
             }
             // The attribute's own buffers are given back when it is read; the element's name, which the tag holds
             // to its end, keeps what it reserved.
-            let mark = self.scratch_mark();
+            let mark = self.scratch;
             let attribute = self
                 .nsname()?
                 .ok_or_else(|| self.syntax_error("expected attribute name in element"))?;
@@ -636,11 +614,11 @@ impl<'a> Decoder<'a> {
                 attribute.local
             };
             self.release_scratch_to(mark);
-            let cost = sink.attribute_cost(value.len());
-            self.charge(cost.charge)?;
+            let cost = self.cost(|| sink.attribute_cost(value.len()));
+            self.reserve(cost.grown)?;
             self.tag_attributes = self.tag_attributes.saturating_add(1);
             sink.attribute(value);
-            self.release(cost.release);
+            self.release(cost.freed);
         }
         self.tag_attributes = 0;
         Ok(Token::Start { name })
@@ -836,7 +814,7 @@ impl<'a> Decoder<'a> {
         let mut name = Vec::new();
         if self.is_limited() {
             // Whatever the name is for, it is read whole before anything is known about it, so it is reserved first.
-            let run = self.name_run();
+            let run = self.run_len(|b| b.is_ascii() && !is_name_byte(b));
             self.scratch(run.saturating_add(ALLOCATION_OVERHEAD_BYTES))?;
             name.reserve_exact(run);
         }
