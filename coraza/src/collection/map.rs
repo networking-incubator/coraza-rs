@@ -52,6 +52,9 @@ pub struct Map {
     case_sensitive: bool,
     /// Internal storage from `lookup_key` to `Vec<KeyValue>`, in insertion order.
     /// Keys are lowercase for case-insensitive maps.
+    ///
+    /// [`Map::allocated_bytes`] counts it from its capacity, which every change to it must keep true, see
+    /// [`index_table_bytes`].
     data: IndexMap<Key, Vec<KeyValue>, ahash::RandomState>,
     /// The variable this collection represents
     variable: RuleVariable,
@@ -452,6 +455,24 @@ impl Map {
         }
     }
 
+    /// Whether the map files `key` under `lookup`, a key as [`Map::lookup_key`] files it, told without the lowercase
+    /// copy that makes: `key` folded a byte at a time as [`lower_bytes`] folds it.
+    pub(crate) fn files_under(&self, key: &[u8], lookup: &[u8]) -> bool {
+        if self.case_sensitive {
+            return key == lookup;
+        }
+        key.utf8_chunks()
+            .flat_map(|chunk| {
+                let lowered = chunk.valid().chars().flat_map(|character| {
+                    let mut buffer = [0_u8; 4];
+                    let len = crate::utils::lowercase_char(character).encode_utf8(&mut buffer).len();
+                    buffer.into_iter().take(len)
+                });
+                lowered.chain(chunk.invalid().iter().copied())
+            })
+            .eq(lookup.iter().copied())
+    }
+
     /// Every key, with its original casing, and value, in insertion order.
     ///
     /// Keyless selections walk the map in this order, so the last keyless match (and the
@@ -625,7 +646,7 @@ impl Map {
     /// Appends `value`, which the map takes without copying, to the values of the exact key bytes.
     ///
     /// The buffer is trimmed to its length first, so that a value read into a growing buffer does not keep the
-    /// growth.
+    /// growth; the trim can copy it beside the buffer, which a caller with a budget charges for.
     pub(crate) fn add_owned(&mut self, key: &[u8], mut value: Vec<u8>) {
         value.shrink_to_fit();
         let lookup = self.lookup_key(key);
@@ -645,17 +666,19 @@ impl Map {
     }
 
     /// Keeps the first `keep` values of `key` and drops the rest, removing the key if none stay.
+    ///
+    /// The list keeps its capacity: trimming it would copy what stays beside it, which a body that ran out of budget
+    /// has no room for.
     pub(crate) fn truncate_values(&mut self, key: &[u8], keep: usize) {
         let lookup = self.lookup_key(key);
+        let Some(values) = self.data.get_mut(lookup.as_ref()) else {
+            return;
+        };
+        self.values = self.values.saturating_sub(count_of(values.len().saturating_sub(keep)));
+        values.truncate(keep);
         if keep == 0 {
-            if let Some(removed) = self.data.shift_remove(lookup.as_ref()) {
-                self.values = self.values.saturating_sub(count_of(removed.len()));
-            }
-        } else if let Some(values) = self.data.get_mut(lookup.as_ref()) {
-            let dropped = values.len().saturating_sub(keep);
-            values.truncate(keep);
-            values.shrink_to_fit();
-            self.values = self.values.saturating_sub(count_of(dropped));
+            // Not `shift_remove`, see `index_table_bytes`.
+            self.data.retain(|map_key, _| map_key.as_bytes() != lookup.as_ref());
         }
     }
 
@@ -682,10 +705,17 @@ impl Map {
             .map(|value| KeyValue::new(key, lookup.as_ref(), value.as_ref()))
             .collect();
         let added = key_values.len();
-        if let Some(replaced) = self.data.insert(Key::from_slice(lookup.as_ref()), key_values) {
-            self.values = self.values.saturating_sub(count_of(replaced.len()));
-        }
-        self.values = self.values.saturating_add(count_of(added));
+        // Not `insert` for a held key, see `index_table_bytes`.
+        let replaced = if let Some(held) = self.data.get_mut(lookup.as_ref()) {
+            std::mem::replace(held, key_values).len()
+        } else {
+            self.data.insert(Key::from_slice(lookup.as_ref()), key_values);
+            0
+        };
+        self.values = self
+            .values
+            .saturating_sub(count_of(replaced))
+            .saturating_add(count_of(added));
     }
 
     /// Replaces the value at `index` of `key`, or appends it if `index` is past the end.
@@ -721,14 +751,11 @@ impl Map {
 
     /// Removes `key` and all its values, keeping the other keys in insertion order.
     ///
-    /// `shift_remove` memmoves the entries after `key`, so each removal is O(N) (one runs per
-    /// match under `apply_setvar`); `swap_remove` is O(1) but reorders, and ordering is the
-    /// guarantee this type provides.
+    /// Each removal rebuilds the hash index (see [`index_table_bytes`]), O(N) whichever key it is (one runs per match
+    /// under `apply_setvar`); `swap_remove` would be O(1) but reorders, and ordering is the guarantee this type
+    /// provides. The rebuild, a `retain` over every key, takes about 0.7 µs with 100 keys: keep removals off hot paths.
     pub(crate) fn remove(&mut self, key: &str) {
-        let lookup = self.lookup_key(key.as_bytes());
-        if let Some(removed) = self.data.shift_remove(lookup.as_ref()) {
-            self.values = self.values.saturating_sub(count_of(removed.len()));
-        }
+        self.truncate_values(key.as_bytes(), 0);
     }
 
     /// Removes every key.
@@ -773,9 +800,11 @@ impl Map {
         }
     }
 
-    /// What adding one key that the map does not hold takes from its table, see [`index_growth`].
-    pub(crate) fn new_key_table_growth(&self) -> Growth {
-        index_growth::<(Key, Vec<KeyValue>)>(self.data.len(), self.data.capacity())
+    /// What adding one key that the map does not hold takes from its table once `earlier` other keys new to it have
+    /// grown it, see [`index_growth`].
+    pub(crate) fn new_key_table_growth(&self, earlier: usize) -> Growth {
+        let len = self.data.len().saturating_add(earlier);
+        index_growth::<(Key, Vec<KeyValue>)>(len, self.data.capacity().max(index_capacity_for(len)))
     }
 
     /// The capacity of the table of keys.
@@ -888,13 +917,15 @@ pub(crate) const FIRST_INSERT_OVERHEAD_BYTES: usize = 4
     + 4 * size_of::<KeyValue>()
     + 2 * ALLOCATION_OVERHEAD_BYTES;
 
-/// Estimated bytes of an `IndexMap`'s backing allocations for `capacity` entries.
+/// Bytes of an `IndexMap`'s backing allocations for `capacity` entries, as indexmap 2 and hashbrown 0.17 lay them out.
 ///
 /// `IndexMap` stores entries in a vector of `(hash, key, value)` and looks them up through
-/// a hash index of bucket indices, so a `HashMap` bucket model does not describe it. The
-/// entry vector is sized from the capacity and the index is rounded up to a power of two,
-/// which over-counts rather than under-counts. Neither allocation shrinks on removal, so a
-/// cleared map keeps its cost.
+/// a hash index of bucket indices, so a `HashMap` bucket model does not describe it. Neither
+/// allocation shrinks on removal, so a cleared map keeps its cost.
+///
+/// `IndexMap::capacity` reports both only while the index holds no tombstone and has not grown without the entries,
+/// so a map measured from it removes keys with `retain`, which rebuilds the index, rather than `shift_remove` and its
+/// kin, and calls `insert` only for a key a lookup missed: `insert` grows a full index before it finds the key.
 pub(crate) fn index_table_bytes<T>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
@@ -916,23 +947,29 @@ pub(crate) fn index_growth<T>(len: usize, capacity: usize) -> Growth {
 }
 
 /// The capacity an `IndexMap` has grown to once it holds `len` entries: the hash index's, which the entry vector
-/// follows. Its buckets are the power of two that keeps the load at or under seven eighths, four at least, and
-/// a table below eight buckets holds one entry fewer than it has.
+/// follows. A table below eight buckets holds one entry fewer than it has.
 pub(crate) fn index_capacity_for(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    let buckets = if len < 4 {
+    let buckets = index_buckets(len);
+    if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 }
+}
+
+/// The buckets of the hash index for `capacity` entries: the power of two that keeps the load at or under seven
+/// eighths, four at least.
+fn index_buckets(capacity: usize) -> usize {
+    if capacity < 4 {
         4
-    } else if len < 8 {
+    } else if capacity < 8 {
         8
     } else {
-        len.saturating_mul(8)
+        capacity
+            .saturating_mul(8)
             .div_ceil(7)
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)
-    };
-    if buckets < 8 { buckets - 1 } else { buckets / 8 * 7 }
+    }
 }
 
 /// Estimated bytes of the allocations of a map of values whose table has `capacity` entries.
@@ -990,33 +1027,22 @@ fn stored_key_bytes(key: &[u8]) -> Growth {
     }
 }
 
-/// Estimated bytes of the entry vector for `capacity` entries.
+/// Bytes of the entry vector for `capacity` entries, each an indexmap `Bucket`: the entry and its hash.
 fn index_entries_bytes<T>(capacity: usize) -> usize {
-    // Three extra words cover the hash IndexMap stores beside each entry and the padding a
-    // `Bucket` may need before its key.
-    capacity.saturating_mul(size_of::<T>().saturating_add(3 * size_of::<usize>()))
+    allocation_bytes(capacity.saturating_mul(size_of::<T>().saturating_add(size_of::<usize>())))
 }
 
-/// Estimated bytes of the hash index for `capacity` entries.
-///
-/// Mirrors the standard library's capacity-to-bucket mapping (at least four buckets,
-/// otherwise `(capacity + 1) * 8 / 7` rounded up to a power of two) so the estimate
-/// over-counts rather than under-counts. One index word and one control byte are charged per
-/// bucket, plus two words for the index allocation's header.
+/// Bytes of the hash index for `capacity` entries: an index word and a control byte per bucket.
 fn index_buckets_bytes(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
     }
-    let buckets = capacity
-        .saturating_add(1)
-        .saturating_mul(8)
-        .div_ceil(7)
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-        .max(4);
-    buckets
-        .saturating_mul(size_of::<usize>().saturating_add(1))
-        .saturating_add(size_of::<usize>().saturating_mul(2))
+    // hashbrown repeats one group of control bytes past the buckets, 16 bytes in its widest (SSE2) build.
+    allocation_bytes(
+        index_buckets(capacity)
+            .saturating_mul(size_of::<usize>().saturating_add(1))
+            .saturating_add(16),
+    )
 }
 
 #[cfg(test)]
@@ -1685,7 +1711,7 @@ mod tests {
 
         let mut map = Map::new_case_sensitive(RuleVariable::Args);
         for index in 0..2_000 {
-            let growth = map.new_key_table_growth();
+            let growth = map.new_key_table_growth(0);
             let capacity = map.key_table_capacity();
             map.add(&format!("key{index}"), "v");
             if growth == Growth::default() {
@@ -1700,6 +1726,38 @@ mod tests {
                 assert!(map.key_table_capacity() > capacity);
             }
         }
+
+        // Four keys new to a full table of three grow it to seven and fill it: the fifth grows it again.
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        for index in 0..3 {
+            map.add(&format!("held{index}"), "v");
+        }
+        let ahead = map.new_key_table_growth(4);
+        for index in 0..4 {
+            map.add(&format!("new{index}"), "v");
+        }
+        assert_eq!(
+            ahead,
+            map.new_key_table_growth(0),
+            "the fifth new key grows the table again"
+        );
+    }
+
+    #[test]
+    fn removed_keys_leave_the_table_they_held_counted() {
+        use super::{Map, map_capacity_bytes};
+        use crate::types::RuleVariable;
+
+        // A full table of 2048 buckets, where removals leave tombstones unless the index is rebuilt.
+        let mut map = Map::new_case_sensitive(RuleVariable::TX);
+        for index in 0..1_792 {
+            map.add(&format!("key{index}"), "v");
+        }
+        let table = map_capacity_bytes(map.key_table_capacity());
+        for index in 5..1_792 {
+            map.remove(&format!("key{index}"));
+        }
+        assert!(map.allocated_bytes() > table, "neither allocation shrinks on removal");
     }
 
     #[test]

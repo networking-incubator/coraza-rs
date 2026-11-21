@@ -23,6 +23,8 @@
 mod media_type;
 mod parser;
 
+use std::collections::LinkedList;
+
 pub(crate) use parser::Part;
 
 use crate::body_processors::budget::MemoryBudget;
@@ -34,27 +36,35 @@ fn is_token_name(name: &str) -> bool {
         .all(|character| character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character))
 }
 
-/// Format a valid MIME header name as Go's canonical header key.
+/// A part header as `MULTIPART_PART_HEADERS` holds it, `Name: value`, in a buffer of its length, its name as Go's
+/// canonical header key.
 ///
 /// Go's `textproto` canonicalizes a name that is one token (`net/textproto/reader.go`,
 /// `canonicalMIMEHeaderKey`, go1.27.3) and keeps the name as sent when it holds a space
 /// (go.dev/issue/34540), which is what a part header map is keyed by.
-pub(crate) fn canonical_header_name(name: &str) -> String {
-    if !is_token_name(name) {
-        return name.to_owned();
-    }
-    let mut starts_word = true;
-    name.chars()
-        .map(|character| {
-            let character = if starts_word {
-                character.to_ascii_uppercase()
+pub(crate) fn header_line(name: &str, value: &[u8]) -> Vec<u8> {
+    let mut line = Vec::with_capacity(header_line_len(name, value));
+    line.extend_from_slice(name.as_bytes());
+    if is_token_name(name) {
+        // A token is ASCII, so its case changes byte by byte.
+        let mut starts_word = true;
+        for byte in &mut line {
+            *byte = if starts_word {
+                byte.to_ascii_uppercase()
             } else {
-                character.to_ascii_lowercase()
+                byte.to_ascii_lowercase()
             };
-            starts_word = character == '-';
-            character
-        })
-        .collect()
+            starts_word = *byte == b'-';
+        }
+    }
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(value);
+    line
+}
+
+/// The length of the [`header_line`] of `name` and `value`, which is what it allocates.
+pub(crate) fn header_line_len(name: &str, value: &[u8]) -> usize {
+    name.len().saturating_add(2).saturating_add(value.len())
 }
 
 /// Why a multipart body could not be parsed.
@@ -90,15 +100,15 @@ pub(crate) enum FailureCause {
 /// `truncated` reports that `body` is only the prefix a `ProcessPartial` body limit
 /// retained, which Go's body processor inspects up to the last complete part.
 ///
-/// The parts it returns are charged to `memory`, and reading stops, as for any other parse failure, when
-/// they would take more than half of what it has left. The caller gives each part's
-/// [`Part::owned_bytes`] back as it drops the part.
+/// The parts it returns are charged to `memory`, with the list that holds them, and reading stops, as for any other
+/// parse failure, when they would take more than it has left. The caller gives each part's [`Part::owned_bytes`]
+/// back as it drops the part.
 pub(crate) fn parse<'a>(
     content_type: &[u8],
     body: &'a [u8],
     truncated: bool,
     memory: &mut MemoryBudget,
-) -> (Vec<Part<'a>>, Option<ParseFailure>, bool) {
+) -> (LinkedList<Part<'a>>, Option<ParseFailure>, bool) {
     // The parsed media type and the parser's boundary markers are held while it reads: charged from the header.
     let setup = if memory.is_limited() {
         parser::setup_cost(content_type)
@@ -111,7 +121,7 @@ pub(crate) fn parse<'a>(
             strict: false,
             cause: FailureCause::MemoryBudget,
         };
-        return (Vec::new(), Some(failure), false);
+        return (LinkedList::new(), Some(failure), false);
     }
     let parsed = parse_charged(content_type, body, truncated, memory);
     memory.refund(setup);
@@ -124,12 +134,12 @@ fn parse_charged<'a>(
     body: &'a [u8],
     truncated: bool,
     memory: &mut MemoryBudget,
-) -> (Vec<Part<'a>>, Option<ParseFailure>, bool) {
+) -> (LinkedList<Part<'a>>, Option<ParseFailure>, bool) {
     let content_type = match media_type::parse(content_type) {
         Ok(content_type) => content_type,
         Err(error) => {
             return (
-                Vec::new(),
+                LinkedList::new(),
                 Some(ParseFailure {
                     message: error.to_owned(),
                     strict: true,
@@ -144,7 +154,7 @@ fn parse_charged<'a>(
     // (`internal/bodyprocessors/multipart.go:31-34`, v3.8.1).
     if !content_type.media_type().starts_with(b"multipart/") {
         return (
-            Vec::new(),
+            LinkedList::new(),
             Some(ParseFailure {
                 message: "not a multipart body".to_owned(),
                 strict: false,
@@ -156,17 +166,11 @@ fn parse_charged<'a>(
     // A missing boundary reaches `multipart.NewReader` as the empty string in Go, whose
     // first `NextPart` reports `multipart: boundary is empty`.
     let boundary = content_type.param(b"boundary").unwrap_or_default();
-    // Reading may hold up to half of what the host can spare, which leaves the rest for publishing the first
-    // parts while the others are still held; the parts' charge is given back as they are published.
-    let reading = MemoryBudget::new(memory.remaining().map(|left| left / 2));
     let parser = parser::MultipartParser::new(boundary, body)
         .truncated(truncated)
-        .with_memory_budget(reading);
+        .with_memory_budget(*memory);
     let (parts, error) = parser.parse();
-    if let (Some(before), Some(after)) = (reading.remaining(), parser.memory_left().remaining()) {
-        memory.charge(before.saturating_sub(after));
-    }
-    let bounded = reading.is_limited();
+    *memory = parser.memory_left();
     let failure = error.map(|error| ParseFailure {
         // The host's memory budget is not one of Go's reader errors.
         strict: !error.is_budget(),
@@ -176,7 +180,7 @@ fn parse_charged<'a>(
             FailureCause::Malformed
         },
         // The line a failure quotes is cut short under a budget, as the message is kept long after the parse.
-        message: if bounded { error.bounded() } else { error }.go_message(),
+        message: if memory.is_limited() { error.bounded() } else { error }.go_message(),
     });
     (parts, failure, parser.cut_open())
 }

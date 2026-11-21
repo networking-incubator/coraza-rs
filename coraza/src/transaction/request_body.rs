@@ -22,6 +22,7 @@
 
 use std::{
     borrow::Cow,
+    collections::LinkedList,
     io::Write as _,
     path::{Path, PathBuf},
 };
@@ -38,9 +39,8 @@ use crate::{
         truncate_custom_body_text, xml,
     },
     collection::{
-        ALLOCATION_OVERHEAD_BYTES, Growth, Map, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes,
-        grown_list_capacity, index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes,
-        vec_grown_capacity,
+        ALLOCATION_OVERHEAD_BYTES, Growth, Map, allocation_bytes, fold_scratch_bytes, index_capacity_for, index_growth,
+        index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
     },
     transformations::url_decode,
     types::{BodyLimitAction, RulePhase},
@@ -207,7 +207,7 @@ impl Transaction {
                             self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
                             break;
                         }
-                        let growth = budget::insert_growth(&destinations, &key, value.len());
+                        let growth = self.post_argument_growth(&key, value.len());
                         if !memory.charge(growth.grown) {
                             self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
                             break;
@@ -215,7 +215,7 @@ impl Transaction {
                         transient = transient.saturating_add(fold).saturating_add(growth.freed);
                     }
                     self.insert_post_argument(&key, &value);
-                    // The decoded pair, the copy and what a growth replaced are gone once the pair is in.
+                    // The decoded pair, the copy, what a growth replaced and the text are gone once the pair is in.
                     memory.refund(transient);
                     count = count.saturating_add(1);
                 }
@@ -286,15 +286,14 @@ impl Transaction {
     /// parts that were read hold an upload, or `None` when that has interrupted the transaction.
     fn ban_multipart_uploads(
         &mut self,
-        parts: &[multipart::Part<'_>],
+        parts: &LinkedList<multipart::Part<'_>>,
         failure: Option<&multipart::ParseFailure>,
         cut_open: bool,
     ) -> Option<bool> {
         let published_upload = self.config.reject_multipart_file_uploads
-            && parts.iter().any(|part| {
-                part.filename.as_deref().is_some_and(|name| !name.is_empty())
-                    || part.alt_filename.as_deref().is_some_and(|name| !name.is_empty())
-            });
+            && parts
+                .iter()
+                .any(|part| part.published_filenames().iter().any(Option::is_some));
         if published_upload {
             self.multipart_strict_error.set("1");
             self.inbound_data_error.set("1");
@@ -325,7 +324,7 @@ impl Transaction {
     fn process_multipart_body(&mut self, body: &[u8], partial: bool, discarded: bool) -> Result<(), String> {
         let mut memory = self.memory_budget();
         let content_type = self.request_headers.first("content-type").unwrap_or_default();
-        let (parts, failure, cut_open) = multipart::parse(content_type, body, partial, &mut memory);
+        let (mut parts, failure, cut_open) = multipart::parse(content_type, body, partial, &mut memory);
         let parse_stopped = failure
             .as_ref()
             .is_some_and(|failure| failure.cause == FailureCause::MemoryBudget);
@@ -344,33 +343,35 @@ impl Transaction {
         let mut total_size = 0_u64;
         let mut file_count = self.uploaded_paths.len();
 
-        let mut budget_error = None;
-        // What the part just published held, freed when it is dropped; its slot is not, as the vector outlives it.
+        // What the part just published held, freed by the time the next is taken.
         let mut release_previous = 0_usize;
         // The bytes a temporary upload's path takes, worked out once and only when a file needs one.
         let mut upload_path_bytes = None;
-        for part in parts {
+        while let Some(part) = parts.pop_front() {
             memory.refund(release_previous);
+            // Past the limit, as when rejected, an upload is still recorded (as Go does) but not written.
+            let over_limit = file_count >= self.config.upload_file_limit;
+            let written = !over_limit && !reject_uploads;
             // Everything the part adds is charged before any of it is, so a part that does not fit adds nothing.
-            let upload_dir = &self.config.upload_dir;
-            let destinations = [&self.args_post, &self.args];
             if memory.is_limited() {
-                // The lowercase copy a lookup makes of a name with a capital is charged before it is made, once: the
-                // metadata collections fold it whatever `ARGS` does, and each holds its copy alone.
-                let lookup = fold_scratch_bytes(&part.name);
-                if !memory.charge(lookup) {
-                    self.note_budget_stop(true, true);
-                    budget_error = Some(MULTIPART_MEMORY_BUDGET_ERROR.to_owned());
+                // Lookups fold one name at a time (metadata maps always), so the largest copy is charged once.
+                let lookup = part
+                    .published_filenames()
+                    .into_iter()
+                    .flatten()
+                    .map(fold_scratch_bytes)
+                    .fold(fold_scratch_bytes(&part.name), usize::max);
+                if !self.charge_dropping_last(&mut memory, &mut parts, lookup) {
                     break;
                 }
-                // The test `add_post_argument` makes: a field past the argument limit is dropped, and costs nothing.
-                let admitted = self.args_post.value_count() < self.config.argument_limit;
-                let cost = multipart_publish_cost(&part, destinations, admitted, || {
-                    *upload_path_bytes.get_or_insert_with(|| upload_path_bytes_of(upload_dir))
+                let cost = self.multipart_publish_cost(&part, || {
+                    if written {
+                        *upload_path_bytes.get_or_insert_with(|| upload_path_bytes_of(&self.config.upload_dir))
+                    } else {
+                        0
+                    }
                 });
-                if !memory.charge(cost.grown) {
-                    self.note_budget_stop(true, true);
-                    budget_error = Some(MULTIPART_MEMORY_BUDGET_ERROR.to_owned());
+                if !self.charge_dropping_last(&mut memory, &mut parts, cost.grown) {
                     break;
                 }
                 release_previous = part.owned_bytes().saturating_add(lookup).saturating_add(cost.freed);
@@ -387,8 +388,7 @@ impl Transaction {
             self.publish_part_metadata(&part);
             // Go publishes only non-empty filenames, while a `filename*` that decoded to nothing still contributes
             // its charset and language (`internal/bodyprocessors/multipart.go:88-105`, v3.8.1).
-            let filename = part.filename.as_deref().filter(|filename| !filename.is_empty());
-            let alt_filename = part.alt_filename.as_deref().filter(|filename| !filename.is_empty());
+            let [filename, alt_filename] = part.published_filenames();
             if part.malformed_filename {
                 self.multipart_strict_error.set("1");
             }
@@ -402,9 +402,6 @@ impl Transaction {
                 total_size = total_size
                     .checked_add(size)
                     .ok_or_else(|| "multipart size overflow".to_owned())?;
-                // Past the limit `FILES`, `FILES_SIZES` and `FILES_NAMES` still record the
-                // upload, as Go always does: only the temporary file write stops.
-                let over_limit = file_count >= self.config.upload_file_limit;
                 if over_limit {
                     self.multipart_strict_error.set("1");
                 }
@@ -416,9 +413,7 @@ impl Transaction {
                 }
                 self.files_names.add("", &part.name);
                 file_count += 1;
-                // A rejected upload and one past the limit are recorded but not written
-                // to disk.
-                if over_limit || reject_uploads {
+                if !written {
                     continue;
                 }
                 // Compute the fallback only when a file actually needs a temporary file.
@@ -440,8 +435,28 @@ impl Transaction {
         self.files_combined_size.set(total_size.to_string());
         match failure {
             Some(failure) => Err(failure.message),
-            None => budget_error.map_or(Ok(()), Err),
+            None if self.request_body_stopped_by_memory_budget() => Err(MULTIPART_MEMORY_BUDGET_ERROR.to_owned()),
+            None => Ok(()),
         }
+    }
+
+    /// Charges `bytes` to `memory`, dropping the last of the multipart `parts` waiting to be published until they
+    /// fit, as reading fewer would have left room for them: a larger budget then never publishes fewer. A drop is a
+    /// stop for the budget, noted as it happens; false when no part is left to drop.
+    fn charge_dropping_last(
+        &mut self,
+        memory: &mut MemoryBudget,
+        parts: &mut LinkedList<multipart::Part<'_>>,
+        bytes: usize,
+    ) -> bool {
+        while !memory.charge(bytes) {
+            self.note_budget_stop(true, true);
+            let Some(last) = parts.pop_back() else {
+                return false;
+            };
+            memory.refund(last.owned_bytes());
+        }
+        true
     }
 
     /// Publishes a multipart part's headers, name, filenames and the charset and language of its `filename*`.
@@ -449,17 +464,11 @@ impl Transaction {
         for (name, value) in &part.headers {
             // Go Coraza v3.8.1 `multipart.go:70` stores the header value's raw bytes;
             // a lossy text view would make distinct invalid-UTF-8 values equal.
-            let mut header = multipart::canonical_header_name(name).into_bytes();
-            header.extend_from_slice(b": ");
-            header.extend_from_slice(value);
-            self.multipart_part_headers.add_bytes(&part.name, header);
+            self.multipart_part_headers
+                .add_owned(&part.name, multipart::header_line(name, value));
         }
         self.multipart_name.add_bytes(&part.name, &part.name);
-        for filename in [part.filename.as_deref(), part.alt_filename.as_deref()]
-            .into_iter()
-            .flatten()
-            .filter(|filename| !filename.is_empty())
-        {
+        for filename in part.published_filenames().into_iter().flatten() {
             self.multipart_filename.add_bytes(&part.name, filename);
         }
         if let Some(encoding) = &part.filename_encoding {
@@ -467,6 +476,79 @@ impl Transaction {
             self.multipart_filename_language
                 .add_bytes(&part.name, &encoding.language);
         }
+    }
+
+    /// What `insert_post_argument` allocates for a value of `value_len` bytes under `key`: its entries in `ARGS_POST`
+    /// and `ARGS`, and the text `ARGS_COMBINED_SIZE` is then set from.
+    fn post_argument_growth(&self, key: &[u8], value_len: usize) -> Growth {
+        budget::insert_growth(&[&self.args_post, &self.args], key, value_len).plus(SIZE_TEXT)
+    }
+
+    /// What publishing `part` allocates, its file's path `upload_path_bytes` long (0 when none is written).
+    fn multipart_publish_cost(&self, part: &multipart::Part<'_>, upload_path_bytes: impl FnOnce() -> usize) -> Growth {
+        let name = part.name.as_slice();
+        let [filename, alt_filename] = part.published_filenames();
+        let headers = part
+            .headers
+            .iter()
+            .map(|(header, value)| multipart::header_line_len(header, value));
+        let headers = budget::values_growth(&self.multipart_part_headers, name, headers);
+        let mut cost = headers.plus(budget::values_growth(&self.multipart_name, name, [name.len()]));
+        if let Some(encoding) = &part.filename_encoding {
+            cost = cost
+                .plus(budget::values_growth(
+                    &self.multipart_filename_charset,
+                    name,
+                    [encoding.charset.len()],
+                ))
+                .plus(budget::values_growth(
+                    &self.multipart_filename_language,
+                    name,
+                    [encoding.language.len()],
+                ));
+        }
+        let Some(file) = filename.or(alt_filename) else {
+            // The test `add_post_argument` makes: a field past the argument limit is dropped, and costs nothing.
+            if self.args_post.value_count() < self.config.argument_limit {
+                cost = cost.plus(self.post_argument_growth(name, part.data.len()));
+            }
+            return cost;
+        };
+        let filenames = filename.into_iter().chain(alt_filename).map(<[u8]>::len);
+        let files = [Some(file), alt_filename.filter(|&alt| alt != file)];
+        cost = cost
+            .plus(budget::values_growth(&self.multipart_filename, name, filenames))
+            .plus(budget::values_growth(
+                &self.files,
+                b"",
+                files.into_iter().flatten().map(<[u8]>::len),
+            ))
+            .plus(budget::first_values_growth(
+                &self.files_sizes,
+                files.into_iter().flatten(),
+                SIZE_TEXT_BYTES,
+            ))
+            .plus(budget::values_growth(&self.files_names, b"", [name.len()]))
+            .plus(SIZE_TEXT);
+        let path = upload_path_bytes();
+        if path > 0 {
+            // Kept in `FILES_TMPNAMES` and for cleanup; writing holds 3 more (tempfile 3.27 doubles its buffer).
+            let uploads = (self.uploaded_paths.len(), self.uploaded_paths.capacity());
+            let writing = allocation_bytes(path).saturating_mul(3);
+            cost = cost
+                .plus(budget::values_growth(&self.files_tmp_names, b"", [path]))
+                .plus(budget::list_growth(
+                    uploads,
+                    0,
+                    size_of::<PathBuf>(),
+                    vec_grown_capacity,
+                ))
+                .plus(Growth {
+                    grown: allocation_bytes(path).saturating_add(writing),
+                    freed: writing,
+                });
+        }
+        cost
     }
 
     /// Select a request body processor, retaining its name even when this slice does not
@@ -502,77 +584,24 @@ const MEMORY_BUDGET_ERROR: &str = "parsed arguments exceed the body memory budge
 /// The error reported when the parts of a multipart body would take it past the memory budget the host set.
 const MULTIPART_MEMORY_BUDGET_ERROR: &str = "published parts exceed the body memory budget";
 
+/// Longest decimal rendering of a `u64`: the text of a size, which `FILES_SIZES` keeps and `ARGS_COMBINED_SIZE` is
+/// set from.
+const SIZE_TEXT_BYTES: usize = 20;
+
+/// The buffer the text of a size is built in, which is given back once the text is stored.
+const SIZE_TEXT: Growth = Growth {
+    grown: allocation_bytes(SIZE_TEXT_BYTES),
+    freed: allocation_bytes(SIZE_TEXT_BYTES),
+};
+
 /// The bytes the path of one temporary upload takes: the directory the file is written under, which is the one
 /// [`upload_directory`] resolves and not the configured text, as the lossy text `FILES_TMPNAMES` keeps of it, and
-/// the file name added to it. A host that has no directory writes no file, so the least a path is charged stands.
+/// the file name added to it. 0 for a host that has no directory, which writes no file.
 fn upload_path_bytes_of(configured: &str) -> usize {
     /// The file name `tempfile` appends to the directory is a fixed-length random one.
     const TEMP_NAME_BYTES: usize = 32;
-    /// The least a path is charged: a default directory and a file name.
-    const TEMP_PATH_BYTES: usize = 128 + TEMP_NAME_BYTES;
 
-    upload_directory(configured)
-        .map_or(0, |dir| dir.to_string_lossy().len().saturating_add(TEMP_NAME_BYTES))
-        .max(TEMP_PATH_BYTES)
-}
-
-/// What publishing `part` costs the budget. Every metadata entry and header text is charged conservatively; a field
-/// is charged exactly what [`budget::insert_growth`] says for `destinations`, `ARGS_POST` and `ARGS`, when `admitted`
-/// says the argument limit lets it in. That call and the collections the name is filed in make lowercase copies of
-/// it, which the caller charges first.
-/// `upload_path_bytes` gives the bytes of a temporary upload's path, asked for only when the part is a file.
-fn multipart_publish_cost(
-    part: &multipart::Part<'_>,
-    destinations: [&Map; 2],
-    admitted: bool,
-    upload_path_bytes: impl FnOnce() -> usize,
-) -> Growth {
-    /// Longest decimal rendering of a `u64`, the value in `FILES_SIZES`.
-    const SIZE_TEXT_BYTES: usize = 20;
-    let name_key = budget::map_key_bytes(&part.name);
-    let mut cost = 0_usize;
-    for (name, value) in &part.headers {
-        // `Name: value`, built, then stored.
-        let header = name.len().saturating_add(2).saturating_add(value.len());
-        cost = cost
-            .saturating_add(budget::insert_cost(name_key, header))
-            .saturating_add(header);
-    }
-    cost = cost.saturating_add(budget::insert_cost(name_key, part.name.len()));
-    let filenames = [part.filename.as_deref(), part.alt_filename.as_deref()];
-    // Every collection that is given a filename looks it up through a copy of its own, one at a time: the largest of
-    // the filenames the part publishes is held.
-    let mut fold = 0;
-    for filename in filenames.into_iter().flatten().filter(|filename| !filename.is_empty()) {
-        fold = fold.max(fold_scratch_bytes(filename));
-        cost = cost
-            .saturating_add(budget::insert_cost(name_key, filename.len()))
-            .saturating_add(budget::insert_cost(0, filename.len()))
-            .saturating_add(budget::insert_cost(budget::map_key_bytes(filename), SIZE_TEXT_BYTES));
-    }
-    if let Some(encoding) = &part.filename_encoding {
-        cost = cost
-            .saturating_add(budget::insert_cost(name_key, encoding.charset.len()))
-            .saturating_add(budget::insert_cost(name_key, encoding.language.len()));
-    }
-    let is_file = filenames.into_iter().flatten().any(|filename| !filename.is_empty());
-    let mut field = Growth::default();
-    if is_file {
-        let path = upload_path_bytes();
-        cost = cost
-            .saturating_add(budget::insert_cost(0, part.name.len()))
-            // The path in `FILES_TMPNAMES`, and the one kept for cleanup with its slot in a list that may have
-            // doubled.
-            .saturating_add(budget::insert_cost(0, path))
-            .saturating_add(path)
-            .saturating_add(2 * size_of::<PathBuf>());
-    } else if admitted {
-        field = budget::insert_growth(&destinations, &part.name, part.data.len());
-    }
-    Growth {
-        grown: cost.saturating_add(fold).saturating_add(field.grown),
-        freed: fold.saturating_add(field.freed),
-    }
+    upload_directory(configured).map_or(0, |dir| dir.to_string_lossy().len().saturating_add(TEMP_NAME_BYTES))
 }
 
 /// Process a custom body and merge its narrow output through transaction insertion paths.
@@ -771,10 +800,8 @@ fn add_body_processor_file(tx: &mut Transaction, upload_dir: &Path, file: &BodyP
         .checked_add(size)
         .ok_or_else(|| "upload size overflow".to_owned())?;
 
-    let mut content_type = Vec::with_capacity(file.content_type.len().saturating_add(14));
-    content_type.extend_from_slice(b"Content-Type: ");
-    content_type.extend_from_slice(&file.content_type);
-    tx.multipart_part_headers.add_bytes(&file.name, content_type);
+    tx.multipart_part_headers
+        .add_bytes(&file.name, multipart::header_line("Content-Type", &file.content_type));
     // Past the limit `FILES`, `FILES_SIZES` and `FILES_NAMES` still record the upload,
     // as the built-in multipart processor does: only the temporary file write stops.
     tx.files.add_bytes(b"", &file.filename);
@@ -1150,18 +1177,20 @@ impl TableLedger {
         } else {
             0
         };
+        // A collection's table of two generations back is never allocated beside the new one, so it is given back.
         self.targets
             .iter()
             .zip(new_to)
             .take(copies)
             .filter(|(_, new)| *new)
-            .filter_map(|(target, _)| target.grown_capacity())
-            .fold(walk, |sum, capacity| sum.saturating_add(map_capacity_bytes(capacity)))
+            .filter_map(|(target, _)| {
+                Some(map_capacity_bytes(target.grown_capacity()?).saturating_sub(target.charged[0]))
+            })
+            .fold(walk, usize::saturating_add)
     }
 
     /// Records that the tables hold the path now, once the growth that [`TableLedger::growth`] reported was
-    /// charged: what the old tables were charged is given back, but for the previous generation of each
-    /// collection's table.
+    /// charged: what the walk's old table was charged is given back.
     fn advance(&mut self, memory: &mut MemoryBudget, distinct: usize, copies: usize, new_to: [bool; MAX_TARGETS]) {
         let capacity = index_capacity_for(distinct);
         if capacity > self.walk_capacity {
@@ -1174,7 +1203,6 @@ impl TableLedger {
                 continue;
             }
             if let Some(capacity) = target.grown_capacity() {
-                memory.refund(target.charged[0]);
                 target.charged = [target.charged[1], map_capacity_bytes(capacity)];
                 target.capacity = capacity;
             }
@@ -1211,9 +1239,10 @@ struct JsonFlattener<'m> {
     folded_bytes: usize,
     /// What has been charged for the collections' values, lists and keys, which they allocate only after the walk.
     unfilled: usize,
-    /// What has been charged for the old allocation of a list while it grows, or the buffer a key's text is built in,
-    /// the most of them: they are not held together, so one is reserved for every growth. It also covers what
-    /// `folded`, and the old allocation of the walk's list while it grows, take beyond `unfilled`.
+    /// What has been charged for the old allocation of a list while it grows, the buffer a key's text is built in, or
+    /// the text `ARGS_COMBINED_SIZE` is set from as an entry is published into `ARGS_POST` and `ARGS`, the most of
+    /// them: they are not held together, so one is reserved for every growth. It also covers what `folded`, and the
+    /// old allocation of the walk's list while it grows, take beyond `unfilled`.
     transient: usize,
     /// The capacity the stack of open containers has been charged for.
     frames_charged: usize,
@@ -1497,7 +1526,8 @@ impl<'m> JsonFlattener<'m> {
         let value = allocation_bytes(value_len);
         // A list that grows is held beside the one it replaces, which is freed after: only the new one stays charged,
         // and the largest old one, which is held beside the finished lists when the collections are filled. A key's
-        // text is built in a buffer that is freed alike.
+        // text is built in a buffer that is freed alike, and so is the text a request's entry, published into
+        // `ARGS_POST` and `ARGS`, then sets `ARGS_COMBINED_SIZE` from.
         let walk_growth = walk_list.map_or_else(Growth::default, |values| {
             budget::list_growth(
                 (1, 1),
@@ -1506,7 +1536,8 @@ impl<'m> JsonFlattener<'m> {
                 vec_grown_capacity,
             )
         });
-        let (mut collections, mut largest) = (Growth::default(), 0_usize);
+        let mut collections = Growth::default();
+        let mut largest = if copies == MAX_TARGETS { SIZE_TEXT.freed } else { 0 };
         let mut add = |growth: Growth| {
             collections = collections.plus(growth);
             largest = largest.max(growth.freed);
@@ -1514,18 +1545,10 @@ impl<'m> JsonFlattener<'m> {
         // Collections the path is new to, whose tables of keys take it.
         let mut new_to = [false; MAX_TARGETS];
         for (map, new) in self.held.iter().zip(new_to.iter_mut()) {
-            add(match map.value_list_shape(&lookup) {
-                Some(shape) => budget::list_growth(shape, walked, VALUE_ENTRY_BYTES, grown_list_capacity),
-                // The list the walk's first value makes, which the following ones are added to.
-                None if walked > 0 => budget::list_growth((1, 1), walked - 1, VALUE_ENTRY_BYTES, grown_list_capacity),
-                None => {
-                    *new = true;
-                    Growth {
-                        grown: allocation_bytes(VALUE_ENTRY_BYTES),
-                        freed: 0,
-                    }
-                },
-            });
+            // The walk's earlier values of the path are published before this one, into the same list.
+            let (list, first) = budget::value_list_growth(map.value_list_shape(&lookup), walked);
+            *new = first;
+            add(list);
             add(key_bytes(key, &lookup, *new));
         }
         // What the collections are charged: a copy of the value each, and their lists and keys.
@@ -2614,14 +2637,12 @@ PAYLOAD\r\n\
     fn an_upload_path_is_charged_from_the_resolved_directory() {
         // A relative directory is written under the current directory, so that is the path that is retained.
         let resolved = std::path::absolute("relative").unwrap();
-        assert!(super::upload_path_bytes_of("relative") >= resolved.to_string_lossy().len() + 32);
+        assert_eq!(
+            super::upload_path_bytes_of("relative"),
+            resolved.to_string_lossy().len() + 32
+        );
         let long = format!("/{}", "d".repeat(400));
         assert_eq!(super::upload_path_bytes_of(&long), 401 + 32);
-        assert_eq!(
-            super::upload_path_bytes_of("/tmp"),
-            160,
-            "a short directory is charged the floor"
-        );
     }
 
     #[test]
