@@ -773,17 +773,9 @@ impl Map {
         }
     }
 
-    /// What adding one key that the map does not hold takes from its table: the grown table, held beside the old
-    /// one while the entries move, and the old one, freed after. Nothing while the table has room.
+    /// What adding one key that the map does not hold takes from its table, see [`index_growth`].
     pub(crate) fn new_key_table_growth(&self) -> Growth {
-        let (len, capacity) = (self.data.len(), self.data.capacity());
-        if len < capacity {
-            return Growth::default();
-        }
-        Growth {
-            grown: map_capacity_bytes(index_capacity_for(len.saturating_add(1)).max(capacity)),
-            freed: map_capacity_bytes(capacity),
-        }
+        index_growth::<(Key, Vec<KeyValue>)>(self.data.len(), self.data.capacity())
     }
 
     /// The capacity of the table of keys.
@@ -908,6 +900,19 @@ pub(crate) fn index_table_bytes<T>(capacity: usize) -> usize {
         return 0;
     }
     index_entries_bytes::<T>(capacity).saturating_add(index_buckets_bytes(capacity))
+}
+
+/// What adding one entry to an `IndexMap` of `T` entries that holds `len` in `capacity` takes from its table: the
+/// grown table, held beside the old one while the entries move, and the old one, freed after. Nothing while the
+/// table has room.
+pub(crate) fn index_growth<T>(len: usize, capacity: usize) -> Growth {
+    if len < capacity {
+        return Growth::default();
+    }
+    Growth {
+        grown: index_table_bytes::<T>(index_capacity_for(len.saturating_add(1)).max(capacity)),
+        freed: index_table_bytes::<T>(capacity),
+    }
 }
 
 /// The capacity an `IndexMap` has grown to once it holds `len` entries: the hash index's, which the entry vector

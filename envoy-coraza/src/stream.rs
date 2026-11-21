@@ -675,7 +675,7 @@ impl CorazaHttp {
         if ingests {
             self.request_copy_bytes = body_size;
         }
-        self.request_engine_bytes = lease.engine_before_parsing();
+        self.request_engine_bytes = lease.engine_before_parsing;
         if !self.update_accounting() {
             return Err(TerminalOutcome::RetainedBodyBudgetExhausted { phase: "request-body" });
         }
@@ -684,7 +684,7 @@ impl CorazaHttp {
         } else {
             Vec::new()
         };
-        let budget = self.parse_budget(lease.after_parsing());
+        let budget = self.parse_budget(lease.after_parsing);
         let diagnostics_before = self.diagnostic_count();
         let interruption = self.tx.as_deref_mut().and_then(|tx| {
             tx.set_body_memory_budget(Some(budget));
@@ -1249,7 +1249,7 @@ impl CorazaHttp {
         if ingests {
             self.response_copy_bytes = body_size;
         }
-        self.response_engine_bytes = lease.engine_before_parsing();
+        self.response_engine_bytes = lease.engine_before_parsing;
         if !self.update_accounting() {
             return Err(TerminalOutcome::RetainedBodyBudgetExhausted {
                 phase: "response-body-copy",
@@ -1274,7 +1274,7 @@ impl CorazaHttp {
             }
             body = bytes;
         }
-        let budget = self.parse_budget(lease.after_parsing());
+        let budget = self.parse_budget(lease.after_parsing);
         let diagnostics_before = self.diagnostic_count();
         let interruption = self.tx.as_deref_mut().and_then(|tx| {
             tx.set_body_memory_budget(Some(budget));
@@ -1666,42 +1666,28 @@ impl Drop for CorazaHttp {
 /// keeps a copy of that prefix only if it is one that stores the raw body (see [`BodyCopy`]).
 #[derive(Debug, Default)]
 struct BodyLease {
-    /// What the transaction already held, which the engine's share of the cap starts from.
-    existing: usize,
-    /// The prefix of the body the engine's buffer retains.
-    prefix: usize,
-    /// The copy of that prefix made before the parse.
-    before: usize,
-    /// The copy of that prefix made after it.
-    after: usize,
+    /// The engine's share while it parses: what the transaction already held, the prefix of the body its buffer
+    /// retains, and a copy of that prefix made first.
+    engine_before_parsing: usize,
+    /// The copy of that prefix made after the parse, which the parse must leave room for.
+    after_parsing: usize,
 }
 
 impl BodyLease {
-    /// The lease for a body of `body_size` bytes under `limit`, when `ingests` says the engine takes it.
+    /// The lease for a body of `body_size` bytes under `limit`, when `ingests` says the engine takes it, beside the
+    /// `existing` bytes the transaction holds.
     fn new(ingests: bool, body_size: usize, limit: i64, copy: BodyCopy, existing: usize) -> Self {
-        if !ingests {
-            return Self {
-                existing,
-                ..Self::default()
-            };
-        }
-        let prefix = usize::try_from(limit).map_or(body_size, |limit| body_size.min(limit));
+        let prefix = if ingests {
+            usize::try_from(limit).map_or(body_size, |limit| body_size.min(limit))
+        } else {
+            0
+        };
         Self {
-            existing,
-            prefix,
-            before: if copy == BodyCopy::BeforeParsing { prefix } else { 0 },
-            after: if copy == BodyCopy::AfterParsing { prefix } else { 0 },
+            engine_before_parsing: existing
+                .saturating_add(prefix)
+                .saturating_add(if copy == BodyCopy::BeforeParsing { prefix } else { 0 }),
+            after_parsing: if copy == BodyCopy::AfterParsing { prefix } else { 0 },
         }
-    }
-
-    /// The engine's share while it parses: what it held, the buffer it retains the body in, and a copy made first.
-    fn engine_before_parsing(&self) -> usize {
-        self.existing.saturating_add(self.prefix).saturating_add(self.before)
-    }
-
-    /// The copy that follows the parse, which the parse must leave room for.
-    fn after_parsing(&self) -> usize {
-        self.after
     }
 }
 
@@ -2134,7 +2120,7 @@ mod tests {
 
         let size = body.len();
         stream.response_host_bytes = size;
-        let outcome = stream.inspect_response_body(size, true, true, |_| Ok(Some(body.clone())));
+        let outcome = stream.inspect_response_body(size, true, true, move |_| Ok(Some(body)));
 
         assert!(
             matches!(outcome, Ok(None)),
@@ -2474,9 +2460,7 @@ mod scripted_host_tests {
 
     /// A stream pinned to the generation `config` compiles to.
     fn stream(config: &str) -> CorazaHttp {
-        let config = Config::parse(config.as_bytes()).expect("configuration is valid");
-        let generation = Generation::compile(config).expect("policy compiles");
-        CorazaHttp::new(Some(Rc::new(generation)), Rc::new(Cell::new(0)))
+        stream_beside(config, 0).0
     }
 
     /// A stream whose default policy denies source address 1.2.3.4.
@@ -2496,12 +2480,17 @@ mod scripted_host_tests {
             (":path", b"/"),
         ];
         test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        headers.len()
+    }
+
+    /// Scripts the properties of a connection from 1.2.3.4:5555 to 10.0.0.1:8080 over HTTP/1.1.
+    fn script_connection_properties() {
         test_hostcalls::set_property("request.protocol", b"HTTP/1.1");
         test_hostcalls::set_property("source.address", b"1.2.3.4:5555");
         test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
         test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
         test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
-        headers.len()
     }
 
     /// The policy an `authority` request over `scheme` selects.
@@ -2701,11 +2690,7 @@ mod scripted_host_tests {
             ("content-length", length.as_bytes()),
         ];
         test_hostcalls::set_request_headers(&headers);
-        test_hostcalls::set_property("request.protocol", b"HTTP/1.1");
-        test_hostcalls::set_property("source.address", b"1.2.3.4:5555");
-        test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
-        test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
-        test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
+        script_connection_properties();
         test_hostcalls::set_request_body(body);
         assert_eq!(
             stream.on_http_request_headers(headers.len(), false),
@@ -2939,20 +2924,8 @@ mod scripted_host_tests {
     /// A stream whose GET request is complete, beside streams that hold `others` bytes of the root.
     fn get_beside(config: &str, others: usize) -> CorazaHttp {
         let (mut stream, _) = stream_beside(config, others);
-        test_hostcalls::reset();
-        let headers: [(&str, &[u8]); 4] = [
-            (":authority", b"a.example"),
-            (":scheme", b"http"),
-            (":method", b"GET"),
-            (":path", b"/"),
-        ];
-        test_hostcalls::set_request_headers(&headers);
-        test_hostcalls::set_property("request.protocol", b"HTTP/1.1");
-        test_hostcalls::set_property("source.address", b"1.2.3.4:5555");
-        test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
-        test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
-        test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
-        assert_eq!(stream.on_http_request_headers(headers.len(), true), Action::Continue);
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
         stream
     }
 

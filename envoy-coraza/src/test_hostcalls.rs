@@ -215,27 +215,22 @@ extern "C" fn proxy_get_buffer_bytes(
     return_buffer_data: *mut *mut u8,
     return_buffer_size: *mut usize,
 ) -> Status {
-    let (configuration, request_body, response_body) = HOST.with_borrow(|host| {
-        (
-            host.plugin_configuration.clone(),
-            host.request_body.clone(),
-            host.response_body.clone(),
-        )
-    });
-    let window = |body: Vec<u8>| {
+    let window = |body: &[u8]| {
         let end = start.saturating_add(max_size).min(body.len());
         body.get(start.min(end)..end).unwrap_or_default().to_vec()
     };
-    match (buffer_type, configuration, request_body, response_body) {
-        (BufferType::PluginConfiguration, Some(configuration), ..) => {
-            hand_out(configuration, return_buffer_data, return_buffer_size);
+    let data = HOST.with_borrow(|host| match buffer_type {
+        BufferType::PluginConfiguration => host.plugin_configuration.clone(),
+        BufferType::HttpRequestBody => host.request_body.as_deref().map(window),
+        BufferType::HttpResponseBody => host.response_body.as_deref().map(window),
+        _ => None,
+    });
+    match data {
+        Some(data) => {
+            hand_out(data, return_buffer_data, return_buffer_size);
             Status::Ok
         },
-        (BufferType::HttpRequestBody, _, Some(body), _) | (BufferType::HttpResponseBody, _, _, Some(body)) => {
-            hand_out(window(body), return_buffer_data, return_buffer_size);
-            Status::Ok
-        },
-        _ => Status::NotFound,
+        None => Status::NotFound,
     }
 }
 
@@ -260,13 +255,17 @@ extern "C" fn proxy_get_header_map_pairs(
     return_map_data: *mut *mut u8,
     return_map_size: *mut usize,
 ) -> Status {
-    let (request, response) = HOST.with_borrow(|host| (host.request_headers.clone(), host.response_headers.clone()));
-    match (map_type, request, response) {
-        (MapType::HttpRequestHeaders, Some(headers), _) | (MapType::HttpResponseHeaders, _, Some(headers)) => {
-            hand_out(serialize_map(&headers), return_map_data, return_map_size);
+    let serialized = HOST.with_borrow(|host| match map_type {
+        MapType::HttpRequestHeaders => host.request_headers.as_deref().map(serialize_map),
+        MapType::HttpResponseHeaders => host.response_headers.as_deref().map(serialize_map),
+        _ => None,
+    });
+    match serialized {
+        Some(serialized) => {
+            hand_out(serialized, return_map_data, return_map_size);
             Status::Ok
         },
-        _ => Status::NotFound,
+        None => Status::NotFound,
     }
 }
 

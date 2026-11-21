@@ -21,6 +21,8 @@
 //! here turn what a parser is about to store into the bytes [`crate::transaction::Transaction::body_memory_bytes`]
 //! would later count for it, so that the budget and the authoritative accounting agree.
 
+use std::borrow::Cow;
+
 use crate::collection::{
     Growth, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, Map, VALUE_ENTRY_BYTES,
     allocation_bytes, grown_list_capacity, key_bytes,
@@ -83,6 +85,17 @@ impl MemoryBudget {
             },
         }
     }
+}
+
+/// `text` cut to its first `max` bytes at a character boundary, with a marker when something was cut: what an error
+/// message quotes under a budget, as the message is kept long after the buffers it quotes are given back.
+pub(crate) fn excerpt(text: &str, max: usize) -> Cow<'_, str> {
+    if text.len() <= max {
+        return Cow::Borrowed(text);
+    }
+    let mut cut = text.get(..text.floor_char_boundary(max)).unwrap_or_default().to_owned();
+    cut.push_str("...");
+    Cow::Owned(cut)
 }
 
 /// The bytes of a name that a case-insensitive map may keep for one value: the lookup key and the original beside
@@ -193,6 +206,15 @@ mod tests {
         assert_eq!(map_key_bytes(b""), 0);
         // Arithmetic that would overflow saturates instead of wrapping into a small charge.
         assert_eq!(insert_cost(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn an_excerpt_is_cut_at_a_character_boundary_and_marked() {
+        use super::excerpt;
+        assert!(matches!(excerpt("abc", 3), std::borrow::Cow::Borrowed("abc")));
+        assert_eq!(excerpt("abcd", 3), "abc...");
+        // The third byte is inside the two-byte "é", so the cut falls before it.
+        assert_eq!(excerpt("ab\u{e9}d", 3), "ab...");
     }
 
     #[test]
