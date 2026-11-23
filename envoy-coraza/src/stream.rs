@@ -20,8 +20,11 @@
 )]
 
 use std::{
+    borrow::Cow,
     cell::Cell,
-    net::{IpAddr, SocketAddr},
+    fmt::Write as _,
+    io::Write as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
     str,
 };
@@ -38,7 +41,7 @@ use proxy_wasm::{
 
 use crate::{
     observability::{self, HealthState, InterruptionPhase},
-    policy::{Generation, Policy},
+    policy::{split_port, Generation, Policy},
 };
 
 /// Largest request body held by the connector or Envoy before a body verdict.
@@ -71,6 +74,8 @@ const UNSUPPORTED_BODY: &[u8] = b"Request feature is not supported\n";
 pub(crate) enum TerminalOutcome {
     /// No configured policy matched; traffic continued uninspected.
     UnmatchedAuthority,
+    /// No configured policy matched, and the configuration refuses such requests.
+    UnmatchedAuthorityRefused,
     /// The selected policy has `SecRuleEngine Off`.
     EngineOff,
     /// The request or response used an unsupported feature.
@@ -100,7 +105,7 @@ pub(crate) enum TerminalOutcome {
 impl TerminalOutcome {
     fn inspection_reason(&self) -> &'static str {
         match self {
-            Self::UnmatchedAuthority => "unmatched_authority",
+            Self::UnmatchedAuthority | Self::UnmatchedAuthorityRefused => "unmatched_authority",
             Self::EngineOff => "engine_off",
             Self::Unsupported(_) => "unsupported",
             Self::Denied { .. } => "denied",
@@ -124,7 +129,8 @@ impl TerminalOutcome {
             Self::Incomplete { .. } | Self::BodyPartiallyInspected { .. } | Self::BodyMemoryBudgetStopped { .. } => {
                 "incomplete"
             },
-            Self::BodyTooLarge { .. }
+            Self::UnmatchedAuthorityRefused
+            | Self::BodyTooLarge { .. }
             | Self::RetainedBodyBudgetExhausted { .. }
             | Self::InvalidLifecycle { .. }
             | Self::InvalidAuthority { .. } => "error",
@@ -138,6 +144,7 @@ impl TerminalOutcome {
         matches!(
             self,
             Self::Incomplete { .. }
+                | Self::UnmatchedAuthorityRefused
                 | Self::BodyMemoryBudgetStopped { .. }
                 | Self::BodyTooLarge { .. }
                 | Self::RetainedBodyBudgetExhausted { .. }
@@ -146,6 +153,17 @@ impl TerminalOutcome {
                 | Self::UpstreamFailureOrCancellation
         )
     }
+}
+
+/// Whether a policy with request body access off let request body bytes through unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadRequestBody {
+    /// The policy reads the body, or the request ended without one.
+    Absent,
+    /// The headers did not end the request, so body bytes may still follow.
+    Pending,
+    /// Body bytes went through.
+    Passed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,9 +336,7 @@ pub(crate) struct CorazaHttp {
     telemetry_publish_failed: bool,
     request_body_truncated: bool,
     response_body_truncated: bool,
-    /// Whether a body processor stopped at the memory budget with no rule denying, so the body was only partly
-    /// inspected.
-    body_inspection_stopped: bool,
+    unread_request_body: UnreadRequestBody,
     request_mode: RequestMode,
     request_method: String,
     request_protocol: String,
@@ -353,7 +369,7 @@ impl CorazaHttp {
             telemetry_publish_failed: false,
             request_body_truncated: false,
             response_body_truncated: false,
-            body_inspection_stopped: false,
+            unread_request_body: UnreadRequestBody::Absent,
             request_mode: RequestMode::Inspect,
             request_method: String::new(),
             request_protocol: String::new(),
@@ -512,18 +528,7 @@ impl CorazaHttp {
             );
         };
         let Some((policy_name, policy)) = generation.select_named(&normalized_authority) else {
-            self.lifecycle.bypass_request();
-            self.request_mode = RequestMode::Uninspected;
-            self.outcome = Some(TerminalOutcome::UnmatchedAuthority);
-            if generation.first_unmatched_request() {
-                log_warn(
-                    "envoy-coraza: no authority policy matched; request passed uninspected \
-                     (further such requests in this configuration generation are logged at debug level)",
-                );
-            } else {
-                log_debug("envoy-coraza: no authority policy matched; request passed uninspected");
-            }
-            return Action::Continue;
+            return self.unmatched_authority(generation);
         };
         self.selected_policy = Some(policy_name.to_owned());
         self.tx = Some(Box::new(policy.waf.new_transaction()));
@@ -578,8 +583,40 @@ impl CorazaHttp {
         self.request_body_action_after_headers(body_access, end_of_stream)
     }
 
+    /// Refuses a request whose authority selects no policy with 421, or passes it uninspected when the configuration
+    /// allows that or has no policies.
+    fn unmatched_authority(&mut self, generation: &Generation) -> Action {
+        if generation.refuses_unmatched() {
+            if generation.first_unmatched_request() {
+                log_warn(
+                    "envoy-coraza: no authority policy matched; request refused with 421 (set \
+                     \"unmatched_authority\": \"allow\" to pass such requests uninspected; further such requests in \
+                     this configuration generation are logged at debug level)",
+                );
+            } else {
+                log_debug("envoy-coraza: no authority policy matched; request refused with 421");
+            }
+            return self.reject_request(421, REQUEST_INCOMPLETE_BODY, TerminalOutcome::UnmatchedAuthorityRefused);
+        }
+        self.lifecycle.bypass_request();
+        self.request_mode = RequestMode::Uninspected;
+        self.outcome = Some(TerminalOutcome::UnmatchedAuthority);
+        if generation.first_unmatched_request() {
+            log_warn(
+                "envoy-coraza: no authority policy matched; request passed uninspected \
+                 (further such requests in this configuration generation are logged at debug level)",
+            );
+        } else {
+            log_debug("envoy-coraza: no authority policy matched; request passed uninspected");
+        }
+        Action::Continue
+    }
+
     /// Complete phase 2 at headers when the engine will not ingest the request body.
     fn request_body_action_after_headers(&mut self, body_access: bool, end_of_stream: bool) -> Action {
+        if !body_access && !end_of_stream {
+            self.unread_request_body = UnreadRequestBody::Pending;
+        }
         if !body_access || end_of_stream {
             self.complete_request_body(0)
         } else {
@@ -627,6 +664,19 @@ impl CorazaHttp {
         if let Some(interruption) = interruption {
             return self.reject_interruption(&interruption, "request-body", InterruptionPhase::RequestBody);
         }
+        // The budget is the connector's own limit: what the parser did not reach was not inspected, whatever the
+        // policy's rules or engine mode, so the body is not forwarded.
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.request_body_stopped_by_memory_budget())
+        {
+            return self.reject_request(
+                503,
+                REQUEST_INCOMPLETE_BODY,
+                TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" },
+            );
+        }
         if self.tx.as_ref().is_some_and(|tx| tx.arguments_limit_reached()) {
             return self.reject_request(
                 413,
@@ -640,17 +690,6 @@ impl CorazaHttp {
         if self.tx.as_ref().is_some_and(|tx| tx.request_body_stats().truncated) {
             self.outcome
                 .get_or_insert(TerminalOutcome::BodyPartiallyInspected { phase: "request-body" });
-        }
-        // The policy let it through, as its rules decide, but only what the parser got to was inspected, and the
-        // telemetry must not say the request was inspected whole.
-        if self
-            .tx
-            .as_ref()
-            .is_some_and(|tx| tx.request_body_stopped_by_memory_budget())
-        {
-            self.body_inspection_stopped = true;
-            self.outcome
-                .get_or_insert(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" });
         }
         Action::Continue
     }
@@ -727,6 +766,13 @@ impl CorazaHttp {
             return Action::Continue;
         }
         if self.lifecycle.request == RequestStage::Complete {
+            // Only a policy that does not read the body completes the request before its body ends.
+            self.unread_request_body = match self.unread_request_body {
+                UnreadRequestBody::Pending if body_size > 0 => UnreadRequestBody::Passed,
+                // An HTTP/2 request can end with an empty DATA frame: its body was empty, so nothing went unread.
+                UnreadRequestBody::Pending if end_of_stream => UnreadRequestBody::Absent,
+                unread => unread,
+            };
             return Action::Continue;
         }
         if !self.lifecycle.request_body() {
@@ -837,6 +883,10 @@ impl CorazaHttp {
             );
         }
         if request_complete {
+            // Trailers end a request whose body never came, so nothing went unread.
+            if self.unread_request_body == UnreadRequestBody::Pending {
+                self.unread_request_body = UnreadRequestBody::Absent;
+            }
             Action::Continue
         } else {
             self.complete_request_body(self.request_body_size)
@@ -1481,15 +1531,31 @@ impl CorazaHttp {
         let (Some(generation), Some(final_outcome)) = (self.generation.clone(), self.final_outcome.clone()) else {
             return;
         };
+        // A request body that went through unread was not inspected, whatever ended the stream, as a truncated one
+        // is. One that had not come yet can still reach the backend after a response-phase ending: a phase-4 denial
+        // at response headers finalizes the stream while the request still flows. Only the filter's own reply in the
+        // request phase stops it.
+        let request_body_unread = match self.unread_request_body {
+            UnreadRequestBody::Passed => true,
+            UnreadRequestBody::Pending => {
+                self.request_mode != RequestMode::Replied
+                    && matches!(
+                        final_outcome,
+                        TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
+                    )
+            },
+            UnreadRequestBody::Absent => false,
+        };
         let inspection_complete = matches!(
             final_outcome,
             TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
         ) && !self.request_body_truncated
             && !self.response_body_truncated
-            // A rule that denied has decided on what it saw; a body that was let through has not been seen whole.
-            && !(self.body_inspection_stopped && final_outcome == TerminalOutcome::Completed);
+            && !request_body_unread;
         let reason = if self.finalization_result == FinalizationResult::Failed {
             "finalization_error"
+        } else if request_body_unread {
+            "request_body_not_inspected"
         } else {
             self.outcome.as_ref().unwrap_or(&final_outcome).inspection_reason()
         };
@@ -1823,84 +1889,136 @@ fn headers_within_limits(headers: &[(String, Vec<u8>)], reported_count: usize) -
         .is_some_and(|total| total <= MAX_HEADERS_BYTES)
 }
 
-pub(crate) fn normalize_authority(authority: &[u8], scheme: &[u8]) -> Option<String> {
+/// The policy lookup key of a request authority over `scheme`, or `None` when it is not a valid authority.
+///
+/// The key is lowercase, drops one trailing dot of a registered name and the scheme's default port, writes an IPv6
+/// literal in its compressed form, an IPv4-mapped one (`[::ffff:10.0.0.1]`, `[::ffff:a00:1]`) as the dotted-decimal
+/// IPv4 address it holds, and a port without leading zeros. A registered name is limited to letters, digits, `-`, `.`
+/// and `_` with no empty label, so percent-encoding and sub-delimiters, such as the `,` Envoy joins repeated `Host`
+/// headers with, are refused rather than decoded. A host made only of numbers is an IPv4 address and must be written
+/// in dotted-decimal form. Configuration keys are validated with the same function, so they are in this form too. The
+/// key borrows from `authority` unless it must differ from it in more than a dropped part: a lowercased letter, a
+/// rewritten IPv6 literal (an IPv4-mapped one that ends with its dotted address is borrowed), or a port after a
+/// changed host or without its leading zeros.
+pub(crate) fn normalize_authority<'a>(authority: &'a [u8], scheme: &[u8]) -> Option<Cow<'a, str>> {
     let authority = str::from_utf8(authority).ok()?;
     if authority.is_empty() {
-        return Some(String::new());
+        return Some(Cow::Borrowed(""));
     }
-    let lower = authority.to_ascii_lowercase();
-    let (host, port) = authority_parts(&lower)?;
+    let (host, port) = split_port(authority).map_or((authority, None), |(host, port)| (host, Some(port)));
     let default_port = if scheme.eq_ignore_ascii_case(b"http") {
-        Some("80")
+        Some(80)
     } else if scheme.eq_ignore_ascii_case(b"https") {
-        Some("443")
+        Some(443)
     } else {
         None
     };
-    if port == default_port {
-        Some(host.to_owned())
-    } else {
-        Some(lower)
-    }
+    let port = match port {
+        Some(text) => {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let number = text.parse::<u16>().ok()?;
+            (Some(number) != default_port).then_some((number, text.len() == 1 || !text.starts_with('0')))
+        },
+        None => None,
+    };
+    let canonical = canonical_host(host)?;
+    let host_unchanged = matches!(canonical, Cow::Borrowed(name) if name.len() == host.len());
+    Some(match port {
+        None => canonical,
+        Some((_, true)) if host_unchanged => Cow::Borrowed(authority),
+        Some((number, _)) => {
+            let mut key = match canonical {
+                Cow::Owned(key) => key,
+                Cow::Borrowed(name) => {
+                    let mut key = String::with_capacity(name.len() + PORT_SUFFIX_BYTES);
+                    key.push_str(name);
+                    key
+                },
+            };
+            write!(key, ":{number}").ok()?;
+            Cow::Owned(key)
+        },
+    })
 }
 
-fn authority_parts(authority: &str) -> Option<(&str, Option<&str>)> {
-    if authority.starts_with('[') {
-        let close = authority.find(']')?;
-        let host = authority.get(..=close)?;
-        let address = authority.get(1..close)?.parse::<std::net::Ipv6Addr>().ok()?;
-        let _ = address;
-        let suffix = authority.get(close.saturating_add(1)..)?;
-        let port = if suffix.is_empty() {
-            None
+/// Longest `:port` suffix, which a copied lookup key leaves room for.
+const PORT_SUFFIX_BYTES: usize = ":65535".len();
+
+/// Longest IPv6 literal: the longest text form of an address (`INET6_ADDRSTRLEN` less its NUL) in brackets.
+const MAX_IPV6_LITERAL_BYTES: usize = "[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]".len();
+
+/// The lookup form of a host: an IPv6 literal in its compressed form, a dotted-decimal IPv4 address (which an
+/// IPv4-mapped IPv6 literal becomes), or a lowercase registered name, each without one trailing dot; `None` when it is
+/// none of them.
+fn canonical_host(host: &str) -> Option<Cow<'_, str>> {
+    if let Some(literal) = host.strip_prefix('[') {
+        // The parse is the validation, and its text, written on the stack to compare it, is the canonical form.
+        let literal = literal.strip_suffix(']')?;
+        let address = literal.parse::<Ipv6Addr>().ok()?;
+        let mut text = [0_u8; MAX_IPV6_LITERAL_BYTES];
+        let mut unwritten = text.as_mut_slice();
+        // An IPv4-mapped literal names the IPv4 address it holds (RFC 4291, 2.5.5.2), so it is that address's key;
+        // its dotted text, when the literal ends with it, is borrowed.
+        let own = if let Some(ipv4) = address.to_ipv4_mapped() {
+            write!(unwritten, "{ipv4}").ok()?;
+            literal.rsplit_once(':').map_or(literal, |(_, tail)| tail)
         } else {
-            Some(valid_authority_port(suffix.strip_prefix(':')?)?)
+            write!(unwritten, "[{address}]").ok()?;
+            host
         };
-        Some((host, port))
-    } else {
-        let mut colons = authority.match_indices(':');
-        let Some((index, _)) = colons.next() else {
-            return valid_reg_name(authority).then_some((authority, None));
-        };
-        if colons.next().is_some() {
-            return None;
-        }
-        let host = authority.get(..index)?;
-        let port = valid_authority_port(authority.get(index.saturating_add(1)..)?)?;
-        valid_reg_name(host).then_some((host, Some(port)))
+        let written = MAX_IPV6_LITERAL_BYTES.checked_sub(unwritten.len())?;
+        let canonical = str::from_utf8(text.get(..written)?).ok()?;
+        return Some(if canonical == own {
+            Cow::Borrowed(own)
+        } else {
+            let mut key = String::with_capacity(canonical.len() + PORT_SUFFIX_BYTES);
+            key.push_str(canonical);
+            Cow::Owned(key)
+        });
     }
-}
-
-fn valid_authority_port(port: &str) -> Option<&str> {
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    // Labels of letters, digits, `-` and `_`, separated by single dots.
+    let mut label_empty = true;
+    let mut uppercase = false;
+    for byte in name.bytes() {
+        match byte {
+            b'.' if label_empty => return None,
+            b'.' => label_empty = true,
+            b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => label_empty = false,
+            b'A'..=b'Z' => {
+                label_empty = false;
+                uppercase = true;
+            },
+            _ => return None,
+        }
+    }
+    if label_empty {
         return None;
     }
-    port.parse::<u16>().ok().map(|_| port)
+    // Resolvers and backends read a host of numbers only as an IPv4 address in one of its other spellings
+    // (`010.0.0.1`, `10.0.0.01`, `10.1`, `167772161`, `0xa000001`), which could reach an address key's backend under
+    // the default policy; only the dotted-decimal form can match a key, so the others are refused.
+    if name.split('.').all(numeric_label) {
+        return name.parse::<Ipv4Addr>().is_ok().then_some(Cow::Borrowed(name));
+    }
+    Some(if uppercase {
+        let mut lower = String::with_capacity(name.len() + PORT_SUFFIX_BYTES);
+        lower.push_str(name);
+        lower.make_ascii_lowercase();
+        Cow::Owned(lower)
+    } else {
+        Cow::Borrowed(name)
+    })
 }
 
-fn valid_reg_name(host: &str) -> bool {
-    if host.is_empty() {
-        return false;
+/// Whether a host label is a number as an IPv4 parser reads one: decimal, octal with a leading zero, or `0x` hex.
+fn numeric_label(label: &str) -> bool {
+    match label.strip_prefix("0x").or_else(|| label.strip_prefix("0X")) {
+        Some(hex) => hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        None => label.bytes().all(|byte| byte.is_ascii_digit()),
     }
-    let bytes = host.as_bytes();
-    let mut index = 0;
-    while let Some(byte) = bytes.get(index).copied() {
-        if byte == b'%' {
-            if !bytes
-                .get(index.saturating_add(1)..index.saturating_add(3))
-                .is_some_and(|escape| escape.len() == 2 && escape.iter().all(u8::is_ascii_hexdigit))
-            {
-                return false;
-            }
-            index += 3;
-            continue;
-        }
-        if !(byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte)) {
-            return false;
-        }
-        index += 1;
-    }
-    true
 }
 
 fn authority_host(authority: &str) -> &str {
@@ -1973,10 +2091,13 @@ mod tests {
     use proxy_wasm::types::{Action, Status};
 
     use super::{
-        normalize_authority, request_authority, CorazaHttp, Lifecycle, RequestMode, RequestStage, ResponseStage,
-        TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES,
+        normalize_authority, request_authority, CorazaHttp, Cow, Ipv4Addr, Lifecycle, RequestMode, RequestStage,
+        ResponseStage, TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES,
     };
-    use crate::{config::Config, policy::Generation};
+    use crate::{
+        config::Config,
+        policy::{split_port, Generation},
+    };
 
     #[test]
     fn lifecycle_runs_each_http_phase_and_finalization_once() {
@@ -2187,6 +2308,60 @@ mod tests {
             normalize_authority(b"[2001:DB8::1]", b"http").as_deref(),
             Some("[2001:db8::1]")
         );
+        for (authority, scheme, expected) in [
+            // One trailing dot names the same host.
+            ("a.example.", "http", "a.example"),
+            ("A.Example.:8080", "http", "a.example:8080"),
+            ("a.example.:80", "http", "a.example"),
+            // A port is a number: leading zeros neither hide the default port nor make another one.
+            ("a.example:080", "http", "a.example"),
+            ("a.example:08080", "http", "a.example:8080"),
+            ("a.example:00", "http", "a.example:0"),
+            // An IPv6 literal is looked up in its canonical text form.
+            ("[0:0:0:0:0:0:0:1]", "http", "[::1]"),
+            ("[2001:0db8:0:0:0:0:0:0001]:8443", "https", "[2001:db8::1]:8443"),
+            // An IPv4-mapped literal is looked up as its IPv4 address.
+            ("[::ffff:192.0.2.1]", "http", "192.0.2.1"),
+            ("[::FFFF:c000:201]:8080", "http", "192.0.2.1:8080"),
+            ("[::ffff:192.0.2.1]:80", "http", "192.0.2.1"),
+            ("[::192.0.2.1]", "http", "[::c000:201]"),
+            ("192.0.2.1.", "http", "192.0.2.1"),
+            ("under_score.example", "http", "under_score.example"),
+        ] {
+            assert_eq!(
+                normalize_authority(authority.as_bytes(), scheme.as_bytes()).as_deref(),
+                Some(expected),
+                "{scheme}://{authority}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authority_already_in_normal_form_is_not_copied() {
+        for (authority, scheme) in [
+            ("a.example", "http"),
+            ("a.example:8080", "http"),
+            ("a.example:80", "http"),
+            ("a.example.", "http"),
+            ("[::1]", "http"),
+            ("[::1]:8080", "http"),
+            ("[::1]:80", "http"),
+            ("[::ffff:192.0.2.1]", "http"),
+            ("[0:0:0:0:0:FFFF:192.0.2.1]", "http"),
+            // The longest IPv6 text form still fits the buffer its canonical form is written to.
+            ("[1111:2222:3333:4444:5555:6666:7777:8888]:8443", "https"),
+            ("10.0.0.1", "http"),
+            ("10.0.0.1.:80", "http"),
+            ("", "http"),
+        ] {
+            assert!(
+                matches!(
+                    normalize_authority(authority.as_bytes(), scheme.as_bytes()),
+                    Some(Cow::Borrowed(_))
+                ),
+                "{authority} is borrowed"
+            );
+        }
     }
 
     #[test]
@@ -2207,6 +2382,39 @@ mod tests {
             "port is out of range"
         );
         assert_eq!(normalize_authority(b"", b"http").as_deref(), Some(""));
+        for authority in [
+            // Percent-encoding and sub-delimiters are no part of a host name, whatever a backend makes of them.
+            "a%2eexample",
+            "a.example,a.example",
+            "a.example;x",
+            "a~b.example",
+            "a!b.example",
+            "a'b.example",
+            // Empty labels: only one trailing dot is the root.
+            "a.example..",
+            ".a.example",
+            "a..example",
+            ".",
+            // IPv6 literals parse as addresses or not at all.
+            "[fe80::1%25eth0]",
+            "[v1.x]",
+            "[::1]x",
+            "[::1]:",
+            "a.example:",
+            "a.example:1:2",
+            // A host of numbers only is a dotted-decimal IPv4 address or nothing.
+            "010.0.0.1",
+            "10.0.0.01",
+            "10.1",
+            "167772161",
+            "0xa000001",
+            "0Xa.0.0.1",
+            "256.0.0.1",
+            "1.2.3.4.5",
+            "1.2.3.4..",
+        ] {
+            assert_eq!(normalize_authority(authority.as_bytes(), b"http"), None, "{authority}");
+        }
 
         let headers = vec![(":method".to_owned(), b"GET".to_vec())];
         assert_eq!(
@@ -2218,6 +2426,171 @@ mod tests {
             b"",
             "an absent authority stays empty"
         );
+    }
+
+    /// A xorshift64 generator with a fixed seed, so that a failing input reproduces.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        /// A number below `bound`, which is not 0.
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(bound).unwrap_or(u64::MAX)).unwrap_or_default()
+        }
+
+        /// One of `items`, which is not empty.
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items.get(self.below(items.len())).copied().unwrap_or_default()
+        }
+    }
+
+    /// Checks what every lookup key holds for `authority` over `scheme`, whatever the input.
+    fn check_lookup_key(authority: &[u8], scheme: &str) {
+        let key = normalize_authority(authority, scheme.as_bytes());
+        let Ok(text) = std::str::from_utf8(authority) else {
+            assert_eq!(key, None, "{authority:?} is not UTF-8");
+            return;
+        };
+        assert_eq!(
+            normalize_authority(text.to_ascii_uppercase().as_bytes(), scheme.as_bytes()),
+            normalize_authority(text.to_ascii_lowercase().as_bytes(), scheme.as_bytes()),
+            "{scheme}://{text}: case does not matter"
+        );
+        let Some(key) = key.filter(|key| !key.is_empty()) else {
+            return;
+        };
+        assert!(
+            matches!(normalize_authority(key.as_bytes(), scheme.as_bytes()), Some(Cow::Borrowed(again)) if again == key),
+            "{scheme}://{text}: the key {key} is its own key, and borrowed"
+        );
+        assert!(
+            key.bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b':' | b'[' | b']')),
+            "{scheme}://{text}: the key {key} is lowercase"
+        );
+        let (host, port) = split_port(&key).map_or((&*key, None), |(host, port)| (host, Some(port)));
+        if let Some(port) = port {
+            assert!(port == "0" || !port.starts_with('0'), "{key}: no leading zeros");
+            let default_port = match scheme {
+                "http" => "80",
+                "https" => "443",
+                _ => "",
+            };
+            assert_ne!(port, default_port, "{scheme}://{text}: the default port is dropped");
+            assert!(
+                matches!(normalize_authority(host.as_bytes(), scheme.as_bytes()), Some(Cow::Borrowed(bare)) if bare == host),
+                "the bare host of {key} is a key"
+            );
+        }
+        assert!(!host.ends_with('.'), "{key}: no trailing dot");
+        let numeric = |label: &str| {
+            label.strip_prefix("0x").map_or_else(
+                || label.bytes().all(|byte| byte.is_ascii_digit()),
+                |hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            )
+        };
+        if !host.starts_with('[') && host.split('.').all(numeric) {
+            assert!(
+                host.parse::<Ipv4Addr>()
+                    .is_ok_and(|address| address.to_string() == host),
+                "{text}: a numeric host is a dotted-decimal IPv4 address"
+            );
+        }
+        if !text.contains([':', '[']) && !text.ends_with('.') {
+            assert_eq!(
+                normalize_authority(format!("{text}.").as_bytes(), scheme.as_bytes()).as_deref(),
+                Some(&*key),
+                "{text}: one trailing dot names the same host"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_keys_hold_their_properties_for_every_short_authority() {
+        const ALPHABET: &[u8] = b"aZ09fx.:[]%,-_";
+        let mut authority = Vec::new();
+        for length in 0..=4_u32 {
+            for mut index in 0..ALPHABET.len().pow(length) {
+                authority.clear();
+                for _ in 0..length {
+                    authority.push(ALPHABET.get(index % ALPHABET.len()).copied().unwrap_or_default());
+                    index /= ALPHABET.len();
+                }
+                for scheme in ["http", "https", ""] {
+                    check_lookup_key(&authority, scheme);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_keys_hold_their_properties_for_random_authorities() {
+        const TOKENS: [&str; 26] = [
+            "a", "B", "0", "1", "9", "f", "x", "0x", "example", ".", "..", ":", "::", "[", "]", "%", "%2e", ",", "-",
+            "_", "~", "\0", "80", "443", "080", "\u{e9}",
+        ];
+        const GROUPS: [&str; 10] = ["0", "00", "0000", "1", "db8", "FFFF", "fe80", "2001", "abcd", "1.2.3.4"];
+        const PORTS: [&str; 9] = ["", ":80", ":080", ":443", ":8080", ":0", ":65535", ":65536", ":"];
+        let mut random = Xorshift(0x2545_F491_4F6C_DD1D);
+        for _ in 0..100_000 {
+            let mut text = String::new();
+            for _ in 0..random.below(9) {
+                text.push_str(random.pick(&TOKENS));
+            }
+            // An IPv6 literal, more or less well formed, with or without a port.
+            let mut literal = String::from("[");
+            for group in 0..random.below(10) {
+                if group > 0 {
+                    literal.push_str(if random.below(8) == 0 { "::" } else { ":" });
+                }
+                literal.push_str(random.pick(&GROUPS));
+            }
+            literal.push(']');
+            literal.push_str(random.pick(&PORTS));
+            for scheme in ["http", "https", ""] {
+                check_lookup_key(text.as_bytes(), scheme);
+                check_lookup_key(literal.as_bytes(), scheme);
+            }
+        }
+        check_lookup_key(b"a.example\xff", "http");
+    }
+
+    #[test]
+    fn ipv4_spellings_are_keys_only_in_dotted_decimal_form() {
+        // Independent of the parser: four decimal labels up to 255 without leading zeros.
+        let dotted_decimal = |text: &str| {
+            text.split('.').count() == 4
+                && text.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.bytes().all(|byte| byte.is_ascii_digit())
+                        && (label == "0" || !label.starts_with('0'))
+                        && label.parse::<u16>().is_ok_and(|value| value <= 255)
+                })
+        };
+        let mut random = Xorshift(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..50_000 {
+            let mut text = String::new();
+            for index in 0..=random.below(5) {
+                if index > 0 {
+                    text.push('.');
+                }
+                let value = random.below(300);
+                let label = match random.below(4) {
+                    0 => format!("{value}"),
+                    1 => format!("0{value}"),
+                    2 => format!("0x{value:x}"),
+                    _ => format!("{value:03}"),
+                };
+                text.push_str(&label);
+            }
+            assert_eq!(
+                normalize_authority(text.as_bytes(), b"http").as_deref(),
+                dotted_decimal(&text).then_some(text.as_str()),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -2449,7 +2822,7 @@ mod scripted_host_tests {
         types::{Action, Status},
     };
 
-    use super::{CorazaHttp, TerminalOutcome, MAX_ROOT_RETAINED_BODY_BYTES};
+    use super::{CorazaHttp, TerminalOutcome, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES};
     use crate::{config::Config, policy::Generation, test_hostcalls};
 
     /// One mebibyte.
@@ -2522,6 +2895,11 @@ mod scripted_host_tests {
             Some("open"),
             "the bare host is a different authority"
         );
+        assert_eq!(
+            selected_policy(&config, "b.example:08080", "http").as_deref(),
+            Some("strict"),
+            "leading zeros do not make another port"
+        );
     }
 
     #[test]
@@ -2541,8 +2919,212 @@ mod scripted_host_tests {
         }
         assert_eq!(
             selected_policy(&config, "b.example:8080", "http").as_deref(),
-            Some("open"),
-            "a non-default port is another authority"
+            Some("strict"),
+            "a port without a key of its own falls back to the bare host's key, not to the default"
+        );
+    }
+
+    /// Runs a bodyless GET for `authority` over `scheme` against `config`; returns the action, the selected policy
+    /// and the local replies.
+    fn get_for(config: &str, authority: &str, scheme: &str) -> (Action, Option<String>, Vec<u32>) {
+        let mut get = stream(config);
+        let count = script_request(authority, scheme);
+        let action = get.on_http_request_headers(count, true);
+        (
+            action,
+            get.selected_policy.clone(),
+            test_hostcalls::local_reply_statuses(),
+        )
+    }
+
+    /// The only policy denies every request, and only its authority selects it: there is no default.
+    const STRICT_ONLY: &str = r#"{"directives_map": {"strict": ["SecRuleEngine On",
+        "SecAction \"id:1,phase:1,deny,status:403\""]},
+        "per_authority_directives": {"victim.example": "strict"}, "enable_filter_state_logs": true}"#;
+
+    /// The same, with a default that inspects nothing.
+    const STRICT_AND_OPEN: &str = r#"{"directives_map": {"strict": ["SecRuleEngine On",
+        "SecAction \"id:1,phase:1,deny,status:403\""], "open": ["SecRuleEngine On"]},
+        "default_directives": "open", "per_authority_directives": {"victim.example": "strict"}}"#;
+
+    /// Spellings of `victim.example` that a backend serves as that host.
+    const RESPELLINGS: [(&str, &str); 6] = [
+        ("victim.example.", "http"),
+        ("VICTIM.example.", "http"),
+        ("victim.example:8080", "http"),
+        ("victim.example:443", "http"),
+        ("victim.example:80", "https"),
+        ("victim.example:0", "http"),
+    ];
+
+    /// Spellings that are no registered name: a percent-encoded dot and what Envoy joins two `Host` headers into.
+    const NOT_A_REGISTERED_NAME: [&str; 2] = ["victim%2eexample", "victim.example,x"];
+
+    #[test]
+    fn authority_spellings_must_not_dodge_the_only_policy() {
+        assert_eq!(
+            get_for(STRICT_ONLY, "victim.example", "http"),
+            (Action::Pause, Some("strict".to_owned()), vec![403])
+        );
+        for (authority, scheme) in RESPELLINGS {
+            assert_eq!(
+                get_for(STRICT_ONLY, authority, scheme),
+                (Action::Pause, Some("strict".to_owned()), vec![403]),
+                "{scheme}://{authority} selects the policy of its host"
+            );
+        }
+        for authority in NOT_A_REGISTERED_NAME {
+            assert_eq!(
+                get_for(STRICT_ONLY, authority, "http"),
+                (Action::Pause, None, vec![400]),
+                "{authority} is refused as an invalid authority"
+            );
+        }
+        // Without a default, a host the configuration does not list is refused, not passed uninspected.
+        assert_eq!(
+            get_for(STRICT_ONLY, "other.example", "http"),
+            (Action::Pause, None, vec![421])
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+            Some("unmatched_authority")
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome").as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn authority_spellings_must_not_fall_to_the_weaker_default() {
+        for (authority, scheme) in RESPELLINGS {
+            assert_eq!(
+                get_for(STRICT_AND_OPEN, authority, scheme),
+                (Action::Pause, Some("strict".to_owned()), vec![403]),
+                "{scheme}://{authority} selects the policy of its host"
+            );
+        }
+        for authority in NOT_A_REGISTERED_NAME {
+            assert_eq!(
+                get_for(STRICT_AND_OPEN, authority, "http"),
+                (Action::Pause, None, vec![400]),
+                "{authority} is refused as an invalid authority"
+            );
+        }
+        assert_eq!(
+            get_for(STRICT_AND_OPEN, "other.example", "http"),
+            (Action::Continue, Some("open".to_owned()), vec![]),
+            "an unlisted host gets the default"
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_ipv6_literal_selects_its_compressed_key() {
+        let config = authority_config("[::1]");
+        for authority in ["[0:0:0:0:0:0:0:1]", "[::1]", "[0:0::1]:8080", "[::0001]"] {
+            assert_eq!(
+                selected_policy(&config, authority, "http").as_deref(),
+                Some("strict"),
+                "{authority}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_spelling_of_an_ipv4_key_is_refused_rather_than_given_the_default() {
+        let config = STRICT_AND_OPEN.replace("victim.example", "10.0.0.1");
+        for authority in ["10.0.0.1", "10.0.0.1.", "10.0.0.1:80", "10.0.0.1:8080"] {
+            assert_eq!(
+                get_for(&config, authority, "http"),
+                (Action::Pause, Some("strict".to_owned()), vec![403]),
+                "{authority} selects the address's policy"
+            );
+        }
+        for authority in [
+            "010.0.0.1",
+            "10.0.0.01",
+            "10.000.0.1",
+            "10.1",
+            "10.0.1",
+            "167772161",
+            "0xa000001",
+            "0XA000001",
+            "0xa.0.0.1",
+            "0x0a.0x00.0x00.0x01",
+            "012.0.0.1:80",
+            "10.0.0.1.0",
+            "0x",
+        ] {
+            assert_eq!(
+                get_for(&config, authority, "http"),
+                (Action::Pause, None, vec![400]),
+                "{authority} is refused as an invalid authority"
+            );
+        }
+        // Digits are ordinary in a host name that is not numbers only, and such a host gets the default.
+        for authority in [
+            "10.0.0.1.example",
+            "1.example",
+            "0x1.example",
+            "123abc",
+            "example.10",
+            "10-0-0-1",
+        ] {
+            assert_eq!(
+                get_for(&config, authority, "http"),
+                (Action::Continue, Some("open".to_owned()), vec![]),
+                "{authority} is a host name"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ipv4_mapped_literal_selects_the_policy_of_its_ipv4_key() {
+        let config = STRICT_AND_OPEN.replace("victim.example", "10.0.0.1");
+        for authority in [
+            "[::ffff:10.0.0.1]",
+            "[::ffff:a00:1]",
+            "[::FFFF:10.0.0.1]:8080",
+            "[0:0:0:0:0:ffff:10.0.0.1]:80",
+        ] {
+            assert_eq!(
+                get_for(&config, authority, "http"),
+                (Action::Pause, Some("strict".to_owned()), vec![403]),
+                "{authority} selects the address's policy"
+            );
+        }
+        // A deprecated IPv4-compatible literal is not IPv4-mapped, so it stays an IPv6 address.
+        assert_eq!(
+            get_for(&config, "[::10.0.0.1]", "http"),
+            (Action::Continue, Some("open".to_owned()), vec![]),
+        );
+        // With no default, the mapped literal is no unlisted host either.
+        let strict_only = STRICT_ONLY.replace("victim.example", "10.0.0.1");
+        assert_eq!(
+            get_for(&strict_only, "[::ffff:a00:1]", "http"),
+            (Action::Pause, Some("strict".to_owned()), vec![403]),
+        );
+    }
+
+    #[test]
+    fn unmatched_authority_allow_and_an_empty_policy_map_keep_passing_uninspected() {
+        let allow = r#"{"directives_map": {"strict": ["SecRuleEngine On", "SecAction \"id:1,phase:1,deny,status:403\""]},
+            "per_authority_directives": {"victim.example": "strict"}, "unmatched_authority": "allow"}"#;
+        for config in [allow, r#"{"directives_map": {}}"#] {
+            assert_eq!(
+                get_for(config, "other.example", "http"),
+                (Action::Continue, None, vec![]),
+                "{config}"
+            );
+        }
+        assert_eq!(
+            get_for(allow, "victim.example.", "http"),
+            (Action::Pause, Some("strict".to_owned()), vec![403]),
+            "the listed host is still enforced in every spelling"
         );
     }
 
@@ -2860,23 +3442,46 @@ mod scripted_host_tests {
         let (mut stream, _) = stream_beside(&policy(limits, ""), 0);
         let size = begin_post(&mut stream, "text/xml", &body);
         let before = held(&stream);
-        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
         assert_eq!(
-            parser_budget(&stream),
+            parse_only(&mut stream, size),
             Some(MAX_ROOT_RETAINED_BODY_BYTES - 2 * size - LIMIT - before)
         );
         assert!(test_hostcalls::local_reply_statuses().is_empty());
+        refused_as_budget_stopped(&policy(limits, ""), "text/xml", &body);
 
         // A URL-encoded body of the same size also holds a copy of the 8 MiB prefix while it parses.
         let body = pairs_of(2 * LIMIT - 64);
         let (mut stream, _) = stream_beside(&policy(limits, ""), 0);
         let size = begin_post(&mut stream, "application/x-www-form-urlencoded", &body);
         let before = held(&stream);
-        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
         assert_eq!(
-            parser_budget(&stream),
+            parse_only(&mut stream, size),
             Some(MAX_ROOT_RETAINED_BODY_BYTES - 2 * size - 2 * LIMIT - before)
         );
+        refused_as_budget_stopped(&policy(limits, ""), "application/x-www-form-urlencoded", &body);
+    }
+
+    /// Asserts that a POST of `body` on an idle root is refused because the parser stopped at what the root left it:
+    /// both 8 `MiB` prefixes above parse into more than that, and the part not parsed is not forwarded.
+    fn refused_as_budget_stopped(config: &str, content_type: &str, body: &[u8]) {
+        let (mut stream, _) = stream_beside(config, 0);
+        let size = begin_post(&mut stream, content_type, body);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Pause, "{content_type}");
+        assert_eq!(test_hostcalls::local_reply_statuses(), [503], "{content_type}");
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" }),
+            "{content_type}"
+        );
+    }
+
+    /// Runs the request body of `stream`, whose headers wait for it, through the engine as `on_http_request_body`
+    /// does but without drawing its verdict, and returns the memory budget the parser was given.
+    fn parse_only(stream: &mut CorazaHttp, size: usize) -> Option<usize> {
+        stream.request_host_bytes = size;
+        assert!(stream.update_accounting(), "the body fits the root");
+        assert!(stream.inspect_request_body(size, true).is_ok());
+        parser_budget(stream)
     }
 
     #[test]
@@ -2904,11 +3509,19 @@ mod scripted_host_tests {
         // The same bytes with a processor that keeps no copy go to the engine, with nothing to parse in.
         let (mut stream, _) = stream_beside(&probe_policy, others);
         let size = begin_post(&mut stream, "text/xml", &xml);
-        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
-        let left = parser_budget(&stream).expect("the parser was given a budget");
+        let left = parse_only(&mut stream, size).expect("the parser was given a budget");
         assert!(
             left.abs_diff(MIB) < 4096,
             "a mebibyte, less what the transaction held in between: {left}"
+        );
+        // The parser stops in that mebibyte, so the body is refused rather than forwarded.
+        let (mut stream, _) = stream_beside(&probe_policy, others);
+        begin_post(&mut stream, "text/xml", &xml);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [503]);
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" })
         );
     }
 
@@ -2983,7 +3596,7 @@ mod scripted_host_tests {
     }
 
     #[test]
-    fn a_request_the_budget_stopped_the_parser_in_and_no_rule_denied_is_not_reported_as_inspected_whole() {
+    fn a_request_the_budget_stopped_the_parser_in_is_refused_even_when_no_rule_denies() {
         let body = xml_list(MIB);
         let config = policy(LIMITS, "");
         let finish = |others: usize| {
@@ -2993,45 +3606,632 @@ mod scripted_host_tests {
             drop(stream);
             let (mut stream, _) = stream_beside(&config, others.saturating_sub(before));
             begin_post(&mut stream, "text/xml", &body);
-            assert_eq!(
-                stream.on_http_request_body(size, true),
-                Action::Continue,
-                "no rule denies the error"
-            );
-            assert!(test_hostcalls::local_reply_statuses().is_empty());
-            let stopped = stream
-                .tx
-                .as_deref()
-                .is_some_and(coraza::transaction::Transaction::request_body_stopped_by_memory_budget);
-            test_hostcalls::set_response_headers(&[(":status", b"200")]);
-            assert_eq!(stream.on_http_response_headers(1, true), Action::Continue);
+            let action = stream.on_http_request_body(size, true);
+            if action == Action::Continue {
+                test_hostcalls::set_response_headers(&[(":status", b"200")]);
+                assert_eq!(stream.on_http_response_headers(1, true), Action::Continue);
+            }
             (
-                stopped,
+                action,
+                test_hostcalls::local_reply_statuses(),
                 test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete"),
                 test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason"),
                 test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome"),
             )
         };
-        // Room for the three charges and a few kilobytes: the parser gets that far and no further.
+        // Room for the three charges and a few kilobytes: the parser gets that far and no further, and the part it
+        // did not parse is not forwarded.
         let tight = MAX_ROOT_RETAINED_BODY_BYTES - 3 * body.len() - 8 * 1024;
         assert_eq!(
             finish(tight),
             (
-                true,
+                Action::Pause,
+                vec![503],
                 Some("false".to_owned()),
                 Some("body_memory_budget_stopped".to_owned()),
-                Some("completed".to_owned())
+                Some("incomplete".to_owned())
             ),
-            "the request was let through as the policy decided, and the telemetry says it was partly inspected"
+            "no rule reads REQBODY_ERROR, and the connector refuses the body its budget stopped"
         );
         assert_eq!(
             finish(0),
             (
-                false,
+                Action::Continue,
+                vec![],
                 Some("true".to_owned()),
                 Some("complete".to_owned()),
                 Some("completed".to_owned())
             )
+        );
+    }
+
+    /// `content-type` of a URL-encoded form.
+    const FORM: &str = "application/x-www-form-urlencoded";
+
+    /// What the filter answered a POST of `body` as `content_type`, beside streams that hold `others` bytes of the
+    /// root: the action, the local replies and the published inspection reason.
+    fn post_beside(config: &str, others: usize, content_type: &str, body: &[u8]) -> (Action, Vec<u32>, Option<String>) {
+        let (mut stream, _) = stream_beside(config, others);
+        begin_post(&mut stream, content_type, body);
+        let action = stream.on_http_request_body(body.len(), true);
+        (
+            action,
+            test_hostcalls::local_reply_statuses(),
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason"),
+        )
+    }
+
+    /// A custom body policy without the baseline, as a CRS-only policy is for `REQBODY_ERROR`: it denies `attack` in
+    /// any argument and reads no body error.
+    const NO_BASELINE: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess On",
+        "SecRequestBodyLimit 16777216", "SecRequestBodyInMemoryLimit 16777216",
+        "SecRule REQUEST_HEADERS:Content-Type \"^application/x-www-form-urlencoded\" \"id:10,phase:1,pass,nolog,ctl:requestBodyProcessor=URLENCODED\"",
+        "SecRule REQUEST_HEADERS:Content-Type \"^application/json\" \"id:11,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\"",
+        "SecRule ARGS \"@contains attack\" \"id:900,phase:2,deny,status:403\""]},
+        "default_directives": "p", "enable_filter_state_logs": true}"#;
+
+    /// The reference deployment's baseline in front of the same rule.
+    const WITH_BASELINE: &str = r#"{"directives_map": {"p": ["Include @recommended-conf", "SecRuleEngine On",
+        "SecRule ARGS \"@contains attack\" \"id:900,phase:2,deny,status:403\""]},
+        "default_directives": "p", "enable_filter_state_logs": true}"#;
+
+    /// `pairs` URL-encoded pairs with values of `value_len` bytes, then the attack as the last argument.
+    fn urlencoded(pairs: usize, value_len: usize) -> Vec<u8> {
+        let value = "v".repeat(value_len);
+        let mut body = Vec::new();
+        for index in 0..pairs {
+            body.extend_from_slice(format!("k{index}={value}&").as_bytes());
+        }
+        body.extend_from_slice(b"x=attack");
+        body
+    }
+
+    /// A JSON object of `pairs` members with values of `value_len` bytes, then the attack as the last member.
+    fn json_object(pairs: usize, value_len: usize) -> Vec<u8> {
+        let value = "v".repeat(value_len);
+        let mut body = b"{".to_vec();
+        for index in 0..pairs {
+            body.extend_from_slice(format!("\"k{index}\":\"{value}\",").as_bytes());
+        }
+        body.extend_from_slice(b"\"x\":\"attack\"}");
+        body
+    }
+
+    /// Whether a POST answer is the refusal of a body the budget stopped.
+    fn budget_refusal(answer: &(Action, Vec<u32>, Option<String>)) -> bool {
+        *answer == (Action::Pause, vec![503], Some("body_memory_budget_stopped".to_owned()))
+    }
+
+    #[test]
+    fn a_body_the_budget_stopped_must_not_be_forwarded() {
+        // About 256 KiB in 500 benign pairs, under SecArgumentsLimit, then the attack.
+        let body = urlencoded(500, 512);
+        assert_eq!(
+            post_beside(NO_BASELINE, 0, FORM, &body).1,
+            [403],
+            "an idle root: the attack is denied"
+        );
+        let mut stopped = 0;
+        for slack in [512 * 1024, 256 * 1024, 128 * 1024, 64 * 1024, 32 * 1024, 16 * 1024] {
+            // What the other streams of this root hold: everything but four copies of this body and `slack`.
+            let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - slack;
+            let answer = post_beside(NO_BASELINE, others, FORM, &body);
+            assert!(
+                answer.1 == [403] || budget_refusal(&answer),
+                "slack {slack}: the body was denied or refused, not forwarded: {answer:?}"
+            );
+            stopped += usize::from(budget_refusal(&answer));
+        }
+        assert!(stopped > 0, "at least one slack value stopped the parser");
+    }
+
+    #[test]
+    fn a_single_large_body_on_an_idle_root_is_denied_or_refused() {
+        // 500 pairs stay under SecArgumentsLimit, whose 413 would otherwise mask the budget. The two larger bodies
+        // fill the idle root on their own: their host buffer, guest copy and parse copies take most of it.
+        for value_len in [8_000_usize, 16_000, 24_000, 32_000] {
+            let body = urlencoded(500, value_len);
+            let answer = post_beside(NO_BASELINE, 0, FORM, &body);
+            assert!(
+                answer.1 == [403] || budget_refusal(&answer),
+                "a {} byte body was denied or refused, not forwarded: {answer:?}",
+                body.len()
+            );
+            if value_len >= 24_000 {
+                assert!(budget_refusal(&answer), "{} bytes: {answer:?}", body.len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_the_budget_stopped_is_refused_in_detection_only_too() {
+        // The budget is the connector's limit, not a rule's: the engine mode does not let the unread part through.
+        let detection_only = NO_BASELINE.replace("SecRuleEngine On", "SecRuleEngine DetectionOnly");
+        let body = urlencoded(500, 32_000);
+        assert!(
+            budget_refusal(&post_beside(&detection_only, 0, FORM, &body)),
+            "the body was refused"
+        );
+    }
+
+    #[test]
+    fn a_json_body_on_a_busy_root_is_refused() {
+        let body = json_object(500, 512);
+        assert_eq!(
+            post_beside(NO_BASELINE, 0, "application/json", &body).1,
+            [403],
+            "control: an idle root denies"
+        );
+        for slack in [512 * 1024, 64 * 1024, 16 * 1024] {
+            let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - slack;
+            let answer = post_beside(NO_BASELINE, others, "application/json", &body);
+            assert!(budget_refusal(&answer), "slack {slack}: {answer:?}");
+        }
+    }
+
+    #[test]
+    fn baseline_rule_200002_backstops_the_budget_stop() {
+        // A rule that denies on the body error still answers first: 400 from rule 200002, not the connector's 503.
+        let body = urlencoded(500, 512);
+        assert_eq!(post_beside(WITH_BASELINE, 0, FORM, &body).1, [403]);
+        for slack in [512 * 1024, 64 * 1024, 16 * 1024] {
+            let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - slack;
+            assert_eq!(
+                post_beside(WITH_BASELINE, others, FORM, &body),
+                (Action::Pause, vec![400], Some("denied".to_owned())),
+                "slack {slack}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_the_budget_stopped_under_process_partial_is_replaced_not_forwarded() {
+        // With ProcessPartial and a limit the body fits in, a parse the budget stopped is not reported as a truncation
+        // that lets the response through.
+        let body = json_list(200 * 1024);
+        let config = policy(LIMITS, r#", "SecResponseBodyLimitAction ProcessPartial""#);
+        let probe = get_beside(&config, 0);
+        let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - held(&probe) - 16 * 1024;
+        let mut stream = get_beside(&config, others);
+        respond(&mut stream, &body);
+        assert_eq!(test_hostcalls::response_replacement_statuses(), ["502"]);
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" })
+        );
+    }
+
+    #[test]
+    fn a_request_body_the_policy_does_not_read_is_reported_as_not_inspected() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off"]},
+            "default_directives": "p", "enable_filter_state_logs": true}"#;
+        let body = b"q=1' UNION SELECT password FROM users--";
+        let mut post = stream(config);
+        test_hostcalls::reset();
+        let length = body.len().to_string();
+        let headers: [(&str, &[u8]); 6] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", b"/"),
+            ("content-type", FORM.as_bytes()),
+            ("content-length", length.as_bytes()),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        test_hostcalls::set_request_body(body);
+        assert_eq!(post.on_http_request_headers(headers.len(), false), Action::Continue);
+        assert_eq!(post.on_http_request_body(body.len(), true), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200")]);
+        assert_eq!(post.on_http_response_headers(1, true), Action::Continue);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+            Some("request_body_not_inspected")
+        );
+
+        // A request without a body loses nothing.
+        let mut get = stream(config);
+        let count = script_request("a.example", "http");
+        assert_eq!(get.on_http_request_headers(count, true), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200")]);
+        assert_eq!(get.on_http_response_headers(1, true), Action::Continue);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
+            Some("true")
+        );
+    }
+
+    /// A policy that does not read request bodies.
+    const BODY_OFF: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
+        "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502\""]},
+        "default_directives": "p", "enable_filter_state_logs": true}"#;
+
+    /// Scripts the headers of a POST whose body follows in `frames` (size, end of stream), runs the stream through
+    /// them, then answers `status`; returns the request actions and the published reason, outcome and completeness.
+    fn post_in_frames(config: &str, frames: &[(usize, bool)], status: &[u8]) -> (Vec<Action>, [Option<String>; 3]) {
+        let mut post = stream(config);
+        test_hostcalls::reset();
+        let headers: [(&str, &[u8]); 5] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", b"/"),
+            ("content-type", b"application/octet-stream"),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        let mut actions = vec![post.on_http_request_headers(headers.len(), false)];
+        let mut held = 0;
+        for &(size, end_of_stream) in frames {
+            // A paused body accumulates in the host's buffer; a continued one is passed on.
+            held = if actions.last() == Some(&Action::Pause) {
+                held + size
+            } else {
+                size
+            };
+            test_hostcalls::set_request_body(&vec![b'x'; held]);
+            actions.push(post.on_http_request_body(held, end_of_stream));
+        }
+        if test_hostcalls::local_reply_statuses().is_empty() {
+            test_hostcalls::set_response_headers(&[(":status", status)]);
+            post.on_http_response_headers(1, true);
+        }
+        (actions, published())
+    }
+
+    /// The reason, outcome and completeness the stream published.
+    fn published() -> [Option<String>; 3] {
+        ["inspection_reason", "terminal_outcome", "inspection_complete"]
+            .map(|name| test_hostcalls::published_property(&format!("io.coraza.waf.v1.{name}")))
+    }
+
+    /// The published reason, outcome and completeness.
+    fn health(reason: &str, outcome: &str, complete: &str) -> [Option<String>; 3] {
+        [reason, outcome, complete].map(|value| Some(value.to_owned()))
+    }
+
+    /// [`BODY_OFF`]'s phase-3 rule, on a policy that inspects only a 1-byte prefix of the request body.
+    const BODY_CUT: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyLimit 1",
+        "SecRequestBodyLimitAction ProcessPartial",
+        "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502\""]},
+        "default_directives": "p", "enable_filter_state_logs": true}"#;
+
+    /// Whether every response replacement so far answered `status`, and there was one.
+    fn replaced_with(status: &str) -> bool {
+        let replacements = test_hostcalls::response_replacement_statuses();
+        !replacements.is_empty() && replacements.iter().all(|replacement| replacement == status)
+    }
+
+    #[test]
+    fn a_response_phase_denial_after_an_unread_request_body_reports_both() {
+        let (actions, published) = post_in_frames(BODY_OFF, &[(3, true)], b"201");
+        assert_eq!(actions, [Action::Continue, Action::Continue], "the body is not held");
+        assert!(replaced_with("502"), "the denial replaces the response");
+        assert_eq!(
+            published,
+            health("request_body_not_inspected", "denied", "false"),
+            "the body reached the backend unread, and the stream was denied"
+        );
+        // As a truncated body is reported beside the same denial.
+        let (_, published) = post_in_frames(BODY_CUT, &[(3, true)], b"201");
+        assert!(replaced_with("502"), "the denial replaces the response");
+        assert_eq!(published, health("body_partially_inspected", "denied", "false"));
+        // Without the denial, the unread body is reported beside the completed stream.
+        let (_, published) = post_in_frames(BODY_OFF, &[(3, true)], b"200");
+        assert!(
+            test_hostcalls::response_replacement_statuses().is_empty(),
+            "nothing is replaced"
+        );
+        assert_eq!(published, health("request_body_not_inspected", "completed", "false"));
+        // A response-phase denial before any body byte came does not stop the request, so its body may still follow.
+        let (_, published) = post_in_frames(BODY_OFF, &[], b"201");
+        assert!(replaced_with("502"), "the denial replaces the response");
+        assert_eq!(published, health("request_body_not_inspected", "denied", "false"));
+    }
+
+    #[test]
+    fn a_denial_at_response_headers_before_the_request_body_reports_the_body_unread() {
+        // Without response body inspection, phase 4 runs at the response headers; a denial there finalizes the stream
+        // while the request body can still reach the backend.
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
+            "SecAction \"id:6,phase:4,deny,status:502\""]},
+            "default_directives": "p", "enable_filter_state_logs": true}"#;
+        let mut post = stream(config);
+        let count = script_request("a.example", "http");
+        assert_eq!(post.on_http_request_headers(count, false), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
+        assert_eq!(post.on_http_response_headers(2, false), Action::Pause);
+        assert!(
+            post.lifecycle.finalized,
+            "the denial ended the stream at the response headers"
+        );
+        assert!(replaced_with("502"), "the denial replaces the response");
+        let unread = health("request_body_not_inspected", "denied", "false");
+        assert_eq!(published(), unread);
+        test_hostcalls::set_request_body(b"abc");
+        assert_eq!(
+            post.on_http_request_body(3, true),
+            Action::Continue,
+            "the body goes on unread"
+        );
+        assert_eq!(published(), unread);
+
+        // A request-phase denial is the filter's own reply, so no body follows it.
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
+            "SecAction \"id:7,phase:2,deny,status:403\""]},
+            "default_directives": "p", "enable_filter_state_logs": true}"#;
+        let mut post = stream(config);
+        let count = script_request("a.example", "http");
+        post.on_http_request_headers(count, false);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [403]);
+        assert_eq!(published(), health("denied", "denied", "true"));
+    }
+
+    #[test]
+    fn a_request_that_ends_with_trailers_and_no_body_is_not_an_unread_one() {
+        // HTTP/2 can end a request with trailers alone, after headers without END_STREAM.
+        let mut post = stream(BODY_OFF);
+        let count = script_request("a.example", "http");
+        assert_eq!(post.on_http_request_headers(count, false), Action::Continue);
+        test_hostcalls::set_request_trailers(&[("x-checksum", b"0")]);
+        assert_eq!(post.on_http_request_trailers(1), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200")]);
+        assert_eq!(post.on_http_response_headers(1, true), Action::Continue);
+        assert_eq!(published(), health("complete", "completed", "true"), "no body");
+        // Bytes before the trailers stay unread.
+        let mut post = stream(BODY_OFF);
+        let count = script_request("a.example", "http");
+        assert_eq!(post.on_http_request_headers(count, false), Action::Continue);
+        test_hostcalls::set_request_body(b"abc");
+        assert_eq!(post.on_http_request_body(3, false), Action::Continue);
+        test_hostcalls::set_request_trailers(&[("x-checksum", b"0")]);
+        assert_eq!(post.on_http_request_trailers(1), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200")]);
+        assert_eq!(post.on_http_response_headers(1, true), Action::Continue);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+            Some("request_body_not_inspected")
+        );
+    }
+
+    #[test]
+    fn an_empty_last_data_frame_is_an_empty_body_and_not_an_unread_one() {
+        // HTTP/2 can end a request with an empty DATA frame after headers without END_STREAM.
+        let (actions, published) = post_in_frames(BODY_OFF, &[(0, true)], b"200");
+        assert_eq!(actions, [Action::Continue, Action::Continue], "nothing is held");
+        assert_eq!(published, health("complete", "completed", "true"), "an empty body");
+        // Bytes in an earlier frame stay unread when the last one is empty.
+        let (_, published) = post_in_frames(BODY_OFF, &[(3, false), (0, true)], b"200");
+        assert_eq!(
+            published,
+            health("request_body_not_inspected", "completed", "false"),
+            "bytes went through"
+        );
+        // A response that completes while the body may still come is not reported as having seen it.
+        let (_, published) = post_in_frames(BODY_OFF, &[], b"200");
+        assert_eq!(
+            published,
+            health("request_body_not_inspected", "completed", "false"),
+            "the body had not ended"
+        );
+    }
+
+    /// Runs a POST of `body` to `path`, with `headers` after its pseudo-headers, through the stream to a 200 response
+    /// unless the filter replies first; returns the local replies and the published reason, outcome and completeness.
+    fn post_with(config: &str, path: &str, headers: &[(&str, &[u8])], body: &[u8]) -> (Vec<u32>, [Option<String>; 3]) {
+        let mut post = stream(config);
+        test_hostcalls::reset();
+        let mut all: Vec<(&str, &[u8])> = vec![
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", path.as_bytes()),
+        ];
+        all.extend_from_slice(headers);
+        test_hostcalls::set_request_headers(&all);
+        script_connection_properties();
+        test_hostcalls::set_request_body(body);
+        post.on_http_request_headers(all.len(), false);
+        if test_hostcalls::local_reply_statuses().is_empty() {
+            post.on_http_request_body(body.len(), true);
+        }
+        if test_hostcalls::local_reply_statuses().is_empty() {
+            test_hostcalls::set_response_headers(&[(":status", b"200")]);
+            post.on_http_response_headers(1, true);
+        }
+        (test_hostcalls::local_reply_statuses(), published())
+    }
+
+    /// `fields` multipart text parts, then a file part when `file` is set.
+    fn multipart(fields: usize, file: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        for index in 0..fields {
+            body.extend_from_slice(
+                format!("--b\r\nContent-Disposition: form-data; name=\"k{index}\"\r\n\r\nv\r\n").as_bytes(),
+            );
+        }
+        if file {
+            body.extend_from_slice(
+                b"--b\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\r\nhello\r\n",
+            );
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        body
+    }
+
+    #[test]
+    fn a_policy_without_a_body_access_line_refuses_uploads_large_forms_and_encoded_bodies() {
+        let policy = |directives: &str| {
+            format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On"{directives}]}}, "default_directives": "p",
+                "enable_filter_state_logs": true}}"#
+            )
+        };
+        let default_on = policy("");
+        let form: &[(&str, &[u8])] = &[("content-type", FORM.as_bytes())];
+        let upload: &[(&str, &[u8])] = &[("content-type", b"multipart/form-data; boundary=b")];
+        let gzip: &[(&str, &[u8])] = &[("content-type", FORM.as_bytes()), ("content-encoding", b"gzip")];
+        let refused =
+            |status, reason: &str, outcome: &str, complete: &str| (vec![status], health(reason, outcome, complete));
+        let passed = || (vec![], health("complete", "completed", "true"));
+        // A file part: the engine's host ban on uploads, an interruption with no rule.
+        assert_eq!(
+            post_with(&default_on, "/upload", upload, &multipart(1, true)),
+            refused(413, "denied", "denied", "true")
+        );
+        assert_eq!(
+            ["rule_id", "status"].map(|name| test_hostcalls::published_property(&format!("io.coraza.waf.{name}"))),
+            [Some("0".to_owned()), Some("413".to_owned())]
+        );
+        assert_eq!(
+            post_with(&default_on, "/upload", upload, &multipart(1, false)),
+            passed()
+        );
+        // More than `SecArgumentsLimit` (1000) fields. A multipart body the limit stopped could hide a file part in
+        // what it did not read, so the upload ban refuses it.
+        assert_eq!(
+            post_with(&default_on, "/upload", form, &urlencoded(999, 1)),
+            passed(),
+            "1000 fields"
+        );
+        assert_eq!(
+            post_with(&default_on, "/upload", form, &urlencoded(1000, 1)),
+            refused(413, "incomplete", "incomplete", "false")
+        );
+        // A JSON body that a rule parses as JSON, as CRS rules 901360 and 901370 do for `application/*+json`.
+        let json_rule = policy(
+            r#", "SecRule REQUEST_HEADERS:Content-Type \"@contains +json\" \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\"""#,
+        );
+        let json_api: &[(&str, &[u8])] = &[("content-type", b"application/vnd.api+json")];
+        assert_eq!(
+            post_with(&json_rule, "/upload", json_api, &json_object(998, 1)),
+            passed(),
+            "999 members"
+        );
+        assert_eq!(
+            post_with(&json_rule, "/upload", json_api, &json_object(999, 1)),
+            passed(),
+            "1000 members"
+        );
+        assert_eq!(
+            post_with(&json_rule, "/upload", json_api, &json_object(1000, 1)),
+            refused(413, "incomplete", "incomplete", "false"),
+            "1001 members"
+        );
+        assert_eq!(
+            post_with(&default_on, "/upload", upload, &multipart(1001, false)),
+            refused(413, "denied", "denied", "true")
+        );
+        // Any `Content-Encoding` but `identity`.
+        assert_eq!(
+            post_with(&default_on, "/upload", gzip, b"a=1"),
+            refused(415, "unsupported", "unsupported", "false")
+        );
+        // A body of `SecRequestBodyLimit` bytes or more, under the engine default `Reject`, which reads none of it.
+        assert_eq!(
+            post_with(&policy(r#", "SecRequestBodyLimit 4""#), "/upload", form, b"a=1"),
+            passed(),
+            "under the limit"
+        );
+        assert_eq!(
+            post_with(&policy(r#", "SecRequestBodyLimit 4""#), "/upload", form, b"a=12"),
+            refused(413, "denied", "denied", "false")
+        );
+
+        // The upload ban and the limit are the engine's interruptions, which `DetectionOnly` does not enforce; the
+        // argument limit and the encoding are the connector's own refusals, in every mode but `Off`.
+        let detection_only = policy(r#", "SecRuleEngine DetectionOnly""#);
+        assert_eq!(
+            post_with(&detection_only, "/upload", upload, &multipart(1, true)),
+            passed()
+        );
+        assert_eq!(
+            post_with(&detection_only, "/upload", form, &urlencoded(1000, 1)),
+            refused(413, "incomplete", "incomplete", "false")
+        );
+        assert_eq!(
+            post_with(&detection_only, "/upload", gzip, b"a=1"),
+            refused(415, "unsupported", "unsupported", "false")
+        );
+
+        // `SecRequestBodyAccess Off` passes each of them on unread.
+        let unread = || (vec![], health("request_body_not_inspected", "completed", "false"));
+        let body_off = policy(r#", "SecRequestBodyAccess Off""#);
+        assert_eq!(post_with(&body_off, "/upload", upload, &multipart(1, true)), unread());
+        assert_eq!(post_with(&body_off, "/upload", form, &urlencoded(1000, 1)), unread());
+        assert_eq!(post_with(&body_off, "/upload", gzip, b"a=1"), unread());
+        // A higher `SecArgumentsLimit` reads a larger form.
+        assert_eq!(
+            post_with(
+                &policy(r#", "SecArgumentsLimit 2000""#),
+                "/upload",
+                form,
+                &urlencoded(1000, 1)
+            ),
+            passed()
+        );
+    }
+
+    #[test]
+    fn the_readmes_path_scoped_opt_outs_let_through_only_the_bodies_of_the_paths_they_name() {
+        // The upgrade notes' `ctl:requestBodyAccess=Off` rules, exactly.
+        let ctl_off = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecRule REQUEST_FILENAME \"@streq /upload\" \"id:1,phase:1,pass,nolog,chain\"",
+            "SecRule REQUEST_HEADERS:Content-Type \"@beginsWith multipart/form-data\" \"ctl:requestBodyAccess=Off\"",
+            "SecRule REQUEST_FILENAME \"@streq /import\" \"id:2,phase:1,pass,nolog,chain\"",
+            "SecRule &REQUEST_HEADERS:Content-Encoding \"@gt 0\" \"ctl:requestBodyAccess=Off\""]},
+            "default_directives": "p", "enable_filter_state_logs": true}"#;
+        let form: &[(&str, &[u8])] = &[("content-type", FORM.as_bytes())];
+        let upload: &[(&str, &[u8])] = &[("content-type", b"multipart/form-data; boundary=b")];
+        let gzip: &[(&str, &[u8])] = &[("content-type", FORM.as_bytes()), ("content-encoding", b"gzip")];
+        let unread = (vec![], health("request_body_not_inspected", "completed", "false"));
+        assert_eq!(post_with(ctl_off, "/upload", upload, &multipart(1, true)), unread);
+        assert_eq!(post_with(ctl_off, "/import", gzip, b"a=1"), unread);
+        assert_eq!(
+            post_with(ctl_off, "/upload", form, &urlencoded(1000, 1)),
+            (vec![413], health("incomplete", "incomplete", "false")),
+            "a form the rules do not match is still read"
+        );
+        // The client chooses its headers, not the endpoint a path names: the same headers elsewhere switch nothing off.
+        let upload_refused = (vec![413], health("denied", "denied", "true"));
+        assert_eq!(
+            post_with(ctl_off, "/import", upload, &multipart(1, true)),
+            upload_refused
+        );
+        assert_eq!(post_with(ctl_off, "/", upload, &multipart(1, true)), upload_refused);
+        assert_eq!(
+            post_with(ctl_off, "/upload", gzip, b"a=1"),
+            (vec![415], health("unsupported", "unsupported", "false"))
+        );
+    }
+
+    #[test]
+    fn a_policy_without_a_body_access_line_holds_a_streamed_body_until_it_ends() {
+        // The default reads request bodies, so every frame waits for the last one: a streamed body (a gRPC stream, a
+        // long chunked upload) reaches the backend only when it is complete, and is inspected then.
+        let default_on = r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p",
+            "enable_filter_state_logs": true}"#;
+        let (actions, published) = post_in_frames(default_on, &[(3, false), (3, false), (3, true)], b"200");
+        assert_eq!(
+            actions,
+            [Action::Pause, Action::Pause, Action::Pause, Action::Continue],
+            "held to the end"
+        );
+        assert_eq!(published, health("complete", "completed", "true"), "inspected whole");
+        // A body over the 16 MiB the host buffers is refused rather than passed on.
+        let (actions, _) = post_in_frames(default_on, &[(MAX_REQUEST_BODY_BYTES + 1, false)], b"200");
+        assert_eq!(actions, [Action::Pause, Action::Pause], "refused");
+        assert_eq!(test_hostcalls::local_reply_statuses(), [413], "too large");
+        // `SecRequestBodyAccess Off` passes every frame on as it comes.
+        let (actions, _) = post_in_frames(BODY_OFF, &[(3, false), (3, false), (3, true)], b"200");
+        assert_eq!(
+            actions,
+            [Action::Continue, Action::Continue, Action::Continue, Action::Continue],
+            "streamed"
         );
     }
 }

@@ -126,7 +126,8 @@ spec:
                         socket_address:
                           address: __WASM_FETCH_ADDRESS__
                           port_value: __WASM_FETCH_PORT__
-    # Access log with the Coraza filter state.
+    # The connection manager settings the filter depends on (envoy-coraza/README.md, "Required Envoy
+    # configuration"), and an access log with the Coraza filter state.
     - applyTo: NETWORK_FILTER
       match:
         context: GATEWAY
@@ -141,6 +142,20 @@ spec:
           name: envoy.filters.network.http_connection_manager
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            use_remote_address: true
+            # The number of trusted proxies in front of the gateway, such as a cloud load balancer: 0 when clients
+            # connect to it directly. See step 6 for a value this patch cannot set.
+            xff_num_trusted_hops: 0
+            strip_trailing_host_dot: true
+            strip_any_host_port: true
+            normalize_path: true
+            merge_slashes: true
+            path_with_escaped_slashes_action: REJECT_REQUEST
+            common_http_protocol_options:
+              headers_with_underscores_action: REJECT_REQUEST
+            # Finite, and long enough for the largest upload to arrive.
+            request_timeout: 60s
+            stream_idle_timeout: 60s
             access_log:
               - name: envoy.access_loggers.file
                 typed_config:
@@ -149,6 +164,16 @@ spec:
                   log_format:
                     text_format_source:
                       inline_string: "path=%REQ(:PATH)% event=%FILTER_STATE(wasm.io.coraza.waf.event:PLAIN)% rule_id=%FILTER_STATE(wasm.io.coraza.waf.rule_id:PLAIN)% phase=%FILTER_STATE(wasm.io.coraza.waf.phase:PLAIN)% action=%FILTER_STATE(wasm.io.coraza.waf.action:PLAIN)% status=%FILTER_STATE(wasm.io.coraza.waf.status:PLAIN)%\n"
+    # Legacy rewrite headers that would select a path no path rule saw.
+    - applyTo: ROUTE_CONFIGURATION
+      match:
+        context: GATEWAY
+      patch:
+        operation: MERGE
+        value:
+          request_headers_to_remove:
+            - x-original-url
+            - x-rewrite-url
     # The Coraza filter, immediately before the router.
     - applyTo: HTTP_FILTER
       match:
@@ -214,7 +239,101 @@ The `sha256` pin makes the fetch verifiable: if the served bytes do not
 match, Envoy keeps the VM failed and, with `FAIL_CLOSED`, the gateway
 returns 503 until the artifact is fixed.
 
-## 6. Send traffic
+## 6. Check the gateway's connection manager
+
+The filter depends on Envoy settings that istiod generates or that the patch
+above merges in; see
+[Required Envoy configuration](../../envoy-coraza/README.md#required-envoy-configuration).
+Do not assume Istio's defaults: dump the gateway's listener, routes and
+clusters and check each row. The dumps go to a new directory, not to
+`/tmp/coraza-demo`, which step 3 serves over HTTP.
+
+```sh
+GATEWAY_POD=$(kubectl -n your-namespace get pods -l gateway.networking.k8s.io/gateway-name=coraza-gateway -o jsonpath='{.items[0].metadata.name}')
+CHECK_DIR=$(mktemp -d)
+istioctl proxy-config listener "$GATEWAY_POD" -n your-namespace --port 80 -o json >"$CHECK_DIR/listener.json"
+istioctl proxy-config route "$GATEWAY_POD" -n your-namespace -o json >"$CHECK_DIR/routes.json"
+istioctl proxy-config cluster "$GATEWAY_POD" -n your-namespace -o json >"$CHECK_DIR/clusters.json"
+python3 - "$CHECK_DIR" <<'PY'
+import json
+import re
+import sys
+
+dumps = {}
+for name in ("listener", "routes", "clusters"):
+    with open(f"{sys.argv[1]}/{name}.json") as dump_file:
+        dumps[name] = json.load(dump_file)
+
+
+def values(node, key):
+    """Every value of `key`, in snake_case or camelCase, anywhere under `node`."""
+    camel = re.sub(r"_(.)", lambda match: match.group(1).upper(), key)
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name in (key, camel):
+                yield value
+            yield from values(value, key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from values(item, key)
+
+
+required = {
+    "failure_policy": "FAIL_CLOSED",
+    "allow_on_headers_stop_iteration": True,
+    "use_remote_address": True,
+    "strip_trailing_host_dot": True,
+    "strip_any_host_port": True,
+    "normalize_path": True,
+    "merge_slashes": True,
+    "path_with_escaped_slashes_action": "REJECT_REQUEST",
+    "headers_with_underscores_action": "REJECT_REQUEST",
+}
+for key, want in required.items():
+    found = list(values(dumps["listener"], key))
+    verdict = "ok   " if found and all(value == want for value in found) else "FIX  "
+    print(f"{verdict}{key}: {found or 'absent'} (want {want!r})")
+removed = {name for names in values(dumps["routes"], "request_headers_to_remove") for name in names}
+verdict = "ok   " if {"x-original-url", "x-rewrite-url"} <= removed else "FIX  "
+print(f"{verdict}request_headers_to_remove: {sorted(removed) or 'absent'} (want x-original-url and x-rewrite-url)")
+# JSON output leaves out a field at its default (0, false or unset), so absent means that default.
+checks = [
+    ("listener", "xff_num_trusted_hops", "the number of trusted proxies in front of the gateway"),
+    ("listener", "proxy_100_continue", "absent or false"),
+    ("listener", "stream_idle_timeout", "finite, sized to the largest upload"),
+    ("listener", "request_timeout", "finite, sized to the largest upload"),
+    ("listener", "max_request_headers_kb", "absent, the default 60"),
+    ("listener", "accept_http_10", "absent or false"),
+    ("listener", "per_connection_buffer_limit_bytes", "13107200 to 16777216; absent is 1 MiB"),
+    ("clusters", "per_connection_buffer_limit_bytes", "13107200 to 16777216; absent is 1 MiB"),
+    ("routes", "request_body_buffer_limit", "13107200 to 16777216, or absent"),
+    ("routes", "domains", "the protected hosts, not *, when per-authority policies differ"),
+]
+for dump, key, want in checks:
+    found = sorted({json.dumps(value) for value in values(dumps[dump], key)})
+    print(f"check {dump} {key}: {', '.join(found) or 'absent'} (want {want})")
+PY
+```
+
+Every `FIX` row needs the patch of step 5 or a change to it. Of the `check`
+rows, `xff_num_trusted_hops` must equal the number of trusted proxies in front
+of the gateway, `proxy_100_continue` must be absent or `false`, and both
+timeouts must be finite and sized to the largest upload. The buffer limits must
+be at least the largest `SecRequestBodyLimit` in use, 13107200 for this guide's
+policy (from `@recommended-conf`), and at most 16 MiB, or Envoy answers 413 or
+500 itself for larger bodies; the virtual host `domains` must name the protected
+hosts rather than `*` whenever per-authority policies differ. A `MERGE` leaves a
+field it sets to `0` or `false` as it was, so when the dump shows another
+`xff_num_trusted_hops` or `proxy_100_continue: true`, change the value istiod
+generates instead, for example through the gateway's `numTrustedProxies` proxy
+setting. The dumps cannot show two rows of the table: keep Envoy's
+`envoy.reloadable_features.http_reject_path_with_fragment` runtime flag at its
+default, and Envoy's `wasm` log level at `warn` or more verbose, or the rule
+lines and the filter's configure-time warnings and notices are dropped (audit
+lines, logged at `critical`, are dropped only at `off`). Remove `$CHECK_DIR`
+when done.
+
+## 7. Send traffic
 
 ```sh
 GATEWAY_POD=$(kubectl -n your-namespace get pods -l gateway.networking.k8s.io/gateway-name=coraza-gateway -o name | head -1)
@@ -232,7 +351,7 @@ The matching CRS rule id is in the gateway access log:
 kubectl -n your-namespace logs deploy/coraza-gateway-istio -c istio-proxy | grep rule_id
 ```
 
-## 7. Clean up
+## 8. Clean up
 
 ```sh
 kubectl -n your-namespace delete envoyfilter/coraza-demo gateway/coraza-gateway httproute/coraza-route
@@ -247,5 +366,9 @@ kill %1 %2 2>/dev/null || true   # port-forward and http.server
 - Envoy keeps an already-loaded wasm VM across EnvoyFilter replacements:
   restart the gateway deployment after applying a new artifact or digest.
 - The same artifacts also ship as OCI images
-  (`ghcr.io/networking-incubator/coraza-rs`, `nightly` tags) usable with
-  Istio's `WASMPlugin` `image` field.
+  (`ghcr.io/networking-incubator/coraza-rs`, `nightly` tags), but deploy them
+  with the `EnvoyFilter` form of this guide, not Istio's `WasmPlugin`. The
+  `WasmPlugin` API has no field for `allow_on_headers_stop_iteration` (read in
+  `istio.io/api` v1.30.5 and v1.32.0-alpha); without it every inspected body
+  hangs until the idle timeout, and whether istiod sets it internally is not
+  verified.

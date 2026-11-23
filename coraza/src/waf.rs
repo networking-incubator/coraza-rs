@@ -29,7 +29,7 @@ use crate::{
     audit_log::{AuditLogCallback, AuditLogRegistry, AuditLogger, ErrorLog},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugLevel, DebugLogger, Writer, noop_logger},
-    rules::RuleGroup,
+    rules::{Rule, RuleGroup},
     transaction::{Transaction, TransactionPool},
 };
 
@@ -296,6 +296,22 @@ impl Waf {
     pub fn rule_count(&self) -> usize {
         self.rules.count()
     }
+
+    /// Every compiled action as `(rule id, action name, argument)`, in directive order, chain members included under
+    /// their top-level rule's id.
+    ///
+    /// The name is the lowercase SecLang action name and the argument its text, for example `("ctl",
+    /// "ruleEngine=Off")`. It is a read-only view for a host that reviews a compiled rule set once, such as one that
+    /// reports the rules able to switch inspection off; transactions never use it.
+    pub fn rule_actions(&self) -> impl Iterator<Item = (i32, &str, &str)> + '_ {
+        self.rules.iter().flat_map(|rule| {
+            let id = rule.metadata().id;
+            std::iter::once(rule)
+                .chain(&rule.chain)
+                .flat_map(Rule::actions)
+                .map(move |action| (id, action.name.as_str(), action.argument.as_str()))
+        })
+    }
 }
 
 impl Default for Waf {
@@ -385,6 +401,26 @@ mod tests {
             audit_log: path.to_string_lossy().into_owned(),
             ..WafConfig::default()
         }
+    }
+
+    #[test]
+    fn rule_actions_lists_chain_members_under_their_rule_id() {
+        let mut parser = Parser::new();
+        parser
+            .from_string(
+                "SecAction \"id:1,phase:1,pass,nolog,ctl:ruleEngine=Off\"\n\
+                 SecRule REQUEST_METHOD \"@streq PUT\" \"id:2,phase:1,pass,nolog,chain\"\n\
+                 SecRule REQUEST_URI \"@beginsWith /u\" \"ctl:requestBodyAccess=Off\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let ctl: Vec<_> = waf.rule_actions().filter(|(_, name, _)| *name == "ctl").collect();
+        assert_eq!(ctl, [(1, "ctl", "ruleEngine=Off"), (2, "ctl", "requestBodyAccess=Off")]);
+        assert!(
+            waf.rule_actions().any(|action| action == (2, "pass", "")),
+            "every action is listed, not only ctl"
+        );
+        assert_eq!(Waf::default().rule_actions().count(), 0);
     }
 
     #[test]

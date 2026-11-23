@@ -41,7 +41,7 @@ use coraza::{
 };
 
 use crate::{
-    config::{add_rule_data, display_name, normalize_rule_data_name, Config, RULE_DATA_LIMITS},
+    config::{add_rule_data, display_name, normalize_rule_data_name, Config, UnmatchedAuthority, RULE_DATA_LIMITS},
     observability::{self, Diagnostics},
 };
 
@@ -202,10 +202,11 @@ impl RuleData for CountingRuleData {
 
     /// Expands `pattern` without the built-in `@` files.
     ///
-    /// `@recommended-conf` starts the engine in `DetectionOnly`, so a wildcard that
-    /// matched it, such as `Include *` after `SecRuleEngine On`, would load the
-    /// policy with only a warning and stop it blocking. coraza-proxy-wasm resolves
-    /// its `@` names only by exact name too: its directory listing omits them.
+    /// `@recommended-conf` sets body access, limits and audit logging, so a wildcard
+    /// that matched it, such as `Include *` after a policy's own settings, would
+    /// silently override them, and loading it twice fails on its duplicate rule ids.
+    /// coraza-proxy-wasm resolves its `@` names only by exact name too: its directory
+    /// listing omits them.
     fn glob(&self, pattern: &str) -> io::Result<Vec<std::path::PathBuf>> {
         let mut paths = self.memory.glob(pattern)?;
         paths.retain(|path| !self.unlisted.iter().any(|name| path.as_path() == Path::new(name)));
@@ -250,8 +251,15 @@ pub(crate) struct Generation {
     generation_id: u64,
     /// Configure-time warnings, one per policy that needs one.
     warnings: Vec<String>,
+    /// Configure-time notices, one per policy that enforces, with the number of its rules that switch the rule engine
+    /// or request body access off.
+    notices: Vec<String>,
+    /// Configure-time details, one per rule that switches the rule engine or request body access off.
+    switches: Vec<String>,
     /// Whether a request that matched no policy was already reported at warning level.
     unmatched_reported: Cell<bool>,
+    /// What happens to a request whose authority selects no policy.
+    unmatched_authority: UnmatchedAuthority,
 }
 
 /// A generation that cannot be built.
@@ -299,6 +307,8 @@ pub(crate) enum CompileError {
         /// Missing policy name.
         policy: String,
     },
+    /// Policies are configured but nothing selects one, and unmatched authorities are refused.
+    NoSelector,
     /// The configuration is over a generation-wide bound.
     Limit {
         /// Bound that was exceeded, built from its constant.
@@ -341,6 +351,11 @@ impl Display for CompileError {
                     display_name(policy)
                 )
             },
+            Self::NoSelector => f.write_str(
+                "policies are configured but neither default_directives nor per_authority_directives selects one, \
+                 so every request selects no policy and would be refused with 421; set default_directives, or set \
+                 \"unmatched_authority\": \"allow\" to pass such requests uninspected",
+            ),
             Self::Limit { limit } => write!(f, "generation exceeds its {limit}"),
         }
     }
@@ -413,6 +428,10 @@ impl PolicyCompiler {
             .with_rule_limit(rule_budget.parser_limit());
         parser.config_mut().multiphase_evaluation = true;
         parser.config_mut().audit_engine_locked = false;
+        // Host default: request bodies are inspected unless the policy says otherwise. The limit comes with it, as the
+        // engine default (128 MiB) is over what this host buffers and `check_wasm_safety` would refuse the policy.
+        parser.config_mut().request_body_access = true;
+        parser.config_mut().request_body_limit = MAX_REQUEST_BODY_LIMIT;
         let error_diagnostics = Arc::clone(&self.diagnostics);
         parser.on_error_log(move |matched| {
             observability::error_log(matched, &error_diagnostics);
@@ -460,6 +479,12 @@ impl PolicyCompiler {
                 display_name(name)
             )),
         }
+        if !waf.config().request_body_access {
+            warnings.push(format!(
+                "envoy-coraza: policy {} uses SecRequestBodyAccess Off; request bodies are not inspected",
+                display_name(name)
+            ));
+        }
         for warning in parser_warnings {
             warnings.push(format!("envoy-coraza: policy {}: {warning}", display_name(name)));
         }
@@ -469,6 +494,41 @@ impl PolicyCompiler {
         })?;
         Ok((policy, count, warnings))
     }
+}
+
+/// One line per rule of `waf` that switches the rule engine or request body access off at run time, naming the rule
+/// and every such `ctl` action it runs.
+fn inspection_switches(policy: &str, waf: &Waf) -> Vec<String> {
+    let mut rules: Vec<(i32, String)> = Vec::new();
+    for (id, action, argument) in waf.rule_actions() {
+        // The compiler validated the option names and values, so only these spellings reach here.
+        let switches_off = action == "ctl"
+            && match argument.split_once('=') {
+                Some(("ruleEngine", value)) => !value.eq_ignore_ascii_case("on"),
+                Some(("requestBodyAccess", value)) => value.eq_ignore_ascii_case("off"),
+                _ => false,
+            };
+        if !switches_off {
+            continue;
+        }
+        // A rule's actions, chain members included, are listed together, so only the last entry can share its id.
+        match rules.last_mut() {
+            Some((last, ctls)) if *last == id => {
+                ctls.push_str(", ctl:");
+                ctls.push_str(argument);
+            },
+            _ => rules.push((id, format!("ctl:{argument}"))),
+        }
+    }
+    rules
+        .into_iter()
+        .map(|(id, ctls)| {
+            format!(
+                "envoy-coraza: policy {} rule {id} runs {ctls}; requests it matches are not fully inspected",
+                display_name(policy)
+            )
+        })
+        .collect()
 }
 
 /// Truncates an engine diagnostic so one log line stays bounded.
@@ -526,19 +586,30 @@ impl Generation {
             per_authority_directives,
             enable_filter_state_logs,
             mut rule_data,
+            unmatched_authority,
         } = config;
-        let unlisted = builtin_rule_data(&mut rule_data)?;
-        let diagnostics = Arc::new(Diagnostics::default());
+        let allow_unmatched = unmatched_authority == UnmatchedAuthority::Allow;
         let mut warnings = Vec::new();
         if directives_map.is_empty() {
             warnings.push("envoy-coraza: no policies configured; every request passes uninspected".to_owned());
         } else if default_directives.is_none() && per_authority_directives.is_empty() {
+            if !allow_unmatched {
+                return Err(CompileError::NoSelector);
+            }
             warnings.push(
                 "envoy-coraza: policies are configured but no default_directives or per_authority_directives \
                  selects one; every request passes uninspected"
                     .to_owned(),
             );
+        } else if default_directives.is_none() && allow_unmatched {
+            warnings.push(
+                "envoy-coraza: unmatched_authority is \"allow\" and no default_directives is set; a request to an \
+                 unlisted authority passes uninspected"
+                    .to_owned(),
+            );
         }
+        let unlisted = builtin_rule_data(&mut rule_data)?;
+        let diagnostics = Arc::new(Diagnostics::default());
         let source: Arc<dyn RuleData> = Arc::new(CountingRuleData::new(
             Memory::new(rule_data),
             unlisted,
@@ -549,6 +620,8 @@ impl Generation {
             diagnostics: Arc::clone(&diagnostics),
         };
         let mut policies = BTreeMap::new();
+        let mut notices = Vec::new();
+        let mut switches = Vec::new();
         let mut generation_rules = 0_usize;
         for (name, directives) in directives_map {
             let remaining = limits.rules_per_generation.saturating_sub(generation_rules);
@@ -567,6 +640,15 @@ impl Generation {
             let (policy, count, policy_warnings) = compiler.compile(&name, &directives, rule_budget)?;
             generation_rules = generation_rules.saturating_add(count);
             warnings.extend(policy_warnings);
+            let policy_switches = inspection_switches(&name, &policy.waf);
+            if policy.waf.config().rule_engine == RuleEngineStatus::On {
+                notices.push(format!(
+                    "envoy-coraza: policy {} enforces; rules that switch the rule engine or request body access off: {}",
+                    display_name(&name),
+                    policy_switches.len()
+                ));
+            }
+            switches.extend(policy_switches);
             policies.insert(name, policy);
         }
 
@@ -578,24 +660,34 @@ impl Generation {
             diagnostics,
             generation_id: 0,
             warnings,
+            notices,
+            switches,
             unmatched_reported: Cell::new(false),
+            unmatched_authority,
         })
     }
 
-    /// Selects the policy for a normalized `authority`: an exact match, else the default.
+    /// Selects the policy for a normalized `authority`: an exact match, else, when it carries a port, the bare host's,
+    /// else the default.
     ///
-    /// `None` means the request is passed uninspected. That matches upstream,
-    /// which logs a warning and continues for an authority that has no policy
-    /// and no default; the lifecycle step will log and continue the same way.
+    /// `None` means no policy matched. The stream refuses such a request with 421 unless the configuration sets
+    /// `"unmatched_authority": "allow"` or has no policies ([`Self::refuses_unmatched`]). corazawaf/coraza-proxy-wasm
+    /// logs a warning and continues instead; the networking-incubator fork answers 500.
     pub(crate) fn select_named(&self, authority: &str) -> Option<(&str, &Policy)> {
         let name = self
             .authority_policies
             .get(authority)
+            .or_else(|| self.authority_policies.get(split_port(authority)?.0))
             .or(self.default_policy.as_ref())?;
         Some((name, self.policies.get(name)?))
     }
 
-    /// Selects the policy for a normalized `authority`: an exact match, else the default.
+    /// Whether a request that selects no policy is refused: the generation has policies and does not allow it.
+    pub(crate) fn refuses_unmatched(&self) -> bool {
+        !self.policies.is_empty() && self.unmatched_authority == UnmatchedAuthority::Reject
+    }
+
+    /// Selects the policy for a normalized `authority`, as [`Self::select_named`] does.
     #[cfg_attr(not(test), expect(dead_code, reason = "policy tests exercise the selection API"))]
     pub(crate) fn select(&self, authority: &str) -> Option<&Policy> {
         self.select_named(authority).map(|(_, policy)| policy)
@@ -604,6 +696,16 @@ impl Generation {
     /// Configure-time warnings, one per policy that needs one.
     pub(crate) fn warnings(&self) -> impl Iterator<Item = &str> {
         self.warnings.iter().map(String::as_str)
+    }
+
+    /// Configure-time notices, which the root logs at warning level so that the recommended log level shows them.
+    pub(crate) fn notices(&self) -> impl Iterator<Item = &str> {
+        self.notices.iter().map(String::as_str)
+    }
+
+    /// Configure-time details naming each rule a notice counts, which the root logs at info level.
+    pub(crate) fn switches(&self) -> impl Iterator<Item = &str> {
+        self.switches.iter().map(String::as_str)
     }
 
     /// Records that a request matched no policy and returns whether it is the first one of this generation.
@@ -633,6 +735,13 @@ impl Generation {
     pub(crate) fn set_id(&mut self, generation_id: u64) {
         self.generation_id = generation_id;
     }
+}
+
+/// An `authority` split into its host and port, when it has a port: `host:port` or `[v6]:port`.
+pub(crate) fn split_port(authority: &str) -> Option<(&str, &str)> {
+    let (host, port) = authority.rsplit_once(':')?;
+    // A colon inside an IPv6 literal does not start a port.
+    (!host.starts_with('[') || host.ends_with(']')).then_some((host, port))
 }
 
 /// Rejects an effective WAF configuration that cannot run on a WASM host.
@@ -762,7 +871,8 @@ mod tests {
 
     #[test]
     fn only_the_first_unmatched_request_of_a_generation_is_reported() {
-        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}}"#);
         assert!(
             generation.first_unmatched_request(),
             "the first unmatched request is reported"
@@ -773,13 +883,14 @@ mod tests {
                 "later ones are not reported again"
             );
         }
-        let fresh = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        let fresh =
+            parse_generation(r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}}"#);
         assert!(fresh.first_unmatched_request(), "each generation reports once");
     }
 
     #[test]
     fn a_non_empty_generation_does_not_warn_about_missing_policies() {
-        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+        let generation = parse_generation(r#"{"directives_map": {"p": []}, "default_directives": "p"}"#);
         assert!(
             !generation.warnings().any(|warning| warning.contains("no policies")),
             "warnings were {:?}",
@@ -789,7 +900,8 @@ mod tests {
 
     #[test]
     fn every_policy_locks_the_audit_engine_and_body_ceilings() {
-        let generation = parse_generation(r#"{"directives_map": {"p": ["SecRuleEngine On"], "q": []}}"#);
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": ["SecRuleEngine On"], "q": []}, "default_directives": "p"}"#);
         assert_eq!(generation.policies.len(), 2, "both policies compile");
         for (name, policy) in &generation.policies {
             let config = policy.waf.config();
@@ -831,19 +943,47 @@ mod tests {
     }
 
     #[test]
+    fn a_port_without_a_key_of_its_own_selects_the_bare_host_before_the_default() {
+        let generation = parse_generation(
+            r#"{
+                "directives_map": {"host": [], "port": [], "fallback": []},
+                "per_authority_directives": {"a.example": "host", "a.example:8080": "port", "[::1]": "host"},
+                "default_directives": "fallback"
+            }"#,
+        );
+        for (authority, expected) in [
+            ("a.example", "host"),
+            ("a.example:8080", "port"),
+            ("a.example:9090", "host"),
+            ("[::1]:9090", "host"),
+            ("b.example:9090", "fallback"),
+            ("b.example", "fallback"),
+        ] {
+            let selected = generation.select(authority).unwrap();
+            assert!(
+                std::ptr::eq(selected, generation.policies.get(expected).unwrap()),
+                "{authority} selects {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn an_absent_default_does_not_select_the_first_policy() {
-        let generation = parse_generation(r#"{"directives_map": {"only": ["SecRuleEngine On"]}}"#);
+        let generation =
+            parse_generation(r#"{"directives_map": {"only": ["SecRuleEngine On"]}, "unmatched_authority": "allow"}"#);
         assert!(
             generation.select("nope").is_none(),
             "a single policy is not an implicit default"
         );
+        let error = compile_error(r#"{"directives_map": {"only": ["SecRuleEngine On"]}}"#);
+        assert!(error.contains("selects no policy"), "message was {error:?}");
     }
 
     #[test]
     fn an_unknown_authority_without_a_default_is_uninspected() {
         let generation = parse_generation(r#"{"directives_map": {"only": []}, "default_directives": "only"}"#);
         assert!(generation.select("nope").is_some(), "the configured default is used");
-        let no_default = parse_generation(r#"{"directives_map": {"only": []}}"#);
+        let no_default = parse_generation(r#"{"directives_map": {"only": []}, "unmatched_authority": "allow"}"#);
         assert!(no_default.select("nope").is_none(), "no default means no policy");
     }
 
@@ -896,6 +1036,7 @@ mod tests {
             &format!(
                 r#"{{
                     "directives_map": {{"p": ["Include many.conf", "Include many.conf"]}},
+                    "default_directives": "p",
                     "rule_data": {{"many.conf": {}}}
                 }}"#,
                 serde_json::Value::String(rules)
@@ -923,7 +1064,7 @@ mod tests {
             .join("\n");
         let error = compile_with(
             &format!(
-                r#"{{"directives_map": {{"p": [{}]}}}}"#,
+                r#"{{"directives_map": {{"p": [{}]}}, "default_directives": "p"}}"#,
                 serde_json::Value::String(packed)
             ),
             SMALL_LIMITS,
@@ -1062,18 +1203,149 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_baseline_starts_in_detection_only_and_warns() {
+    fn the_built_in_baseline_enforces_without_a_rule_engine_line() {
         let generation =
             parse_generation(r#"{"directives_map": {"p": ["Include @recommended-conf"]}, "default_directives": "p"}"#);
         assert!(
-            generation.warnings().any(|warning| warning.contains("DetectionOnly")),
+            !generation.warnings().any(|warning| warning.contains("DetectionOnly")),
             "warnings were {:?}",
             generation.warnings().collect::<Vec<_>>()
         );
         assert_eq!(
+            generation.notices().collect::<Vec<_>>(),
+            ["envoy-coraza: policy \"p\" enforces; rules that switch the rule engine or request body access off: 0"]
+        );
+        assert_eq!(
             interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
-            None,
-            "DetectionOnly logs 200002 without blocking"
+            Some((200_002, 400)),
+            "the engine default On blocks with rule 200002"
+        );
+    }
+
+    #[test]
+    fn detection_only_before_or_after_the_baseline_stays_detection_only_and_warns() {
+        for directives in [
+            ["Include @recommended-conf", "SecRuleEngine DetectionOnly"],
+            ["SecRuleEngine DetectionOnly", "Include @recommended-conf"],
+        ] {
+            let generation = parse_generation(
+                &serde_json::json!({"directives_map": {"p": directives}, "default_directives": "p"}).to_string(),
+            );
+            assert!(
+                generation.warnings().any(|warning| warning.contains("DetectionOnly")),
+                "{directives:?}: warnings were {:?}",
+                generation.warnings().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
+                None,
+                "{directives:?}: DetectionOnly logs 200002 without blocking"
+            );
+            assert_eq!(generation.notices().count(), 0, "{directives:?}: no `enforces` line");
+        }
+    }
+
+    /// A SQL injection in a multipart field.
+    const MULTIPART_SQLI: &[u8] =
+        b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--b--\r\n";
+
+    /// A policy of `directives` and then a rule that denies a SQL injection in the body arguments.
+    fn body_rule_generation(directives: &[&str]) -> Generation {
+        let mut directives = directives.to_vec();
+        directives.push("SecRule ARGS|ARGS_NAMES|REQUEST_BODY \"@detectSQLi\" \"id:1,phase:2,deny,status:403\"");
+        parse_generation(
+            &serde_json::json!({"directives_map": {"p": directives}, "default_directives": "p"}).to_string(),
+        )
+    }
+
+    #[test]
+    fn a_policy_that_does_not_mention_body_access_inspects_request_bodies() {
+        let generation = body_rule_generation(&["SecRuleEngine On"]);
+        assert_eq!(
+            interruption(&generation, "/", MULTIPART, MULTIPART_SQLI),
+            Some((1, 403)),
+            "the multipart field is inspected"
+        );
+        assert_eq!(
+            interruption(
+                &generation,
+                "/",
+                Some("application/x-www-form-urlencoded"),
+                b"q=1' UNION SELECT password FROM users--"
+            ),
+            Some((1, 403)),
+            "the form field is inspected"
+        );
+        assert!(
+            !generation.warnings().any(|warning| warning.contains("not inspected")),
+            "warnings were {:?}",
+            generation.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn switching_request_body_access_off_is_honoured_and_warned_about() {
+        let generation = body_rule_generation(&["SecRuleEngine On", "SecRequestBodyAccess Off"]);
+        assert_eq!(interruption(&generation, "/", MULTIPART, MULTIPART_SQLI), None);
+        assert!(
+            generation
+                .warnings()
+                .any(|warning| warning.contains("policy \"p\"") && warning.contains("request bodies are not inspected")),
+            "warnings were {:?}",
+            generation.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_rule_that_switches_inspection_off_is_counted_and_named_by_id() {
+        let generation = body_rule_generation(&[
+            "SecRuleEngine On",
+            "SecRule REQUEST_URI \"@beginsWith /health\" \"id:77,phase:1,pass,nolog,ctl:ruleEngine=Off\"",
+            "SecAction \"id:78,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly\"",
+            "SecRule REQUEST_METHOD \"@streq PUT\" \"id:79,phase:1,pass,nolog,chain\"",
+            "SecRule REQUEST_URI \"@beginsWith /upload\" \"ctl:requestBodyAccess=Off\"",
+            "SecAction \"id:80,phase:1,pass,nolog,ctl:ruleEngine=On,ctl:requestBodyAccess=On\"",
+            "SecRule REQUEST_METHOD \"@streq POST\" \"id:81,phase:1,pass,nolog,ctl:requestBodyAccess=Off,chain\"",
+            "SecRule REQUEST_URI \"@beginsWith /bulk\" \"ctl:ruleEngine=On,ctl:ruleEngine=Off\"",
+        ]);
+        // One warning-level line per policy counts them; one info-level line per rule names it.
+        assert_eq!(
+            generation.notices().collect::<Vec<_>>(),
+            ["envoy-coraza: policy \"p\" enforces; rules that switch the rule engine or request body access off: 4"]
+        );
+        assert!(
+            !generation.warnings().any(|warning| warning.contains("ctl:")),
+            "the rules are not named at warning level: {:?}",
+            generation.warnings().collect::<Vec<_>>()
+        );
+        let switches = generation.switches().collect::<Vec<_>>();
+        for (id, ctl) in [
+            (77, "ctl:ruleEngine=Off"),
+            (78, "ctl:ruleEngine=DetectionOnly"),
+            (79, "ctl:requestBodyAccess=Off"),
+        ] {
+            assert_eq!(
+                switches
+                    .iter()
+                    .filter(|line| line.contains(&format!("rule {id} ")) && line.contains(ctl))
+                    .count(),
+                1,
+                "one line for rule {id}: {switches:?}"
+            );
+        }
+        // A rule with several such actions is counted once and named with all of them, chain members included.
+        let rule_81 = switches
+            .iter()
+            .filter(|line| line.contains("rule 81 "))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rule_81,
+            ["envoy-coraza: policy \"p\" rule 81 runs ctl:requestBodyAccess=Off, ctl:ruleEngine=Off; requests it matches are not fully inspected"]
+        );
+        assert!(
+            !switches.iter().any(|line| line.contains("rule 80 ")),
+            "switching inspection on is not reported: {switches:?}"
         );
     }
 
@@ -1114,36 +1386,37 @@ mod tests {
         directives
     }
 
-    /// The directives `build.rs` comments out of the built-in baseline: they need a filesystem.
-    const FILESYSTEM_DIRECTIVES: [&str; 2] = ["SecRequestBodyInMemoryLimit", "SecDataDir"];
+    /// The directives `build.rs` comments out of the built-in baseline: two need a filesystem, and the engine mode
+    /// is left to the engine default (On).
+    const DISABLED_DIRECTIVES: [&str; 3] = ["SecRequestBodyInMemoryLimit", "SecDataDir", "SecRuleEngine"];
 
-    /// The filesystem directive `line` sets, if any.
-    fn filesystem_directive(line: &str) -> Option<&'static str> {
+    /// The disabled directive `line` sets, if any.
+    fn disabled_directive(line: &str) -> Option<&'static str> {
         let first = line.split_whitespace().next()?;
-        FILESYSTEM_DIRECTIVES
+        DISABLED_DIRECTIVES
             .into_iter()
             .find(|name| name.eq_ignore_ascii_case(first))
     }
 
     #[test]
-    fn the_built_in_baseline_differs_from_upstream_only_in_filesystem_directives() {
+    fn the_built_in_baseline_differs_from_upstream_only_in_the_disabled_directives() {
         // build.rs derives the built-in copy from the engine copy, which is
         // byte-identical to Go Coraza's file (`cargo xtask go-fixtures-check`), and
-        // leaves out only the two directives that need a filesystem, so every rule
-        // and every other setting stays upstream's.
+        // leaves out only the two directives that need a filesystem and the engine
+        // mode, so every rule and every other setting stays upstream's.
         let upstream = directives(coraza::seclang::RECOMMENDED_CONF);
         let host = directives(std::str::from_utf8(super::RECOMMENDED_CONF).unwrap());
-        for name in FILESYSTEM_DIRECTIVES {
+        for name in DISABLED_DIRECTIVES {
             assert!(
                 upstream
                     .iter()
-                    .any(|directive| filesystem_directive(directive) == Some(name)),
-                "upstream no longer sets {name}; review WASM_DISABLED_DIRECTIVES in build.rs"
+                    .any(|directive| disabled_directive(directive) == Some(name)),
+                "upstream no longer sets {name}; review the disabled directive lists in build.rs"
             );
         }
         let expected: Vec<String> = upstream
             .into_iter()
-            .filter(|directive| filesystem_directive(directive).is_none())
+            .filter(|directive| disabled_directive(directive).is_none())
             .collect();
         assert_eq!(host, expected);
     }
@@ -1166,7 +1439,7 @@ mod tests {
         let mut disabled = Vec::new();
         let mut lines = body.split_inclusive('\n');
         while let Some(line) = lines.next() {
-            if !line.starts_with("# Disabled for WASM: ") {
+            if !line.starts_with("# Disabled for WASM: ") && !line.starts_with("# Left to the engine default (On): ") {
                 restored.push_str(line);
                 continue;
             }
@@ -1177,19 +1450,27 @@ mod tests {
             let directive = commented
                 .strip_prefix('#')
                 .expect("the directive below a note is commented out");
-            disabled.push(filesystem_directive(directive).expect("only filesystem directives are disabled"));
+            disabled.push(disabled_directive(directive).expect("only the listed directives are disabled"));
             restored.push_str(directive);
         }
         disabled.sort_unstable();
-        let mut expected = FILESYSTEM_DIRECTIVES;
+        let mut expected = DISABLED_DIRECTIVES;
         expected.sort_unstable();
         assert_eq!(disabled, expected);
-        for name in FILESYSTEM_DIRECTIVES {
+        for name in DISABLED_DIRECTIVES {
             assert!(
                 header.contains(&format!("\n# - {name}\n")),
                 "the header lists {name}:\n{header}"
             );
         }
+        assert!(
+            body.contains("# Left to the engine default (On): envoy-coraza enforces unless the policy says otherwise.\n#SecRuleEngine DetectionOnly\n"),
+            "the engine mode has its own note, not the Wasm one"
+        );
+        assert!(
+            !header.contains("starts in DetectionOnly,"),
+            "the header does not say the file starts in DetectionOnly:\n{header}"
+        );
         assert_eq!(restored, coraza::seclang::RECOMMENDED_CONF);
     }
 
@@ -1236,7 +1517,7 @@ mod tests {
     #[cfg(feature = "embed-crs")]
     #[test]
     fn embedded_crs_does_not_pollute_the_unprefixed_rules_namespace() {
-        let error = compile_error(r#"{"directives_map": {"p": ["Include rules/*.conf"]}}"#);
+        let error = compile_error(r#"{"directives_map": {"p": ["Include rules/*.conf"]}, "default_directives": "p"}"#);
         assert!(
             error.contains("matched no files"),
             "the embedded entries must live under crs/, not rules/: {error:?}"
@@ -1283,9 +1564,9 @@ mod tests {
 
     #[test]
     fn a_bare_wildcard_include_keeps_an_enforced_policy_blocking() {
-        // `*` matches every root-level name, and the built-in baseline has one. Its
-        // `SecRuleEngine DetectionOnly` would override the `SecRuleEngine On` before the
-        // `Include`, so the policy would load with only a warning and stop blocking.
+        // `*` matches every root-level name, and the built-in baseline has one. Its body
+        // and audit settings would silently override the policy's own, so a wildcard does
+        // not load it.
         let config = |directives: &[&str]| {
             serde_json::json!({
                 "directives_map": {"p": directives},
@@ -1299,17 +1580,18 @@ mod tests {
         #[cfg(not(feature = "embed-crs"))]
         {
             let generation = parse_generation(&config(&["SecRuleEngine On", "Include *"]));
-            assert_eq!(
-                generation.select("example.com").unwrap().waf.config().rule_engine,
-                super::RuleEngineStatus::On,
-                "the wildcard must not load the baseline's DetectionOnly"
-            );
-            assert!(
-                !generation.warnings().any(|warning| warning.contains("DetectionOnly")),
-                "warnings were {:?}",
-                generation.warnings().collect::<Vec<_>>()
-            );
             assert_eq!(interruption(&generation, "/attack", None, b""), Some((7, 403)));
+            assert_eq!(
+                interruption(&generation, "/", Some("application/json"), b"{\"a\":"),
+                None,
+                "the wildcard must not load the baseline's rule 200002"
+            );
+            let settings = generation.select("example.com").unwrap().waf.config();
+            assert_eq!(
+                (settings.request_body_limit, settings.response_body_access),
+                (MAX_REQUEST_BODY_LIMIT, false),
+                "the wildcard must not load the baseline's body settings"
+            );
 
             // Naming the baseline still loads it, and the wildcard after it does not load
             // it again, which would also fail on its duplicate rule ids.
@@ -1360,6 +1642,7 @@ mod tests {
         let error = compile_error(
             r#"{
                 "directives_map": {"p": ["Include crs/crs-setup.conf"]},
+                "default_directives": "p",
                 "rule_data": {"./crs/crs-setup.conf": "SecNotADirective x"}
             }"#,
         );
@@ -1409,6 +1692,63 @@ mod tests {
             None,
             "a benign form passes"
         );
+    }
+
+    /// The embedded name of the CRS file that held rules 905100 and 905110.
+    #[cfg(feature = "embed-crs")]
+    const CRS_905_KEY: &str = "crs/rules/REQUEST-905-COMMON-EXCEPTIONS.conf";
+
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_crs_inspects_a_loopback_dummy_connection() {
+        // CRS rule 905110 removed every CRS rule for this request, and behind a proxy the client chooses the address.
+        let generation = parse_generation(DOCUMENTED_CRS_POLICY);
+        let policy = generation.policies.get("crs").unwrap();
+        for (address, protocol) in [
+            ("127.0.0.1", "HTTP/1.1"),
+            ("127.0.0.1", "HTTP/1.0"),
+            ("::1", "HTTP/1.1"),
+        ] {
+            let mut transaction = policy.waf.new_transaction();
+            transaction.set_remote_addr(address);
+            transaction.process_uri("/", "GET", protocol);
+            transaction.add_request_header("Host", "victim.example");
+            transaction.add_request_header("User-Agent", "curl/8 (internal dummy connection)");
+            transaction.add_request_header("Cookie", "session=1' UNION SELECT password FROM users--");
+            let interruption = match transaction.process_request_headers() {
+                Some(interruption) => Some(interruption),
+                None => transaction.process_request_body(b""),
+            };
+            assert_eq!(
+                interruption.map(|interruption| (interruption.rule_id, interruption.status)),
+                Some((949_110, 403)),
+                "{address} {protocol}"
+            );
+        }
+    }
+
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_905_exceptions_file_holds_no_rule() {
+        let (_, bytes) = super::embedded_crs::EMBEDDED_CRS
+            .iter()
+            .find(|(name, _)| *name == CRS_905_KEY)
+            .expect("the embedded key is kept");
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(
+            text.lines()
+                .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
+            "only comments:\n{text}"
+        );
+        assert!(text.contains("905110"), "the stub says what it removed:\n{text}");
+
+        // A configured entry with the same name still replaces it, here with an invalid directive, so the error proves
+        // the configured entry was read.
+        let error = compile_error(&format!(
+            r#"{{"directives_map": {{"p": ["Include {CRS_905_KEY}"]}}, "default_directives": "p",
+                "rule_data": {{"{CRS_905_KEY}": "SecNotADirective x"}}}}"#
+        ));
+        assert!(error.contains("unknown directive"), "message was {error:?}");
     }
 
     #[cfg(feature = "embed-crs")]
@@ -1465,6 +1805,7 @@ mod tests {
                 "directives_map": {
                     "p": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:1,phase:1,deny,status:403\""]
                 },
+                "default_directives": "p",
                 "rule_data": {"data.txt": "# comment\nattack\n"}
             }"##,
         );
@@ -1484,6 +1825,7 @@ mod tests {
                 "directives_map": {
                     "p": ["SecRule REMOTE_ADDR \"@ipMatchFromFile networks.txt\" \"id:2,phase:1,deny,status:403\""]
                 },
+                "default_directives": "p",
                 "rule_data": {"networks.txt": "# comment\n203.0.113.0/24\n"}
             }"##,
         );
@@ -1500,6 +1842,7 @@ mod tests {
         let generation = parse_generation(
             r#"{
                 "directives_map": {"p": ["Include rules/*.conf"]},
+                "default_directives": "p",
                 "rule_data": {
                     "rules/a.conf": "SecRule REQUEST_URI \"@contains attack\" \"id:3,phase:1,deny,status:403\""
                 }
@@ -1521,6 +1864,7 @@ mod tests {
                     "p": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:4,phase:1,deny,status:403\""],
                     "q": ["SecRule REQUEST_URI \"@pmFromFile data.txt\" \"id:5,phase:1,deny,status:403\""]
                 },
+                "default_directives": "p",
                 "rule_data": {"data.txt": "attack\n"}
             }"#,
         );
@@ -1544,6 +1888,7 @@ mod tests {
         let error = compile_with(
             r#"{
                 "directives_map": {"p": ["Include a.conf", "Include a.conf"]},
+                "default_directives": "p",
                 "rule_data": {"a.conf": "SecRuleEngine On\n"}
             }"#,
             limits,
@@ -1560,7 +1905,7 @@ mod tests {
     #[test]
     fn a_rule_data_file_that_is_missing_fails_the_policy() {
         let error = compile_error(
-            r#"{"directives_map": {"p": ["SecRule REQUEST_URI \"@pmFromFile absent.txt\" \"id:1,deny\""]}}"#,
+            r#"{"directives_map": {"p": ["SecRule REQUEST_URI \"@pmFromFile absent.txt\" \"id:1,deny\""]}, "default_directives": "p"}"#,
         );
         assert!(
             error.starts_with("policy \"p\": "),
@@ -1572,7 +1917,7 @@ mod tests {
     #[test]
     fn an_invalid_directive_fails_the_whole_generation() {
         let error = compile_error(
-            r#"{"directives_map": {"good": ["SecRuleEngine On"], "broken": ["SecRuleEngine On", "SecNotADirective x"]}}"#,
+            r#"{"directives_map": {"good": ["SecRuleEngine On"], "broken": ["SecRuleEngine On", "SecNotADirective x"]}, "default_directives": "good"}"#,
         );
         assert!(
             error.starts_with("policy \"broken\": "),
@@ -1586,7 +1931,7 @@ mod tests {
 
     #[test]
     fn a_upload_directory_is_rejected() {
-        let error = compile_error(r#"{"directives_map": {"p": ["SecUploadDir /tmp"]}}"#);
+        let error = compile_error(r#"{"directives_map": {"p": ["SecUploadDir /tmp"]}, "default_directives": "p"}"#);
         assert!(error.contains("SecUploadDir"), "message was {error:?}");
         assert!(
             error.starts_with("policy \"p\" cannot run on this host: "),
@@ -1596,14 +1941,16 @@ mod tests {
 
     #[test]
     fn keeping_uploaded_files_is_rejected() {
-        let error = compile_error(r#"{"directives_map": {"p": ["SecUploadDir /tmp", "SecUploadKeepFiles On"]}}"#);
+        let error = compile_error(
+            r#"{"directives_map": {"p": ["SecUploadDir /tmp", "SecUploadKeepFiles On"]}, "default_directives": "p"}"#,
+        );
         assert!(error.contains("SecUploadKeepFiles"), "message was {error:?}");
     }
 
     #[test]
     fn an_audit_target_is_rejected() {
         let error = compile_error(
-            r#"{"directives_map": {"p": ["SecAuditEngine On", "SecAuditLog /tmp/audit.log", "SecAuditLogType Serial"]}}"#,
+            r#"{"directives_map": {"p": ["SecAuditEngine On", "SecAuditLog /tmp/audit.log", "SecAuditLogType Serial"]}, "default_directives": "p"}"#,
         );
         assert!(error.contains("SecAuditLog"), "message was {error:?}");
         assert!(error.contains("sink"), "message was {error:?}");
@@ -1630,10 +1977,13 @@ mod tests {
             ("SecAuditLogType Https", "HTTPS"),
             ("SecAuditLogType Concurrent", "SecAuditLogType"),
         ] {
-            let error = compile_error(&format!(r#"{{"directives_map": {{"p": ["{rule}"]}}}}"#));
+            let error = compile_error(&format!(
+                r#"{{"directives_map": {{"p": ["{rule}"]}}, "default_directives": "p"}}"#
+            ));
             assert!(error.contains(expected), "message was {error:?}");
         }
-        let generation = parse_generation(r#"{"directives_map": {"p": ["SecAuditEngine Off"]}}"#);
+        let generation =
+            parse_generation(r#"{"directives_map": {"p": ["SecAuditEngine Off"]}, "default_directives": "p"}"#);
         assert!(
             generation.policies.contains_key("p"),
             "the all-Off default audit configuration is accepted"
@@ -1643,7 +1993,7 @@ mod tests {
     #[test]
     fn a_body_spill_threshold_is_rejected() {
         let error = compile_error(
-            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 100"]}}"#,
+            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 100"]}, "default_directives": "p"}"#,
         );
         assert!(error.contains("SecRequestBodyInMemoryLimit"), "message was {error:?}");
         assert!(error.contains("spill"), "message was {error:?}");
@@ -1652,7 +2002,7 @@ mod tests {
     #[test]
     fn a_matching_in_memory_limit_is_accepted() {
         let generation = parse_generation(
-            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 1000"]}}"#,
+            r#"{"directives_map": {"p": ["SecRequestBodyLimit 1000", "SecRequestBodyInMemoryLimit 1000"]}, "default_directives": "p"}"#,
         );
         assert!(
             generation.policies.contains_key("p"),
@@ -1664,7 +2014,7 @@ mod tests {
     fn request_body_limits_are_bounded_and_positive() {
         for limit in ["16777216", "13107200"] {
             let accepted = parse_generation(&format!(
-                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}}}"#
+                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}, "default_directives": "p"}}"#
             ));
             assert!(
                 accepted.policies.contains_key("p"),
@@ -1674,7 +2024,7 @@ mod tests {
 
         for limit in ["16777217", "0"] {
             let error = compile_error(&format!(
-                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}}}"#
+                r#"{{"directives_map": {{"p": ["SecRequestBodyAccess On", "SecRequestBodyLimit {limit}"]}}, "default_directives": "p"}}"#
             ));
             // A zero limit is rejected by core WAF validation before this host check, so
             // the message may not name the directive.
@@ -1692,13 +2042,13 @@ mod tests {
     #[test]
     fn response_body_limits_are_bounded_and_positive() {
         let accepted = parse_generation(
-            r#"{"directives_map": {"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit 1048576"]}}"#,
+            r#"{"directives_map": {"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit 1048576"]}, "default_directives": "p"}"#,
         );
         assert!(accepted.policies.contains_key("p"), "the response ceiling is accepted");
 
         for limit in ["1048577", "0"] {
             let error = compile_error(&format!(
-                r#"{{"directives_map": {{"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit {limit}"]}}}}"#
+                r#"{{"directives_map": {{"p": ["SecResponseBodyAccess On", "SecResponseBodyLimit {limit}"]}}, "default_directives": "p"}}"#
             ));
             // A zero limit is rejected by core WAF validation before this host check, so
             // the message may not name the directive.
@@ -1793,8 +2143,19 @@ mod tests {
     }
 
     #[test]
-    fn policies_without_a_selector_warn_that_nothing_can_be_selected() {
-        let generation = parse_generation(r#"{"directives_map": {"p": []}}"#);
+    fn policies_without_a_selector_are_refused_unless_unmatched_authorities_are_allowed() {
+        // Such a generation could only refuse every request, or pass every one uninspected.
+        let error = compile_error(r#"{"directives_map": {"p": []}}"#);
+        assert!(
+            error.contains("default_directives") && error.contains("per_authority_directives"),
+            "the error names both missing selectors: {error:?}"
+        );
+        assert!(
+            error.contains("unmatched_authority"),
+            "the error names the opt-in: {error:?}"
+        );
+
+        let generation = parse_generation(r#"{"directives_map": {"p": []}, "unmatched_authority": "allow"}"#);
         let warnings = generation.warnings().collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1, "one warning for the generation: {warnings:?}");
         assert!(
@@ -1803,6 +2164,18 @@ mod tests {
                 .unwrap()
                 .contains("no default_directives or per_authority_directives"),
             "the warning names both missing selectors: {warnings:?}"
+        );
+
+        // With "allow", per-authority policies and no default, an unlisted authority passes uninspected.
+        let generation = parse_generation(
+            r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}, "unmatched_authority": "allow"}"#,
+        );
+        assert!(
+            generation
+                .warnings()
+                .any(|warning| warning.contains("unlisted authority passes uninspected")),
+            "warnings were {:?}",
+            generation.warnings().collect::<Vec<_>>()
         );
 
         for config in [
@@ -1829,7 +2202,8 @@ mod tests {
                         "SecIgnoreRuleCompilationErrors On",
                         "SecRule REQUEST_URI \"@notAnOperator\" \"id:1,phase:1,deny\""
                     ]
-                }
+                },
+                "default_directives": "strict"
             }"#,
         );
         assert!(
@@ -1859,7 +2233,8 @@ mod tests {
                         "SecIgnoreRuleCompilationErrors On",
                         "SecRule REQUEST_URI \"@contains attack\" \"id:1,phase:1,deny,status:403\""
                     ]
-                }
+                },
+                "default_directives": "p"
             }"#,
         );
         assert!(
@@ -1879,6 +2254,7 @@ mod tests {
             directives.push("Include f0.conf".to_owned());
         }
         config.directives_map.insert("p".to_owned(), directives);
+        config.default_directives = Some("p".to_owned());
         config
             .rule_data
             .insert("f0.conf".to_owned(), b"SecRuleEngine On\n".to_vec());
@@ -1909,6 +2285,7 @@ SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
                 "p": ["Include chain.conf"],
                 "q": ["Include chain.conf"]
             },
+            "default_directives": "p",
             "rule_data": {"chain.conf": CHAIN}
         });
         Generation::compile_with_limits(parse_config(&config.to_string()), limits)
@@ -1981,13 +2358,13 @@ SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
     #[test]
     fn rule_caps_accept_the_boundary_and_reject_one_more() {
         let at_policy_limit = compile_with(
-            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\""]}}"#,
+            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\""]}, "default_directives": "p"}"#,
             SMALL_LIMITS,
         );
         assert!(at_policy_limit.is_ok(), "exactly the per-policy limit is accepted");
 
         let error = compile_with(
-            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\"", "SecAction \"id:3\""]}}"#,
+            r#"{"directives_map": {"p": ["SecAction \"id:1\"", "SecAction \"id:2\"", "SecAction \"id:3\""]}, "default_directives": "p"}"#,
             SMALL_LIMITS,
         )
         .unwrap_err()
@@ -2007,7 +2384,8 @@ SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
                 "directives_map": {
                     "p": ["SecAction \"id:1\"", "SecAction \"id:2\""],
                     "q": ["SecAction \"id:3\""]
-                }
+                },
+                "default_directives": "p"
             }"#,
             SMALL_LIMITS,
         );
@@ -2018,7 +2396,8 @@ SecRule REQUEST_URI "@contains f" "id:6,phase:1""#;
                 "directives_map": {
                     "p": ["SecAction \"id:1\"", "SecAction \"id:2\""],
                     "q": ["SecAction \"id:3\"", "SecAction \"id:4\""]
-                }
+                },
+                "default_directives": "p"
             }"#,
             SMALL_LIMITS,
         )

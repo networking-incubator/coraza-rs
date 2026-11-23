@@ -12,7 +12,13 @@ This repository uses GitHub Actions to block risky changes early.
   `cargo test -p coraza` pass with the `host-operators,validate-schema` umbrella
   feature set, so the feature-gated operators keep their tests.
 - `envoy-wasm`: builds the `wasm32-wasip1` filter and runs its shell-based
-  integration checks against the pinned Envoy 1.40.0 image.
+  integration checks against the pinned Envoy 1.40.0 image. The harness fails
+  when the example configuration lacks a setting that the connector README's
+  "Required Envoy configuration" table marks as set, and checks that a
+  client-supplied `X-Forwarded-For` does not reach `REMOTE_ADDR`, that
+  respelled hosts keep their policy, that invalid authorities are refused with
+  400, that dot segments and doubled slashes are resolved before the rules see
+  the path, and that a header name with an underscore is refused.
 - `envoy-wasm-crs`: fetches the CRS release pinned in `envoy-coraza/crs.pin`
   (verifying its SHA-256), builds the filter with the non-default `embed-crs`
   feature, and runs `make test-envoy-wasm-crs`. It also runs the Envoy lifecycle
@@ -22,9 +28,15 @@ This repository uses GitHub Actions to block risky changes early.
   embedded tree, and asserts that SQL injection requests, including one in the
   field after a multipart part with an empty header block, are denied by CRS
   rule 949110 and that an unterminated multipart body is denied by baseline rule
-  200002. The default `envoy-wasm` run and this one both check the same
-  multipart cases against a `recommended.local` policy that loads the baseline
-  without the CRS.
+  200002. It also checks that the embedded tree's stub for CRS rules 905100
+  and 905110 holds: an "internal dummy connection" `GET /` carrying a SQL
+  injection, sent from inside the Envoy container so that `REMOTE_ADDR` is
+  127.0.0.1, is denied before the backend and rule 107 logs the loopback
+  address, and the same request claiming 127.0.0.1 in `X-Forwarded-For` from
+  outside is denied too. The default `envoy-wasm` run and this one both check
+  the same multipart cases against a `recommended.local` policy that loads the
+  baseline without the CRS, and the same Envoy settings and request
+  normalization cases.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
   shellcheck); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
@@ -110,7 +122,7 @@ where downloaded tool integrity is enforced.
   `profiles-multiphase.json`, and copies the module's `coraza.conf-recommended`
   to `coraza/coraza.conf-recommended`. That is the only copy: envoy-coraza's
   `build.rs` derives the built-in `@recommended-conf` from it on every build, and
-  fails if a directive it comments out for the Wasm filter is no longer set. The
+  fails if a directive it comments out (the Wasm-specific ones and `SecRuleEngine`) is no longer set. The
   command needs the pinned module in the Go module cache (`go mod download`).
   `cargo xtask go-fixtures-check` compares the checked-in operator and profile
   data bytes and the recommended configuration with that module and validates

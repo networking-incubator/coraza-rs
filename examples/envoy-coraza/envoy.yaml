@@ -20,6 +20,20 @@ static_resources:
                 stat_prefix: coraza_ingress
                 codec_type: AUTO
                 proxy_100_continue: false
+                # The settings envoy-coraza depends on; see "Required Envoy configuration" in envoy-coraza/README.md.
+                # REMOTE_ADDR is the TCP peer, not a client-supplied X-Forwarded-For entry: this listener is the edge.
+                use_remote_address: true
+                xff_num_trusted_hops: 0
+                # Every spelling of a host selects that host's policy.
+                strip_trailing_host_dot: true
+                strip_any_host_port: true
+                # Rules see the path the backend routes on.
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: REJECT_REQUEST
+                common_http_protocol_options:
+                  headers_with_underscores_action: REJECT_REQUEST
+                request_timeout: 60s
                 access_log:
                   - name: envoy.access_loggers.file
                     typed_config:
@@ -33,6 +47,9 @@ static_resources:
                 stream_idle_timeout: 60s
                 route_config:
                   name: local_routes
+                  request_headers_to_remove:
+                    - x-original-url
+                    - x-rewrite-url
                   virtual_hosts:
                     - name: test_service
                       domains: ["*"]
@@ -78,7 +95,8 @@ static_resources:
                                     "SecRule REQUEST_URI \"@streq /phase1-deny\" \"id:101,phase:1,deny,status:403,auditlog,msg:'test blocked'\"",
                                     "SecRule ARGS_POST \"@contains block\" \"id:102,phase:2,deny,status:403\"",
                                     "SecRule RESPONSE_BODY \"@contains secret\" \"id:103,phase:4,deny,status:502\"",
-                                    "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:104,phase:4,deny,status:502\""
+                                    "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:104,phase:4,deny,status:502\"",
+                                    "SecRule REMOTE_ADDR \"@ipMatch 9.9.9.9\" \"id:106,phase:1,deny,status:403\""
                                   ],
                                   "reject": [
                                     "SecRuleEngine On",
