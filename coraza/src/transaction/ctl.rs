@@ -214,14 +214,11 @@ impl Transaction {
             Some(_) => return,
             None => VariableException::new_string(key),
         };
-        let (target_variables, target_count) = if self.multiphase_evaluation() {
-            match variable {
-                RuleVariable::Args => ([RuleVariable::ArgsGet, RuleVariable::ArgsPost], 2),
-                RuleVariable::ArgsNames => ([RuleVariable::ArgsGetNames, RuleVariable::ArgsPostNames], 2),
-                _ => ([variable, variable], 1),
-            }
+        let split = variable.multiphase_split();
+        let target_variables = if self.multiphase_evaluation() && !split.is_empty() {
+            split
         } else {
-            ([variable, variable], 1)
+            std::slice::from_ref(&variable)
         };
         let ids = match command {
             "ruleRemoveTargetById" => parse_id_range(selector)
@@ -249,7 +246,7 @@ impl Transaction {
         };
         for id in ids {
             let targets = self.removed_rule_targets.entry(id).or_default();
-            for target_variable in target_variables.iter().copied().take(target_count) {
+            for target_variable in target_variables.iter().copied() {
                 let target = (target_variable, exception.clone());
                 if !targets.contains(&target) {
                     targets.push(target);

@@ -178,13 +178,33 @@ pub fn url_decode(input: &[u8]) -> TransformationResult {
     (transformed, true, None)
 }
 
-/// Normalizes a command line as Go Coraza's `t:cmdLine` does.
+/// Normalizes a command line as Go Coraza's `t:cmdLine` does, and also removes the backtick.
 ///
-/// Removes quotes, backslashes and carets, drops the space before `/` and `(`,
+/// Removes quotes, backslashes, carets and backticks, drops the space before `/` and `(`,
 /// replaces `,` and `;` with a space, collapses whitespace runs to one space,
-/// and lowercases ASCII letters.
+/// and lowercases ASCII letters. Go keeps the backtick, which lets the `PowerShell` in-word
+/// escape (``Invoke`-`Expression``) and bash's empty substitution (```c``at```) hide a command.
+/// One backtick of a run is kept, as Go keeps it, in three cases:
+/// - the next byte after it that is neither removed nor a backtick is `~` (so ``a ` ~+`` becomes `a ~+`), which CRS
+///   932270 reads as a tilde expansion;
+/// - the run is all that is between a `(` already written and the next written `)`, or between a `[` and the next
+///   written `]`, so ```$(``)``` becomes ``$(`)`` and ```/e[^``^]c``` becomes ``/e[`]c``: CRS 932130, and 932131 in
+///   `User-Agent` and `Referer`, need a byte inside `$(...)` and inside the glob `/e[...]`, and bash runs the empty
+///   substitution as nothing (```/e[^``^]c``` is the glob `/e[^^]c`, which matches `/etc`). A byte written between
+///   them, a space too, ends the case (```$( `` )``` becomes `$( )`, which those rules match). ```${``}``` keeps none:
+///   bash rejects it (`bad substitution`);
+/// - the last byte written before it is `%`, whatever follows, so ``for %` in (x) do calc`` stays one: Windows takes
+///   any character that is not a digit as the loop variable, a backtick too (`%%` in a batch file), and CRS 932140
+///   needs one (`%+[^ ]+ in\(`). A removed byte between them does not end the case (``%^` in`` keeps it), a written
+///   one, a space too, does.
+///
+/// Every other backtick is removed, so a backtick before a word, as in ``if `defined x`` for CRS
+/// 932140, cannot split the word from the space before it.
+/// Known miss, closable only by a rule change (see the difference ledger): CRS 932238 (PL3) no longer sees a command
+/// in backticks (`` echo `whoami` `` still blocks at PL1 through 932235, 932260 and 932380); Go and the previous
+/// `t:cmdLine` match it at PL1. It still sees one after a `%`, where the backtick is kept.
 pub fn cmd_line(input: &[u8]) -> TransformationResult {
-    let Some(start) = input.iter().position(|byte| needs_cmd_line(*byte)) else {
+    let Some(start) = input.iter().position(|&byte| cmd_line_byte(byte) != CmdLineByte::Copy) else {
         return (input.to_vec(), false, None);
     };
 
@@ -194,9 +214,51 @@ pub fn cmd_line(input: &[u8]) -> TransformationResult {
     let mut space = false;
     let mut offset = start;
     while let Some(&byte) = input.get(offset) {
-        match byte {
-            b'"' | b'\'' | b'\\' | b'^' => changed = true,
-            b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' => {
+        match cmd_line_byte(byte) {
+            CmdLineByte::Copy => {
+                transformed.push(byte);
+                space = false;
+            },
+            CmdLineByte::Upper => {
+                transformed.push(byte.to_ascii_lowercase());
+                changed = true;
+                space = false;
+            },
+            CmdLineByte::Removed => changed = true,
+            CmdLineByte::Backtick => {
+                // Decide on the next byte not removed, past the removed ones; consuming them keeps
+                // this linear.
+                let rest = input.get(offset + 1..).unwrap_or_default();
+                let skipped = rest
+                    .iter()
+                    .position(|&after| !matches!(cmd_line_byte(after), CmdLineByte::Removed | CmdLineByte::Backtick))
+                    .unwrap_or(rest.len());
+                // A run that is all that is between a written `(` and the next written `)`, or a written `[` and
+                // `]`, keeps one backtick, as `$(``)` becomes `$(`)`: CRS 932130 needs a byte inside the pair. So
+                // does a run after a written `%` (`for %` in (x) do calc`): CRS 932140 needs the loop variable.
+                // The last byte written is the nearest one before the run that is not removed; a backtick run is
+                // consumed whole, so none precedes it. Reading the input, not the output, keeps the loop as fast
+                // on input without a backtick.
+                let previous = || {
+                    input
+                        .get(..offset)
+                        .unwrap_or_default()
+                        .iter()
+                        .rfind(|&&before| cmd_line_byte(before) != CmdLineByte::Removed)
+                };
+                let keep = match rest.get(skipped) {
+                    Some(&b'~') => true,
+                    Some(&b')') => matches!(previous(), Some(&(b'(' | b'%'))),
+                    Some(&b']') => matches!(previous(), Some(&(b'[' | b'%'))),
+                    _ => previous() == Some(&b'%'),
+                };
+                if keep {
+                    transformed.push(byte);
+                }
+                changed |= !keep || skipped > 0;
+                offset += skipped;
+            },
+            CmdLineByte::Space => {
                 if space {
                     changed = true;
                 } else {
@@ -205,18 +267,12 @@ pub fn cmd_line(input: &[u8]) -> TransformationResult {
                     space = true;
                 }
             },
-            b'/' | b'(' => {
+            CmdLineByte::Joiner => {
                 if space && transformed.pop().is_some() {
                     changed = true;
                 }
                 space = false;
                 transformed.push(byte);
-            },
-            _ => {
-                let lowered = byte.to_ascii_lowercase();
-                changed |= lowered != byte;
-                transformed.push(lowered);
-                space = false;
             },
         }
         offset += 1;
@@ -342,13 +398,49 @@ pub fn replace_comments(input: &[u8]) -> TransformationResult {
     (transformed, changed, None)
 }
 
-/// Returns whether `byte` starts a command-line normalization.
-fn needs_cmd_line(byte: u8) -> bool {
-    byte.is_ascii_uppercase()
-        || matches!(
-            byte,
-            b'"' | b'\'' | b'\\' | b'^' | b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' | b'/' | b'('
-        )
+/// What `cmd_line` does with one byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmdLineByte {
+    /// Copied as is.
+    Copy,
+    /// An ASCII uppercase letter, written lowercase.
+    Upper,
+    /// `"`, `'`, `\` or `^`, removed.
+    Removed,
+    /// The backtick, removed unless [`cmd_line`] keeps it.
+    Backtick,
+    /// Whitespace, `,` or `;`, written as one space per run.
+    Space,
+    /// `/` or `(`, which drop the space written before them.
+    Joiner,
+}
+
+/// The [`CmdLineByte`] of every byte value: one load per byte costs less than a match's compares.
+static CMD_LINE_BYTES: [CmdLineByte; 256] = {
+    let mut table = [CmdLineByte::Copy; 256];
+    let mut rest = table.as_mut_slice();
+    let mut byte = 0_u8;
+    while let Some((class, tail)) = rest.split_first_mut() {
+        *class = match byte {
+            b'A'..=b'Z' => CmdLineByte::Upper,
+            b'"' | b'\'' | b'\\' | b'^' => CmdLineByte::Removed,
+            b'`' => CmdLineByte::Backtick,
+            b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' => CmdLineByte::Space,
+            b'/' | b'(' => CmdLineByte::Joiner,
+            _ => CmdLineByte::Copy,
+        };
+        rest = tail;
+        byte = byte.wrapping_add(1);
+    }
+    table
+};
+
+/// Returns what `cmd_line` does with `byte`.
+fn cmd_line_byte(byte: u8) -> CmdLineByte {
+    CMD_LINE_BYTES
+        .get(usize::from(byte))
+        .copied()
+        .unwrap_or(CmdLineByte::Copy)
 }
 
 /// Returns whether `needle` occurs at `offset` in `input`.
@@ -568,11 +660,212 @@ mod tests {
             (b"C^oMMaNd /C DiR", b"command/c dir", true),
             (b"cmd,/c DiR", b"cmd/c dir", true),
             (b"C^OMMAND\xff /C DIR", b"command\xff/c dir", true),
+            // Not Go: the backtick is removed too, as PowerShell's in-word escape and bash's
+            // empty command substitution are no-ops in a command name.
+            (b"`", b"", true),
+            (b"who``ami", b"whoami", true),
+            (b"Invoke`-`Expression", b"invoke-expression", true),
+            (b";c``at /e``tc/pa``sswd", b" cat/etc/passwd", true),
+            (b"a`~+1`", b"a`~+1", true),
+            (b"a``~-", b"a`~-", true),
+            (b"`~", b"`~", false),
+            // The kept backtick is judged by the next byte not removed, past the removed ones.
+            (b"a`\"~+", b"a`~+", true),
+            (b"a`^~-2", b"a`~-2", true),
+            // A space after the backtick is the next byte, not the `~`, so the backtick goes.
+            (b"a ` ~+", b"a ~+", true),
+            (b"`~`whoami", b"`~whoami", true),
+            // Only a `~` keeps a backtick; one before a word is removed, so CRS 932140 sees its
+            // keywords after the space (`if `defined x`).
+            (b"`id", b"id", true),
+            (b"echo `whoami`", b"echo whoami", true),
+            (b"x;`Whoami`", b"x whoami", true),
+            (b")`\"whoami", b")whoami", true),
+            (b"foo`whoami`", b"foowhoami", true),
+            (b"if `defined x", b"if defined x", true),
+            (
+                b"for /f %i `in ('whoami') `do calc",
+                b"for/f %i in(whoami) do calc",
+                true,
+            ),
+            (b"`../x", b"../x", true),
+            (b"$`(id)", b"$(id)", true),
         ] {
             let (result, result_changed, error) = cmd_line(input);
             assert_eq!(result, output, "input: {input:?}");
             assert_eq!(result_changed, changed, "input: {input:?}");
             assert_eq!(error, None);
+        }
+    }
+
+    // Not Go: one backtick of a run survives when the run is all that is between a written `(` and `)`, or `[` and
+    // `]`, so CRS 932130 has a byte inside `$(...)` and `/e[...]`.
+    #[test]
+    fn cmd_line_keeps_one_backtick_alone_between_matching_parentheses_or_brackets() {
+        for (input, output, changed) in [
+            // Parentheses: the run is all that is between `(` and the next `)`.
+            (b"$(``)".as_slice(), b"$(`)".as_slice(), true),
+            (b"$(`)", b"$(`)", false),
+            (b"$(``'')", b"$(`)", true),
+            (b"$(\"`\\`^)", b"$(`)", true),
+            (b"(`'`)", b"(`)", true),
+            (b"a (``)", b"a(`)", true),
+            (b"x$(``)at", b"x$(`)at", true),
+            (b"$(``)$(``)", b"$(`)$(`)", true),
+            (b"$((``))", b"$((`))", true),
+            (b"$(``(``))", b"$((`))", true),
+            (b"$(a(``)b)", b"$(a(`)b)", true),
+            (b"(``~)", b"(`~)", true),
+            // A written byte inside the parentheses, even a space, is not a backtick run alone.
+            (b"( `` )", b"( )", true),
+            (b"(\t``)", b"( )", true),
+            (b"( ``)", b"( )", true),
+            (b"(``;)", b"( )", true),
+            (b"(`;`)", b"( )", true),
+            (b"(``x)", b"(x)", true),
+            (b"(x``)", b"(x)", true),
+            (b"(`whoami`)", b"(whoami)", true),
+            (b"$(`whoami`)", b"$(whoami)", true),
+            (b"$(`'id'`)", b"$(id)", true),
+            (b"(``", b"(", true),
+            (b"``)", b")", true),
+            (b")(``", b")(", true),
+            (b"(`) `", b"(`) ", true),
+            (b"(`)``", b"(`)", true),
+            (b"(`)`)", b"(`))", true),
+            // The same for `[` and `]`: CRS 932130's glob branch, `\[[^\]]+\]`, needs a byte inside the brackets.
+            (b"[``]", b"[`]", true),
+            (b"[`]", b"[`]", false),
+            (b"[^``^]", b"[`]", true),
+            (b"[^`]", b"[`]", true),
+            (b"[``'']", b"[`]", true),
+            (b"[\"`\\`^]", b"[`]", true),
+            (b"/e[^``^]c/passwd", b"/e[`]c/passwd", true),
+            (b"cat /e[^``^]c/passwd", b"cat/e[`]c/passwd", true),
+            (b"$[``]", b"$[`]", true),
+            (b"[[``]]", b"[[`]]", true),
+            (b"[``][``]", b"[`][`]", true),
+            (b"[``(``)]", b"[(`)]", true),
+            (b"([``])", b"([`])", true),
+            (b"[(``)]", b"[(`)]", true),
+            (b"[``~]", b"[`~]", true),
+            // A written byte inside the brackets, a space or `!` too, is not a backtick run alone.
+            (b"[!``]", b"[!]", true),
+            (b"[ `` ]", b"[ ]", true),
+            (b"[ ``]", b"[ ]", true),
+            (b"[``;]", b"[ ]", true),
+            (b"[``x]", b"[x]", true),
+            (b"[x``]", b"[x]", true),
+            (b"[`whoami`]", b"[whoami]", true),
+            (b"[``", b"[", true),
+            (b"``]", b"]", true),
+            (b"][``", b"][", true),
+            // The run needs the matching closing byte: `[` closes with `]` and `(` with `)`.
+            (b"[``)", b"[)", true),
+            (b"(``]", b"(]", true),
+            (b"([``)", b"([)", true),
+            (b"[(``]", b"[(]", true),
+            (b"[`]``", b"[`]", true),
+            (b"[`]`]", b"[`]]", true),
+        ] {
+            let (result, result_changed, error) = cmd_line(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
+    }
+
+    // Not Go: one backtick of a run survives when the last byte written before it is `%`, so CRS 932140 has a FOR
+    // variable (`for %` in (x) do calc`: Windows takes any character that is not a digit, a backtick too).
+    #[test]
+    fn cmd_line_keeps_one_backtick_after_a_percent() {
+        for (input, output, changed) in [
+            // The FOR variable, at the command line (`%`) and in a batch file (`%%`).
+            (b"%`".as_slice(), b"%`".as_slice(), false),
+            (b"%``", b"%`", true),
+            (b"%```", b"%`", true),
+            (b"for %` in (x) do calc", b"for %` in(x) do calc", true),
+            (b"for %%` in (x) do calc", b"for %%` in(x) do calc", true),
+            (b"For %` In (X) Do Calc", b"for %` in(x) do calc", true),
+            (b"for /f %` in ('whoami') do calc", b"for/f %` in(whoami) do calc", true),
+            (b"for /l %%` in (1,1,3) do calc", b"for/l %%` in(1 1 3) do calc", true),
+            (b"for %`` in (x) do calc", b"for %` in(x) do calc", true),
+            // Any byte after the run: `%` before a backtick keeps it, in other contexts too.
+            (b"100%`x`", b"100%`x", true),
+            (b"%`whoami`", b"%`whoami", true),
+            (b"%`a`b", b"%`ab", true),
+            (b"%``a", b"%`a", true),
+            (b"%``a``", b"%`a", true),
+            (b"%`%`", b"%`%`", false),
+            (b"%`a%`", b"%`a%`", false),
+            (b"%`/x", b"%`/x", false),
+            (b"%`(x)", b"%`(x)", false),
+            (b"%`)", b"%`)", false),
+            (b"%`]", b"%`]", false),
+            (b"(%`)", b"(%`)", false),
+            (b"[%`]", b"[%`]", false),
+            (b"%`~", b"%`~", false),
+            // Removed bytes between the `%` and the run, or inside it, leave the `%` the last byte written.
+            (b"%^`", b"%`", true),
+            (b"%'`", b"%`", true),
+            (b"%\\`", b"%`", true),
+            (b"%\"'^``", b"%`", true),
+            (b"%'`'`'x", b"%`x", true),
+            (b"%^`^ in", b"%` in", true),
+            // Another byte written between them ends the case; so does a space or a byte that is lowercased.
+            (b"a`", b"a", true),
+            (b"`%", b"%", true),
+            (b"%a`", b"%a", true),
+            (b"%A`", b"%a", true),
+            (b"% `", b"% ", true),
+            (b"%,`", b"% ", true),
+            (b"%\t`", b"% ", true),
+            (b"%(`", b"%(", true),
+            (b"%/`", b"%/", true),
+            (b"%`a`", b"%`a", true),
+            (b"%a`%", b"%a%", true),
+            (b"for % in (x) do calc", b"for % in(x) do calc", true),
+            (b"for %a in (x) do calc", b"for %a in(x) do calc", true),
+            (b"for `% in (x)", b"for % in(x)", true),
+            (b"for %^` in (x)", b"for %` in(x)", true),
+            (b"for % ` in (x)", b"for % in(x)", true),
+        ] {
+            let (result, result_changed, error) = cmd_line(input);
+            assert_eq!(result, output, "input: {input:?}");
+            assert_eq!(result_changed, changed, "input: {input:?}");
+            assert_eq!(error, None);
+        }
+    }
+
+    #[test]
+    fn cmd_line_maps_each_byte_as_go_does_except_the_backtick() {
+        for byte in 0..=u8::MAX {
+            let expected = match byte {
+                b'"' | b'\'' | b'\\' | b'^' | b'`' => vec![],
+                b',' | b';' | b'\t' | b'\r' | b'\n' => vec![b' '],
+                _ => vec![byte.to_ascii_lowercase()],
+            };
+            let (result, changed, _) = cmd_line(&[byte]);
+            assert_eq!(changed, expected != [byte], "byte {byte}");
+            assert_eq!(result, expected, "byte {byte}");
+        }
+    }
+
+    #[test]
+    fn cmd_line_removes_the_powershell_backtick_escape() {
+        assert_eq!(cmd_line(b"Invoke^-^Expression").0, b"invoke-expression");
+        assert_eq!(cmd_line(b"Invoke`-`Expression").0, b"invoke-expression");
+        assert_eq!(cmd_line(b"Start`-Proc`ess").0, b"start-process");
+    }
+
+    #[test]
+    fn cmd_line_backtick_form_normalizes_like_plain_form() {
+        for (obfuscated, plain) in [
+            (b";c``at /e``tc/pa``sswd".as_slice(), b";cat /etc/passwd".as_slice()),
+            (b"Get`-`Content C:\\secret.txt", b"Get-Content C:\\secret.txt"),
+            (b"Invoke`-`Expression $x", b"Invoke-Expression $x"),
+        ] {
+            assert_eq!(cmd_line(obfuscated).0, cmd_line(plain).0, "input: {obfuscated:?}");
         }
     }
 

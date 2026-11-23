@@ -114,6 +114,77 @@ adding them requires a shared-corpus fixture first.
   literal keys, so they select nothing. This is a pre-existing selector-parser
   deviation (`coraza/src/seclang/variable_parser.rs::parse_key`) with no engine
   case ID or fixture hash yet.
+- Multiphase negation is scoped by family: `!ARGS_NAMES:x` no longer removes
+  `ARGS_GET:x`/`ARGS_POST:x`, and `!ARGS:x` no longer removes the `*_NAMES`
+  views. Go's `AddVariableNegation` applies the cross product
+  (`internal/corazawaf/rule.go:615-619,645-650` in v3.8.1); Go's own
+  `RemoveRuleTargetByID` maps by family (`transaction.go:721-745`), as this
+  engine's `ctl:ruleRemoveTarget*` path does. Both paths now share
+  `RuleVariable::multiphase_split`, and for a rule that lists `ARGS` or
+  `ARGS_NAMES` the result equals multiphase off. On a rule that lists a split
+  variable itself (`ARGS_GET`), `!ARGS:x` still removes `ARGS_GET:x` under
+  multiphase only, as in Go. CRS's
+  `SecRuleUpdateTargetById 930120 "!ARGS_NAMES:/^json\.profile[.\w\-]*$/"` keeps
+  the value of `json.profile` inspected.
+- `!@rx` compiles without the multi-line flag, so `^` and `$` anchor the whole
+  value and one matching line does not satisfy a negated allow-list. Go prepends
+  `(?sm)` to every text pattern unless built with `coraza.rule.no_regex_multiline`
+  (`internal/operators/rx.go:65-78`). A positive `@rx` keeps `(?sm)`. Dropping the
+  flag only makes a pattern match less, so a negated rule only fires more: CRS
+  920120 fires on a file name with a literal `%0a`, 942200 and 942440 on
+  multi-line text.
+- Byte-path `@rx` (a pattern with a `\xHH` escape that is not valid UTF-8) is
+  dot-all and takes the same multi-line choice. Go's `newBinaryRX` compiles the
+  raw pattern without flags (`internal/operators/rx.go:186-194`). This reverses
+  the S-17 alignment of commit `e66a6a0`; CRS 933180 sees `$f(` and `)` split by
+  a newline.
+- `t:cmdLine` removes the backtick as it removes `"`, `'`, `\` and `^`; Go's
+  `cmdLine` keeps it (`internal/transformations/cmd_line.go:45`). One backtick
+  of a run stays, as in Go, in three cases only: when the next byte after it
+  that `t:cmdLine` neither removes nor treats as a backtick is `~`
+  (``a ` ~+`` becomes `a ~+`); when the run is all that is between a `(` already
+  written and the next written `)`, or between a `[` already written and the
+  next written `]`; and when the last byte written before the run is `%`.
+  Second case:
+  ```$(``)``` becomes ``$(`)`` and ```/e[^``^]c``` becomes ``/e[`]c``, so 932130
+  (PL1), and 932131 (PL2) in `User-Agent` and `Referer`, still match
+  ```;c$(``)at /e$(``)tc/pa$(``)sswd```, ```who$(``)ami``` and
+  ```cat /e[^``^]c/passwd``` as in Go, because their `[^\)]+` needs a byte inside
+  `$(...)` and their glob branch, `[^\]]+`, a byte inside `/e[...]`. Bash runs
+  the empty substitution as nothing, so ```/e[^``^]c``` is the glob `/e[^^]c`,
+  which matches `/etc`. A byte written between them, a space too, ends that case
+  (```$( `` )``` becomes `$( )`, which `[^\)]+` matches). ```${``}``` keeps no
+  backtick: bash rejects it (`bad substitution`). Third case, whatever follows
+  the run: ``for %` in (x) do calc``
+  becomes ``for %` in(x) do calc`` and the batch form ``for %%` in (x) do calc``
+  keeps its backtick too, so 932140 (PL1) still matches `%+[^ ]+ in\(` as it
+  does with the previous `t:cmdLine`. Windows takes any character that is not a
+  digit as a FOR loop variable, a backtick included, so the shape is a real
+  command. A removed byte between the `%` and the run does not end the case
+  (``%^` in`` keeps it); a written byte, a space too, does.
+  PowerShell's in-word escape (``Invoke`-`Expression``) and bash's empty pair
+  (```c``at```) normalize like the plain command, and so does a backtick before
+  a Windows keyword: CRS 932140 (PL1) needs the space or `)` directly before
+  `in(`, `do`, `defined` and `exist`, and catches
+  ``cmd /c "if `defined x calc"`` and
+  ``cmd /c "for /f %i `in ('whoami') `do calc"`` (Go misses both). Only rules
+  with `t:cmdLine` benefit: ```who``ami``` and `who$()ami` still pass CRS at
+  PL1. CRS 932270 reads the backtick before `~` as a command start, so
+  `` `~+` ``, ``a`~+` ``, ``a`"~+`` and ``cd`~-`` match it at PL1 (keeping every
+  backtick, as Go does, misses the first two). Known miss: 932238 (critical, 5
+  points at PL3 and PL4) no longer sees a backtick command start, which Go
+  matches: ``echo `whoami` ``, ``x;`whoami` ``, ``foo`whoami` ``,
+  ``a:`whoami` ``. A backtick at a word start cannot be kept for it: it would
+  sit between the space and the keyword of 932140, a PL1 bypass, and in a word
+  it has the bytes of ``Proc`ess``. These requests still block: the `whoami`
+  examples at PL1 through 932235, 932260 and 932380, and ``a:`ps aux` `` from
+  PL2 (it passes PL1 as in Go). A backtick right after a `%` is kept, so 932238
+  still sees ``echo %`whoami` ``. Still open: only the empty pair ``` `` ```
+  is normalized. A substitution that prints nothing (`` `~` ``, `` `:` ``,
+  `` `true` ``, `$()`) still hides the word from the `t:cmdLine` rules:
+  ``;c`~`at /e`~`tc/pa`~`sswd``, ``;c`:`at /e`:`tc/pa`:`sswd`` and
+  `;c$()at /e$()tc/pa$()sswd` pass CRS at PL1 here and in Go, and block from
+  PL2. Closing that needs a rule change.
 
 ## Rust-only multipart parser hardening budgets
 

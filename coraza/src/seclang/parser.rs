@@ -2215,8 +2215,9 @@ SecRule ARGS:q "@rx \"q\"" "id:3,phase:1,pass""#,
     }
 
     #[test]
-    fn compiled_multiphase_negation_excludes_cross_family_args_names() {
-        for (multiphase, expected_match) in [(false, true), (true, false)] {
+    fn compiled_multiphase_negation_leaves_args_names_inspected() {
+        // `!ARGS:foo` excludes values only; the names family keeps `foo` in both modes.
+        for multiphase in [false, true] {
             let mut parser = Parser::new();
             parser.config_mut().multiphase_evaluation = multiphase;
             parser
@@ -2227,9 +2228,11 @@ SecRule ARGS:q "@rx \"q\"" "id:3,phase:1,pass""#,
             tx.add_get_argument("foo", "1");
 
             let interruption = tx.process_request_headers();
-            let matched = tx.matched_rules().iter().any(|rule| rule.rule.id == 1);
-            assert_eq!(matched, expected_match, "multiphase={multiphase}");
-            assert_eq!(interruption.is_some(), expected_match, "multiphase={multiphase}");
+            assert!(
+                tx.matched_rules().iter().any(|rule| rule.rule.id == 1),
+                "multiphase={multiphase}"
+            );
+            assert!(interruption.is_some(), "multiphase={multiphase}");
         }
     }
 

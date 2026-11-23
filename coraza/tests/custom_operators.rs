@@ -68,3 +68,41 @@ fn custom_operator_without_a_verdict_is_a_miss_even_when_negated() {
     assert_eq!(tx.matched_rules().len(), 1);
     assert_eq!(tx.matched_rules().first().map(|matched| matched.rule.id()), Some(3));
 }
+
+/// Matches every value and counts its calls.
+struct Always(Arc<AtomicUsize>);
+
+impl Operator for Always {
+    fn evaluate(&self, _tx: &Transaction, _input: &[u8], _out: &mut Outputs) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+#[test]
+fn custom_rx_keeps_precedence_under_negation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut parser = Parser::new();
+    parser.register_operator("rx", {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |_| Ok(Box::new(Always(Arc::clone(&calls)))))
+    });
+    // The built-in negated `@rx` would fire on this value: its whole value is not `1`.
+    parser
+        .from_string(
+            "SecRuleEngine On\n\
+             SecRule ARGS:q \"!@rx ^1$\" \"id:1,phase:1,deny\"\n\
+             SecRule ARGS:q \"!^1$\" \"id:2,phase:1,deny\"",
+        )
+        .unwrap();
+    let waf = parser.compile().unwrap();
+    let mut tx = waf.new_transaction_with_id("negated-custom-rx");
+    tx.add_get_argument("q", "1\nx");
+
+    assert!(tx.process_request_headers().is_none());
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "both negated forms call the registered operator"
+    );
+}
