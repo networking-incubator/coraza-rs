@@ -216,7 +216,9 @@ pub struct WafConfig {
     /// Debug log verbosity, 0 to 9 inclusive (`SecDebugLogLevel`).
     pub debug_log_level: u8,
 
-    /// Maximum number of ARGS processed per transaction (`SecArgumentsLimit`).
+    /// Maximum number of values each argument collection, and `REQUEST_COOKIES`, holds per
+    /// transaction (`SecArgumentsLimit`); one more is dropped and sets `ARGUMENTS_LIMIT_REACHED`.
+    /// Go applies the limit to arguments only.
     pub argument_limit: usize,
 
     /// Whether argument collection keys are matched case-sensitively.

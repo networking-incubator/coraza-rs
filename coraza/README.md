@@ -36,7 +36,7 @@ baseline a body the engine could not parse is neither inspected nor blocked:
 - 200002 denies a request whose body processor failed (`REQBODY_ERROR`).
 - 200003 denies a multipart body that failed strict validation
   (`MULTIPART_STRICT_ERROR`).
-- 200004 and 200005 deny a request whose arguments were dropped at
+- 200004 and 200005 deny a request whose arguments or cookies were dropped at
   `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`).
 - 200009 denies a request target that does not parse (`URI_PARSE_ERROR`).
 - 200000, 200001 and 200006 select the XML and JSON body processors, which the
@@ -550,6 +550,15 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   just like a disruptive rule that matches after an earlier interruption. This
   is a deliberate deviation in what is logged: Go's audit entry reports it as an
   interruption.
+- `REQUEST_COOKIES` counts against `SecArgumentsLimit` (1000 by default) across
+  every `Cookie` header and `Transaction::add_request_cookie`. The first cookie
+  past the limit is dropped with the rest of its header and sets
+  `ARGUMENTS_LIMIT_REACHED`. This is a deliberate deviation: Go stores every
+  cookie, so a `Cookie: a;a;a;...` header multiplies the work of every rule that
+  reads `REQUEST_COOKIES`. The recommended baseline's rule 200004 denies such a
+  request in phase 1. A policy without rules 200004 and 200005 must deny on
+  `ARGUMENTS_LIMIT_REACHED` itself; otherwise the dropped cookies are never
+  inspected.
 
 ## FTW integration
 

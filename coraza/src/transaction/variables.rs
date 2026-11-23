@@ -29,6 +29,7 @@ use crate::{
     rules::{CollectionView, VariableSpec},
     transformations::text_of,
     types::RuleVariable,
+    utils::lowercase::lowercase_char,
 };
 
 /// The data behind one rule variable in a transaction.
@@ -212,16 +213,17 @@ impl BodyProcessor {
 
     /// Detect a body processor from a content type, if present.
     ///
-    /// Go trims the header value and prefix-matches both media types, ignoring case
-    /// (`internal/corazawaf/transaction.go:411-416`), so parameters, a malformed
-    /// suffix, and invalid bytes never suppress the selection. Matching a parsed
-    /// MIME value instead would skip bodies that a prefix-matching backend such as
-    /// PHP's `sapi_read_post_data` still parses.
+    /// Go trims the header value, lower-cases it with `strings.ToLower` and
+    /// prefix-matches both media types (`internal/corazawaf/transaction.go:411-416`),
+    /// so parameters, a malformed suffix, and invalid bytes after the prefix never
+    /// suppress the selection, and `multİpart/form-data` (U+0130) selects multipart.
+    /// Matching a parsed MIME value instead would skip bodies that a prefix-matching
+    /// backend such as PHP's `sapi_read_post_data` still parses.
     pub(super) fn for_content_type(content_type: &[u8]) -> Option<Self> {
         let content_type = trim_leading_space(content_type);
-        if starts_with_ignore_ascii_case(content_type, b"application/x-www-form-urlencoded") {
+        if starts_with_folded(content_type, "application/x-www-form-urlencoded") {
             Some(Self::UrlEncoded)
-        } else if starts_with_ignore_ascii_case(content_type, b"multipart/form-data") {
+        } else if starts_with_folded(content_type, "multipart/form-data") {
             Some(Self::Multipart)
         } else {
             None
@@ -255,11 +257,31 @@ fn trim_leading_space(value: &[u8]) -> &[u8] {
     value.get(start..).unwrap_or_default()
 }
 
-/// Whether `value` starts with `prefix`, ignoring ASCII case.
-fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+/// Whether `value`, lower-cased the way Go's `strings.ToLower` does, starts with the lower-case `prefix`.
+///
+/// Go reads an invalid byte as U+FFFD, which no prefix character equals, so one before the end of the
+/// prefix ends the match. Walks the value in place, without a lower-cased copy.
+fn starts_with_folded(value: &[u8], prefix: &str) -> bool {
+    // Only U+0130 and U+212A lower-case into ASCII, so an ASCII head, the common case, folds as ASCII.
+    if let Some(head) = value.get(..prefix.len())
+        && head.is_ascii()
+    {
+        return head.eq_ignore_ascii_case(prefix.as_bytes());
+    }
+    let mut expected = prefix.chars();
+    for chunk in value.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            match expected.next() {
+                None => return true,
+                Some(wanted) if lowercase_char(character) == wanted => {},
+                Some(_) => return false,
+            }
+        }
+        if !chunk.invalid().is_empty() {
+            break;
+        }
+    }
+    expected.next().is_none()
 }
 
 #[expect(
@@ -473,5 +495,50 @@ impl Transaction {
             self.rule.set_index("logdata", 0, log_data.as_bytes());
         }
         self.rule.set_index("severity", 0, severity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BodyProcessor;
+
+    #[test]
+    fn content_type_selection_folds_case_like_go() {
+        // Go lower-cases with `strings.ToLower`, whose simple mapping turns U+0130 into `i`, so
+        // `multİpart/form-data` selects multipart there (`internal/corazawaf/transaction.go:411-416`).
+        let cases: &[(&[u8], Option<&str>)] = &[
+            ("appl\u{130}cation/x-www-form-urlencoded".as_bytes(), Some("URLENCODED")),
+            ("applicat\u{130}on/x-www-form-urlencoded".as_bytes(), Some("URLENCODED")),
+            (
+                "APPL\u{130}CAT\u{130}ON/X-WWW-FORM-URLENCODED".as_bytes(),
+                Some("URLENCODED"),
+            ),
+            ("mult\u{130}part/form-data; boundary=b".as_bytes(), Some("MULTIPART")),
+            (b"MULTIPART/FORM-DATA", Some("MULTIPART")),
+            (" \t\u{a0}mult\u{130}part/form-data".as_bytes(), Some("MULTIPART")),
+            // What follows the prefix is not read, whatever it is.
+            ("multipart/form-data\u{130}".as_bytes(), Some("MULTIPART")),
+            (b"multipart/form-data\xff\xc4", Some("MULTIPART")),
+            // An invalid byte inside the prefix ends the match: Go reads it as U+FFFD.
+            (b"mul\xfftipart/form-data", None),
+            (b"appl\xc4cation/x-www-form-urlencoded", None),
+            (b"mult\xc4", None),
+            // A value cut short of the prefix.
+            ("mult\u{130}part/form-dat".as_bytes(), None),
+            (b"application/x-www-form-urlencode", None),
+            // U+212A folds to `k`, which neither media type has; Go keeps U+0131 (dotless `ı`) as it is.
+            ("mult\u{212A}part/form-data".as_bytes(), None),
+            ("\u{212A}multipart/form-data".as_bytes(), None),
+            ("mult\u{131}part/form-data".as_bytes(), None),
+            (b"", None),
+        ];
+        for (content_type, expected) in cases {
+            assert_eq!(
+                BodyProcessor::for_content_type(content_type).map(BodyProcessor::name),
+                *expected,
+                "content type {:?}",
+                String::from_utf8_lossy(content_type)
+            );
+        }
     }
 }

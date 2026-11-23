@@ -29,6 +29,8 @@
 
 use std::collections::HashMap;
 
+use crate::{transformations::lowercase, utils::lowercase::lowercases_to};
+
 /// Go's `errNoMediaType`.
 const NO_MEDIA_TYPE: &str = "mime: no media type";
 /// Go's `errNoSlashAfterFirstToken`.
@@ -160,7 +162,8 @@ impl MediaType {
 pub(super) fn parse(value: &[u8]) -> Result<MediaType, &'static str> {
     let base_end = value.iter().position(|&byte| byte == b';').unwrap_or(value.len());
     let base = value.get(..base_end).unwrap_or_default();
-    let media_type = trim_space(base).to_ascii_lowercase();
+    // Go's `strings.ToLower`, so `multİpart/form-data` (U+0130) is `multipart/form-data`.
+    let media_type = to_lower(trim_space(base));
     check_media_type_disposition(&media_type)?;
 
     let mut params: Indexed<Vec<u8>> = Indexed::default();
@@ -195,6 +198,15 @@ pub(super) fn parse(value: &[u8]) -> Result<MediaType, &'static str> {
 
     stitch_continuations(&mut params, continuation);
     Ok(MediaType { media_type, params })
+}
+
+/// `value` lower-cased as Go's `strings.ToLower` does, which is what `t:lowercase` does: each byte that is not UTF-8
+/// becomes U+FFFD. ASCII, the common case, goes a byte at a time.
+pub(super) fn to_lower(value: &[u8]) -> Vec<u8> {
+    if value.is_ascii() {
+        return value.to_ascii_lowercase();
+    }
+    lowercase(value).0
 }
 
 /// Validate a lowercased, trimmed media type as Go's `checkMediaTypeDisposition`.
@@ -288,8 +300,11 @@ fn decode_2231(value: &[u8]) -> Option<Vec<u8>> {
     let rest = value.get(quote.saturating_add(1)..)?;
     let second = rest.iter().position(|&byte| byte == b'\'').unwrap_or(rest.len());
     let extended = rest.get(second.saturating_add(1)..)?;
-    let charset = charset.to_ascii_lowercase();
-    if charset != b"us-ascii" && charset != b"utf-8" {
+    // Go lower-cases the charset with `strings.ToLower`, so `us-ascİİ` (U+0130) is `us-ascii`; a byte that is not
+    // UTF-8 becomes U+FFFD there, which neither name holds.
+    if !std::str::from_utf8(charset)
+        .is_ok_and(|charset| lowercases_to(charset, "us-ascii") || lowercases_to(charset, "utf-8"))
+    {
         return None;
     }
     percent_decode_strict(extended)
@@ -315,8 +330,17 @@ fn percent_decode_strict(value: &[u8]) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
+/// Every rune Go 1.27's `unicode.IsSpace` accepts, which `strings.TrimSpace` and `TrimLeftFunc(unicode.IsSpace)`
+/// remove.
+#[cfg(test)]
+pub(super) const GO_SPACES: [char; 25] = [
+    '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}',
+    '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+    '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+];
+
 /// Trim the Unicode whitespace Go's `strings.TrimSpace` removes from both ends.
-fn trim_space(value: &[u8]) -> &[u8] {
+pub(super) fn trim_space(value: &[u8]) -> &[u8] {
     let mut start = 0_usize;
     while let Some((character, len)) = decode_first(value.get(start..).unwrap_or_default()) {
         if !character.is_whitespace() {
@@ -339,6 +363,11 @@ fn trim_space(value: &[u8]) -> &[u8] {
 
 /// Decode the first UTF-8 character of `value`, if it starts with a valid one.
 fn decode_first(value: &[u8]) -> Option<(char, usize)> {
+    if let Some(&byte) = value.first()
+        && byte.is_ascii()
+    {
+        return Some((char::from(byte), 1));
+    }
     for len in 1..=value.len().min(4) {
         if let Some(character) = value
             .get(..len)
@@ -353,6 +382,11 @@ fn decode_first(value: &[u8]) -> Option<(char, usize)> {
 
 /// Decode the last UTF-8 character of `value`, if it ends with a valid one.
 fn decode_last(value: &[u8]) -> Option<(char, usize)> {
+    if let Some(&byte) = value.last()
+        && byte.is_ascii()
+    {
+        return Some((char::from(byte), 1));
+    }
     for len in 1..=value.len().min(4) {
         let start = value.len().saturating_sub(len);
         if let Some(character) = value
@@ -475,6 +509,24 @@ mod tests {
     }
 
     #[test]
+    fn lower_cases_the_media_type_like_go() {
+        // Go's `mime.ParseMediaType` lower-cases with `strings.ToLower`, which maps U+0130 to `i` and U+212A to `k`.
+        let parsed = parse("MULT\u{130}PART/Form-Data; boundary=b".as_bytes()).unwrap();
+        assert_eq!(parsed.media_type(), b"multipart/form-data");
+        assert_eq!(parsed.param(b"boundary"), Some(&b"b"[..]));
+        assert_eq!(parse("text/\u{212A}".as_bytes()).unwrap().media_type(), b"text/k");
+        // Other characters stay outside the token alphabet, as an invalid byte does.
+        assert_eq!(
+            parse("mult\u{131}part/form-data".as_bytes()).err(),
+            Some("mime: expected slash after first token")
+        );
+        assert_eq!(
+            parse(b"mult\xc4part/form-data").err(),
+            Some("mime: expected slash after first token")
+        );
+    }
+
+    #[test]
     fn parses_braces_in_rfc_2045_token_parameters() {
         let parsed = parse(b"multipart/form-data; boundary=ab{c}; x=y{z}").unwrap();
         assert_eq!(parsed.param(b"boundary"), Some(&b"ab{c}"[..]));
@@ -521,6 +573,50 @@ mod tests {
         // Without a plain name, Go stores no name at all.
         let value = b"multipart/form-data; name*=iso-8859-1''field";
         assert_eq!(parse(value).unwrap().param(b"name"), None);
+    }
+
+    #[test]
+    fn lower_cases_the_extended_charset_like_go() {
+        // Go's `decode2231Enc` lower-cases the charset with `strings.ToLower`, which maps U+0130 to `i`, but keeps
+        // U+017F, U+0131 and U+212A as they are, and reads an invalid byte as U+FFFD (Go 1.27, `mime.ParseMediaType`).
+        for (charset, expected) in [
+            ("us-asc\u{130}\u{130}".as_bytes(), b"evil".as_slice()),
+            ("US-ASCI\u{130}".as_bytes(), b"evil"),
+            (b"UTF-8", b"evil"),
+            (b"Utf-8", b"evil"),
+            ("u\u{17F}-a\u{17F}cii".as_bytes(), b"safe"),
+            ("us-asc\u{131}i".as_bytes(), b"safe"),
+            (b"us-ascii\xc4", b"safe"),
+            ("\u{212A}us-ascii".as_bytes(), b"safe"),
+            ("\u{FC}tf-8".as_bytes(), b"safe"),
+            ("utf\u{2011}8".as_bytes(), b"safe"),
+        ] {
+            let value = [b"form-data; name=\"safe\"; name*=\"", charset, b"''evil\""].concat();
+            assert_eq!(
+                parse(&value).unwrap().param(b"name"),
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(charset)
+            );
+        }
+    }
+
+    #[test]
+    fn trims_the_white_space_go_trims() {
+        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let padded = format!("{character}x{character}");
+            let expected: &[u8] = if super::GO_SPACES.contains(&character) {
+                b"x"
+            } else {
+                padded.as_bytes()
+            };
+            assert_eq!(
+                super::trim_space(padded.as_bytes()),
+                expected,
+                "U+{:04X}",
+                u32::from(character)
+            );
+        }
     }
 
     #[test]

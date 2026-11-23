@@ -60,7 +60,7 @@ use crate::{
     rules::{RuleGroup, VariableException},
     transformations::text_of,
     types::{AuditEngineStatus, AuditLogPart, AuditLogParts, RuleEngineStatus, RulePhase, RuleSeverity, RuleVariable},
-    utils::time::LocalTime,
+    utils::{lowercase::lowercases_to, time::LocalTime},
     waf::ConfigError,
 };
 
@@ -2336,18 +2336,20 @@ impl Transaction {
 
     /// Store a request header value as supplied by the connector.
     ///
-    /// `Cookie` headers are also parsed into `REQUEST_COOKIES`, as Go Coraza does.
-    /// Connectors that already split cookies may keep using [`Transaction::add_request_cookie`];
-    /// both paths accumulate values.
+    /// `Cookie` headers are also parsed into `REQUEST_COOKIES`, as Go Coraza does, up to the
+    /// argument limit. Connectors that already split cookies may keep using
+    /// [`Transaction::add_request_cookie`]; both paths accumulate values and share the limit.
+    /// The header name is lower-cased like Go's `strings.ToLower` before it is compared, so
+    /// `Coo\u{212A}ie` is a `Cookie` header, as it is in Go.
     pub fn add_request_header(&mut self, key: &str, value: impl AsRef<[u8]>) {
         if key.is_empty() {
             return;
         }
         let value = value.as_ref();
         let first_content_type =
-            key.eq_ignore_ascii_case("content-type") && self.request_headers.first("content-type").is_none();
+            lowercases_to(key, "content-type") && self.request_headers.first("content-type").is_none();
         self.request_headers.add(key, value);
-        if key.eq_ignore_ascii_case("cookie") {
+        if lowercases_to(key, "cookie") {
             self.parse_request_cookies(value);
         }
         if first_content_type && let Some(processor) = BodyProcessor::for_content_type(value) {
@@ -2356,6 +2358,11 @@ impl Transaction {
     }
 
     /// Split one `Cookie` header into `REQUEST_COOKIES` the way Go's parser does.
+    ///
+    /// Cookies count against `SecArgumentsLimit` across every `Cookie` header and
+    /// [`Transaction::add_request_cookie`]: the first cookie past it stops the parse of this
+    /// header and sets `ARGUMENTS_LIMIT_REACHED`, so a flood of `a;a;a;...` cannot multiply the
+    /// work of every rule over `REQUEST_COOKIES`. This is a deviation: Go stores every cookie.
     fn parse_request_cookies(&mut self, value: &[u8]) {
         for part in value.split(|&byte| byte == b';') {
             let part = trim_cookie(part);
@@ -2375,13 +2382,21 @@ impl Transaction {
             if name.is_empty() && value.is_empty() {
                 continue;
             }
+            if !self.within_argument_limit(self.request_cookies.value_count()) {
+                break;
+            }
             self.request_cookies.add(&text_of(name), value);
         }
     }
 
     /// Store a request cookie supplied by a connector that already parsed cookies.
+    ///
+    /// The cookie is dropped, and `ARGUMENTS_LIMIT_REACHED` set, once `REQUEST_COOKIES` holds
+    /// `SecArgumentsLimit` values, as for a `Cookie` header.
     pub fn add_request_cookie(&mut self, key: &str, value: impl AsRef<[u8]>) {
-        self.request_cookies.add(key, value);
+        if self.within_argument_limit(self.request_cookies.value_count()) {
+            self.request_cookies.add(key, value);
+        }
     }
 
     /// Store a response header value as supplied by the connector.
@@ -2390,7 +2405,7 @@ impl Transaction {
             return;
         }
         let value = value.as_ref();
-        let content_type = key.eq_ignore_ascii_case("content-type");
+        let content_type = lowercases_to(key, "content-type");
         self.response_headers.add(key, value);
         if content_type {
             // Go sets this on every `Content-Type` header, so the last one wins. It
@@ -7958,6 +7973,135 @@ content\r\n\
             assert_eq!(cookies.get("b"), ["1", "2"]);
             assert_eq!(cookies.get("c"), [""]);
         }
+    }
+
+    #[test]
+    fn header_names_go_folds_to_cookie_are_parsed_as_cookies() {
+        // Go compares `strings.ToLower(key)`, whose simple mapping turns U+212A into `k` and U+0130 into `i`.
+        let mut tx = Transaction::new("cookie-name-fold");
+        tx.add_request_header("COOKIE", "a=1");
+        tx.add_request_header("Coo\u{212A}ie", "b=2");
+        tx.add_request_header("Cook\u{130}e", "c=3");
+        // U+0131 (dotless `ı`) has no lower-case mapping to `i`, so this is another header.
+        tx.add_request_header("Cook\u{131}e", "d=4");
+        assert_eq!(tx.request_cookies.value_count(), 3, "three names fold to `cookie`");
+        assert!(tx.request_cookies.get("d").is_empty(), "`Cookıe` is not `cookie`");
+    }
+
+    #[test]
+    fn cookies_count_against_the_argument_limit() {
+        // Go stores every cookie; this engine stops at `SecArgumentsLimit`, as it does for arguments, so a header
+        // of `a;a;a;...` cannot multiply the work of every rule over `REQUEST_COOKIES`.
+        let flood = |count: usize| vec!["a=1"; count].join("; ");
+        let mut fits = Transaction::new("cookies-fit");
+        fits.add_request_header("Cookie", flood(1000));
+        assert_eq!(fits.request_cookies.value_count(), 1000, "the default limit is 1000");
+        assert!(!fits.arguments_limit_reached(), "the exact limit fits");
+
+        let mut over = Transaction::new("cookies-over");
+        over.add_request_header("Cookie", flood(1001));
+        assert_eq!(
+            over.request_cookies.value_count(),
+            1000,
+            "the cookie past the limit is dropped"
+        );
+        assert!(over.arguments_limit_reached(), "a dropped cookie sets the flag");
+        assert_eq!(
+            over.get_variable(RuleVariable::ArgumentsLimitReached, None).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn the_cookie_limit_spans_headers_and_connector_cookies() {
+        let config = WafConfig {
+            argument_limit: 5,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("cookie-limit", Arc::new(config.clone()));
+        tx.add_request_header("Cookie", "a=1; b=2");
+        // Empty parts are skipped before they are counted, as empty query pairs are.
+        tx.add_request_header("cookie", "c=3; ; d=4;");
+        tx.add_request_cookie("e", "5");
+        assert_eq!(tx.request_cookies.value_count(), 5, "five cookies fit a limit of five");
+        assert!(!tx.arguments_limit_reached(), "the exact limit fits");
+        tx.add_request_header("Cookie", "f=6; g=7");
+        tx.add_request_cookie("h", "8");
+        assert_eq!(tx.request_cookies.value_count(), 5, "nothing is stored past the limit");
+        assert!(tx.arguments_limit_reached(), "a dropped cookie sets the flag");
+        assert!(
+            tx.request_cookies.get("f").is_empty(),
+            "a header past the limit is not read"
+        );
+
+        // The connector path alone reaches the limit too.
+        let mut connector = Transaction::with_config("cookie-limit-connector", Arc::new(config));
+        for index in 0..6 {
+            connector.add_request_cookie(&format!("c{index}"), "1");
+        }
+        assert_eq!(
+            connector.request_cookies.value_count(),
+            5,
+            "the sixth cookie is dropped"
+        );
+        assert!(connector.arguments_limit_reached(), "a dropped cookie sets the flag");
+    }
+
+    #[test]
+    fn sec_arguments_limit_bounds_the_cookies_a_rule_sees() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecArgumentsLimit 5\n\
+                 SecRule ARGUMENTS_LIMIT_REACHED \"@eq 1\" \"id:1,phase:1,deny,status:400\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut fits = waf.new_transaction_with_id("cookie-directive-fits");
+        fits.add_request_header("Cookie", "a;a;a;a;a");
+        assert!(fits.process_request_headers().is_none(), "five cookies fit");
+        let mut over = waf.new_transaction_with_id("cookie-directive-over");
+        over.add_request_header("Cookie", "a;a;a;a;a;a");
+        assert_eq!(
+            over.process_request_headers().map(|interruption| interruption.status),
+            Some(400)
+        );
+        assert_eq!(over.request_cookies.value_count(), 5, "the sixth cookie is dropped");
+    }
+
+    #[test]
+    fn a_cookie_flood_is_evaluated_at_most_argument_limit_times() {
+        struct Counting(Arc<AtomicUsize>);
+        impl crate::operators::Operator for Counting {
+            fn evaluate(&self, _tx: &Transaction, _input: &[u8], _out: &mut Outputs) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut parser = crate::seclang::Parser::new();
+        parser.register_operator("counting", {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_: &str| {
+                let operator: Box<dyn crate::operators::Operator> = Box::new(Counting(Arc::clone(&calls)));
+                Ok(operator)
+            })
+        });
+        parser
+            .from_string("SecRule REQUEST_COOKIES \"@counting\" \"id:1,phase:1,pass\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("cookie-flood");
+        // 30,000 cookies in 60 KB, which fits Envoy's default header limit (X3-01).
+        tx.add_request_header("Cookie", vec!["a"; 30_000].join(";"));
+        assert!(tx.process_request_headers().is_none());
+        assert!(tx.arguments_limit_reached(), "the flood sets the flag");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1000,
+            "every stored cookie is evaluated once, and no more"
+        );
     }
 
     #[test]
