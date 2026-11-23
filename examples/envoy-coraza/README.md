@@ -129,6 +129,11 @@ before reusing these files with other policies. For the request body:
   `rejected plugin configuration: policy "<name>" cannot run on this host:
   SecRequestBodyLimit is <N> bytes, over the 16777216-byte WASM ceiling`. Lower
   the limit, or add `SecRequestBodyAccess Off`.
+* A request with more than `SecArgumentsLimit` cookies (1000), across all its
+  `Cookie` headers, gets 413 (`incomplete`) in any engine mode but `Off`, or
+  400 from rule 200004 at `recommended.local`. This holds even under
+  `SecRequestBodyAccess Off` and when the request has no body; raise
+  `SecArgumentsLimit` instead.
 
 ## Compressed configuration
 

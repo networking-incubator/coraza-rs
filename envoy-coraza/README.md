@@ -114,6 +114,14 @@ each item against your policies before upgrading.
 * **A request body the memory budget stopped is refused with 503** in every
   engine mode, `DetectionOnly` included; see
   [Body memory budget](#body-memory-budget) for which bodies reach it.
+* **Cookies count against `SecArgumentsLimit`**: a request with more than
+  `SecArgumentsLimit` cookies (1000 by default), counted across all its
+  `Cookie` headers, is refused with 413 in any engine mode but `Off`,
+  `DetectionOnly` included, also when the request ends at its headers
+  (`inspection_reason=incomplete`, `inspection_complete=false`). With
+  `@recommended-conf` and `SecRuleEngine On`, its rule 200004 answers 400 first.
+  This holds whatever `SecRequestBodyAccess` says, and earlier builds read every
+  cookie. Raise `SecArgumentsLimit` for clients that send more.
 * **The embedded CRS no longer honours rules 905100 and 905110**; see
   [Embedding the OWASP Core Rule Set](#embedding-the-owasp-core-rule-set).
 * **A refused response is a local reply**, sent when the filter decides,
@@ -249,7 +257,7 @@ could not parse is neither inspected nor blocked.
 | 200000, 200001, 200006 | Select the XML and JSON body processors for XML, `application/json` and `+json` content types; without them those bodies are not parsed into `ARGS_POST`. |
 | 200002 | Denies with 400 when the request body processor fails (`REQBODY_ERROR`). |
 | 200003 | Denies with 400 when a multipart body fails strict validation (`MULTIPART_STRICT_ERROR`). |
-| 200004, 200005 | Deny with 400 when arguments were dropped at `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`). |
+| 200004, 200005 | Deny with 400 when arguments or cookies were dropped at `SecArgumentsLimit` (`ARGUMENTS_LIMIT_REACHED`); cookies are dropped in phase 1, so rule 200004 answers for them. |
 | 200009 | Denies with 400 when the request target does not parse (`URI_PARSE_ERROR`). |
 
 The file has a single source, the engine copy
