@@ -246,9 +246,22 @@ impl Transaction {
                 }
             },
             BodyProcessor::Xml => {
-                let (error, budget_stopped) = match xml::parse_into(body, self.memory_budget(), &mut self.request_xml) {
-                    // The parser stopped for the budget, which is what a message it returns instead of an error says.
-                    Ok(budget_error) => (budget_error, true),
+                let parsed = xml::parse_into(
+                    body,
+                    self.memory_budget(),
+                    self.config.argument_limit,
+                    truncated,
+                    &mut self.request_xml,
+                );
+                let (error, budget_stopped) = match parsed {
+                    Ok(None) => (None, false),
+                    Ok(Some(xml::Stop::MemoryBudget(message))) => (Some(message), true),
+                    // Go has no limit here. Each value is one more evaluation of every rule that reads XML, so past
+                    // the limit the body is an error, the values before it still inspected.
+                    Ok(Some(xml::Stop::ArgumentLimit(message))) => {
+                        self.arguments_limit_reached.set("1");
+                        (Some(message), false)
+                    },
                     // Go stores the processor's own error unchanged, which for XML is
                     // `encoding/xml`'s `XML syntax error on line N: ...`
                     // (`internal/corazawaf/transaction.go:1780-1786`, v3.8.1). Its text quotes the document, so it
@@ -710,12 +723,8 @@ fn process_custom_body_in(
             BodyDirection::Response => add_response_body_argument(tx, &name, &value),
         }
     }
-    for (path, value) in output.xml {
-        match direction {
-            BodyDirection::Request => tx.request_xml.add_bytes(&path, &value),
-            BodyDirection::Response => tx.response_xml.add_bytes(&path, &value),
-        }
-    }
+    let xml_error = publish_custom_xml(tx, direction, output.xml);
+    error = error.or(xml_error);
     for file in &output.files {
         let Some(upload_dir) = upload_dir else {
             if error.is_none() {
@@ -734,6 +743,30 @@ fn process_custom_body_in(
     if let Some(message) = error {
         record_custom_body_processor_error(tx, direction, &message);
     }
+}
+
+/// Publishes a custom processor's XML values into the direction's collection up to the argument limit, past which,
+/// as for the built-in processor, the values before it stay and the rest is an error, which it returns.
+fn publish_custom_xml(
+    tx: &mut Transaction,
+    direction: BodyDirection,
+    values: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Option<String> {
+    let limit = tx.config.argument_limit;
+    let xml = match direction {
+        BodyDirection::Request => &mut tx.request_xml,
+        BodyDirection::Response => &mut tx.response_xml,
+    };
+    for (path, value) in values {
+        if xml.value_count() >= limit {
+            tx.arguments_limit_reached.set("1");
+            return Some(format!(
+                "custom body processor XML output exceeded the {limit} value argument limit"
+            ));
+        }
+        xml.add_bytes(&path, &value);
+    }
+    None
 }
 
 /// Set the matching request or response processor error variables.
@@ -4058,5 +4091,245 @@ mod custom_file_metadata_tests {
             "the charge covers the retained path"
         );
         tx.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "XML limit tests use fixed fixtures")]
+mod xml_limit_tests {
+    use std::sync::Arc;
+
+    use super::process_custom_body_processor;
+    use crate::{
+        body_processors::{
+            BodyDirection, BodyProcessor as CustomBodyProcessor, BodyProcessorOptions, BodyProcessorOutput,
+        },
+        config::WafConfig,
+        transaction::Transaction,
+        types::RuleVariable,
+    };
+
+    /// Whether `variable` is `1`.
+    fn raised(tx: &Transaction, variable: RuleVariable) -> bool {
+        tx.get_variable(variable, None).as_deref() == Some("1")
+    }
+
+    #[test]
+    fn an_xml_body_past_the_argument_limit_keeps_the_values_before_it_and_reports_the_limit() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRequestBodyAccess On\nSecAction \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        for (count, over) in [(1000, false), (1001, true)] {
+            let mut tx = waf.new_transaction();
+            tx.add_request_header("Content-Type", "application/xml");
+            tx.process_request_headers();
+            tx.process_request_body(format!("<r>{}</r>", "<i>1</i>".repeat(count)).as_bytes());
+            assert_eq!(raised(&tx, RuleVariable::ArgumentsLimitReached), over, "{count}");
+            assert_eq!(raised(&tx, RuleVariable::ReqbodyError), over, "{count}");
+            assert_eq!(raised(&tx, RuleVariable::ReqbodyProcessorError), over, "{count}");
+            assert_eq!(
+                tx.request_xml.value_count(),
+                1000,
+                "{count}: the prefix stays inspected"
+            );
+            assert!(
+                !tx.request_body_stopped_by_memory_budget(),
+                "{count}: the limit is not the budget"
+            );
+            if over {
+                assert_eq!(
+                    tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+                    Some("XML: parsed XML exceeds the 1000 value argument limit")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_xml_body_that_ends_in_a_tag_is_an_error_unless_a_process_partial_limit_cut_it_there() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRequestBodyAccess On\nSecRequestBodyLimit 19\nSecRequestBodyLimitAction ProcessPartial\n\
+                 SecAction \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        // The limit keeps `<r a="1"><i b="2" c` of the second body, as Go reads it. The rest was never inspected,
+        // but the complete attributes of the tag the cut ended in are published. A body that ends there itself is
+        // not well formed, and the tag it ends in would be read by a lenient backend.
+        for (body, error, published) in [
+            (&b"<r a=\"1\"><i b=\"2\""[..], true, 0),
+            (b"<r a=\"1\"><i b=\"2\" c=\"3\"/></r>", false, 2),
+        ] {
+            let mut tx = waf.new_transaction();
+            tx.add_request_header("Content-Type", "application/xml");
+            tx.process_request_headers();
+            tx.process_request_body(body);
+            assert_eq!(raised(&tx, RuleVariable::ReqbodyError), error, "{error}");
+            assert_eq!(raised(&tx, RuleVariable::InboundDataError), !error, "{error}");
+            assert_eq!(tx.request_xml.value_count(), published, "{error}");
+            if error {
+                assert_eq!(
+                    tx.get_variable(RuleVariable::ReqbodyErrorMsg, None).as_deref(),
+                    Some("XML: XML syntax error on line 1: unexpected EOF")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_process_partial_cut_inside_an_xml_token_inspects_what_the_token_had_read() {
+        // The backend gets the whole body, and `PWNED` is before the limit in every one of these. The limit lands
+        // in the start tag after a complete attribute, in an attribute's value, or in a reference in text or in an
+        // attribute, wherever the padding after the payload puts it.
+        let pad = "x".repeat(5000);
+        let reference = "&amp;".repeat(1000);
+        let bodies = [
+            (
+                "attribute then a long one",
+                format!("<r a=\"PWNED\" b=\"{pad}\"/>"),
+                100,
+            ),
+            (
+                "attribute then a long one, deeper",
+                format!("<r><i a=\"PWNED\" b=\"{pad}\"/></r>"),
+                1000,
+            ),
+            ("value", format!("<r a=\"PWNED{pad}\"/>"), 12),
+            ("attribute then a name", "<r a=\"PWNED\" b=\"x\"/>".to_owned(), 14),
+            (
+                "attribute then an equal sign",
+                "<r a=\"PWNED\" b=\"x\"/>".to_owned(),
+                15,
+            ),
+            ("attribute then a slash", "<r a=\"PWNED\"/>".to_owned(), 13),
+            ("reference in an attribute", "<r a=\"PWNED &amp;\"/>".to_owned(), 16),
+            ("reference in text", format!("<r>PWNED {reference}</r>"), 10),
+            ("html entity", "<r>PWNED &nbsp;</r>".to_owned(), 11),
+            ("numeric reference", "<r>PWNED &#x41;</r>".to_owned(), 13),
+            // libxml2 in recover mode reads the value and what follows as the parent's text, so a tag that has a
+            // parent hides it from the rule if the cut drops it.
+            ("unquoted value", format!("<r a=PWNED{pad}/>"), 100),
+            ("unquoted value, nested", format!("<p><r a=PWNED{pad}/></p>"), 100),
+            (
+                "unquoted value, nested, cut after it",
+                "<p><r a=PWNED/></p>".to_owned(),
+                13,
+            ),
+            (
+                "unquoted value, deeper, after an attribute",
+                format!("<a><b><r x=\"1\" a=PWNED{pad}/>"),
+                30,
+            ),
+            ("text, which the cut never hid", "<r>PWNED x</r>".to_owned(), 8),
+        ];
+        let mut missed = Vec::new();
+        for (what, body, limit) in bodies {
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit {limit}\n\
+                     SecRequestBodyLimitAction ProcessPartial\n\
+                     SecAction \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"\n\
+                     SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"\n\
+                     SecRule XML:/*|XML://@* \"@contains PWNED\" \"id:2,phase:2,deny,status:403\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction();
+            tx.add_request_header("Content-Type", "application/xml");
+            tx.process_request_headers();
+            let interruption = tx.process_request_body(body.as_bytes());
+            if interruption.map(|i| (i.rule_id, i.status)) != Some((2, 403))
+                || !raised(&tx, RuleVariable::InboundDataError)
+                || raised(&tx, RuleVariable::ReqbodyError)
+            {
+                missed.push(format!("{what}: cut at {limit}"));
+            }
+        }
+        assert!(missed.is_empty(), "not detected, or refused: {missed:?}");
+        // A cut inside a CDATA section or a UTF-8 character is the syntax error Go gives, a 400.
+        for (what, body, limit) in [
+            ("CDATA", "<r><![CDATA[PWNED]]></r>".to_owned(), 17),
+            ("UTF-8 in text", "<r>PWNED \u{e9}</r>".to_owned(), 10),
+            ("UTF-8 in an attribute", "<r a=\"PWNED \u{e9}\"/>".to_owned(), 13),
+        ] {
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine On\nSecRequestBodyAccess On\nSecRequestBodyLimit {limit}\n\
+                     SecRequestBodyLimitAction ProcessPartial\n\
+                     SecAction \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"\n\
+                     SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction();
+            tx.add_request_header("Content-Type", "application/xml");
+            tx.process_request_headers();
+            let interruption = tx.process_request_body(body.as_bytes());
+            assert_eq!(
+                interruption.map(|i| (i.rule_id, i.status)),
+                Some((200_002, 400)),
+                "{what}"
+            );
+        }
+    }
+
+    /// Emits its count of XML values.
+    struct XmlValues(usize);
+
+    impl CustomBodyProcessor for XmlValues {
+        fn process(
+            &self,
+            _body: &[u8],
+            _direction: BodyDirection,
+            _options: &BodyProcessorOptions<'_>,
+            out: &mut BodyProcessorOutput,
+        ) -> Result<(), String> {
+            for _ in 0..self.0 {
+                out.add_xml(b"/v", b"1");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn custom_xml_values_past_the_argument_limit_are_reported_in_both_directions() {
+        for direction in [BodyDirection::Request, BodyDirection::Response] {
+            for (count, over) in [(1000, false), (1001, true)] {
+                let mut tx = Transaction::with_config("custom-xml-limit", Arc::new(WafConfig::default()));
+                process_custom_body_processor(&mut tx, b"", direction, false, &XmlValues(count));
+                let (xml, error, message) = match direction {
+                    BodyDirection::Request => (
+                        &tx.request_xml,
+                        RuleVariable::ReqbodyError,
+                        RuleVariable::ReqbodyErrorMsg,
+                    ),
+                    BodyDirection::Response => (
+                        &tx.response_xml,
+                        RuleVariable::ResBodyError,
+                        RuleVariable::ResBodyErrorMsg,
+                    ),
+                };
+                assert_eq!(xml.value_count(), 1000, "{direction:?} {count}");
+                assert_eq!(
+                    raised(&tx, RuleVariable::ArgumentsLimitReached),
+                    over,
+                    "{direction:?} {count}"
+                );
+                assert_eq!(raised(&tx, error), over, "{direction:?} {count}");
+                if over {
+                    let message = tx.get_variable(message, None).unwrap();
+                    assert!(
+                        message.ends_with("custom body processor XML output exceeded the 1000 value argument limit"),
+                        "{message}"
+                    );
+                }
+            }
+        }
     }
 }

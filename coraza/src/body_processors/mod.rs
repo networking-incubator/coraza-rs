@@ -439,7 +439,9 @@ impl BodyProcessorOutput {
     /// Add a value to the request or response XML collection under `path`.
     ///
     /// Charged like an argument: its staged bytes against the content budget and its collection copy against the
-    /// metadata budget.
+    /// metadata budget. When the output is merged, values past `SecArgumentsLimit`, counted with those the
+    /// collection already holds, are dropped: `ARGUMENTS_LIMIT_REACHED` is set and a body error is reported for the
+    /// direction.
     pub fn add_xml(&mut self, path: &[u8], value: &[u8]) {
         if !self.reserve_entry(path, value, 1, self.xml.is_empty()) {
             return;

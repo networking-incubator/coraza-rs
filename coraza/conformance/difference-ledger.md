@@ -185,6 +185,67 @@ adding them requires a shared-corpus fixture first.
   ``;c`~`at /e`~`tc/pa`~`sswd``, ``;c`:`at /e`:`tc/pa`:`sswd`` and
   `;c$()at /e$()tc/pa$()sswd` pass CRS at PL1 here and in Go, and block from
   PL2. Closing that needs a rule change.
+- XML entities, DOCTYPEs, directives, comments and instructions. Go Coraza's
+  XML processor reads with `Strict` off: it publishes a reference to an
+  undeclared entity such as `&p;` as written and skips directives, comments and
+  processing instructions whole, so `<!DOCTYPE a [<!ENTITY p "...">]><a>&p;</a>`
+  is accepted with `&p;` in `XML:/*` (observed with the Go oracle) while an
+  entity-expanding backend reads the payload. This engine refuses the document
+  with `REQBODY_ERROR`: a complete reference to an entity that is not
+  predefined or HTML's (`invalid character entity &p;`, Go's `Strict` wording),
+  a name past ASCII included; a DOCTYPE with an internal subset, an external
+  identifier, a literal or a markup declaration, its root name glued to the
+  keyword or not, a word or another character before or after its root name but
+  blanks, comments and the closing `>`, or a root name that is not an XML name,
+  by the check an element's name gets (`<!DOCTYPE 1abc>`, `<!DOCTYPE -r>`, invalid UTF-8, a character Go's name tables lack); any other directive, and any directive
+  after the first element; and a control character, U+FFFE or U+FFFF in a
+  comment or instruction, and a `--` inside a comment in a DOCTYPE (Go skips a
+  comment in a directive without that check, and refuses one between tags
+  too).
+  libxml2 in recover mode reads the subset of
+  `<!DOCTYPEa [...]>`, before 2.15 skips just the quote of a DOCTYPE literal
+  and reads what follows as a subset or the root element, and reads what such a
+  directive or comment holds as markup
+  (`coraza/src/body_processors/xml/decoder.rs`). Under a body memory budget an
+  error that quotes the document (an undeclared entity, an invalid name, the
+  version or encoding of a declaration) is a stop for the budget, not this
+  error, where the budget has no room for its message: the values read stay,
+  and a host that refuses a budget stop refuses it, whatever its rules.
+- XML bodies that end inside a token. Go Coraza accepts `unexpected EOF`
+  anywhere (for `ProcessPartial`) and drops the token the input ends in: the
+  attributes of a start tag, the text before a reference, or a comment,
+  instruction or directive, so `<r a="..." b="...` or `<r>... &amp` publishes
+  nothing while libxml2 in recover mode keeps the attribute or the text. This
+  engine refuses such a body with `REQBODY_ERROR` (`unexpected EOF`, Go's
+  wording) unless a body limit discarded the rest of it, and accepts, as Go
+  does, one that ends between tags with elements open. Where a body limit cut
+  the body, it publishes what the token had read and Go drops: the complete
+  attributes of a start tag, the part of an attribute value up to the cut,
+  quoted or not, and the text before a reference, the reference as written.
+  Where the cut is in a CDATA section (`unexpected EOF in CDATA section`) or in
+  a UTF-8 character of text or of a quoted value (`invalid UTF-8`), it is Go's
+  syntax error. Where it is in a reference and the text it ends, the reference as
+  written included, holds a forbidden character or broken UTF-8 (`&\xc3`,
+  `\0 &am`, `&\xef\xbf\xbe`, a name holding U+FFFE), it is refused for that,
+  a deliberate deviation: Go accepts the body there (`unexpected EOF`) and
+  drops the text, and this engine fails closed. A cut inside a comment, instruction, DOCTYPE, element name or
+  attribute name is accepted, as in Go, when the unexpected EOF is the only error in the bytes before it: a
+  forbidden character, a `--` inside a comment, a word after a DOCTYPE's root name (`<!DOCTYPE r extra`, with no
+  delimiter after it yet; the root name itself, or a blank after it, is accepted), a root name that is no XML name once a blank, `>` or
+  comment ends it (`<!DOCTYPE 1abc `; cut inside it, `<!DOCTYPE 1ab`, it is accepted), a character before it that is no blank, comment or
+  name (`<!DOCTYPE @`), a directive whose first word, cut at its end, is not the start of `DOCTYPE` in any case
+  (`<!ELE`, `<!ENTI`; `<!DOC` and `<!doct` are accepted, as is `DOCTYPE` with a root name glued to it), an invalid name
+  that ends before the cut (a name is checked once it is complete, so a cut inside one is accepted) or any other syntax error there refuses the body, as it refuses the
+  whole document. A comment, instruction or directive
+  publishes nothing, cut or whole, and neither does a bare attribute name or an
+  element name the cut ended in (`coraza/src/body_processors/xml/mod.rs`).
+- XML value count. Go Coraza publishes every XML attribute and text value; this
+  engine stops at `SecArgumentsLimit` values, keeps those, and sets
+  `ARGUMENTS_LIMIT_REACHED` and `REQBODY_ERROR`. The values committed before the
+  stop stay, but the attributes of a start tag the limit interrupts are not
+  kept, the ones that fit the limit included, so the collection can end below
+  the limit: at a limit of two, a text value and then a start tag with two
+  attributes leave just the text value (`coraza/src/body_processors/xml/mod.rs`).
 
 ## Rust-only multipart parser hardening budgets
 

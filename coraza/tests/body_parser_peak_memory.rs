@@ -309,6 +309,10 @@ fn json_ordinary(count: usize) -> Vec<u8> {
     body
 }
 
+/// The configuration of every XML case: an argument limit no case reaches, as the form cases have, so that only the
+/// budget, or nothing, stops a document.
+const XML_LIMIT: &str = "SecArgumentsLimit 100000000";
+
 /// Peak growth the XML processor may reach without a budget, as a multiple of the body, in bytes asked for. Values
 /// are read straight into `REQUEST_XML`, so a value costs its text and one entry of the collection's list, which
 /// grows by a quarter at a time: the worst body, a dense one, peaks at about eight times its size, where it was
@@ -321,7 +325,7 @@ const XML_CHUNK_PEAK_FACTOR: usize = 20;
 
 /// A value costs its entry in the collection's list, forty bytes and a quarter spare, whatever its text, so a body
 /// of one value per two or three bytes, which no real document is, holds up to twenty-five times its size.
-/// Only an absolute budget bounds that; without one Go Coraza admits it too.
+/// Under a raised argument limit only an absolute budget bounds that; Go Coraza, which has no limit, admits it too.
 const XML_ONE_PER_TWO_BYTES_PEAK_FACTOR: usize = 30;
 
 /// And counting the allocator's chunks, where each of the million values is one of thirty-two bytes.
@@ -334,14 +338,14 @@ const JSON_PEAK_FACTOR: usize = 26;
 const MIB: usize = 1024 * 1024;
 
 /// Bodies that amplify, with the most their peak may be as a multiple of the body, without and with the allocator's
-/// chunks. The JSON one is over Go's raw budget and refused; an XML document never is.
+/// chunks. The JSON one is over Go's raw budget and refused; an XML document under the raised limit never is.
 fn amplifying_cases() -> [(Case, usize, usize); 4] {
     [
         (
             case(
                 "xml, one value per two bytes in one tag",
                 "xml",
-                "",
+                XML_LIMIT,
                 repeated(b"<r", b" b", 2 * MIB, b"></r>"),
             ),
             XML_ONE_PER_TWO_BYTES_PEAK_FACTOR,
@@ -351,7 +355,7 @@ fn amplifying_cases() -> [(Case, usize, usize); 4] {
             case(
                 "xml, 14-byte element with an attribute and text",
                 "xml",
-                "",
+                XML_LIMIT,
                 repeated(b"<r>", b"<a b=\"c\">d</a>", 2 * MIB, b"</r>"),
             ),
             XML_PEAK_FACTOR,
@@ -361,7 +365,7 @@ fn amplifying_cases() -> [(Case, usize, usize); 4] {
             case(
                 "xml, valueless attributes in many tags",
                 "xml",
-                "",
+                XML_LIMIT,
                 repeated(b"<r>", b"<a b c d e f g h/>", 2 * MIB, b"</r>"),
             ),
             XML_ONE_PER_TWO_BYTES_PEAK_FACTOR,
@@ -419,7 +423,7 @@ fn without_a_budget_nothing_but_gos_own_limit_is_refused_and_accounting_covers_w
         case(
             "ordinary xml",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(
                 b"<r>",
                 b"<item id=\"7\"><name>Alice</name><note>hello world</note></item>",
@@ -430,13 +434,13 @@ fn without_a_budget_nothing_but_gos_own_limit_is_refused_and_accounting_covers_w
         case(
             "dense xml list",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"<i>12345</i>", MIB, b"</r>"),
         ),
         case(
             "densest ordinary xml list",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"<i>1</i>", MIB, b"</r>"),
         ),
         case("ordinary json", "json", "", json_ordinary(8_000)),
@@ -478,7 +482,7 @@ const SLACK: usize = MIB;
 
 /// The bodies that must stop at the budget.
 fn budgeted_cases() -> Vec<Case> {
-    let xml = |label, body| case(label, "xml", "", body);
+    let xml = |label, body| case(label, "xml", XML_LIMIT, body);
     let json = |label, body| case(label, "json", "", body);
     let form = |label, body| case(label, "urlencoded", "SecArgumentsLimit 100000000", body);
     vec![
@@ -564,7 +568,7 @@ fn a_budget_that_is_not_reached_changes_nothing() {
         case(
             "xml",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(
                 b"<r>",
                 b"<item id=\"7\"><name>Alice</name><note>hello world</note></item>",
@@ -602,33 +606,33 @@ fn admitted_cases() -> Vec<Case> {
         case(
             "xml, densest list",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"<i>1</i>", 60_000, b"</r>"),
         ),
         case(
             "xml, attribute and text",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"<a b=\"c\">d</a>", 60_000, b"</r>"),
         ),
         case(
             "xml, valueless attributes",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"<a b c d e f g h/>", 60_000, b"</r>"),
         ),
         // References shorten the text below the buffer it was read into, which is trimmed to it when it is stored.
         case(
             "xml, one escaped text node",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<r>", b"&amp;", 250_000, b"</r>"),
         ),
         // 513 values take the list of `/*` past 512 slots, which grows to 1,024 beside the old one.
         case(
             "xml, one past a full list",
             "xml",
-            "",
+            XML_LIMIT,
             format!("<r>{}</r>", "<i>1</i>".repeat(513)).into_bytes(),
         ),
         // The shape that reached 95 MB of peak and 72 MB retained at 400 KB with a raised argument limit and no
@@ -817,13 +821,18 @@ fn xml_names_are_reserved_before_they_are_read_and_a_tags_name_stays_reserved_to
             case(
                 "a long processing instruction target",
                 "xml",
-                "",
+                XML_LIMIT,
                 repeated(b"<?", b"x", BIG, b" data?><r/>"),
             ),
             0,
         ),
         (
-            case("a long prefixed name", "xml", "", repeated(b"<", b"x", BIG, b":y/>")),
+            case(
+                "a long prefixed name",
+                "xml",
+                XML_LIMIT,
+                repeated(b"<", b"x", BIG, b":y/>"),
+            ),
             0,
         ),
         // A 1 MiB element name stays live while the attributes after a short first one are read: a 3 MiB budget
@@ -832,7 +841,7 @@ fn xml_names_are_reserved_before_they_are_read_and_a_tags_name_stays_reserved_to
             case(
                 "a name, a short attribute and a long one",
                 "xml",
-                "",
+                XML_LIMIT,
                 name_in_tag.into_bytes(),
             ),
             3 * MIB,
@@ -859,7 +868,7 @@ fn a_start_tag_the_budget_stops_in_keeps_none_of_its_attributes_and_takes_them_b
         case(
             "xml",
             "xml",
-            "",
+            XML_LIMIT,
             format!("<r>{tags}<b y=\"1\" z=\"{}\"/></r>", "x".repeat(value)).into_bytes(),
         )
     };
@@ -934,37 +943,37 @@ fn the_diagnostics_of_malformed_input_stay_within_the_budget_and_are_accounted_f
         case(
             "xml: a long mismatched end tag name",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<a></", b"b", size, b">"),
         ),
         case(
             "xml: a long end tag name with nothing open",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"</", b"b", size, b">"),
         ),
         case(
             "xml: characters after a long end tag name",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<a></", b"b", size, b" x>"),
         ),
         case(
             "xml: an end tag name in the wrong space",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<p:a></q:", b"b", size, b">"),
         ),
         case(
             "xml: a bad version in the declaration",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<?xml version=\"", b"9", size, b"\"?><a/>"),
         ),
         case(
             "xml: an unsupported encoding in the declaration",
             "xml",
-            "",
+            XML_LIMIT,
             repeated(b"<?xml encoding=\"", b"e", size, b"\"?><a/>"),
         ),
         case(

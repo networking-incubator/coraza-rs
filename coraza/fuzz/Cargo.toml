@@ -55,4 +55,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "coraza_xml_body"
+path = "fuzz_targets/coraza_xml_body.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

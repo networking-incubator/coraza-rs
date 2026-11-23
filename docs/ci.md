@@ -68,11 +68,11 @@ the [parity protocol](../libperfusion/tools/parity/PROTOCOL.md).
   per-target `-max_len`: `raw_bytes` (262144), `sql_grammar` (4096) and
   `html_grammar` (4096) in `libperfusion`; `coraza_variable_list` (4096),
   `seclang_operator` (4096), `seclang_rule_compilation` (4096),
-  `coraza_uri_parser` (65536), `coraza_json_body` (65536) and
-  `coraza_multipart_body` (65536) in `coraza`.
+  `coraza_uri_parser` (65536), `coraza_json_body` (65536),
+  `coraza_multipart_body` (65536) and `coraza_xml_body` (65536) in `coraza`.
 - Campaign corpora and crash artifacts are per target under
   `$RUNNER_TEMP/fuzz/corpus/<target>` and `$RUNNER_TEMP/fuzz/artifacts/<target>`.
-- Each campaign requests 60 seconds of fuzzing for nine targets. Expect roughly
+- Each campaign requests 60 seconds of fuzzing for ten targets. Expect roughly
   10-15 minutes of wall time including the fuzz build, corpus setup and log
   upload on the CI runner; the 20-minute job timeout is sized for that range.
 - Uploads campaign logs and crash artifacts, including on failure.
