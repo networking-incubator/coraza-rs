@@ -31,7 +31,7 @@ use std::{
 
 use coraza::{
     transaction::{BodyCopy, Interruption, Transaction},
-    types::RuleEngineStatus,
+    types::{RuleEngineStatus, RuleVariable},
 };
 use proxy_wasm::{
     hostcalls,
@@ -68,6 +68,17 @@ const RESPONSE_BLOCK_BODY: &[u8] = b"Upstream response blocked\n";
 const REQUEST_INCOMPLETE_BODY: &[u8] = b"Request inspection unavailable\n";
 const RESPONSE_INCOMPLETE_BODY: &[u8] = b"Response inspection unavailable\n";
 const UNSUPPORTED_BODY: &[u8] = b"Request feature is not supported\n";
+
+/// Whether a body processor reported an error on the request body of `tx`: it stopped where it failed, so what
+/// follows was not inspected, and the XML processor, which drops a document it refuses whole, kept none of it.
+fn body_processor_failed(tx: &Transaction) -> bool {
+    tx.get_variable(RuleVariable::ReqbodyError, None).as_deref() == Some("1")
+}
+
+/// Whether the request body of `tx` has the XML processor, which drops a document it refuses whole.
+fn xml_processor(tx: &Transaction) -> bool {
+    tx.get_variable(RuleVariable::ReqbodyProcessor, None).as_deref() == Some("XML")
+}
 
 /// Terminal or explicitly incomplete outcome retained for Stage E publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +348,7 @@ pub(crate) struct CorazaHttp {
     telemetry_publish_failed: bool,
     request_body_truncated: bool,
     response_body_truncated: bool,
+    request_body_failed: bool,
     unread_request_body: UnreadRequestBody,
     request_mode: RequestMode,
     request_method: String,
@@ -367,6 +379,7 @@ impl CorazaHttp {
             telemetry_publish_failed: false,
             request_body_truncated: false,
             response_body_truncated: false,
+            request_body_failed: false,
             unread_request_body: UnreadRequestBody::Absent,
             request_mode: RequestMode::Inspect,
             request_method: String::new(),
@@ -693,7 +706,18 @@ impl CorazaHttp {
                 },
             );
         }
-        if self.tx.as_ref().is_some_and(|tx| tx.request_body_stats().truncated) {
+        // A processor that failed part way, and no rule denied: the budget and the argument limit are refused above,
+        // and a rule that denies on `REQBODY_ERROR` has refused the request, so the policy lets it pass, and the
+        // part of the body the processor did not read, or all of an XML document, was not inspected. A body the limit
+        // cut keeps the truncation as its reason: its parse error comes from the cut, and what the processor read
+        // before it stays inspected. The XML processor keeps nothing of a document it refuses, so for it the failure
+        // is the reason, whatever its cause.
+        let truncated = self.tx.as_ref().is_some_and(|tx| tx.request_body_stats().truncated);
+        self.request_body_failed = self
+            .tx
+            .as_deref()
+            .is_some_and(|tx| body_processor_failed(tx) && (!truncated || xml_processor(tx)));
+        if truncated {
             self.outcome
                 .get_or_insert(TerminalOutcome::BodyPartiallyInspected { phase: "request-body" });
         }
@@ -1395,11 +1419,13 @@ impl CorazaHttp {
         // is; "released" is not "delivered", since a later Envoy filter could still hold the bytes, so this reports
         // conservatively. One that had not come yet can still be released only after a response that completed: a
         // refusal's local reply ends the stream, and the filter holds whatever of the request still arrives after it.
-        let request_body_unread = match self.unread_request_body {
-            UnreadRequestBody::Passed => true,
-            UnreadRequestBody::Pending => final_outcome == TerminalOutcome::Completed,
-            UnreadRequestBody::Absent => false,
-        };
+        // A body a processor failed on, which no rule denied, is reported as not inspected too.
+        let request_body_unread = self.request_body_failed
+            || match self.unread_request_body {
+                UnreadRequestBody::Passed => true,
+                UnreadRequestBody::Pending => final_outcome == TerminalOutcome::Completed,
+                UnreadRequestBody::Absent => false,
+            };
         let inspection_complete = matches!(
             final_outcome,
             TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
@@ -3253,6 +3279,53 @@ mod scripted_host_tests {
         }
     }
 
+    #[test]
+    fn an_xml_error_whose_message_does_not_fit_the_budget_is_refused_by_the_connector_where_no_rule_denies_first() {
+        // `&unknown;` quotes the document in its error, which needs room in the budget. Where there is none the parse
+        // stops for the budget instead: the connector answers 503 then, in every engine mode, unless a rule denies the
+        // body error first, as rule 200002 of `@recommended-conf` does with 400. With room the error is the XML's own.
+        let body = b"<r a=\"1\"><i>x</i>&unknown;</r>";
+        let default_on = policy(LIMITS, "");
+        let detection_only = policy(LIMITS, r#", "SecRuleEngine DetectionOnly""#);
+        let backstop = policy(LIMITS, DENY_BODY_ERRORS);
+        // The statuses of the replies to `body` where the root leaves the stream `spare` bytes to parse in.
+        let statuses = |config: &str, spare: usize| {
+            let (mut stream, root) = stream_beside(config, 0);
+            let size = begin_post(&mut stream, "text/xml", body);
+            // What this very transaction holds is not known before the stream is built.
+            root.set(MAX_ROOT_RETAINED_BODY_BYTES - 3 * size - held(&stream) - spare);
+            stream.on_http_request_body(size, true);
+            test_hostcalls::local_reply_statuses()
+        };
+        let (mut stopped_then_denied, mut parsed_then_denied) = (0, 0);
+        for spare in (0..=16 * 1024).step_by(128) {
+            let (default, only, denying) = (
+                statuses(&default_on, spare),
+                statuses(&detection_only, spare),
+                statuses(&backstop, spare),
+            );
+            assert_eq!(default, only, "{spare}: DetectionOnly answers as the default does");
+            if default == [503] {
+                // Rule 200002 answers first once the stopped parse leaves what the check after it needs; below that
+                // the check answers 503, as it does for any body.
+                assert!(denying == [400] || denying == [503], "{spare}: {denying:?}");
+                stopped_then_denied += usize::from(denying == [400]);
+            } else {
+                assert_eq!(
+                    default,
+                    Vec::<u32>::new(),
+                    "{spare}: the error is the XML's own, and nothing denies it"
+                );
+                assert_eq!(denying, [400], "{spare}: rule 200002");
+                parsed_then_denied += 1;
+            }
+        }
+        assert!(
+            stopped_then_denied > 0 && parsed_then_denied > 0,
+            "{stopped_then_denied} budgets stop the parse and are denied, {parsed_then_denied} reach the error"
+        );
+    }
+
     /// A policy with `rules` beside the body policy a connector gets from CRS: XML, JSON and URL-encoded bodies are
     /// parsed as their content types select, and nothing reads `REQBODY_ERROR`, unless `rules` does.
     fn policy(limits: &str, rules: &str) -> String {
@@ -3268,8 +3341,10 @@ mod scripted_host_tests {
         )
     }
 
-    /// The body limits of the policies above.
-    const LIMITS: &str = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608","#;
+    /// The body limits of the policies above, with an argument limit the dense XML lists never reach, so that only the
+    /// budget stops them.
+    const LIMITS: &str =
+        r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608", "SecArgumentsLimit 100000000","#;
 
     /// What the transaction of `stream` holds, which the engine's share of the root's cap starts from.
     fn held(stream: &CorazaHttp) -> usize {
@@ -3354,7 +3429,7 @@ mod scripted_host_tests {
     #[test]
     fn a_body_the_engine_keeps_a_prefix_of_is_leased_the_prefix_and_not_the_whole_of_what_the_host_holds() {
         const LIMIT: usize = 8 * MIB;
-        let limits = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608", "SecRequestBodyLimitAction ProcessPartial","#;
+        let limits = r#""SecRequestBodyLimit 8388608", "SecRequestBodyInMemoryLimit 8388608", "SecArgumentsLimit 100000000", "SecRequestBodyLimitAction ProcessPartial","#;
         // The host holds 16 MiB and the engine retains 8: with the host's buffer and the guest's copy that is 40 MiB,
         // where charging the whole body three times and a fourth for a copy asked for 64 and left nothing to parse.
         let body = xml_list(2 * LIMIT - 64);
@@ -4200,6 +4275,230 @@ mod scripted_host_tests {
             Some("200004")
         );
         assert_eq!(get_with_cookies(WITH_BASELINE, &[1000]), passed);
+    }
+
+    /// An XML document of `values` text values, the last of them `last`.
+    fn xml_values(values: usize, last: &str) -> Vec<u8> {
+        let mut body = b"<r>".to_vec();
+        for _ in 1..values {
+            body.extend_from_slice(b"<i>1</i>");
+        }
+        body.extend_from_slice(format!("<i>{last}</i></r>").as_bytes());
+        body
+    }
+
+    #[test]
+    fn an_xml_body_past_the_argument_limit_or_not_well_formed_is_never_reported_complete_unless_a_rule_denies_it() {
+        let policy = |directives: &str| {
+            format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On",
+                "SecRule REQUEST_HEADERS:Content-Type \"@contains xml\" \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"",
+                "SecRule REQUEST_HEADERS:Content-Type \"@contains json\" \"id:2,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\"",
+                "SecRule XML:/* \"@contains attack\" \"id:900,phase:2,deny,status:403\""{directives}]}},
+                "default_directives": "p", "enable_filter_state_logs": true}}"#
+            )
+        };
+        let xml: &[(&str, &[u8])] = &[("content-type", b"application/xml")];
+        let default_on = policy("");
+        let refused =
+            |status, reason: &str, outcome: &str, complete: &str| (vec![status], health(reason, outcome, complete));
+        let passed = || (vec![], health("complete", "completed", "true"));
+        // `SecArgumentsLimit` (1000) values are read whole, and a rule reads the last of them.
+        assert_eq!(
+            post_with(&default_on, "/", xml, &xml_values(1000, "benign")),
+            passed(),
+            "1000 values"
+        );
+        assert_eq!(
+            post_with(&default_on, "/", xml, &xml_values(1000, "attack")),
+            refused(403, "denied", "denied", "true"),
+            "the 1000th value is inspected"
+        );
+        // The 1001st is not: the parser stops, and the connector refuses the body as incomplete whatever the policy
+        // says, in every engine mode but `Off`, instead of passing what it did not read. A flood of attributes in
+        // one tag, the stop that keeps nothing of the tag, is refused the same way.
+        let attributes = format!("<r{}/>", " b".repeat(1001));
+        let detection_only = policy(r#", "SecRuleEngine DetectionOnly""#);
+        let partial = policy(r#", "SecRequestBodyLimitAction ProcessPartial""#);
+        for (config, body) in [
+            (&default_on, xml_values(1001, "attack")),
+            (&default_on, xml_values(1001, "benign")),
+            (&default_on, attributes.clone().into_bytes()),
+            (&detection_only, xml_values(1001, "attack")),
+            (&detection_only, attributes.into_bytes()),
+            (&partial, xml_values(1001, "attack")),
+        ] {
+            assert_eq!(
+                post_with(config, "/", xml, &body),
+                refused(413, "incomplete", "incomplete", "false"),
+                "{} bytes",
+                body.len()
+            );
+        }
+        // A rule that denies on the body error or on the dropped argument answers first, as for any denial.
+        let backstop = policy(r#", "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"""#);
+        assert_eq!(
+            post_with(&backstop, "/", xml, &xml_values(1001, "attack")),
+            refused(400, "denied", "denied", "true")
+        );
+        // A raised limit reads the larger document.
+        assert_eq!(
+            post_with(
+                &policy(r#", "SecArgumentsLimit 2000""#),
+                "/",
+                xml,
+                &xml_values(1001, "benign")
+            ),
+            passed()
+        );
+        // A document that is not well formed, which the parser drops whole, is the policy's to refuse: it sets
+        // `REQBODY_ERROR`, and the connector refuses it only where a rule denies on that. Where none does the request
+        // passes, and none of its values was inspected, which is reported as for a body released unread.
+        let not_well_formed = b"<r><i>attack</i>&p;</r>";
+        assert_eq!(
+            post_with(&backstop, "/", xml, not_well_formed),
+            refused(400, "denied", "denied", "true")
+        );
+        let unread = || (vec![], health("request_body_not_inspected", "completed", "false"));
+        assert_eq!(post_with(&default_on, "/", xml, not_well_formed), unread());
+        assert_eq!(post_with(&detection_only, "/", xml, not_well_formed), unread());
+    }
+
+    #[test]
+    fn a_request_body_a_processor_failed_on_part_way_is_reported_as_not_inspected_unless_a_rule_denies_it() {
+        let policy = |directives: &str| {
+            format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On",
+                "SecRule REQUEST_HEADERS:Content-Type \"@contains xml\" \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"",
+                "SecRule REQUEST_HEADERS:Content-Type \"@contains json\" \"id:2,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON\"",
+                "SecRule ARGS_POST|XML:/* \"@contains attack\" \"id:900,phase:2,deny,status:403\""{directives}]}},
+                "default_directives": "p", "enable_filter_state_logs": true}}"#
+            )
+        };
+        let default_on = policy("");
+        let detection_only = policy(r#", "SecRuleEngine DetectionOnly""#);
+        let backstop = policy(r#", "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"""#);
+        let xml: &[(&str, &[u8])] = &[("content-type", b"application/xml")];
+        let json: &[(&str, &[u8])] = &[("content-type", b"application/json")];
+        let form_data: &[(&str, &[u8])] = &[("content-type", b"multipart/form-data; boundary=b")];
+        let passed = || (vec![], health("complete", "completed", "true"));
+        let unread = || (vec![], health("request_body_not_inspected", "completed", "false"));
+        let refused =
+            |status, reason: &str, outcome: &str, complete: &str| (vec![status], health(reason, outcome, complete));
+        // A multipart body of two fields, the header of the second as given.
+        let multipart_with = |first: &str, second: &str, header: &str| {
+            format!(
+                "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n{first}\r\n--b\r\n{header}\r\n\r\n{second}\r\n--b--\r\n"
+            )
+            .into_bytes()
+        };
+        let bodies = [
+            // A syntax error part way: the processor keeps `a` and never reads the rest, which a backend that
+            // reads single quotes would see.
+            (json, &br#"{"a":"benign"}"#[..], &br#"{"a":"benign",'c':"attack"}"#[..]),
+            (json, &br#"{"a":"benign"}"#[..], &br#"{"a":"#[..]),
+            (
+                xml,
+                &b"<r><i>benign</i></r>"[..],
+                &b"<r><i>benign</i><i>attack</i>&p;</r>"[..],
+            ),
+        ];
+        for (headers, whole, cut) in bodies {
+            let name = String::from_utf8_lossy(cut);
+            assert_eq!(
+                post_with(&default_on, "/", headers, whole),
+                passed(),
+                "{name}: well formed"
+            );
+            assert_eq!(post_with(&default_on, "/", headers, cut), unread(), "{name}");
+            assert_eq!(
+                post_with(&detection_only, "/", headers, cut),
+                unread(),
+                "{name}: DetectionOnly"
+            );
+            // A rule that denies on the error refuses first, and is reported as any denial is.
+            assert_eq!(
+                post_with(&backstop, "/", headers, cut),
+                refused(400, "denied", "denied", "true"),
+                "{name}: rule 200002"
+            );
+        }
+        // A body `ProcessPartial` cut fails to parse because of the cut, not the client: it keeps the truncation as
+        // its reason, as a cut URL-encoded, XML or multipart body does, and the status does not change.
+        let cut = policy(r#", "SecRequestBodyLimit 12", "SecRequestBodyLimitAction ProcessPartial""#);
+        assert_eq!(
+            post_with(&cut, "/", json, br#"{"a":"benign","b":"benign"}"#),
+            (vec![], health("body_partially_inspected", "completed", "false"))
+        );
+        // The XML processor drops a document it refuses whole, so a syntax error that a retained prefix holds leaves
+        // none of its values inspected, and that is the reason, where the cut alone would be the partial one, as with
+        // JSON above. A cut prefix that parses keeps the truncation as its reason, and a cut that is itself the
+        // error (in a CDATA section) drops the document too. A rule that denies on the error answers first.
+        let cut_xml = |directives: &str| {
+            policy(&format!(
+                r#", "SecRequestBodyLimit 24", "SecRequestBodyLimitAction ProcessPartial"{directives}"#
+            ))
+        };
+        let partial = || (vec![], health("body_partially_inspected", "completed", "false"));
+        let detection_only_cut = cut_xml(r#", "SecRuleEngine DetectionOnly""#);
+        for (body, expected, name) in [
+            (
+                &b"<r><i>x</i>&p;</r><i>attack</i><i>attack</i>"[..],
+                unread(),
+                "a syntax error in the prefix",
+            ),
+            (
+                b"<r><i>x</i><i>benign benign</i><i>attack</i>",
+                partial(),
+                "a prefix that parses",
+            ),
+            (
+                b"<r><![CDATA[benign benign benign]]></r>",
+                unread(),
+                "a cut in a CDATA section",
+            ),
+        ] {
+            let name = format!("{} ({name})", String::from_utf8_lossy(body));
+            assert_eq!(post_with(&cut_xml(""), "/", xml, body), expected, "{name}");
+            assert_eq!(
+                post_with(&detection_only_cut, "/", xml, body),
+                expected,
+                "{name}: DetectionOnly"
+            );
+        }
+        assert_eq!(
+            post_with(
+                &cut_xml(r#", "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"""#),
+                "/",
+                xml,
+                b"<r><i>x</i>&p;</r><i>attack</i><i>attack</i>"
+            ),
+            // A denial is the reason, as for any request, and the body the limit cut is still not complete.
+            refused(400, "denied", "denied", "false"),
+            "rule 200002"
+        );
+        // What the processor read before it failed is still inspected: a rule that denies on it answers, and the
+        // denial is what is reported, complete, as for a parser stop that a rule denies.
+        assert_eq!(
+            post_with(&default_on, "/", json, br#"{"a":"attack",'c':"benign"}"#),
+            refused(403, "denied", "denied", "true")
+        );
+        // A multipart body whose second part has a header that is no header: a parse error with the first part kept.
+        // The host's ban on uploads refuses the body the parser stopped in, with 413, where the engine enforces; in
+        // `DetectionOnly` nothing does, and it passes, the same.
+        let field = r#"Content-Disposition: form-data; name="c""#;
+        let well_formed = multipart_with("benign", "benign", field);
+        let malformed = multipart_with("benign", "attack", "no colon here");
+        assert_eq!(post_with(&default_on, "/", form_data, &well_formed), passed());
+        assert_eq!(
+            post_with(&default_on, "/", form_data, &malformed),
+            refused(413, "denied", "denied", "true")
+        );
+        assert_eq!(post_with(&detection_only, "/", form_data, &malformed), unread());
+        assert_eq!(
+            post_with(&backstop, "/", form_data, &malformed),
+            refused(400, "denied", "denied", "true")
+        );
     }
 
     #[test]

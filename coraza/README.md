@@ -579,6 +579,94 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   and cannot split the `Location` header an embedder puts it in. A target
   without such bytes is unchanged. This is a deliberate deviation: Go Coraza
   stores the raw bytes, and its HTTP middleware never sends a `Location` header.
+- The XML request body processor refuses what a backend's parser would read as
+  text this engine never inspects. These are a syntax error: a complete
+  reference to an entity that is neither one of XML's five nor an HTML 4 entity
+  (`&p;`, or a name past ASCII such as `&Ͱ;`); a DOCTYPE with an internal
+  subset (`[`), an external identifier (`SYSTEM` or `PUBLIC`, in any case), a
+  quoted literal or a markup declaration, whether or not its root name is glued
+  to the keyword, or with a word or any other character before or after its
+  root name but blanks, comments and the closing `>` (`<!DOCTYPE r extra>`,
+  `<!DOCTYPE @r>`), or a root name that is not an XML name, by the same check
+  as an element's (`<!DOCTYPE 1abc>`, `<!DOCTYPE -r>`, invalid UTF-8, or a
+  character outside Go's name tables that XML 1.0's fifth edition allows, which
+  an element name is refused for too; a bare `<!DOCTYPE name>` with a name such
+  as `a:b-c.1` or `é` is accepted); any other
+  directive, such as `<!ENTITY ...>` outside a DOCTYPE, and any directive
+  after the first element; a control character other than tab and line ends,
+  U+FFFE or U+FFFF in a comment or processing instruction, and a `--` inside a
+  comment in a DOCTYPE (Go refuses one between tags too); and a body that ends
+  inside a tag, a reference, a comment, an instruction or a directive
+  (`unexpected EOF`) when no body limit cut it there. libxml2 in recover mode reads
+  the subset of `<!DOCTYPEa [...]>`; before 2.15 it skips just the quote of
+  `<!DOCTYPE a "...` and reads what follows as a subset or the root element; it
+  ends a comment or instruction at such a character, and within an element
+  skips just the `<!` of a directive, and reads on from there as markup; and it
+  keeps the attributes of a tag, or the text before a reference, that the input
+  ends in. `REQBODY_ERROR` and `REQBODY_PROCESSOR_ERROR` are set, no value of
+  the document is kept, and the baseline's rule 200002 denies with 400. Under
+  a body memory budget (`Transaction::set_body_memory_budget`) an error that
+  quotes the document, an undeclared entity, an invalid name or the version or
+  encoding of a declaration, needs room in the budget for its message: where
+  the budget has none, the parse stops for the budget instead, keeping the
+  values it read and setting `REQBODY_ERROR` with the budget's message, and a
+  host that refuses a stop for the budget, as the Envoy connector does with
+  503, refuses it where no rule denies first: with the enforcing
+  `@recommended-conf`, rule 200002 can answer 400 first. Go
+  Coraza publishes `&p;` as written, skips directives, comments and
+  instructions whole, and drops a token the input ends in, so an entity's
+  payload, or markup or values they held, reached such a backend unseen. A bare
+  `<!DOCTYPE name>` before the first element, a body that ends between tags
+  with elements open, references without `;`, numeric references and HTML
+  entities such as `&nbsp;` are unchanged. A body that
+  `SecRequestBodyLimitAction ProcessPartial` cut inside a token is not
+  refused, and publishes what the token had read, where Go drops it with the
+  token: the complete attributes of a start tag, the part of an attribute value
+  up to the cut, quoted or not, and the text before a reference, which ends at
+  the cut, the reference as written (`&am`). Only what the cut left unread goes
+  uninspected, as past any `ProcessPartial` cut. A comment, instruction or
+  directive publishes nothing, cut or whole, and neither does a bare attribute
+  name or an element name that the cut ended in. Three cuts are refused, with
+  `REQBODY_ERROR` set and a 400 from rule 200002: inside a CDATA section, and
+  inside a UTF-8 character of text or of a quoted value, which are Go's syntax
+  errors, and inside a reference when the text it ends, the reference as
+  written included, holds a forbidden character or broken UTF-8 (`&\xc3`,
+  `\0 &am`, `&\xef\xbf\xbe`, a name holding U+FFFE). Go accepts the body at
+  such a reference and drops the text, so this is stricter than Go on purpose,
+  to fail closed. A cut inside a comment, instruction, DOCTYPE,
+  element name or attribute name is accepted like any other cut, when the
+  unexpected EOF is the only error in the bytes before it: a forbidden
+  character, a `--` inside a comment, a word after a DOCTYPE's root name
+  (`<!DOCTYPE r extra`, with no delimiter after it yet; the root name itself, or a
+  blank after it, is accepted), a root name that is no XML name once a blank,
+  `>` or comment ends it (`<!DOCTYPE 1abc `; cut inside it, `<!DOCTYPE 1ab`, it
+  is accepted), a character before it that is no blank, comment
+  or name (`<!DOCTYPE @`), a directive whose first word, cut at its end, is
+  not the start of `DOCTYPE` in any case (`<!ELE`, `<!ENTI`; `<!DOC` and
+  `<!doct` are accepted, and so is `DOCTYPE` with a root name glued to it),
+  an invalid name that ends before the cut (a name is checked once it is
+  complete, so a cut inside one is accepted) or any other syntax error there
+  refuses the body, as it refuses the whole document. The cost is a false
+  positive on XML that declares its own
+  entities and on documents whose DOCTYPE names an external DTD (`PUBLIC` or
+  `SYSTEM`), such as XHTML 1.0, SVG 1.1, property lists and
+  `<!DOCTYPE html SYSTEM "about:legacy-compat">`; the other refusals concern
+  only documents that are not well-formed XML. To accept such documents on a
+  path, select another body processor for it with a later phase 1
+  `ctl:requestBodyProcessor`.
+- XML values count against `SecArgumentsLimit`. `REQUEST_XML` keeps at most as
+  many attribute and text values together as the limit (1000 by default); a
+  document with more stops there, keeps the values before it, and sets
+  `ARGUMENTS_LIMIT_REACHED` and `REQBODY_ERROR`, so the baseline's rules 200002
+  and 200005 deny it. The values committed before the stop stay, but the
+  attributes of a start tag the limit stops in are not kept, as when the memory
+  budget stops in one, the ones that fit the limit included, so the collection
+  can end below the limit (at a limit of two, a text value and then a start tag
+  with two attributes leave just the text value). A custom body processor's XML
+  output is cut at the same limit, in both directions, with the same flag and
+  the direction's body error. Go Coraza has no limit on XML values, and each is
+  one more evaluation of every rule that reads XML. Deployments with large SOAP
+  or feed uploads raise `SecArgumentsLimit`.
 
 ## FTW integration
 

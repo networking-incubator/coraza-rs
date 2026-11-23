@@ -4,7 +4,12 @@
 //! The part of Go's `encoding/xml` `Decoder` (`src/encoding/xml/xml.go`) that Go
 //! Coraza's XML body processor uses, set up as it sets it up: `Strict` off, `AutoClose`
 //! with the HTML elements, and `Entity` with HTML's. Name spaces aren't translated, since
-//! the body processor reads no names.
+//! the body processor reads no names. Unlike Go, it refuses what would make a backend's parser
+//! see other text than it does: a reference to an entity that is not predefined or HTML's, a
+//! DOCTYPE with more than its name and comments, any other directive, and a character XML does
+//! not allow in a comment or instruction; and it tells an input that ends within a token, which
+//! loses the token, from one that ends between two. Where a body limit cut the input, a reference or an unquoted
+//! attribute value it ends in ends there instead, as written.
 
 use std::fmt;
 
@@ -61,10 +66,20 @@ pub(super) enum DecodeError {
         budget: usize,
     },
 
-    /// The input ended within a token or an element: Go's `SyntaxError` "unexpected EOF"
+    /// Reading on would publish more values than the argument limit allows; there is no Go counterpart.
+    ArgumentLimit {
+        /// The limit, in values.
+        limit: usize,
+    },
+
+    /// The input ended within an element, or within a token, which is then lost: Go's `SyntaxError` "unexpected EOF".
+    /// A reference, or an unquoted attribute value, is no such token where a body limit cut the input: it ends
+    /// there instead.
     UnexpectedEof {
         /// Current one-based line number.
         line: usize,
+        /// Whether it ended within a token rather than between two.
+        in_token: bool,
     },
 
     /// Go's `SyntaxError`: what's wrong, on which line (from 1)
@@ -85,7 +100,10 @@ impl fmt::Display for DecodeError {
             DecodeError::MemoryBudget { budget } => {
                 write!(f, "parsed XML exceeds the {budget} byte body memory budget")
             },
-            DecodeError::UnexpectedEof { line } => {
+            DecodeError::ArgumentLimit { limit } => {
+                write!(f, "parsed XML exceeds the {limit} value argument limit")
+            },
+            DecodeError::UnexpectedEof { line, .. } => {
                 write!(f, "XML syntax error on line {line}: unexpected EOF")
             },
             DecodeError::Syntax { line, message } => {
@@ -129,12 +147,19 @@ pub(super) struct Decoder<'a> {
     next_token: Option<Token>,
     /// The memory its host allows it, which charges everything the decoder holds, values and scratch alike
     memory: MemoryBudget,
+    /// The most values the sink may hold
+    limit: usize,
+    /// Whether a body limit cut the input: a reference or an unquoted attribute value it ends in then ends there, as
+    /// written
+    cut: bool,
     /// Stack entries already charged against `memory`: the stack's high-water mark, as it never shrinks
     open_charged: usize,
     /// Scratch bytes charged against `memory` since the token began, given back when it ends
     scratch: usize,
     /// Attribute values the start tag being read has handed over, which it takes back if it does not complete
     tag_attributes: usize,
+    /// Whether an element has started, after which no directive is accepted
+    past_prolog: bool,
     /// Bytes of the names of the elements open now
     open_name_bytes: usize,
     /// The most `open_name_bytes` has reached, which is what has been charged for names
@@ -157,7 +182,9 @@ const EXCERPT_BYTES: usize = 64;
 impl<'a> Decoder<'a> {
     /// Create a decoder over an XML document that holds what it reads within the host's `memory` budget: it reads
     /// ahead to size what it is about to allocate, and charges that first. An unlimited budget changes nothing.
-    pub(super) fn new(input: &'a [u8], memory: MemoryBudget) -> Self {
+    /// A sink that holds `limit` values takes no more. `cut` tells that a body limit discarded the rest of the body,
+    /// which ends the input where the document did not.
+    pub(super) fn new(input: &'a [u8], memory: MemoryBudget, limit: usize, cut: bool) -> Self {
         Self {
             input,
             offset: 0,
@@ -167,9 +194,12 @@ impl<'a> Decoder<'a> {
             pending_charged: 0,
             next_token: None,
             memory,
+            limit,
+            cut,
             open_charged: 0,
             scratch: 0,
             tag_attributes: 0,
+            past_prolog: false,
             open_name_bytes: 0,
             name_bytes_charged: 0,
         }
@@ -192,6 +222,19 @@ impl<'a> Decoder<'a> {
             Err(DecodeError::MemoryBudget {
                 budget: self.memory.limit(),
             })
+        }
+    }
+
+    /// Admits one more value into a sink that holds `count`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::ArgumentLimit`] when the sink already holds as many as the limit allows.
+    pub(super) fn admit(&self, count: usize) -> Result<(), DecodeError> {
+        if count < self.limit {
+            Ok(())
+        } else {
+            Err(DecodeError::ArgumentLimit { limit: self.limit })
         }
     }
 
@@ -291,7 +334,12 @@ impl<'a> Decoder<'a> {
             None => match self.raw_token(sink)? {
                 Some(token) => token,
                 None if self.open.is_empty() => return Ok(None),
-                None => return Err(DecodeError::UnexpectedEof { line: self.line }),
+                None => {
+                    return Err(DecodeError::UnexpectedEof {
+                        line: self.line,
+                        in_token: false,
+                    });
+                },
             },
         };
         let token = match self.auto_close(&token) {
@@ -320,6 +368,7 @@ impl<'a> Decoder<'a> {
                     self.reserve(self.open_name_bytes - self.name_bytes_charged)?;
                     self.name_bytes_charged = self.open_name_bytes;
                 }
+                self.past_prolog = true;
                 let auto_close = AUTO_CLOSE.iter().copied().find(|html| equal_fold(html, &name.local));
                 self.open.push(Open {
                     name: name.clone(),
@@ -410,8 +459,8 @@ impl<'a> Decoder<'a> {
                     }
                     Token::CharData(self.text(TextEnd::Cdata)?)
                 },
-                _ => {
-                    self.directive()?;
+                first => {
+                    self.directive(first)?;
                     Token::Other
                 },
             },
@@ -436,16 +485,17 @@ impl<'a> Decoder<'a> {
         if keep {
             content.reserve_exact(self.scratch_for(|decoder| decoder.through(b"?>"))?);
         }
-        let mut previous = 0;
+        let (mut b0, mut b1) = (0, 0);
         loop {
             let b = self.mustgetc()?;
-            if previous == b'?' && b == b'>' {
+            if b1 == b'?' && b == b'>' {
                 break;
             }
+            self.skippable(b0, b1, b)?;
             if keep {
                 content.push(b);
             }
-            previous = b;
+            (b0, b1) = (b1, b);
         }
         content.pop();
         if !keep {
@@ -538,59 +588,96 @@ impl<'a> Decoder<'a> {
                 }
                 return Ok(());
             }
+            self.skippable(b0, b1, b)?;
             (b0, b1) = (b1, b);
         }
     }
 
-    /// Reads a directive such as `<!DOCTYPE ...>`, after its `<!` and first byte: up to
-    /// the `>` that isn't quoted and closes every `<` it holds, its comments skipped.
-    fn directive(&mut self) -> Result<(), DecodeError> {
-        let mut quote = 0;
-        let mut depth = 0_usize;
-        // A byte read while looking for a comment, handled as if just read, but for
-        // ending the directive
-        let mut reread = None;
+    /// Checks the byte `b` of a comment or processing instruction, after `b0` and `b1`.
+    ///
+    /// # Errors
+    ///
+    /// When `b` ends a character XML does not allow: a control character but tab and line ends, U+FFFE or U+FFFF.
+    /// Go skips them with the rest, but libxml2 in recover mode ends the comment or instruction there and reads what
+    /// follows as markup.
+    #[inline]
+    fn skippable(&self, b0: u8, b1: u8, b: u8) -> Result<(), DecodeError> {
+        let code = match (b0, b1, b) {
+            (_, _, 0x20..0xBE | b'\t' | b'\n' | b'\r') => return Ok(()),
+            (_, _, 0..0x20) => u32::from(b),
+            (0xEF, 0xBF, 0xBE) => 0xFFFE,
+            (0xEF, 0xBF, 0xBF) => 0xFFFF,
+            _ => return Ok(()),
+        };
+        Err(self.syntax_error(format!("illegal character code U+{code:04X}")))
+    }
+
+    /// Reads a directive such as `<!DOCTYPE ...>`, after its `<!`, from its `first` byte:
+    /// up to its `>`, its comments skipped.
+    ///
+    /// # Errors
+    ///
+    /// Any directive but a DOCTYPE before the first element, and a DOCTYPE with an internal subset, an external
+    /// identifier, a literal or a markup declaration in it, a word or another character before or after its root
+    /// name but blanks, comments and the end, or a root name that is no XML name (checked when a delimiter ends it,
+    /// as an element's is, so a bare `<!DOCTYPE 1a>` is refused and one the input ends in is not). A comment in it is
+    /// read, and refused when malformed, as one between tags. Go skips a directive whole, but a backend's parser reads
+    /// a DOCTYPE, and the entities it declares or fetches expand there into text this one never sees; libxml2 in
+    /// recover mode also takes `<!DOCTYPE` with the root name glued to it, before 2.15 skips just the quote of a
+    /// literal and reads what follows as a subset or the root element, and within an element skips just the `<!` of a
+    /// directive and reads what it quotes or nests as markup. No valid document has another directive, a literal
+    /// outside an external identifier or a subset, or a word after the root name of a DOCTYPE that has neither. A bare
+    /// `<!DOCTYPE name>` is skipped as in Go.
+    fn directive(&mut self, first: u8) -> Result<(), DecodeError> {
+        if self.past_prolog {
+            return Err(self.syntax_error("directive after the first element is not accepted"));
+        }
+        // Its words outside comments, from the first byte, which must start one.
+        let mut words = DirectiveWords::default();
+        let mut b = first;
         loop {
-            let b = if let Some(b) = reread.take() {
-                b
-            } else {
-                let b = self.mustgetc()?;
-                if quote == 0 && b == b'>' && depth == 0 {
-                    return Ok(());
-                }
-                b
-            };
-            if b == quote {
-                quote = 0;
-            } else if quote != 0 {
-                // Quoted
-            } else if b == b'\'' || b == b'"' {
-                quote = b;
-            } else if b == b'>' {
-                depth -= 1;
-            } else if b == b'<' {
-                let mut mismatch = None;
-                for &expected in b"!--" {
-                    let b = self.mustgetc()?;
-                    if b != expected {
-                        mismatch = Some(b);
-                        break;
-                    }
-                }
-                if mismatch.is_some() {
-                    depth += 1;
-                    reread = mismatch;
-                    continue;
-                }
-                let (mut b0, mut b1) = (0, 0);
-                loop {
-                    let b = self.mustgetc()?;
-                    if b0 == b'-' && b1 == b'-' && b == b'>' {
-                        break;
-                    }
-                    (b0, b1) = (b1, b);
-                }
+            let root_len = words.take(b).map_err(|cause| self.syntax_error(cause))?;
+            // The root name just ended, at this byte: it must be an XML name, as an element's is.
+            let root_end = self.offset.saturating_sub(1);
+            let root = root_end
+                .checked_sub(root_len)
+                .and_then(|start| self.input.get(start..root_end));
+            if root_len > 0 && !root.is_some_and(is_name) {
+                return Err(self.syntax_error("DOCTYPE root name is not an XML name"));
             }
+            match b {
+                b'>' => return Ok(()),
+                b'\'' | b'"' => return Err(self.syntax_error("DOCTYPE with a literal is not accepted")),
+                b'[' => return Err(self.syntax_error("DOCTYPE with an internal subset is not accepted")),
+                b'<' => {
+                    for &expected in b"!-" {
+                        if self.mustgetc()? != expected {
+                            return Err(self.syntax_error("DOCTYPE with a markup declaration is not accepted"));
+                        }
+                    }
+                    // As between tags, so a comment is malformed in both or in neither.
+                    self.comment()?;
+                },
+                // Between its keyword and its root name, and past the root name, a DOCTYPE has blanks, comments and
+                // its end, and nothing else is well formed.
+                _ if (words.names_root() || words.awaits_root())
+                    && b.is_ascii()
+                    && !is_name_byte(b)
+                    && !matches!(b, b' ' | b'\t' | b'\r' | b'\n') =>
+                {
+                    return Err(self.syntax_error(MORE_THAN_ROOT_NAME));
+                },
+                _ => {},
+            }
+            b = match self.mustgetc() {
+                Ok(b) => b,
+                Err(eof) => {
+                    // A word past the root name that the input ends in is refused as one a delimiter ended: it is
+                    // already more than a root name, however much a body limit cut off it.
+                    words.end().map_err(|cause| self.syntax_error(cause))?;
+                    return Err(eof);
+                },
+            };
         }
     }
 
@@ -598,10 +685,11 @@ impl<'a> Decoder<'a> {
     /// for one, and an unquoted value is the run of letters, digits, `_`, `:` and `-`
     /// (not `Strict`).
     ///
-    /// A single start tag can hold as many attributes as the body has bytes, so each value is charged as it is
-    /// read and handed to the sink at once, instead of waiting in a list beside the collection it joins. A tag that
-    /// does not complete leaves them with the caller, who is told how many by [`Decoder::unfinished_attributes`]
-    /// and drops them, as a token that was never returned never had them.
+    /// A single start tag can hold as many attributes as the body has bytes, so each value is admitted under the
+    /// argument limit and charged as it is read, and handed to the sink at once, instead of waiting in a list beside
+    /// the collection it joins. A tag the budget or the limit ends in leaves them with the caller, who is told how many
+    /// by [`Decoder::unfinished_attributes`] and drops them, as a token that was never returned never had them. One the
+    /// input ends in, as a body limit cut it, keeps them.
     fn start_tag(&mut self, sink: &mut dyn super::Sink) -> Result<Token, DecodeError> {
         let name = self
             .nsname()?
@@ -635,6 +723,7 @@ impl<'a> Decoder<'a> {
                 attribute.local
             };
             self.release_scratch_to(mark);
+            self.admit(sink.value_count())?;
             let cost = self.cost(&value, |len| sink.attribute_cost(len));
             self.reserve(cost.grown)?;
             self.tag_attributes = self.tag_attributes.saturating_add(1);
@@ -645,12 +734,14 @@ impl<'a> Decoder<'a> {
         Ok(Token::Start { name })
     }
 
-    /// How many attribute values the start tag the input or the budget ended in had handed over before it ended.
+    /// How many attribute values the start tag the input, the budget or the limit ended in had handed over before it
+    /// ended.
     pub(super) const fn unfinished_attributes(&self) -> usize {
         self.tag_attributes
     }
 
-    /// Reads an attribute's value, after its `=` (Go's `attrval`).
+    /// Reads an attribute's value, after its `=` (Go's `attrval`). An unquoted value that a body limit cut the input
+    /// in ends there, like a quoted one, and keeps what it had read.
     fn attribute_value(&mut self) -> Result<String, DecodeError> {
         let b = self.mustgetc()?;
         if b == b'"' || b == b'\'' {
@@ -662,7 +753,12 @@ impl<'a> Decoder<'a> {
             decoder.run_len(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-')))
         })?);
         loop {
-            let b = self.mustgetc()?;
+            let b = match self.mustgetc() {
+                Ok(b) => b,
+                // A body limit cut the value: what it read is kept, as for a quoted one.
+                Err(DecodeError::UnexpectedEof { .. }) if self.cut => return Ok(value),
+                Err(error) => return Err(error),
+            };
             if b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-') {
                 value.push(char::from(b));
             } else {
@@ -674,8 +770,10 @@ impl<'a> Decoder<'a> {
 
     /// Reads text up to `end`, past it for a quote or `]]>`. Outside CDATA sections, the
     /// entities XML predefines and HTML 4's, and numeric character references, are
-    /// replaced, and others kept as written (not `Strict`); `\r\n` and `\r` read as `\n`.
-    /// Text that reaches the end of the input ends there, but for a CDATA section's.
+    /// replaced, a reference to any other entity is an error, and what only looks like a
+    /// reference is kept as written (not `Strict`); `\r\n` and `\r` read as `\n`.
+    /// Text that reaches the end of the input ends there, but for a CDATA section's, and so does the text of a
+    /// reference that a body limit cut the input in.
     fn text(&mut self, end: TextEnd) -> Result<String, DecodeError> {
         let (mut b0, mut b1) = (0, 0);
         let mut text = Vec::new();
@@ -722,8 +820,24 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads an entity or character reference, after its `&`, onto `text`: what it stands
-    /// for, or as written.
+    /// for, or as written when it has no `;`, or is ASCII and no name.
+    ///
+    /// # Errors
+    ///
+    /// A complete reference `&name;` to an entity that is neither predefined nor HTML's, or past ASCII to no entity.
+    /// Input that ends within the reference, unless a body limit cut it there.
     fn reference(&mut self, text: &mut Vec<u8>) -> Result<(), DecodeError> {
+        match self.whole_reference(text) {
+            // A reference a body limit cut ends the text there, which keeps what was read, the reference as written.
+            // The text it ends is checked: it is refused when that text, the reference as written included, holds a
+            // forbidden character or broken UTF-8, where Go accepts.
+            Err(DecodeError::UnexpectedEof { .. }) if self.cut => Ok(()),
+            result => result,
+        }
+    }
+
+    /// [`Decoder::reference`] of one that the input does not end in.
+    fn whole_reference(&mut self, text: &mut Vec<u8>) -> Result<(), DecodeError> {
         let start = text.len();
         text.push(b'&');
         let mut replacement = None;
@@ -760,8 +874,14 @@ impl<'a> Decoder<'a> {
             self.read_name(text)?;
             if self.mustgetc()? == b';' {
                 let name = text.get(start.saturating_add(1)..).unwrap_or_default();
-                if is_name(name) {
+                // Past ASCII, a name Go's tables do not hold is one to a parser of XML 1.0's fifth edition.
+                if is_name(name) || !name.is_ascii() {
+                    // An entity the document declared itself would expand in a backend's parser into text this one
+                    // never sees, so a reference to any other is refused, as Go's `Strict` mode refuses it.
                     replacement = entity(name);
+                    if replacement.is_none() {
+                        return Err(self.unknown_entity(name));
+                    }
                 }
                 text.push(b';');
             } else {
@@ -773,6 +893,17 @@ impl<'a> Decoder<'a> {
             text.extend_from_slice(replacement.encode_utf8(&mut [0; 4]).as_bytes());
         }
         Ok(())
+    }
+
+    /// The error for a reference to `name`, which is no entity this decoder knows; out of line, as `text` inlines
+    /// [`Decoder::reference`].
+    #[cold]
+    #[inline(never)]
+    fn unknown_entity(&mut self, name: &[u8]) -> DecodeError {
+        match self.excerpt(name) {
+            Ok(shown) => self.syntax_error(format!("invalid character entity &{shown};")),
+            Err(error) => error,
+        }
     }
 
     /// `text` as a string, if it's UTF-8 of the characters XML allows.
@@ -872,7 +1003,10 @@ impl<'a> Decoder<'a> {
 
     /// Read one byte or report that the input ended.
     fn mustgetc(&mut self) -> Result<u8, DecodeError> {
-        self.getc().ok_or(DecodeError::UnexpectedEof { line: self.line })
+        self.getc().ok_or(DecodeError::UnexpectedEof {
+            line: self.line,
+            in_token: true,
+        })
     }
 
     /// Steps back over the byte [`Self::getc`] just read.
@@ -889,6 +1023,107 @@ impl<'a> Decoder<'a> {
             line: self.line,
             message: message.into(),
         }
+    }
+}
+
+/// Why a DOCTYPE with a word, or a character that is none, before or after its root name is refused.
+const MORE_THAN_ROOT_NAME: &str = "DOCTYPE with more than its root name is not accepted";
+
+/// What the words of a directive, outside its comments, say about it: whether it is a DOCTYPE, and whether it has
+/// a word past its root name. Only as much of a word as the longest keyword is kept, so nothing allocates.
+#[derive(Default)]
+struct DirectiveWords {
+    /// The start of the word being read.
+    word: [u8; 7],
+    /// The length of the word being read, which may pass what `word` holds.
+    len: usize,
+    /// The words read before it, the root name counted with a keyword it is glued to.
+    count: usize,
+}
+
+impl DirectiveWords {
+    /// Whether the root name has ended: the `DOCTYPE` keyword and the word after it, or a word glued to the keyword.
+    const fn names_root(&self) -> bool {
+        self.count >= 2
+    }
+
+    /// Whether the `DOCTYPE` keyword has ended and the root name has not begun.
+    const fn awaits_root(&self) -> bool {
+        self.count == 1 && self.len == 0
+    }
+
+    /// Reads the next byte of the directive outside comments. Returns the length of the root name this byte ends, which
+    /// is the bytes before it, or 0 if it ends none: a root name has a delimiter after it, and one the input ends in
+    /// is not checked, as a body limit may have cut it inside a character or before the rest of it.
+    ///
+    /// # Errors
+    ///
+    /// Why the directive is refused: its first word does not start with `DOCTYPE`, in any case, or there is a word
+    /// after the root name. A lenient backend may take any of these spellings, and a well-formed DOCTYPE with
+    /// nothing else in it has none; `SYSTEM` and `PUBLIC`, in any case, start the external identifier it may not
+    /// have either.
+    fn take(&mut self, b: u8) -> Result<usize, &'static str> {
+        if !b.is_ascii() || is_name_byte(b) {
+            if let Some(slot) = self.word.get_mut(self.len) {
+                *slot = b;
+            }
+            self.len = self.len.saturating_add(1);
+            return Ok(0);
+        }
+        let mut root_len = 0;
+        if self.count == 0 {
+            // libxml2 takes `<!DOCTYPE` with anything after it for a DOCTYPE, the root name glued to it included.
+            if self.len < self.word.len() || !self.word.eq_ignore_ascii_case(b"DOCTYPE") {
+                return Err("directive other than a DOCTYPE is not accepted");
+            }
+            root_len = self.len.saturating_sub(self.word.len());
+            self.count = if root_len > 0 { 2 } else { 1 };
+        } else if self.len > 0 {
+            self.end()?;
+            root_len = self.len;
+            self.count = 2;
+        }
+        self.len = 0;
+        Ok(root_len)
+    }
+
+    /// Checks the word being read once it has ended, by a delimiter or by the end of the input.
+    ///
+    /// # Errors
+    ///
+    /// Why a word is refused: a first word that is no prefix of `DOCTYPE` in any case (a body limit that cut
+    /// `<!ELE` could not have made a DOCTYPE of it), a word after the root name: `SYSTEM` and `PUBLIC`, in any case,
+    /// start an external identifier, and any other word is more than the root name. The root name itself, and a word
+    /// cut inside the keyword or after it (the root name glued to it), are not refused, so a body limit may cut a
+    /// DOCTYPE there.
+    fn end(&self) -> Result<(), &'static str> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        if self.count == 0 {
+            // `word` holds the first 7 bytes, so a longer word is a prefix only if it starts with the whole keyword.
+            let start = self.word.get(..self.len).unwrap_or(&self.word);
+            return if b"DOCTYPE"
+                .get(..start.len())
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case(start))
+            {
+                Ok(())
+            } else {
+                Err("directive other than a DOCTYPE is not accepted")
+            };
+        }
+        if !self.names_root() {
+            return Ok(());
+        }
+        // A word longer than `word` is no keyword.
+        let word = self.word.get(..self.len).unwrap_or_default();
+        Err(
+            if word.eq_ignore_ascii_case(b"SYSTEM") || word.eq_ignore_ascii_case(b"PUBLIC") {
+                "DOCTYPE with an external identifier is not accepted"
+            } else {
+                MORE_THAN_ROOT_NAME
+            },
+        )
     }
 }
 

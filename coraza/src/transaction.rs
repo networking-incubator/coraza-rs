@@ -1386,10 +1386,15 @@ impl Transaction {
     /// Limit what the body processors may retain for one body, in the units [`Transaction::body_memory_bytes`]
     /// counts, or remove the limit with `None`, which is the default.
     ///
-    /// Without a budget the built-in processors refuse what Go Coraza refuses and nothing more (the JSON
-    /// flattener's raw limit of eight times the body, the argument limit, the multipart part and header limits),
-    /// which a host with a fixed memory ceiling may not be able to afford: what a body makes them hold beyond the
-    /// body is many times its size. With a budget set the XML, JSON, URL-encoded and multipart processors charge,
+    /// Without a budget the built-in processors refuse what Go Coraza refuses (the JSON flattener's raw limit of
+    /// eight times the body, the argument limit, the multipart part and header limits), which a host with a fixed
+    /// memory ceiling may not be able to afford: what a body makes them hold beyond the body is many times its size.
+    /// The XML processor also refuses what Go accepts: references to undeclared entities, DOCTYPEs with more than
+    /// their name and comments, other directives, illegal characters in comments and instructions, and a body that
+    /// ends inside a token a body limit did not cut; and it stops at the argument limit where Go has none (see the
+    /// crate README's behavior changes).
+    ///
+    /// With a budget set the XML, JSON, URL-encoded and multipart processors charge,
     /// before allocating it, everything a body makes them hold: the parsed values with the entries that keep them,
     /// and the scratch they parse in. When a body would take them past the budget they stop and keep what they accepted
     /// until then, and report it the way any body processor error is reported: `REQBODY_ERROR`,

@@ -89,13 +89,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_uri_parser" "$RUNNER_TEMP/fuzz/artifacts/coraza_uri_parser"
           mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_json_body" "$RUNNER_TEMP/fuzz/artifacts/coraza_json_body"
           mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_multipart_body" "$RUNNER_TEMP/fuzz/artifacts/coraza_multipart_body"
+          mkdir -p "$RUNNER_TEMP/fuzz/corpus/coraza_xml_body" "$RUNNER_TEMP/fuzz/artifacts/coraza_xml_body"
           export PATH="$RUNNER_TEMP/cargo-fuzz/bin:$PATH"
           cargo fuzz run coraza_uri_parser "$RUNNER_TEMP/fuzz/corpus/coraza_uri_parser" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_uri_parser/" > "$RUNNER_TEMP/fuzz/coraza_uri_parser.log" 2>&1
           cargo fuzz run coraza_json_body "$RUNNER_TEMP/fuzz/corpus/coraza_json_body" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_json_body/" > "$RUNNER_TEMP/fuzz/coraza_json_body.log" 2>&1
           cargo fuzz run coraza_multipart_body "$RUNNER_TEMP/fuzz/corpus/coraza_multipart_body" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_multipart_body/" > "$RUNNER_TEMP/fuzz/coraza_multipart_body.log" 2>&1
+          cargo fuzz run coraza_xml_body "$RUNNER_TEMP/fuzz/corpus/coraza_xml_body" -- -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536 -artifact_prefix="$RUNNER_TEMP/fuzz/artifacts/coraza_xml_body/" > "$RUNNER_TEMP/fuzz/coraza_xml_body.log" 2>&1
           tail -n 4 "$RUNNER_TEMP/fuzz/coraza_uri_parser.log"
           tail -n 4 "$RUNNER_TEMP/fuzz/coraza_json_body.log"
           tail -n 4 "$RUNNER_TEMP/fuzz/coraza_multipart_body.log"
+          tail -n 4 "$RUNNER_TEMP/fuzz/coraza_xml_body.log"
 
       - name: Upload fuzz logs and findings
         if: always()

@@ -1,7 +1,7 @@
 # Fuzzing
 
-The workspace has nine libFuzzer targets across two isolated `fuzz/` packages:
-three detector targets in `libperfusion/fuzz` and six Coraza parser and SecLang
+The workspace has ten libFuzzer targets across two isolated `fuzz/` packages:
+three detector targets in `libperfusion/fuzz` and seven Coraza parser and SecLang
 targets in `coraza/fuzz`.
 
 `libperfusion/fuzz`:
@@ -21,6 +21,7 @@ targets in `coraza/fuzz`.
 - `coraza_uri_parser` exercises the request-URI parser.
 - `coraza_json_body` exercises the JSON request body processor.
 - `coraza_multipart_body` exercises the multipart request body processor.
+- `coraza_xml_body` exercises the XML request body processor.
 
 The libperfusion detector targets check parser progress and token/span bounds.
 Fuzz dependencies stay separate from the published library dependencies.
@@ -41,7 +42,7 @@ cargo fuzz run html_grammar -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=4096
 ```
 
-From `coraza/`, run the six Coraza targets with the same flags:
+From `coraza/`, run the seven Coraza targets with the same flags:
 
 ```sh
 export RUSTUP_TOOLCHAIN=nightly-2026-10-06
@@ -56,6 +57,8 @@ cargo fuzz run coraza_uri_parser -- \
 cargo fuzz run coraza_json_body -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536
 cargo fuzz run coraza_multipart_body -- \
+  -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536
+cargo fuzz run coraza_xml_body -- \
   -seed=20261007 -max_total_time=60 -timeout=5 -max_len=65536
 ```
 

@@ -39,12 +39,15 @@ each item against your policies before upgrading.
     `SecRequestBodyLimitAction ProcessPartial` cut before its closing
     delimiter, is refused the same way, since what was not read could be a
     file;
-  * refuses with 413 a URL-encoded body, or a JSON body that a rule parses as
+  * refuses with 413 a URL-encoded body, a JSON body that a rule parses as
     JSON (CRS does for `application/*+json` and AWS JSON types, with rules
-    901360 and 901370), with more than `SecArgumentsLimit` fields (1000 by
+    901360 and 901370), or an XML body that a rule parses as XML
+    (`@recommended-conf` rule 200000 does for XML content types), with more
+    than `SecArgumentsLimit` fields, or XML attribute and text values (1000 by
     default), in any engine mode but `Off`
     (`inspection_reason=incomplete`, `inspection_complete=false`). With
-    `@recommended-conf`, its rules 200004 and 200005 answer 400 first;
+    `@recommended-conf`, its rules 200002, 200004 and 200005 answer 400
+    first;
   * refuses with 415 every request whose `Content-Encoding` names anything but
     `identity`, such as `gzip` or `br`, with or without a body, in any engine
     mode but `Off` (`inspection_reason=unsupported`): the engine cannot read a
@@ -305,7 +308,10 @@ so they may not have reached the backend) is reported as
 a response-phase rule then denies, `terminal_outcome=denied` shows the denial,
 as it does beside the `body_partially_inspected` of a truncated body. So is a
 request whose body had not ended when its response completed, since the rest
-may still follow. A refusal is different: the filter's local reply, in the
+may still follow, and one whose body a processor failed on part way, an XML or
+JSON syntax error or a malformed multipart part, when no rule denied it (see
+[Body memory budget](#body-memory-budget)), since the part it did not read was
+not inspected. A refusal is different: the filter's local reply, in the
 request or the response phase, ends the stream, so the rest of the body never
 reaches the backend. Over HTTP/1.1 Envoy sends the reply and closes the
 connection, over HTTP/2 it resets the stream, and in both Envoy resets the
@@ -434,8 +440,49 @@ direction:
 The budget covers the body processors only. What rules allocate after the parse (macro expansion, matched values,
 `TX` updates) is not charged in advance, so the check after the phase is what bounds it.
 
+The budget is not all that bounds an XML body: its values count against `SecArgumentsLimit`, and a document with
+more stops at the limit as it stops at the budget, keeping the values before it, but with `ARGUMENTS_LIMIT_REACHED`
+and `REQBODY_ERROR` set instead of the budget's telemetry. Rule 200002 of `@recommended-conf` answers 400; where no
+rule denies, as in detection-only mode, the filter answers 413 as for any dropped argument, in every engine mode but
+`Off`. The values after the stop were not inspected, so that refusal is reported as incomplete
+(`inspection_reason=incomplete`, `inspection_complete=false`), and the body never reaches the backend; a rule that
+denies first is reported as any denial is (`inspection_reason=denied`, `inspection_complete=true`), and the request
+is refused as well.
+
+A body processor that fails for another reason, an XML or JSON syntax error or a malformed multipart part, is different:
+it sets `REQBODY_ERROR`, and the filter does not refuse the request itself: a rule of the policy has to deny it, on the
+error, such as rule 200002 of `@recommended-conf` (400), or on the values the processor retained before it, which a JSON
+or multipart body keeps (an XML document is dropped whole, with none). A request that a rule denies in the request body
+phase is reported by its denial (`inspection_reason=denied`, `inspection_complete=true`), whatever the parser had read,
+as for the stops above; a denial in the response phase, with the request body unread, is reported
+`request_body_not_inspected`, as for any body released unread. Where no rule denies, the request passes: in
+`SecRuleEngine DetectionOnly`, where rule 200002 cannot interrupt either, and in a policy that selects a processor and
+has no rule on `REQBODY_ERROR`, such as one with its own `ctl:requestBodyProcessor=XML` rule and none of the baseline's.
+A policy that includes only the CRS selects the JSON processor (never XML) and has no rule on `REQBODY_ERROR`, so a JSON
+body error is let through there, reported `request_body_not_inspected`. A malformed multipart part is refused with 413
+by the host's ban on uploads where the engine enforces, so that error passes in `DetectionOnly`. A URL-encoded body has
+no error but the budget's. What the processor did not read was not inspected, an XML document being dropped whole with
+none of its values kept and a JSON or multipart body keeping those it read before the error, so a request that passes is
+reported as for a body released unread (`inspection_reason=request_body_not_inspected`, `inspection_complete=false`,
+`terminal_outcome` and the status as for any request; see [Request body access](#request-body-access) and [Recommended
+baseline](#recommended-baseline-recommended-conf)).
+
+A body that `SecRequestBodyLimitAction ProcessPartial` cut is reported `inspection_reason=body_partially_inspected`,
+also when its parse error comes from the cut, as a JSON body's does, since what the processor read before the error
+stays inspected. An XML document that the parser refuses is dropped whole, so one that fails in the retained prefix, or
+in a CDATA section the cut ends, is reported `request_body_not_inspected` as an uncut one is (`inspection_complete=false`
+either way); a cut XML prefix that parses stays `body_partially_inspected`. A rule's denial and the connector's own
+refusals answer first, as for any body.
+
+An XML error that quotes the document (an undeclared entity, an invalid name, a declaration's version or encoding)
+needs room in the budget for its message. Where the budget has none the parse stops for the budget instead, and the
+connector refuses that with 503 as it does any budget stop, in every engine mode, `DetectionOnly` included, so a tight
+budget does not turn such a refusal into a pass. The 503 is the connector's answer where no rule denies first: with
+`@recommended-conf` enforcing, rule 200002 reads `REQBODY_ERROR`, which the stop sets, and can answer 400 first.
+
 The check after the parse stays the authority on what was retained and answers 503. Without a budget, which is the
-engine's default, the processors refuse only what Go Coraza refuses.
+engine's default, the processors refuse only what Go Coraza refuses, and the XML that the
+[crate's behavior changes](../coraza/README.md#behavior-changes) list.
 
 ## Embedding the OWASP Core Rule Set
 

@@ -306,17 +306,29 @@ fn a_budget_never_loosens_gos_own_json_limit() {
 }
 
 #[test]
-fn without_a_budget_no_valid_body_is_an_error_that_go_would_not_report() {
+fn without_a_budget_a_valid_body_is_an_error_go_would_not_report_only_past_the_xml_argument_limit() {
     // 200002 is what turns an error into a 400, so a body that parses must raise none.
     let waf = waf("SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400\"");
     let denied = |content_type: &str, body: &[u8]| request(&waf, content_type, None).process_request_body(body);
 
-    // Repeated attribute and text shapes at every size around the old 4096 byte floor of the XML output limit.
-    for unit in ["<a b=\"c\">d</a>", "<i>1</i>", "<a b c d e f g h/>", "<a b=\"c\"/>"] {
-        for copies in (1..400).step_by(7).chain([4096, 60_000]) {
+    // Repeated attribute and text shapes at every size around the old 4096 byte floor of the XML output limit, up to
+    // the argument limit of 100,000 values. Past it the body is an error, which Go, with no limit, does not report.
+    for (unit, values) in [
+        ("<a b=\"c\">d</a>", 2),
+        ("<i>1</i>", 1),
+        ("<a b c d e f g h/>", 7),
+        ("<a b=\"c\"/>", 1),
+    ] {
+        for copies in (1..400).step_by(7).chain([4096, 100_000 / values]) {
             let body = format!("<r>{}</r>", unit.repeat(copies));
             assert!(denied("text/xml", body.as_bytes()).is_none(), "{copies} of {unit}");
         }
+        let past = format!("<r>{}</r>", unit.repeat(100_000 / values + 1));
+        assert_eq!(
+            denied("text/xml", past.as_bytes()).map(|interruption| interruption.status),
+            Some(400),
+            "one more {unit}"
+        );
     }
     let sixteen = format!("<r>{}</r>", "<a b=\"c\">d</a>".repeat(16));
     assert!(sixteen.len() < 300, "a document of {} bytes", sixteen.len());
@@ -776,6 +788,42 @@ fn a_member_past_the_argument_limit_ends_the_json_walk_as_one_even_when_the_budg
     // A member that is not past the limit and does not fit is still the budget's to refuse.
     let (limit_reached, errored, _) = outcome(&format!("{{\"a\":1,\"c\\n{big}\":3}}"), Some(20_000));
     assert!(!limit_reached && errored);
+}
+
+#[test]
+fn the_xml_floods_a_connector_budget_admits_publish_no_more_than_the_argument_limit() {
+    // The densest shapes, sized as the connector's parse budget on an idle 64 MiB root admitted them: each value
+    // costs every rule that reads XML a full evaluation, and nothing but the argument limit bounds their number.
+    const ROOT: usize = 64 << 20;
+    let waf = waf("SecArgumentsLimit 1000");
+    let flood = |head: &[u8], unit: &[u8], count: usize, tail: &[u8]| [head, &unit.repeat(count), tail].concat();
+    for (label, body) in [
+        ("bare attributes in one tag", flood(b"<r", b" b", 528_211, b"></r>")),
+        ("text values", flood(b"<r>", b"1<i/>", 200_000, b"</r>")),
+        (
+            "attack values",
+            flood(
+                b"<r>",
+                b"<i>../../etc/passwd;cat /etc/shadow' or 1=1-- </i>",
+                20_000,
+                b"</r>",
+            ),
+        ),
+    ] {
+        for budget in [None, Some(ROOT - 3 * body.len())] {
+            let mut tx = request(&waf, "text/xml", budget);
+            tx.process_request_body(&body);
+            let published = values_of(&tx, RuleVariable::RequestXML).len();
+            assert!(published <= 1000, "{label}, {budget:?}: {published} values");
+            assert!(request_body_errored(&tx), "{label}, {budget:?}");
+            assert_eq!(
+                tx.get_variable(RuleVariable::ArgumentsLimitReached, None).as_deref(),
+                Some("1"),
+                "{label}, {budget:?}"
+            );
+            assert!(!tx.request_body_stopped_by_memory_budget(), "{label}, {budget:?}");
+        }
+    }
 }
 
 #[test]
