@@ -10,14 +10,18 @@ To refresh after updating the pinned Go module version in
 
 ```sh
 cargo xtask corpus-refresh
+python3 libperfusion/tools/parity/check_manifest.py --update --go-source \
+  "$(cd xtask/tools && go list -m -f '{{.Dir}}' github.com/corazawaf/libinjection-go)"
 cargo test -p libperfusion
 ```
 
 The refresh imports fixtures from that module version, regenerates the SQL
 oracle and manifest, and updates the Go module checksum. It requires Go 1.24.6
-or later. Dependabot monitors this Go module; after it updates the version,
-refresh the corpus before merging its pull request. The Rust tests report
-parity failures.
+or later. `check_manifest.py` then rewrites
+[`../parity/differential.json`](../parity/differential.json) from the module
+source; `make parity-manifest-check` fails until it names the new module.
+Dependabot monitors this Go module; after it updates the version, run both
+commands before merging its pull request. The Rust tests report parity failures.
 
 Fixture section parsing follows the upstream driver's right-trim behavior. The
 complete attribution and license are in

@@ -32,6 +32,9 @@
 )]
 mod corpus;
 
+#[path = "../tests/common/reviewed.rs"]
+mod reviewed;
+
 use std::{
     fs,
     hint::black_box,
@@ -82,6 +85,8 @@ fn workloads() -> Vec<Workload> {
     ];
 
     let corpus_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    // Fixture verdicts are Go's; a reviewed `go`/`direct` row is a deliberate deviation.
+    let reviewed_rows = reviewed::rows("go", "direct");
     let mut paths: Vec<_> = fs::read_dir(corpus_dir)
         .expect("read repository corpus")
         .map(|entry| entry.expect("read corpus entry").path())
@@ -101,12 +106,22 @@ fn workloads() -> Vec<Workload> {
 
         match DriverKind::from_name(&case.name) {
             Some(DriverKind::Sqli) => {
-                assert_eq!(
-                    sqli.as_ref().map_or("", |value| value.as_str()),
-                    case.expected,
-                    "{}",
-                    case.name
-                );
+                let reviewed = reviewed_rows.iter().any(|row| {
+                    row.id == case.name
+                        && row.matches(
+                            &input,
+                            &format!("sqli:{}", u8::from(!case.expected.is_empty())),
+                            &format!("sqli:{}", u8::from(sqli.is_some())),
+                        )
+                });
+                if !reviewed {
+                    assert_eq!(
+                        sqli.as_ref().map_or("", |value| value.as_str()),
+                        case.expected,
+                        "{}",
+                        case.name
+                    );
+                }
             },
             Some(DriverKind::Xss) => {
                 let expected = match case.expected.as_str() {

@@ -153,7 +153,7 @@ cargo subcommands are pinned.
 
 `make parity-differential` additionally compares against the pinned C and Go
 references. It needs the C checkout selected by
-`libperfusion/tests/parity/manifest.json` and the pinned Go toolchain. See the
+`libperfusion/tests/parity/differential.json` and the pinned Go toolchain. See the
 [CI guide](docs/ci.md) for all checks and prerequisites, the
 [performance report](docs/performance.md) for benchmark methods and results,
 and the [fuzzing guide](libperfusion/docs/FUZZING.md) for local fuzzing.

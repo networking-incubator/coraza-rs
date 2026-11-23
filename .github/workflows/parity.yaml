@@ -53,7 +53,7 @@ jobs:
       - name: Fetch the pinned C reference
         run: |
           set -euo pipefail
-          C_COMMIT="$(python3 -c 'import json; print(json.load(open("libperfusion/tests/parity/manifest.json"))["differential"]["c_reference"]["commit"])')"
+          C_COMMIT="$(python3 -c 'import json; print(json.load(open("libperfusion/tests/parity/differential.json"))["c_reference"]["commit"])')"
           C_DIR="$RUNNER_TEMP/libinjection-c"
           git init --quiet "$C_DIR"
           git -C "$C_DIR" remote add origin https://github.com/libinjection/libinjection.git

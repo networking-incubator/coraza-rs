@@ -788,6 +788,36 @@ mod tests {
         assert_eq!(xss.len(), upstream_xss.len() + local_xss.len());
     }
 
+    /// `data/tables.json` is the only table record, so `tables-check` must
+    /// reject a changed row even when every count stays the same.
+    #[test]
+    fn check_rejects_same_count_table_mutations() {
+        let source = workspace_root().join("libperfusion/data");
+        for (file, from, to) in [
+            (XSS_FILE, "\ntag\tAPPLET\n", "\ntag\tAPPLEZ\n"),
+            (SQL_FILE, "\nUNION\tU\n", "\nUNION\tk\n"),
+        ] {
+            let root = std::env::temp_dir().join(format!("xtask-tables-mutation-{}-{file}", std::process::id()));
+            let data = root.join("libperfusion/data");
+            fs::create_dir_all(&data).unwrap();
+            for entry in fs::read_dir(&source).unwrap() {
+                let path = entry.unwrap().path();
+                fs::copy(&path, data.join(path.file_name().unwrap())).unwrap();
+            }
+            check(&root).unwrap();
+            let contents = fs::read_to_string(data.join(file)).unwrap();
+            assert_eq!(contents.matches(from).count(), 1, "{file}: one mutation point");
+            fs::write(data.join(file), contents.replacen(from, to, 1)).unwrap();
+            let result = check(&root);
+            fs::remove_dir_all(&root).unwrap();
+            assert_eq!(
+                result.unwrap_err(),
+                "local table data differs from data/tables.json; review and refresh it",
+                "{file}"
+            );
+        }
+    }
+
     #[test]
     fn local_supplements_may_hold_only_some_row_kinds() {
         let rows = parse_xss_rows("# comment\nattr\tSRCDOC\tBlack\nattr\tDATA\tUrlScheme\ntag\tMATH\n").unwrap();

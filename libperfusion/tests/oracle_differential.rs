@@ -29,6 +29,9 @@
 
 mod common;
 
+#[path = "common/reviewed.rs"]
+mod reviewed;
+
 #[path = "upstream_common.rs"]
 mod upstream_common;
 
@@ -76,92 +79,45 @@ const HTML_CONTEXTS: [HtmlContext; 5] = [
     HtmlContext::ValueDoubleQuote,
     HtmlContext::ValueBackQuote,
 ];
-const C_XSS_DIFFERENCES: [(&str, &[u8], bool, bool); 13] = [
-    ("xss-event-name-nul", b"<a on\0error=1>", false, true),
-    ("xss-tag-name-nul", b"<sv\0gload>", false, true),
-    ("xss-xmlns-name-nul", b"<a xm\0lns=1>", false, true),
-    ("xss-event-suffix-control", b"<a onerrorfoo=1>", true, false),
-    ("xss-namespace-xmlns-prefix", b"<div xmlnsfoo=\"safe\">", true, false),
-    ("xss-namespace-xlink-prefix", b"<div xlinkfoo=\"safe\">", true, false),
-    ("xss-indirect-url-control", b"<a attributename=href>", true, false),
-    ("xss-indirect-style-control", b"<a attributename=style>", true, false),
-    ("xss-url-nul", b"href=ja\0va:", false, true),
-    ("xss-nul-import-1", b"<?im\0port namespace=\"t\">", false, true),
-    ("xss-nul-import-2", b"<?\0import namespace=\"t\">", false, true),
-    (
-        "xss-nul-entity-1",
-        b"<!\0ENTITY x SYSTEM \"file:///etc/passwd\">",
-        false,
-        true,
-    ),
-    (
-        "xss-nul-entity-2",
-        b"<!EN\0TITY x SYSTEM \"file:///etc/passwd\">",
-        false,
-        true,
-    ),
-];
-/// Pinned C and libperfusion XSS verdicts for the sample inputs the direct
-/// corpus does not carry.
-///
-/// The booleans are `(C, libperfusion)`. Rows where they differ are the
-/// reviewed C deviations; rows where they agree were reviewed deviations
-/// that the local XSS table additions closed, and are kept so a regression
-/// back to the old verdict fails the gate.
-const C_XSS_SAMPLE_VERDICTS: [(&str, &[u8], bool, bool); 9] = [
+/// Pinned C XSS samples the direct corpus does not carry. Their reviewed
+/// verdicts are rows of `tests/parity/reviewed-differences.tsv`: five C-only
+/// detections, and four `<math>` samples that only Go main allows.
+const C_XSS_SAMPLE_CASES: [(&str, &[u8]); 9] = [
     (
         "xss-html5secorg.txt:232",
         b"test 83 <x:template xmlns:x=\"http://www.wapforum.org/2001/wml\" x:ontimer=\"$(x:unesc)j$(y:escape)a$(z:noecs)v$(x)a$(y)s$(z)cript$x:alert(1)\"><x:timer value=\"1\"/></x:template>",
-        true,
-        false,
     ),
     (
         "xss-html5secorg.txt:234",
         b"test 84 <x xmlns:ev=\"http://www.w3.org/2001/xml-events\" ev:event=\"load\" ev:handler=\"javascript:alert(1)//#x",
-        true,
-        false,
     ),
     (
         "xss-html5secorg.txt:236",
         b"test 85 <x xmlns:ev=\"http://www.w3.org/2001/xml-events\" ev:event=\"load\" ev:handler=\"test.evt#x\"/>",
-        true,
-        false,
     ),
     (
         "xss-html5secorg.txt:468",
         b"test 132_1 <set attributeName=\"xlink:href\" begin=\"accessKey(a)\" to=\"//example.com/?a\" />",
-        true,
-        false,
     ),
     (
         "xss-soaj1664ashar-pastebin-u6FY1xDA.txt:78",
         b"74) <math><a xlink:href=\"//jsfiddle.net/t846h/\">click",
-        true,
-        true,
     ),
     (
         "xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102",
         b"97) <math><a xlink:href=\"//jsfiddle.net/t846h/\">click",
-        true,
-        true,
     ),
     (
         "xss-xenotix.txt:693",
         b"<math><a xlink:href=\"//XXXxenotixXXX:3555/xss_serve_payloads/bmpz.bmp\">KCF",
-        true,
-        true,
     ),
     (
         "xss-xenotix.txt:694",
         b"<math><a xlink:href=\"//XXXxenotixXXX:3555/xss_serve_payloads/kcf.js\">KCF",
-        true,
-        true,
     ),
     (
         "xss-xenotix.txt:1196",
         b"<x:script xmlns:x=\"http://www.w3.org/1999/xhtml\">alert(1);</x:script>",
-        true,
-        false,
     ),
 ];
 
@@ -196,16 +152,17 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         "oracle response count differs from request count"
     );
 
+    let reviewed_rows = reviewed::rows("go", "direct");
     let mut result = DifferentialResult::default();
     for ((id, input), response) in cases.iter().zip(responses) {
-        compare_case(id, input, response, &mut result);
+        compare_case(id, input, response, &reviewed_rows, &mut result);
     }
     eprintln!(
         "differential summary: cases={}, comparisons={}, oracle_errors={}, reviewed_exceptions={}, diagnostic_differences={}",
         cases.len(),
         result.comparisons,
         result.oracle_errors,
-        result.accepted_exceptions,
+        result.accepted_exceptions.len(),
         result.diagnostic_differences,
     );
     for diagnostic in result.diagnostic_examples {
@@ -222,10 +179,7 @@ fn pinned_go_oracle_matches_corpus_and_binary_cases() {
         result.oracle_errors, 0,
         "pinned Go module must complete every result field"
     );
-    assert_eq!(
-        result.accepted_exceptions, 4,
-        "libperfusion deviations must stay reviewed"
-    );
+    assert_every_row_observed(&reviewed_rows, result.accepted_exceptions, "Go direct");
 }
 
 #[test]
@@ -254,8 +208,9 @@ fn pinned_c_oracle_matches_corpus_and_binary_cases() {
         cases.len(),
         "C oracle response count differs from request count"
     );
+    let reviewed_rows = reviewed::rows("c", "direct");
     let mut mismatches = Vec::new();
-    let mut reviewed_xss_differences = 0;
+    let mut reviewed_ids = Vec::new();
     for ((id, input), response) in cases.iter().zip(responses) {
         let fields: Vec<_> = response.split('\t').collect();
         assert_eq!(fields.len(), 4, "{id}: malformed C response {response:?}");
@@ -268,9 +223,24 @@ fn pinned_c_oracle_matches_corpus_and_binary_cases() {
             matches!(fields[1], "0" | "1") && matches!(fields[3], "0" | "1"),
             "{id}: invalid C booleans"
         );
-        let known_xss_difference = c_xss_difference(id, input, fields[3] == "1", expected_xss == "1");
-        if known_xss_difference && fields[1] == expected_sqli && fields[2] == expected_fingerprint {
-            reviewed_xss_differences += 1;
+        // A reviewed row covers one detector's verdict; the other must match exactly.
+        let sqli_agrees = fields[1] == expected_sqli && fields[2] == expected_fingerprint;
+        let difference = match (sqli_agrees, fields[3] == expected_xss) {
+            (true, false) => Some(("xss", fields[3], expected_xss)),
+            (false, true) if fields[1] != expected_sqli => Some(("sqli", fields[1], expected_sqli)),
+            _ => None,
+        };
+        if let Some((detector, c_verdict, verdict)) = difference
+            && reviewed_rows.iter().any(|row| {
+                row.id == id
+                    && row.matches(
+                        input,
+                        &format!("{detector}:{c_verdict}"),
+                        &format!("{detector}:{verdict}"),
+                    )
+            })
+        {
+            reviewed_ids.push(id.as_str());
             continue;
         }
         if (fields[1] != expected_sqli || fields[2] != expected_fingerprint || fields[3] != expected_xss)
@@ -289,31 +259,36 @@ fn pinned_c_oracle_matches_corpus_and_binary_cases() {
         }
     }
     assert!(mismatches.is_empty(), "C oracle mismatches:\n{}", mismatches.join("\n"));
-    assert_eq!(reviewed_xss_differences, 20, "C XSS deviation inventory changed");
+    assert_every_row_observed(&reviewed_rows, reviewed_ids, "C direct");
     eprintln!(
-        "C differential passed: {} public SQL/XSS results, {reviewed_xss_differences} reviewed XSS differences",
-        cases.len()
+        "C differential passed: {} public SQL/XSS results, {} reviewed differences",
+        cases.len(),
+        reviewed_rows.len()
     );
 }
 
-fn c_xss_difference(id: &str, input: &[u8], c_result: bool, rust_result: bool) -> bool {
-    C_XSS_DIFFERENCES.iter().chain(C_XSS_SAMPLE_VERDICTS.iter()).any(
-        |(case_id, expected_input, expected_c, expected_rust)| {
-            expected_c != expected_rust
-                && id == *case_id
-                && input == *expected_input
-                && c_result == *expected_c
-                && rust_result == *expected_rust
-        },
-    ) || match id {
-        "xss-svg-prefix-overlong-control" => {
-            input == [b"<svg".as_slice(), &[b'x'; 64], b">"].concat() && c_result && !rust_result
-        },
-        "xss-xsl-prefix-overlong-control" => {
-            input == [b"<xsl".as_slice(), &[b'x'; 64], b">"].concat() && c_result && !rust_result
-        },
-        _ => false,
-    }
+#[test]
+fn reviewed_differences_are_unique_and_in_the_ledger() {
+    // Loading asserts the row format and that ids are unique within a suite.
+    let rows = reviewed::all();
+    let ledger = include_str!("parity/mismatch-ledger.md");
+    let missing: Vec<&str> = rows
+        .iter()
+        .map(|row| row.id)
+        .filter(|id| !ledger.contains(&format!("`{id}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "reviewed ids missing from tests/parity/mismatch-ledger.md: {missing:?}"
+    );
+}
+
+/// Every row of a suite must be observed, each exactly once.
+fn assert_every_row_observed(rows: &[reviewed::Reviewed], mut observed: Vec<&str>, suite: &str) {
+    let mut expected: Vec<&str> = rows.iter().map(|row| row.id).collect();
+    expected.sort_unstable();
+    observed.sort_unstable();
+    assert_eq!(observed, expected, "{suite}: reviewed difference inventory changed");
 }
 
 fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -384,9 +359,9 @@ fn load_cases(manifest_dir: &Path) -> Vec<(String, Vec<u8>)> {
         cases.push((id.to_owned(), input.to_vec()));
     }
     cases.extend(
-        C_XSS_SAMPLE_VERDICTS
+        C_XSS_SAMPLE_CASES
             .iter()
-            .map(|(id, input, ..)| ((*id).to_owned(), (*input).to_vec())),
+            .map(|(id, input)| ((*id).to_owned(), (*input).to_vec())),
     );
     cases
 }
@@ -490,16 +465,22 @@ fn append_boundary_and_byte_cases(cases: &mut Vec<(String, Vec<u8>)>) {
 }
 
 #[derive(Default)]
-struct DifferentialResult {
+struct DifferentialResult<'a> {
     mismatches: Vec<String>,
     diagnostic_examples: Vec<String>,
     comparisons: usize,
     oracle_errors: usize,
-    accepted_exceptions: usize,
+    accepted_exceptions: Vec<&'a str>,
     diagnostic_differences: usize,
 }
 
-fn compare_case(id: &str, input: &[u8], response: &str, result: &mut DifferentialResult) {
+fn compare_case<'a>(
+    id: &'a str,
+    input: &[u8],
+    response: &str,
+    reviewed_rows: &[reviewed::Reviewed],
+    result: &mut DifferentialResult<'a>,
+) {
     let fields: Vec<&str> = response.split('\t').collect();
     if fields.len() != ORACLE_FIELDS || fields.first().copied() != Some(id) {
         result.oracle_errors += 1;
@@ -546,13 +527,30 @@ fn compare_case(id: &str, input: &[u8], response: &str, result: &mut Differentia
         if expected == actual {
             continue;
         }
-        if let Some((expected_exception, actual_exception, count_exception)) =
-            reviewed_perfusion_deviation(id, input, field_index)
-            && expected == expected_exception
-            && actual == actual_exception
+        // Field 3 is the fingerprint: the reviewed SQLi verdict row covers it,
+        // and the row is counted once, on field 2.
+        let verdicts = match field_index {
+            2 => Some(("sqli", expected, actual.as_str())),
+            3 => Some((
+                "sqli",
+                if expected == ":0" { "0" } else { "1" },
+                public_values[0].as_str(),
+            )),
+            21 => Some(("xss", expected, actual.as_str())),
+            _ => None,
+        };
+        if let Some((detector, go_verdict, verdict)) = verdicts
+            && reviewed_rows.iter().any(|row| {
+                row.id == id
+                    && row.matches(
+                        input,
+                        &format!("{detector}:{go_verdict}"),
+                        &format!("{detector}:{verdict}"),
+                    )
+            })
         {
-            if count_exception {
-                result.accepted_exceptions += 1;
+            if field_index != 3 {
+                result.accepted_exceptions.push(id);
             }
             continue;
         }
@@ -575,29 +573,6 @@ fn compare_case(id: &str, input: &[u8], response: &str, result: &mut Differentia
         let stream = html_stream(input, context);
         record_diagnostic(id, input, 16 + context_index, &fields, &stream, result);
     }
-}
-
-fn reviewed_perfusion_deviation(
-    id: &str,
-    input: &[u8],
-    field_index: usize,
-) -> Option<(&'static str, &'static str, bool)> {
-    // The pinned Go module's strchr NUL semantics (upstream #140) match the
-    // C parser this port retains, so the two former `sql-nul-*` deviations
-    // no longer differ; they were removed rather than kept as dead entries.
-    // `<math>` is in the local XSS tag supplement, so these four flag where
-    // Go main allows. The pinned C reference agrees with libperfusion on all
-    // four; see `tests/parity/mismatch-ledger.md`.
-    if field_index == 21
-        && C_XSS_SAMPLE_VERDICTS
-            .iter()
-            .any(|(case_id, case_input, c_result, rust_result)| {
-                id == *case_id && input == *case_input && *c_result && *rust_result
-            })
-    {
-        return Some(("0", "1", true));
-    }
-    None
 }
 
 fn sql_stream(input: &[u8], quote: Quote, dialect: Dialect, folded: bool) -> String {
@@ -663,7 +638,7 @@ fn record_diagnostic(
     field_index: usize,
     fields: &[&str],
     actual: &str,
-    result: &mut DifferentialResult,
+    result: &mut DifferentialResult<'_>,
 ) {
     result.comparisons += 1;
     let expected = fields.get(field_index).copied().unwrap_or("<missing>");

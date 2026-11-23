@@ -6,6 +6,7 @@
 # the upstream table; build.rs merges the two tables and rejects duplicates.
 #
 # Format: KEY<TAB>VALUE_BYTE
+01&N	F
 01;ES	F
 01;T	F
 01;TC	F

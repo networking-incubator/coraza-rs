@@ -15,13 +15,13 @@
 - For every change, including docs, configuration, and tooling, run `make lint` from the repository root before finishing. Fix failures caused by the change and rerun it. Report unrelated failures; do not claim lint passed.
 - Some `typos` findings in detector code are intentional: SQL keyword names, libinjection fingerprints, and XSS/HTML inspection literals may need exact upstream spellings or malformed fixture bytes. Check `_typos.toml` and the pinned parity/corpus sources before editing them. Preserve confirmed literals and use only narrow, commented exceptions for false positives; fix genuine prose typos and do not suppress whole source trees.
 - For every production Rust implementation change, run `make test`.
-- For detector, parser, or input-path changes, run `make parity-differential` with `LIBINJECTION_DIR` set to the C revision pinned in `libperfusion/tests/parity/manifest.json`. This also requires the pinned Go oracle; see [docs/ci.md](docs/ci.md).
+- For detector, parser, or input-path changes, run `make parity-differential` with `LIBINJECTION_DIR` set to the C revision pinned in `libperfusion/tests/parity/differential.json`. This also requires the pinned Go oracle; see [docs/ci.md](docs/ci.md).
 - For parser or input-validation security changes, run a focused fuzz campaign using [the fuzzing guide](libperfusion/docs/FUZZING.md) and promote any discovered crash to a regression fixture.
 - For Envoy adapter or WASM runtime changes, also run `make build-envoy-wasm` and `bash examples/envoy-libperfusion/test-envoy.sh`.
 - For dependency changes, run `make audit`. For workflow or shell changes, run `make lint-extra`.
 - Use [docs/ci.md](docs/ci.md) to select the feature-matrix, coverage, MSRV, and other CI checks relevant to the changed area.
 - Preserve libinjection attribution and license terms when changing upstream-derived source or tables; see `libperfusion/THIRD_PARTY_NOTICES.md`.
-- Refresh pinned corpus and generated tables with `cargo xtask corpus-refresh` and `cargo xtask tables-refresh --upstream <checkout>` as applicable, then review the fixture, manifest, oracle, and table diffs.
+- Refresh pinned corpus and generated tables with `cargo xtask corpus-refresh` and `cargo xtask tables-refresh --upstream <checkout>` as applicable. After a Go module bump, also run `python3 libperfusion/tools/parity/check_manifest.py --update --go-source <dir>`; a C revision bump also sets `C_REFERENCE` in that script to the new commit and reruns it. See the pin table in [docs/ci.md](docs/ci.md). Then review the fixture, manifest, oracle, table, and differential diffs.
 
 ## Performance gate
 

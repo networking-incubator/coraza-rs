@@ -20,6 +20,9 @@
 
 mod common;
 
+#[path = "common/reviewed.rs"]
+mod reviewed;
+
 use std::{fs, path::Path};
 
 use common::{
@@ -215,6 +218,9 @@ fn html5_corpus_baseline() {
 
 #[test]
 fn sqli_corpus_baseline() {
+    // Fixture verdicts are Go's; a reviewed `go`/`direct` row is a deliberate deviation.
+    let reviewed_rows = reviewed::rows("go", "direct");
+    let mut reviewed_ids = Vec::new();
     let mut count = 0_usize;
     for line in include_str!("parity/sqli_oracle.tsv")
         .lines()
@@ -241,6 +247,18 @@ fn sqli_corpus_baseline() {
         );
 
         let actual = sqli(case.input.as_bytes());
+        count += 1;
+        if reviewed_rows.iter().any(|row| {
+            row.id == case.name
+                && row.matches(
+                    case.input.as_bytes(),
+                    &format!("sqli:{}", u8::from(expected_detected)),
+                    &format!("sqli:{}", u8::from(actual.is_some())),
+                )
+        }) {
+            reviewed_ids.push(case.name);
+            continue;
+        }
         assert_eq!(
             actual.is_some(),
             expected_detected,
@@ -253,9 +271,16 @@ fn sqli_corpus_baseline() {
             "SQL fingerprint mismatch for {filename}: input={:?}",
             case.input
         );
-        count += 1;
     }
     assert!(count > 0, "no SQL oracle fixtures found");
+    let mut expected_ids: Vec<&str> = reviewed_rows
+        .iter()
+        .map(|row| row.id)
+        .filter(|id| id.starts_with("test-sqli-"))
+        .collect();
+    expected_ids.sort_unstable();
+    reviewed_ids.sort_unstable();
+    assert_eq!(reviewed_ids, expected_ids, "reviewed SQL fixture deviations changed");
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

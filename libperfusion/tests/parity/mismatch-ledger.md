@@ -1,5 +1,12 @@
 # Differential behavior and mismatch ledger
 
+The machine-readable rows of every reviewed difference below -- oracle,
+suite, exact input bytes and both verdicts -- are in
+[`reviewed-differences.tsv`](reviewed-differences.tsv), keyed by the same
+ids. The direct and generated differential tests, the SQL corpus baselines
+and the `speed` benchmark read them from there; a test checks that every id
+there appears here.
+
 The selected oracle is `libinjection-go` v0.3.6 (release commit
 `355a9b39be7f692a976372cb34b675f45ec07188`), pinned as `v0.3.6` in
 `xtask/tools/go.mod` with checksum
@@ -9,7 +16,7 @@ streams, and five HTML contexts. The generated suite covers 770 deterministic
 byte and grammar inputs.
 
 The direct suite compares 17,380 defined fields. All 869 cases complete
-without oracle errors; 865 match all three public fields. Four exact cases
+without oracle errors; 862 match all three public fields. Seven exact cases
 carry reviewed public-result differences. Parser stream differences are
 reported as diagnostics and do not relax the public-result gate.
 
@@ -27,17 +34,20 @@ pinned C revision's keyword table.
 | `xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102` | `97) <math><a xlink:href="//jsfiddle.net/t846h/">click` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:693` | `<math><a xlink:href="//XXXxenotixXXX:3555/xss_serve_payloads/bmpz.bmp">KCF` | XSS miss | XSS hit | As above. |
 | `xss-xenotix.txt:694` | `<math><a xlink:href="//XXXxenotixXXX:3555/xss_serve_payloads/kcf.js">KCF` | XSS miss | XSS hit | As above. |
+| `test-sqli-038` | `1 and @version` | SQLi miss | SQLi hit, `1&v` | Short numeric boolean, no longer spared at three tokens; the pinned C reference also misses it. |
+| `test-sqli-041` | `1 and "a"` | SQLi miss | SQLi hit, `1&s` | As above. |
+| `test-tokens-words-021` | `` 1 AND`BAR` `` | SQLi miss | SQLi hit, `1&n` | Local `01&N` row; the pinned C reference also misses it. |
 
-Each exception is keyed by both case ID and exact bytes in
-`tests/oracle_differential.rs`. The test requires exactly four reviewed
-exception cases, so unrelated differences fail.
+Each exception is keyed by both case ID and exact bytes. The test requires
+every reviewed `go`/`direct` row to be observed and no other difference, so
+unrelated differences fail.
 
 The generated suite has seven reviewed SQLi verdict differences:
 `raw-0043`, `raw-0060`, `raw-0075`, `raw-0227`, `raw-0292`, `raw-0365` and
 `raw-0373` -- the narrowed `#` comment whitelist described below: each
 minimizes to `"#` or `'#` and yields the `sc` fingerprint Go suppresses. All
-seven are pinned by case ID and exact bytes in
-`tests/generated_differential.rs`; other verdict differences fail.
+seven are pinned by case ID and exact bytes as the `go`/`generated` rows;
+other verdict differences fail.
 
 ## Parser diagnostics
 
@@ -53,8 +63,10 @@ fold-collapse cases, namespace lookalikes, SVG/XSL name boundaries, and
 ## Pinned C reference
 
 The C check uses commit `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`, pinned in
-`tests/parity/manifest.json`. Across 869 inputs, SQLi verdicts and fingerprints
-match exactly. Twenty XSS verdict differences are reviewed:
+`tests/parity/differential.json`. Across 869 inputs, SQLi verdicts and fingerprints
+match exactly except `test-sqli-038`, `test-sqli-041` and
+`test-tokens-words-021`, the three short numeric booleans in the Go table
+above, which C misses too. Twenty XSS verdict differences are reviewed:
 
 - **C misses; libperfusion detects:** `xss-event-name-nul`,
   `xss-tag-name-nul`, `xss-xmlns-name-nul`, `xss-url-nul`,
@@ -67,17 +79,18 @@ match exactly. Twenty XSS verdict differences are reviewed:
   `xss-svg-prefix-overlong-control`, and `xss-xsl-prefix-overlong-control`.
   These cases avoid C's suffix/prefix overmatches and agree with Go main.
 - **C detects; libperfusion and Go main allow:** `xss-html5secorg.txt:232`,
-  `:234`, `:236`, and `:468`; and `xss-xenotix.txt:1196`. The cases contain
-  prefixed XML/SVG elements. Their exact bytes are in the differential test
-  and are checked against both references.
+  `xss-html5secorg.txt:234`, `xss-html5secorg.txt:236`, and
+  `xss-html5secorg.txt:468`; and `xss-xenotix.txt:1196`. The cases contain
+  prefixed XML/SVG elements. Their exact bytes are reviewed rows and are
+  checked against both references.
 - **C and libperfusion detect; Go main allows:**
   `xss-soaj1664ashar-pastebin-u6FY1xDA.txt:78` and `:102`, and
   `xss-xenotix.txt:693` and `:694`. All four are
   `<math><a xlink:href="//host/path">`. They were C-only detections until
   the local `MATH` tag row was added; the row closed them, so these four
   moved from the C difference list to the Go one. They are still pinned by
-  case ID and exact bytes, as `(C, libperfusion) = (true, true)` rows of
-  `C_XSS_SAMPLE_VERDICTS`, so losing the detection again fails the gate.
+  case ID and exact bytes as `go`/`direct` rows, and the C gate allows no
+  difference on them, so losing the detection again fails both gates.
 
 On all 81,420 XSS samples in the pinned C data (the revision carries the
 0xFF `h5_skip_white` fix and its three `data/xss-github-92.txt` samples),
@@ -86,9 +99,9 @@ C flags 81,400 and allows 20. The four samples above are the whole difference
 between libperfusion and Go main, and five C-only detections remain.
 
 The optional C gate compares exact case IDs and bytes and requires exactly
-these twenty XSS differences; new SQL or XSS differences fail. The Go gate
-also checks all nine added sample inputs, including their XSS verdicts, and
-requires exactly four reviewed public-result exceptions.
+these twenty XSS and three SQLi differences; new SQL or XSS differences fail.
+The Go gate also checks all nine added sample inputs, including their XSS
+verdicts, and requires exactly seven reviewed public-result exceptions.
 
 ## Corpus formatter regression
 
@@ -117,6 +130,7 @@ these shapes; each is covered by a test in `tests/regressions.rs`.
 | 8 stacked-statement fingerprints added | `01;ES`, `01;T`, `0S;ES`, `0S;T`, `01;TN`, `0S;TN`, `01;TC`, `0S;TC` absent | present | Length-4 coverage is thin upstream, so `1;WAITFOR DELAY '0:0:5'` passed while `1;WAITFOR DELAY '0:0:5',` was caught |
 | 20 opt-in dialect identifiers (`strict-sql-lookup`) | absent | present when enabled | These improve some function-call detections but can reclassify UNION columns; the default lookup omits them. `sqli_with_strict_fallback()` adds 16 of them on a retry and `ATTACH`, `COPY`, `DETACH` and `VACUUM` only directly after a `;`. See `data/sqli_keywords_strict.txt` |
 | 12 URL-bearing attributes and the `MATH` tag added | absent | present | Local attributes inspect colon-terminated schemes to avoid prose false positives; upstream does not inspect these URL-bearing attributes. See `data/xss_tables_local.txt` |
+| `1&n` fingerprint added; three-token suppression kept only for `s&n` and `n&1` | `1&n` absent; `s&n`, `n&1`, `1&1`, `1&v` and `1&s` suppressed at exactly three raw tokens | `01&N` in `data/sqli_keywords_local.txt`; `1&1`, `1&v` and `1&s` flagged at three tokens | `1 or id=id`, `-1 or pass`, `1 or 1`, `0 or 1` and `1 or 'a'` broaden `WHERE id = <input>` and passed CRS at PL1. A number on the left is not prose; `s&n` and `n&1` ("sexy and 17") stay suppressed, and `n&n` is never listed. False-positive classes: every short `N and\|or word` phrase and every numeric pair |
 
 ### Measured effect on the pinned upstream sample data
 
@@ -127,12 +141,14 @@ asserted in `tests/upstream.rs`.
 | Sample set | Upstream C | libperfusion | Difference |
 | --- | --- | --- | --- |
 | `sqli-*.txt` (85,802) | 85,785 flagged | 85,785 flagged | none |
-| `false_positives.txt` (423) | 21 flagged | 25 flagged | four more, all from the `#` whitelist |
+| `false_positives.txt` (423) | 21 flagged | 32 flagged | eleven more: four from the `#` whitelist, seven from short numeric booleans |
 | `xss*.txt` (81,420) | 81,400 flagged | 81,395 flagged | four more than Go main, all from the `MATH` tag |
 
 The four added false positives are the cost of the `#` change and are
-recorded here rather than argued away: `7" #2 CIRCULAR NEEDLE`,
-`"#2 MOM"`, `BAMBOO CHARCOAL SOAP 1 '#` and `FOO BAR'# BLAH`. Each has the
+recorded here rather than argued away: `7" #2 CIRCULAR NEEDLE`
+(`false_positives.txt:222`), `"#2 MOM"` (`false_positives.txt:226`),
+`BAMBOO CHARCOAL SOAP 1 '#` (`false_positives.txt:232`) and `FOO BAR'# BLAH`
+(`false_positives.txt:302`). Each has the
 same token shape as `admin'#` -- a string the input did not open, closed by
 a `#` comment that ends the input -- so no rule separates them from the
 authentication bypass. Four product-catalog strings in 423 is the price of
@@ -141,15 +157,28 @@ catching the bypass, and a deployment that cannot pay it should revert the
 same shape accounts for the seven reviewed `raw-*` deviations in the
 generated suite.
 
+The seven short numeric boolean false positives are the cost of the `1&n`
+row and of no longer sparing `1&1` at three tokens. The row flags
+`40 AND FAB` (`false_positives.txt:40`), `7 AND HALF`
+(`false_positives.txt:171`), `10.00 AND UNDER` (`false_positives.txt:175`),
+`10 OR LESS` (`false_positives.txt:177`) and `9/PLUGS AND TUNNELS`
+(`false_positives.txt:223`); the arm flags `00 AND 3`
+(`false_positives.txt:174`) and `1950 or 1960` (`false_positives.txt:375`).
+`1 or 2` cannot be told from the injection `0 or 2` by tokens, so no narrower
+rule exists. Measured on the review's sets, the row alone adds 5 of 423
+decoded `false_positives.txt` lines, 5 of 60 short form values and 4 of 20,995
+licence-prose windows; the arm alone adds 2 of 423, 10 of 60 and 9 of 20,995
+(0 of 2,000 random `<word> and|or <word>` pairs for either). Rule 942100 is
+critical, so each is a 403 at PL1; numeric fields that legitimately carry such
+values need a rule exclusion. Adding `0N&N` instead would flag 76.7 % of short
+`X and Y` values and catch nothing more.
+
 The `MATH` tag can also fire on benign MathML; `data/xss_tables_local.txt`
 documents the trade-off and how to drop the row.
 
-The same inventory is pinned a second time, by exact bytes, in
-`REVIEWED_DIFFERENCES` in `benches/speed.rs`: that benchmark checks the port
-against libinjection C input by input before it reports any timing, and the
-nine rows there are these four false positives and the five C-only XSS
-samples above. Changing this table without changing that one fails the
-benchmark.
+The `speed` benchmark checks the port against libinjection C input by input
+before it reports any timing, against the `speed:*` rows: these eleven false
+positives and the five C-only XSS samples above.
 
 `XP_CMDSHELL` was in the dialect list and has been removed: classifying it
 as a `Function` *lost* detections, because
@@ -183,8 +212,8 @@ supplement into the matching upstream table at compile time, so
 `cargo xtask tables-refresh --upstream <checkout>` can rewrite the upstream
 files from a newer C revision without dropping the local rows. The
 upstream-generated files therefore stay byte-identical to what the pinned
-revision produces, and `tables` and `source_sha256` in
-`tests/parity/manifest.json` and `sql`/`xss` in `data/tables.json` continue to
+revision produces, and `source_sha256` in
+`tests/parity/differential.json` and `sql`/`xss` in `data/tables.json` continue to
 describe upstream alone; the supplements are pinned by `local` in
 `data/tables.json` and verified by `cargo xtask tables-check`. The pinned Go
 and C oracles still describe upstream, so the optional
@@ -197,4 +226,4 @@ go1.27.4-X:nodwarf5/linux/amd64. The shipped tables were extracted from C
 revision `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`, recorded in
 `data/tables.json`. The checked-in differential workflow runs both the pinned
 Go module and the C checkout at `1b9f5f077fc10754e7e4b6498cdaa8fbee53d707`,
-recorded in `tests/parity/manifest.json`, as CI oracles.
+recorded in `tests/parity/differential.json`, as CI oracles.

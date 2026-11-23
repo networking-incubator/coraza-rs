@@ -66,7 +66,7 @@ No known byte-identity restrictions remain in the reviewed fixtures as of this r
 
 ## Deliberate deviation classes without engine case IDs yet
 
-The detector ledger also records five deliberate classes. They have no Coraza
+The detector ledger also records six deliberate classes. They have no Coraza
 engine case ID or fixture hash yet, so they are not rows in the table above;
 adding them requires a shared-corpus fixture first.
 
@@ -82,6 +82,10 @@ adding them requires a shared-corpus fixture first.
   `libperfusion/tests/regressions.rs`.
 - Twelve URL-bearing attributes and the `MATH` tag added. Cases are pinned in
   `libperfusion/tests/regressions.rs` and the two XSS corpus rows above.
+- `1&n` fingerprint added; three-token suppression kept only for `s&n` and `n&1`.
+  `@detectSQLi` flags short numeric booleans such as `1 or id`, `1 or 1` and
+  `1 or 2`, including the false positives `5 or more` and `2019 or 2020`. Cases are
+  pinned in `libperfusion/tests/regressions.rs`.
 - Body-limit `Reject` under `SecRuleEngine DetectionOnly`. Go Coraza sets a blocking
   interruption even in detection-only mode; this port records
   `would_be_interruption` and inspects the bytes retained up to the limit.

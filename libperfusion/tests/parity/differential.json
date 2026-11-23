@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "https://github.com/corazawaf/libinjection-go",
+    "version": "v0.3.6",
+    "module_sum": "h1:cXqACFY1anDzC9W127WguanVYvzvvcdQJI0BmErixdk=",
+    "go_toolchain_flavors": [
+      {
+        "version": "go1.27.x",
+        "minimum_patch": 1,
+        "go_experiment": ""
+      },
+      {
+        "version": "go1.27.x-X:nodwarf5",
+        "minimum_patch": 1,
+        "go_experiment": "nodwarf5"
+      }
+    ],
+    "goos": "linux",
+    "goarch": "amd64",
+    "driver": "tools/parity/oracle_driver_test.go",
+    "transport": "tab-separated case id and hex input; binary outputs are hex fields"
+  },
+  "c_reference": {
+    "repository": "https://github.com/libinjection/libinjection",
+    "commit": "1b9f5f077fc10754e7e4b6498cdaa8fbee53d707",
+    "driver": "tests/c_oracle_driver.c",
+    "results": "SQLi verdict and fingerprint; XSS verdict",
+    "reviewed_xss_differences": 20
+  },
+  "sql_dispatch": {
+    "bytes": 256,
+    "sha256": "0ac276cbdd9270e9527c1f6db81b7b76a145a600cebc3dba43bf80181377599e"
+  },
+  "source_sha256": {
+    "sqli_data.go": "196959c0e8c24c06ba604c3b9d926814fc3b3a28702db2a7ef920a0542d58c54",
+    "sqli_parse.go": "8442fa562228890a3f1acbfbcfe8ad76d8d2b840be3b2cce776f2ce683972785",
+    "sqli_token.go": "466f90c777cae2fa7ee48b88fc4c79eb48aa03d0904f6023a4480181196a3134",
+    "sqli.go": "a1e5bd2887a6f04e8262d58fe7add7144023c787e03ec4b466df984f25e41bac",
+    "xss_decls.go": "5c39d0d1b96efe075c30c108c602e31e50a3d8c565342206144012bd9f5b759c",
+    "xss_helpers.go": "d9b1e66d21d0d316a51cd1e547eef4352f99ed74f89fc5190f8d10d0753ea8a9",
+    "html5.go": "d8614fcb7e5dfdb21beac94382d9e109dbb2d4cfac1f1ea0aeb016adf698af80",
+    "xss.go": "768f919a0f0dd54cb9777fee388c539632b16f1ccec8701529c4d476d96e4aaf",
+    "LICENSE": "3296b49ab7f460064a220ce0c5b0ea698a9c82a3d72bec5f10d0e0529cce1023"
+  },
+  "exceptions": [],
+  "expected_oracle_errors": []
+}

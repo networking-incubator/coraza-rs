@@ -257,11 +257,6 @@ fn pinned_module(root: &Path) -> Result<(String, String), String> {
 fn refresh() -> Result<(), String> {
     let root = workspace_root();
     let crate_root = root.join("libperfusion");
-    let previous_manifest: Value = serde_json::from_slice(
-        &fs::read(crate_root.join("tests/parity/manifest.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let previous_differential = previous_manifest.get("differential").cloned();
     let tools_dir = root.join("xtask/tools");
     let version = pinned_module_version(&tools_dir)?;
     let (source_root, downloaded_version, downloaded_sum) = download_module(&tools_dir, &version)?;
@@ -283,19 +278,13 @@ fn refresh() -> Result<(), String> {
     let go_version = run_output(Command::new("go").arg("version"), "read Go version")?;
     let oracle_rows = generate_oracle(&tools_dir, &temporary, &version, &fixtures)?;
 
-    let mut manifest = build_manifest(&version, &module_sum, &go_version, &temporary_corpus, &fixtures)?;
-    if let Some(differential) = previous_differential {
-        manifest
-            .as_object_mut()
-            .ok_or_else(|| "generated manifest root is not an object".to_owned())?
-            .insert("differential".to_owned(), differential);
-    }
+    // This command is the only writer of manifest.json; the differential
+    // metadata lives in differential.json, written by check_manifest.py.
+    let manifest = build_manifest(&version, &module_sum, &go_version, &temporary_corpus, &fixtures)?;
     let manifest_path = temporary_parity.join("manifest.json");
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    manifest_bytes.push(b'\n');
+    fs::write(&manifest_path, manifest_bytes).map_err(|error| error.to_string())?;
     let oracle_path = temporary_parity.join("sqli_oracle.tsv");
     fs::write(&oracle_path, oracle_rows).map_err(|error| error.to_string())?;
     check_snapshot(&temporary_corpus, &manifest_path, &oracle_path, &version, &module_sum)?;

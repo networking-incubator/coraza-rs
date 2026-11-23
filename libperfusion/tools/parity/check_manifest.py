@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Check the pinned libinjection provenance, data tables, and corpus inventory.
+"""Check the pinned libinjection-go source, the C reference pin and the SQL dispatch.
+
+This script is the only writer of ``tests/parity/differential.json``
+(``--update --go-source``). It does not re-derive the facts other tools own:
+``cargo xtask corpus-check`` owns the Go module pin and the fixture inventory
+in ``tests/parity/manifest.json`` (written only by ``cargo xtask
+corpus-refresh``), and ``data/tables.json`` owns the table hashes and the C
+revision they came from (written by ``cargo xtask tables-refresh``, checked by
+``cargo xtask tables-check``). ``differential.json`` repeats the module pin
+from ``manifest.json``, so a module bump fails here until ``--update`` rewrites
+it, and ``C_REFERENCE`` must name the commit ``data/tables.json`` records.
 
 Scope: every table comparison here is against the *upstream-generated*
 ``data/sqli_keywords.txt`` and ``data/xss_tables.txt``. Those two files stay
@@ -11,7 +21,7 @@ The compiled tables are deliberately larger: ``build.rs`` merges
 Those supplements are this project's own additions, are pinned by the
 ``local`` section of ``data/tables.json``, and are verified by
 ``cargo xtask tables-check``; they are intentionally absent from the parity
-manifest, which describes upstream alone. What this script does check about
+metadata, which describes upstream alone. What this script does check about
 them is that they cannot silently change the meaning of an upstream row --
 see :func:`check_local_supplements`.
 """
@@ -30,8 +40,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "tests/parity/manifest.json"
+DIFFERENTIAL = ROOT / "tests/parity/differential.json"
+TABLES = ROOT / "data/tables.json"
 GO_MODULE = "github.com/corazawaf/libinjection-go"
 GO_REPOSITORY = "https://github.com/corazawaf/libinjection-go"
+# A C revision bump edits this commit (check_c_reference requires it to equal
+# data/tables.json) and reruns --update --go-source.
 C_REFERENCE = {
     "repository": "https://github.com/libinjection/libinjection",
     "commit": "1b9f5f077fc10754e7e4b6498cdaa8fbee53d707",
@@ -42,7 +56,6 @@ C_REFERENCE = {
     "reviewed_xss_differences": 20,
 }
 GO_TOOLS = ROOT.parent / "xtask/tools"
-FAMILY_COUNTS = {"sqli": 60, "folding": 119, "tokens": 249, "html5": 68, "xss": 7}
 EXPECTED_KEYWORDS = 9_359
 EXPECTED_FINGERPRINTS = 8_367
 EXPECTED_XSS = {"tags": 20, "events": 432, "attributes": 20}
@@ -63,20 +76,6 @@ def sha256(data: bytes) -> str:
 
 def fail(message: str) -> None:
     raise SystemExit(message)
-
-
-def fixture_inventory() -> tuple[dict[str, int], list[dict[str, object]]]:
-    counts = dict.fromkeys(FAMILY_COUNTS, 0)
-    files: list[dict[str, object]] = []
-    for path in sorted((ROOT / "tests/corpus").glob("test-*.txt")):
-        match = re.match(r"test-(sqli|folding|tokens|html5|xss)-", path.name)
-        if not match:
-            fail(f"unrecognized fixture family: {path.name}")
-        family = match.group(1)
-        counts[family] += 1
-        data = path.read_bytes()
-        files.append({"name": path.name, "size": len(data), "sha256": sha256(data)})
-    return counts, files
 
 
 def compare_fixtures(source: Path) -> None:
@@ -331,8 +330,9 @@ def parse_local_xss_rows() -> list[tuple[str, str]]:
 def check_local_supplements() -> None:
     """Verify the local additions only ever extend the upstream tables.
 
-    The manifest hashes upstream alone, so a local row that repeats or
-    redefines an upstream row would change the compiled tables while leaving
+    The upstream records (``sql``/``xss`` in ``data/tables.json`` and the
+    Go source comparison) describe upstream alone, so a local row that repeats
+    or redefines an upstream row would change the compiled tables while leaving
     every recorded hash intact. ``build.rs`` rejects such a merge at compile
     time; this repeats the check here so the parity gate reports it as a
     provenance problem rather than as a build failure.
@@ -358,34 +358,7 @@ def check_local_supplements() -> None:
         fail(f"data/xss_tables_local.txt redefines upstream XSS rows: {overlaps}")
 
 
-def semantic_table_hash(rows: list[tuple[str, str | None]]) -> str:
-    normalized = [name if kind is None else f"{name}\t{kind}" for name, kind in rows]
-    return sha256("\n".join(sorted(normalized)).encode("ascii"))
-
-
-def local_table_summary() -> dict[str, object]:
-    keywords = parse_rust_keywords(ROOT / "data/sqli_keywords.txt")
-    fingerprints = sum(value == "F" for value in keywords.values())
-    rust_dispatch = parse_rust_dispatch()
-    events, tags, attrs = rust_xss_tables()
-    counts = {"tags": len(tags), "events": len(events), "attributes": len(attrs)}
-    if counts != EXPECTED_XSS:
-        fail(f"unexpected libperfusion XSS table counts: {counts}")
-    return {
-        "sql_keyword_entries": len(keywords),
-        "sql_fingerprint_entries": fingerprints,
-        "sql_dispatch_bytes": len(rust_dispatch),
-        "sql_dispatch_sha256": sha256("\n".join(rust_dispatch).encode("ascii")),
-        "xss_tables": counts,
-        "xss_table_sha256": {
-            "tags": semantic_table_hash([(name, None) for name in tags]),
-            "events": semantic_table_hash([(name, "Deny") for name in events]),
-            "attributes": semantic_table_hash(attrs),
-        },
-    }
-
-
-def compare_data(source: Path) -> tuple[dict[str, object], dict[str, str]]:
+def compare_data(source: Path) -> dict[str, str]:
     go_keywords = parse_go_keywords(source)
     rust_keywords = parse_rust_keywords(ROOT / "data/sqli_keywords.txt")
     if go_keywords != rust_keywords:
@@ -437,46 +410,28 @@ def compare_data(source: Path) -> tuple[dict[str, object], dict[str, str]]:
     copied_license = ROOT / "LICENSES/libinjection-go-BSD-3-Clause.txt"
     if copied_license.read_bytes() != (source / "LICENSE").read_bytes():
         fail("copied libinjection-go license differs from the pinned upstream LICENSE")
-    summary = {
-        "sql_keyword_entries": len(go_keywords),
-        "sql_fingerprint_entries": fingerprints,
-        "sql_dispatch_bytes": len(go_dispatch),
-        "sql_dispatch_sha256": sha256("\n".join(go_dispatch).encode("ascii")),
-        "xss_tables": actual_xss,
-        "xss_table_sha256": {
-            "tags": semantic_table_hash(go_tags),
-            "events": semantic_table_hash([(name, "Deny") for name, _ in go_events]),
-            "attributes": semantic_table_hash(mapped_go_attrs),
-        },
-    }
-    return summary, hashes
+    return hashes
+
+
+def check_c_reference() -> None:
+    """The C revision CI fetches is the one ``data/tables.json`` was refreshed from."""
+    source = json.loads(TABLES.read_text(encoding="utf-8")).get("source")
+    recorded = (source.get("repository"), source.get("commit")) if isinstance(source, dict) else None
+    if recorded != (C_REFERENCE["repository"], C_REFERENCE["commit"]):
+        fail(
+            f"C_REFERENCE in check_manifest.py names {C_REFERENCE['commit']}, but data/tables.json "
+            f"records {recorded}; after a C revision bump update C_REFERENCE, then rerun --update --go-source"
+        )
 
 
 def module_pin() -> tuple[str, str]:
-    go_mod = (GO_TOOLS / "go.mod").read_text(encoding="utf-8")
-    version = None
-    in_require_block = False
-    for line in go_mod.splitlines():
-        line = line.split("//", 1)[0].strip()
-        if line == "require (":
-            in_require_block = True
-            continue
-        if line == ")":
-            in_require_block = False
-            continue
-        fields = line.split()
-        if len(fields) == 3 and fields[:2] == ["require", GO_MODULE]:
-            version = fields[2]
-        elif in_require_block and len(fields) >= 2 and fields[0] == GO_MODULE:
-            version = fields[1]
-    if not version:
-        fail(f"{GO_TOOLS / 'go.mod'} does not pin {GO_MODULE}")
-
-    for line in (GO_TOOLS / "go.sum").read_text(encoding="utf-8").splitlines():
-        fields = line.split()
-        if len(fields) == 3 and fields[0] == GO_MODULE and fields[1] == version:
-            return version, fields[2]
-    fail(f"{GO_TOOLS / 'go.sum'} has no checksum for {GO_MODULE} {version}")
+    """The Go module pin ``cargo xtask corpus-check`` verifies against go.mod and go.sum."""
+    source = json.loads(MANIFEST.read_text(encoding="utf-8")).get("source")
+    version = source.get("version") if isinstance(source, dict) else None
+    module_sum = source.get("module_sum") if isinstance(source, dict) else None
+    if not isinstance(version, str) or not isinstance(module_sum, str) or not version or not module_sum:
+        fail(f"{MANIFEST.relative_to(ROOT)} records no Go module pin; run cargo xtask corpus-refresh")
+    return version, module_sum
 
 
 def pinned_source(path_text: str | None) -> Path | None:
@@ -495,39 +450,37 @@ def pinned_source(path_text: str | None) -> Path | None:
     metadata = json.loads(result.stdout)
     version, module_sum = module_pin()
     if metadata.get("Version") != version or metadata.get("Sum") != module_sum:
-        fail("resolved Go module differs from xtask/tools/go.mod and go.sum")
+        fail(f"resolved Go module differs from the pin in {MANIFEST.relative_to(ROOT)}; run cargo xtask corpus-refresh")
     if Path(metadata.get("Dir", "")).resolve() != source:
         fail(f"Go source must be the module selected by xtask/tools/go.mod: {source}")
     return source
 
 
-def expected_manifest(source: Path | None) -> dict[str, object]:
-    version, module_sum = module_pin()
-    counts, files = fixture_inventory()
-    if counts != FAMILY_COUNTS:
-        fail(f"fixture family counts differ: expected {FAMILY_COUNTS}, found {counts}")
-    if len(files) != 503:
-        fail(f"expected 503 test fixtures, found {len(files)}")
+def expected_differential(source: Path | None) -> dict[str, object]:
     # Runs on both paths: the upstream-versus-source comparison below stays
     # exact, and this is what keeps the local supplements from quietly
-    # changing what those exact hashes describe.
+    # changing what those exact tables describe.
     check_local_supplements()
+    check_c_reference()
+    version, module_sum = module_pin()
+    # Offline, this hash is the only tie between the compiled dispatch and the
+    # last --go-source comparison; the table rows are pinned by data/tables.json.
+    dispatch = parse_rust_dispatch()
 
-    if source is None:
-        data_hashes = {"data/sqli_keywords.txt": sha256((ROOT / "data/sqli_keywords.txt").read_bytes())}
-        table_summary: dict[str, object] | None = local_table_summary()
-    else:
+    data_hashes: dict[str, str] = {}
+    if source is not None:
         compare_fixtures(source)
-        table_summary, upstream_hashes = compare_data(source)
-        data_hashes = {**upstream_hashes, "data/sqli_keywords.txt": sha256((ROOT / "data/sqli_keywords.txt").read_bytes())}
+        data_hashes = compare_data(source)
         local_bsd_hash = sha256((ROOT / "LICENSES/libinjection-go-BSD-3-Clause.txt").read_bytes())
-        if upstream_hashes.get("LICENSE") != local_bsd_hash:
+        if data_hashes.get("LICENSE") != local_bsd_hash:
             fail("crate-local BSD license text differs from the pinned Go source LICENSE")
 
     return {
         "schema": 1,
         "oracle": {
             "repository": GO_REPOSITORY,
+            # Offline, the only tie between the source hashes below and the
+            # module pin corpus-check verifies; a bump fails until --update.
             "version": version,
             "module_sum": module_sum,
             "go_toolchain_flavors": [
@@ -544,9 +497,8 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
             "transport": "tab-separated case id and hex input; binary outputs are hex fields",
         },
         "c_reference": C_REFERENCE,
-        "tables": table_summary,
+        "sql_dispatch": {"bytes": len(dispatch), "sha256": sha256("\n".join(dispatch).encode("ascii"))},
         "source_sha256": data_hashes,
-        "fixtures": {"total": len(files), "families": counts, "files": files},
         "exceptions": [],
         "expected_oracle_errors": EXPECTED_ORACLE_ERRORS,
     }
@@ -555,7 +507,7 @@ def expected_manifest(source: Path | None) -> dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--go-source", help="module cache path selected by xtask/tools/go.mod")
-    parser.add_argument("--update", action="store_true", help="write manifest from the selected module and corpus")
+    parser.add_argument("--update", action="store_true", help="write tests/parity/differential.json from the selected module")
     parser.add_argument("--extract-keywords", action="store_true", help="recreate the checked-in SQL keyword table from the selected module")
     args = parser.parse_args()
 
@@ -567,37 +519,30 @@ def main() -> None:
         if not args.update:
             print("extracted data/sqli_keywords.txt from the selected module")
             return
-    current = expected_manifest(source)
-    expected_fixtures = current.pop("fixtures")
+    current = expected_differential(source)
     if args.update:
-        recorded = json.loads(MANIFEST.read_text(encoding="utf-8"))
-        if recorded.get("schema") != 2 or recorded.get("fixtures") != expected_fixtures:
-            fail("corpus manifest differs; refresh the corpus before updating parity data")
-        recorded["differential"] = current
-        MANIFEST.write_text(json.dumps(recorded, indent=2) + "\n", encoding="utf-8")
-        print(f"updated {MANIFEST.relative_to(ROOT)}")
+        # Without the module source the Go hashes would be dropped, not refreshed.
+        if source is None:
+            fail("--update requires --go-source")
+        DIFFERENTIAL.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        print(f"updated {DIFFERENTIAL.relative_to(ROOT)}")
         return
 
-    recorded = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    if recorded.get("schema") != 2 or recorded.get("fixtures") != expected_fixtures:
-        fail("corpus fixture inventory differs from the manifest")
-    recorded_differential = recorded.get("differential")
-    if not isinstance(recorded_differential, dict):
-        fail("differential parity metadata is missing from the manifest")
+    recorded = json.loads(DIFFERENTIAL.read_text(encoding="utf-8"))
+    if not isinstance(recorded, dict):
+        fail(f"{DIFFERENTIAL.relative_to(ROOT)} is not a JSON object")
     if source is None:
-        recorded_hashes = recorded_differential.get("source_sha256")
+        recorded_hashes = recorded.get("source_sha256")
         if not isinstance(recorded_hashes, dict):
-            fail("source hashes are missing from the differential manifest")
-        if recorded_hashes.get("data/sqli_keywords.txt") != current["source_sha256"].get("data/sqli_keywords.txt"):
-            fail("SQL keyword source hash differs from the pinned manifest")
+            fail("source hashes are missing from the differential metadata")
         local_bsd_hash = sha256((ROOT / "LICENSES/libinjection-go-BSD-3-Clause.txt").read_bytes())
         if recorded_hashes.get("LICENSE") != local_bsd_hash:
-            fail("crate-local BSD license text differs from the pinned manifest")
+            fail("crate-local BSD license text differs from the pinned differential metadata")
         current["source_sha256"] = recorded_hashes
-    if current != recorded_differential:
-        print("parity manifest mismatch; rerun with --update only after reviewing source/data changes", file=sys.stderr)
+    if current != recorded:
+        print("parity differential mismatch; rerun with --update only after reviewing source/data changes", file=sys.stderr)
         raise SystemExit(1)
-    print("parity manifest verified: 503 fixtures and recorded source/table hashes")
+    print(f"parity differential verified: {DIFFERENTIAL.relative_to(ROOT)} matches the C pin, SQL dispatch and source hashes")
 
 
 if __name__ == "__main__":

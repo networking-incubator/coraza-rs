@@ -39,7 +39,10 @@ tables retain their source revision in their headers and are checked with
 `data/sqli_keywords.txt` and `data/xss_tables.txt` are generated from the
 pinned C revision and are rewritten wholesale by `cargo xtask tables-refresh`.
 Local fingerprint additions and XSS rows live in
-`data/sqli_keywords_local.txt` and `data/xss_tables_local.txt`. Optional
+`data/sqli_keywords_local.txt` and `data/xss_tables_local.txt`. Unlike
+upstream, `sqli()` flags short numeric boolean expressions such as `1 or id`
+and `1 or 2`, so numeric fields that legitimately carry such values need a
+rule exclusion. Optional
 dialect identifiers live in `data/sqli_keywords_strict.txt` and are included
 only when the `strict-sql-lookup` Cargo feature is enabled. Those identifiers
 can improve function-call detection but can reclassify UNION column names, so
@@ -54,7 +57,8 @@ on their own. Coraza's `@detectSQLi` and the `envoy-libperfusion` filter use
 this lookup.
 
 Run the usual checks from the repository root. The parity target needs Go
-1.27.1 and `LIBINJECTION_DIR` set to the C revision in the parity manifest.
+1.27.1 and `LIBINJECTION_DIR` set to the C revision pinned in
+`tests/parity/differential.json`.
 
 ```sh
 make lint
@@ -66,6 +70,10 @@ The Go oracle version is pinned in `xtask/tools/go.mod`; update it there, then
 review the refreshed corpus, manifest, tables, and parity results. Refresh Go
 fixtures with `cargo xtask corpus-refresh`, and tables from a libinjection C
 checkout with `cargo xtask tables-refresh --upstream /path/to/libinjection`.
+After a Go module bump, also run
+`python3 libperfusion/tools/parity/check_manifest.py --update --go-source <dir>`.
+A C revision bump also sets `C_REFERENCE` in that script to the new commit and
+reruns it. See the pin table in [docs/ci.md](../docs/ci.md).
 The optional upstream C corpus and table checks use `LIBINJECTION_DIR`:
 
 ```sh

@@ -182,6 +182,82 @@ fn sqli_builtin_keeps_union_column_barewords() {
     assert!(libperfusion::sqli(b"-2 union select 1,2 zzz,version() from x").is_some());
 }
 
+/// A number joined by a logic operator to a bareword (`1&n`, also after the
+/// `id=id` fold) or to a number, variable or string (`1&1`, `1&v`, `1&s`)
+/// broadens `WHERE id = <input>`; upstream lets every one of them through.
+#[test]
+fn sqli_detects_short_numeric_boolean_injections() {
+    for payload in [
+        b"-1 or pass".as_slice(),
+        b"1 or user_id",
+        b"9 || admin",
+        b"0 or is_admin=is_admin",
+        b"1 or id=id",
+        b"5 or current_user",
+        b"2 or 2",
+        b"1 or true",
+        b"0 || 1",
+        b"1 or 1",
+        b"1 and 1",
+        b"1 or 'a'",
+        b"1 or @@version",
+    ] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(payload).is_some(),
+            "missed {:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+/// The fingerprints of the reviewed rows in `tests/parity/reviewed-differences.tsv`
+/// (the verdict gates compare only verdicts there); CRS logs them through `TX.0`.
+#[test]
+fn sqli_short_numeric_boolean_fingerprints() {
+    for (payload, fingerprint) in [
+        (b"1 and @version".as_slice(), "1&v"), // test-sqli-038
+        (b"1 and \"a\"", "1&s"),               // test-sqli-041
+        (b"1 AND`BAR`", "1&n"),                // test-tokens-words-021
+        (b"1 or id", "1&n"),
+        (b"1 or 1", "1&1"),
+    ] {
+        assert_eq!(
+            libperfusion::sqli(payload).unwrap_or_default().as_str(),
+            fingerprint,
+            "{:?}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+/// Word-first three-token booleans stay prose: `n&n` must never be listed, and
+/// `s&n` / `n&1` ("sexy and 17") keep their three-token suppression.
+#[test]
+fn sqli_short_boolean_prose_stays_allowed() {
+    for line in [
+        b"salt and pepper".as_slice(),
+        b"Tom and Jerry",
+        b"yes or no",
+        b"sexy and 17",
+        b"x' or col",
+    ] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(line).is_none(),
+            "flagged {:?}",
+            String::from_utf8_lossy(line)
+        );
+    }
+    // Accepted false positives: a number on the left cannot be told from the
+    // injection `0 or 2` by tokens, so these are now hits (see the ledger).
+    for line in [b"5 or more".as_slice(), b"1 or 2", b"2019 or 2020", b"true or false"] {
+        assert!(
+            libperfusion::sqli_with_strict_fallback(line).is_some(),
+            "missed {:?}",
+            String::from_utf8_lossy(line)
+        );
+    }
+}
+
 #[cfg(feature = "strict-sql-lookup")]
 #[test]
 fn strict_sql_lookup_preserves_dialect_gains() {

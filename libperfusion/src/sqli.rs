@@ -312,8 +312,10 @@ impl<'a, L: SqlLookup> State<'a, L> {
                     return tokens[0].str_open.is_none()
                         && tokens[2].str_close.is_none()
                         && tokens[0].str_close == tokens[2].str_open;
-                } else if matches!(fingerprint, b"s&n" | b"n&1" | b"1&1" | b"1&v" | b"1&s") {
-                    // "sexy and 17" is not SQLi, "sexy and 17<18" is.
+                } else if matches!(fingerprint, b"s&n" | b"n&1") {
+                    // "sexy and 17" is not SQLi, "sexy and 17<18" is. A number on
+                    // the left is not prose: `1 or 1` and `0 or 'a'` broaden a
+                    // numeric `WHERE`, so `1&1`, `1&v` and `1&s` are not spared.
                     if stats.tokens == 3 {
                         return false;
                     }
