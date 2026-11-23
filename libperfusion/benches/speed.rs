@@ -43,6 +43,9 @@
 #[path = "../tests/upstream_common.rs"]
 mod common;
 
+#[path = "../tests/common/reviewed.rs"]
+mod reviewed;
+
 use std::{
     env,
     fmt::Write as _,
@@ -228,76 +231,6 @@ fn time_libinjection(driver: &Path, workload: &Workload, budget: Duration) -> Ti
     }
 }
 
-/// Inputs on which libinjection and this port are known to disagree.
-///
-/// Each row is `(workload, hex input, libinjection, libperfusion)`, keyed by
-/// the exact bytes so an unrelated new difference cannot hide behind a
-/// reviewed one. Every row is a sample of the pinned upstream data and is
-/// accounted for in `tests/parity/mismatch-ledger.md`.
-///
-/// This replaced a per-workload hit *count* delta. A count only says the two
-/// sides disagree about as many inputs as expected; it is satisfied just as
-/// well by one new false positive cancelling one lost detection, which is
-/// exactly the pair of changes correctness checking before timing exists to
-/// catch.
-const REVIEWED_DIFFERENCES: [(&str, &str, bool, bool); 9] = [
-    // The narrowed `#` comment whitelist: these four catalogue strings have
-    // the exact token shape of the `admin'#` authentication bypass.
-    (
-        "sqli: benign samples",
-        "37222023322043495243554c4152204e4545444c45",
-        false,
-        true,
-    ), // 7" #2 CIRCULAR NEEDLE
-    ("sqli: benign samples", "222332204d4f4d22", false, true), // "#2 MOM"
-    (
-        "sqli: benign samples",
-        "42414d424f4f2043484152434f414c20534f41502031202723",
-        false,
-        true,
-    ), // BAMBOO CHARCOAL SOAP 1 '#
-    ("sqli: benign samples", "464f4f20424152272320424c4148", false, true), // FOO BAR'# BLAH
-    // The five C-only XSS detections left after the local `MATH` tag row
-    // closed four of the original nine. Each contains a prefixed XML or SVG
-    // element that C over-matches on; the pinned Go reference agrees with
-    // this port on all five.
-    // xss-html5secorg.txt:232 -- prefixed XML template with a split scheme
-    (
-        "xss: attack samples",
-        "74657374203833203c783a74656d706c61746520786d6c6e733a783d22687474703a2f2f7777772e776170666f72756d2e6f72672f323030312f776d6c2220783a6f6e74696d65723d222428783a756e657363296a2428793a657363617065296124287a3a6e6f65637329762428782961242879297324287a29637269707424783a616c657274283129223e3c783a74696d65722076616c75653d2231222f3e3c2f783a74656d706c6174653e",
-        true,
-        false,
-    ),
-    // xss-html5secorg.txt:234 -- xml-events handler on a prefixed element
-    (
-        "xss: attack samples",
-        "74657374203834203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d226a6176617363726970743a616c6572742831292f2f2378",
-        true,
-        false,
-    ),
-    // xss-html5secorg.txt:236 -- xml-events handler, no scheme
-    (
-        "xss: attack samples",
-        "74657374203835203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d22746573742e6576742378222f3e",
-        true,
-        false,
-    ),
-    // xss-html5secorg.txt:468 -- SVG `set` writing `xlink:href`
-    (
-        "xss: attack samples",
-        "74657374203133325f31203c736574206174747269627574654e616d653d22786c696e6b3a687265662220626567696e3d226163636573734b65792861292220746f3d222f2f6578616d706c652e636f6d2f3f6122202f3e",
-        true,
-        false,
-    ),
-    // xss-xenotix.txt:1196 -- prefixed `x:script` element
-    (
-        "xss: attack samples",
-        "3c783a73637269707420786d6c6e733a783d22687474703a2f2f7777772e77332e6f72672f313939392f7868746d6c223e616c6572742831293b3c2f783a7363726970743e",
-        true,
-        false,
-    ),
-];
-
 /// Lower-case hex of `bytes`.
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -308,23 +241,34 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Checks the two verdicts input by input, allowing only reviewed rows.
-fn compare_verdicts(workload: &Workload, theirs: &[bool], ours: &[bool]) {
-    let mut reviewed = 0_usize;
+///
+/// The reviewed rows are the `speed:<workload>` rows of
+/// `tests/parity/reviewed-differences.tsv`, keyed by the exact bytes so an
+/// unrelated new difference cannot hide behind a reviewed one. A hit *count*
+/// would be satisfied just as well by one new false positive cancelling one
+/// lost detection. Every row whose input the workload holds must be hit; a
+/// full run (`complete`) holds them all.
+fn compare_verdicts(workload: &Workload, theirs: &[bool], ours: &[bool], complete: bool) {
+    let rows = reviewed::rows("c", &format!("speed:{}", workload.name));
+    let detection = workload.detection.name();
+    let mut seen = vec![false; rows.len()];
     let mut unreviewed = Vec::new();
     for ((input, &c_verdict), &port_verdict) in workload.inputs.iter().zip(theirs).zip(ours) {
         if c_verdict == port_verdict {
             continue;
         }
-        let encoded = hex(input);
-        let known = REVIEWED_DIFFERENCES.iter().any(|&(name, bytes, c_hit, port_hit)| {
-            name == workload.name && bytes == encoded && c_hit == c_verdict && port_hit == port_verdict
-        });
-        if known {
-            reviewed += 1;
+        let c_verdict = format!("{detection}:{}", u8::from(c_verdict));
+        let port_verdict = format!("{detection}:{}", u8::from(port_verdict));
+        let known = rows
+            .iter()
+            .position(|row| row.matches(input, &c_verdict, &port_verdict));
+        if let Some(index) = known.and_then(|index| seen.get_mut(index)) {
+            *index = true;
         } else if unreviewed.len() < 16 {
             unreviewed.push(format!(
-                "  (\"{}\", \"{encoded}\", {c_verdict}, {port_verdict}),  // {:?}",
+                "c\tspeed:{}\t<id>\t{}\t{c_verdict}\t{port_verdict}\t<reason>  # {:?}",
                 workload.name,
+                hex(input),
                 String::from_utf8_lossy(input)
             ));
         }
@@ -335,13 +279,15 @@ fn compare_verdicts(workload: &Workload, theirs: &[bool], ours: &[bool]) {
         workload.name,
         unreviewed.join("\n")
     );
-    let expected = REVIEWED_DIFFERENCES
+    let missed: Vec<&str> = rows
         .iter()
-        .filter(|&&(name, ..)| name == workload.name)
-        .count();
-    assert_eq!(
-        reviewed, expected,
-        "{}: reviewed difference inventory changed",
+        .zip(&seen)
+        .filter(|&(row, &seen)| !seen && (complete || workload.inputs.contains(&row.input)))
+        .map(|(row, _)| row.id)
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "{}: reviewed difference inventory changed; rows not observed: {missed:?}",
         workload.name
     );
 }
@@ -427,7 +373,7 @@ fn main() {
                 let theirs = time_libinjection(&driver, workload, budget);
                 (theirs, ours, "port first")
             };
-            compare_verdicts(workload, &theirs.verdicts, &ours.verdicts);
+            compare_verdicts(workload, &theirs.verdicts, &ours.verdicts, benchmarking);
 
             println!(
                 "{:<28} {:>7} {:>9.0} {:>6} {:>12} {:>13.1} {:>9.1} {:>7.2}x",

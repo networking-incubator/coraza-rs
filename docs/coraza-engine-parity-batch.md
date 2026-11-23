@@ -33,7 +33,7 @@ Cargo and Make checks used `RUSTUP_TOOLCHAIN=1.99.1 CARGO_BUILD_JOBS=6`.
 | `cargo xtask conformance-check` | 0 | Manifest, difference ledger, and example are consistent. |
 | `cargo xtask go-fixtures-check --provenance` | 0 | Go Coraza v3.8.1 provenance verified: 29 operator files, 49 default profiles, 52 multiphase profiles. |
 | `python3 libperfusion/tools/parity/check_manifest.py` | 0 | 498 fixtures and source/table hashes verified. |
-| `python3 libperfusion/tools/parity/test_manifest_semantics.py` | 0 | Changed XSS tag value rejected; fixture counts unchanged. |
+| `python3 libperfusion/tools/parity/test_manifest_semantics.py` | 0 | Changed XSS tag value rejected; fixture counts unchanged. This table check now runs as the `xtask` test `tables::tests::check_rejects_same_count_table_mutations`; the script now checks the parity pins. |
 | `cargo test -p coraza --test go_profiles_replay replays_go_engine_profiles -- --exact --nocapture` | 0 | 49/49 profiles, 120/120 stages, zero mismatches. |
 | `cargo test -p coraza --test go_profiles_replay replays_go_engine_profiles_with_multiphase -- --exact --nocapture` | 0 | 52/52 profiles, 123/123 stages, zero mismatches. |
 | `cargo test -p coraza --test go_operators` | 0 | Operator corpus passed. |

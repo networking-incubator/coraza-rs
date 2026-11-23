@@ -25,7 +25,9 @@ implementation. Its BSD-3-Clause notice is preserved in the
 
 Fixture hashes and SQL oracle input hashes are checked by
 `cargo xtask corpus-check`. Refresh them from the version pinned in
-`xtask/tools/go.mod` with `cargo xtask corpus-refresh`.
+`xtask/tools/go.mod` with `cargo xtask corpus-refresh`. A module bump also
+reruns `python3 libperfusion/tools/parity/check_manifest.py --update --go-source
+<dir>`; see the pin table in [docs/ci.md](../docs/ci.md).
 
 The pinned Go module supplies the development oracle and corpus provenance; it
 adds no runtime or Rust crate dependency.

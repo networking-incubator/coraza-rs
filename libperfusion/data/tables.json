@@ -1,9 +1,9 @@
 {
   "local": {
     "sql": {
-      "entries": 8,
+      "entries": 9,
       "file": "sqli_keywords_local.txt",
-      "sha256": "a656980f971eb1b1a13bcd4df8c1a53f35949060199f8ee4efe3ae07a3f1a9de"
+      "sha256": "d47e55936c6fe7c2d0f8d3206629f05ae632d216813f8219bfd579bc19ff5668"
     },
     "strict_sql": {
       "entries": 20,

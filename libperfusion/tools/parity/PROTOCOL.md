@@ -5,16 +5,24 @@
 module cache. It accepts Go 1.27.1 or a newer 1.27 patch with an empty
 `GOEXPERIMENT`, or a matching `-X:nodwarf5` build with
 `GOEXPERIMENT=nodwarf5`. Both use
-`linux/amd64`. The module version and checksum, accepted toolchain flavors, and
-target are in the machine-readable manifest. Each invocation prints its actual
+`linux/amd64`. The module version and checksum are in `tests/parity/manifest.json`;
+the accepted toolchain flavors and target are in `tests/parity/differential.json`.
+Each invocation prints its actual
 `go_version`, `GOEXPERIMENT`, and target to stderr; the Rust harness relays that
 per-run record. The only Go-specific test source is
 [`oracle_driver_test.go`](oracle_driver_test.go), which observes existing APIs
 and parser state. Go is never a Rust runtime dependency.
 
-The Go module pin, data-table hashes, and exceptions live under the
-`differential` key in `tests/parity/manifest.json`. The root manifest fields
-retain the corpus provenance checked by `cargo xtask corpus-check`.
+`tests/parity/manifest.json` holds the Go module pin and the corpus inventory;
+`cargo xtask corpus-refresh` writes it and `cargo xtask corpus-check` checks it.
+`tests/parity/differential.json` holds the C reference pin, the Go module
+version and checksum its source hashes describe, the oracle toolchain, the SQL
+byte dispatch hash, the Go source hashes and the exceptions; only
+`check_manifest.py --update --go-source <dir>` writes it, and
+`make parity-manifest-check` fails while its module or C pin differs from
+`manifest.json` or `data/tables.json`. The table hashes and their C revision are
+in `data/tables.json`, written by `cargo xtask tables-refresh` and checked by
+`cargo xtask tables-check`.
 
 Send one line per case on stdin:
 

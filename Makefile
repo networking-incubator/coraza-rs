@@ -256,7 +256,7 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test       verify corpus and run all tests"
-	@echo "  parity-manifest-check  verify parity fixture inventory and hashes"
+	@echo "  parity-manifest-check  verify the parity C and Go pins, SQL dispatch hash and Go license hash"
 	@echo "  parity-differential   run pinned C/Go corpus and generated-byte parity gates"
 	@echo "  go-harness-check      verify Go fixtures, then gofmt, vet, test and resolution-check the Go benchmark module"
 	@echo "  coraza-coordinator-check  gofmt, vet and test the Coraza benchmark coordinator"

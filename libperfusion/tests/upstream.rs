@@ -25,6 +25,9 @@
 #[path = "upstream_common.rs"]
 mod common;
 
+#[path = "common/reviewed.rs"]
+mod reviewed;
+
 use common::Case;
 use libperfusion::{
     Dialect, HtmlContext as Context, HtmlTokenKind as TokenKind, HtmlTokenizer as Tokenizer, Quote, SqlState, SqlToken,
@@ -110,9 +113,32 @@ fn sqli_folding() {
 #[test]
 #[ignore = "upstream corpus comparison; requires upstream test files via LIBINJECTION_DIR"]
 fn sqli_detection() {
+    // An upstream miss that libperfusion flags on purpose is a reviewed
+    // `c`/`direct` row: its exact bytes report the miss upstream expects, and
+    // every such `test-sqli-` row must be met.
+    let rows: Vec<_> = reviewed::rows("c", "direct")
+        .into_iter()
+        .filter(|row| row.id.starts_with("test-sqli-"))
+        .collect();
+    // A set, not a count: fixtures can repeat an input, so a duplicate must
+    // not stand in for a reviewed row that was never observed.
+    let met = std::cell::RefCell::new(std::collections::BTreeSet::new());
     run_cases("test-sqli-", |input| {
-        libperfusion::sqli(input).map_or_else(Vec::new, |fingerprint| fingerprint.as_bytes().to_vec())
+        let fingerprint = libperfusion::sqli(input);
+        if fingerprint.is_some()
+            && let Some(row) = rows.iter().find(|row| row.matches(input, "sqli:0", "sqli:1"))
+        {
+            met.borrow_mut().insert(row.id);
+            return Vec::new();
+        }
+        fingerprint.map_or_else(Vec::new, |fingerprint| fingerprint.as_bytes().to_vec())
     });
+    let required: std::collections::BTreeSet<_> = rows.iter().map(|row| row.id).collect();
+    assert_eq!(
+        met.into_inner(),
+        required,
+        "reviewed upstream SQL case deviations changed"
+    );
 }
 
 #[test]
@@ -169,9 +195,13 @@ fn sqli_false_positive_samples() {
     // comment whitelist adds four: `7" #2 CIRCULAR NEEDLE`, `"#2 MOM"`,
     // `BAMBOO CHARCOAL SOAP 1 '#`, and `FOO BAR'# BLAH` all have the exact
     // quote-then-hash token shape of the `admin'#` authentication bypass,
-    // so no rule separates them. The cost is recorded in the parity ledger.
+    // so no rule separates them. Short numeric booleans add seven: the `1&n`
+    // row flags `40 AND FAB`, `7 AND HALF`, `10.00 AND UNDER`, `10 OR LESS`
+    // and `9/PLUGS AND TUNNELS`, and no longer sparing `1&1` at three tokens
+    // flags `00 AND 3` and `1950 or 1960`; tokens cannot tell them from
+    // `0 or 2`. The costs are recorded in the parity ledger.
     let (flagged, passed) = count_samples("false_", |s| libperfusion::sqli(s).is_some());
-    assert_eq!((flagged, passed), (25, 398));
+    assert_eq!((flagged, passed), (32, 391));
 }
 
 #[test]

@@ -1,0 +1,63 @@
+# Reviewed differences between libperfusion and its oracles, keyed by id.
+#
+# Every observed difference must match one row of its suite by id (where the
+# suite has ids), exact input bytes and both verdicts; every row of a suite
+# must be observed. Ids are unique within a suite and are explained in
+# mismatch-ledger.md. Verdicts are <detector>:<0|1>.
+#
+# Suites: direct (tests/oracle_differential.rs), generated
+# (tests/generated_differential.rs), speed:<workload> (benches/speed.rs).
+oracle	suite	id	input_hex	oracle_verdict	libperfusion_verdict	reason
+c	direct	xss-event-name-nul	3c61206f6e006572726f723d313e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-tag-name-nul	3c737600676c6f61643e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-xmlns-name-nul	3c6120786d006c6e733d313e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-event-suffix-control	3c61206f6e6572726f72666f6f3d313e	xss:1	xss:0	C suffix or prefix overmatch; agrees with Go main
+c	direct	xss-namespace-xmlns-prefix	3c64697620786d6c6e73666f6f3d2273616665223e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-namespace-xlink-prefix	3c64697620786c696e6b666f6f3d2273616665223e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-indirect-url-control	3c61206174747269627574656e616d653d687265663e	xss:1	xss:0	C suffix or prefix overmatch; agrees with Go main
+c	direct	xss-indirect-style-control	3c61206174747269627574656e616d653d7374796c653e	xss:1	xss:0	C suffix or prefix overmatch; agrees with Go main
+c	direct	xss-url-nul	687265663d6a610076613a	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-nul-import-1	3c3f696d00706f7274206e616d6573706163653d2274223e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-nul-import-2	3c3f00696d706f7274206e616d6573706163653d2274223e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-nul-entity-1	3c2100454e5449545920782053595354454d202266696c653a2f2f2f6574632f706173737764223e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-nul-entity-2	3c21454e005449545920782053595354454d202266696c653a2f2f2f6574632f706173737764223e	xss:0	xss:1	NUL inside a name or comment; follows Go main
+c	direct	xss-html5secorg.txt:232	74657374203833203c783a74656d706c61746520786d6c6e733a783d22687474703a2f2f7777772e776170666f72756d2e6f72672f323030312f776d6c2220783a6f6e74696d65723d222428783a756e657363296a2428793a657363617065296124287a3a6e6f65637329762428782961242879297324287a29637269707424783a616c657274283129223e3c783a74696d65722076616c75653d2231222f3e3c2f783a74656d706c6174653e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-html5secorg.txt:234	74657374203834203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d226a6176617363726970743a616c6572742831292f2f2378	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-html5secorg.txt:236	74657374203835203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d22746573742e6576742378222f3e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-html5secorg.txt:468	74657374203133325f31203c736574206174747269627574654e616d653d22786c696e6b3a687265662220626567696e3d226163636573734b65792861292220746f3d222f2f6578616d706c652e636f6d2f3f6122202f3e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-xenotix.txt:1196	3c783a73637269707420786d6c6e733a783d22687474703a2f2f7777772e77332e6f72672f313939392f7868746d6c223e616c6572742831293b3c2f783a7363726970743e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	direct	xss-svg-prefix-overlong-control	3c737667787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878783e	xss:1	xss:0	C suffix or prefix overmatch; agrees with Go main
+c	direct	xss-xsl-prefix-overlong-control	3c78736c787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878783e	xss:1	xss:0	C suffix or prefix overmatch; agrees with Go main
+c	direct	test-sqli-038	3120616e64204076657273696f6e	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+c	direct	test-sqli-041	3120616e6420226122	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+c	direct	test-tokens-words-021	3120414e446042415260	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+go	direct	xss-soaj1664ashar-pastebin-u6FY1xDA.txt:78	373429203c6d6174683e3c6120786c696e6b3a687265663d222f2f6a73666964646c652e6e65742f74383436682f223e636c69636b	xss:0	xss:1	local MATH tag row; the pinned C reference also flags it
+go	direct	xss-soaj1664ashar-pastebin-u6FY1xDA.txt:102	393729203c6d6174683e3c6120786c696e6b3a687265663d222f2f6a73666964646c652e6e65742f74383436682f223e636c69636b	xss:0	xss:1	local MATH tag row; the pinned C reference also flags it
+go	direct	xss-xenotix.txt:693	3c6d6174683e3c6120786c696e6b3a687265663d222f2f58585878656e6f7469785858583a333535352f7873735f73657276655f7061796c6f6164732f626d707a2e626d70223e4b4346	xss:0	xss:1	local MATH tag row; the pinned C reference also flags it
+go	direct	xss-xenotix.txt:694	3c6d6174683e3c6120786c696e6b3a687265663d222f2f58585878656e6f7469785858583a333535352f7873735f73657276655f7061796c6f6164732f6b63662e6a73223e4b4346	xss:0	xss:1	local MATH tag row; the pinned C reference also flags it
+go	direct	test-sqli-038	3120616e64204076657273696f6e	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+go	direct	test-sqli-041	3120616e6420226122	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+go	direct	test-tokens-words-021	3120414e446042415260	sqli:0	sqli:1	short numeric boolean: 1&n row added, 1&1/1&v/1&s no longer spared at three tokens
+go	generated	raw-0043	20233c5a622a0d603b3a302020583e3b266026ff323a805a5aff2522235920005a5c3222302623302f	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0060	303d32ff0a003a22235a305a25005a2d23205c602aff20	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0075	27232580630d3e266331ff58633dff632058632023203e592a316332	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0227	2320800d3c3a3e253e2d25602223233d592d2259	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0292	62272f260d603b5a5a61585c25ff0d26ff2080302f3032805c603b3b3b2a582223	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0365	2f23800d6100603200303c2f3e235a32318030000a590a3c2f2d32ff632f20582f2560265a5a2060205a3b003e3e30ff63005932270a25592761ff275a003e630d3b3c6127610a2220233e003000592f0d00302d203a0d2062603e	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+go	generated	raw-0373	633a202a26300a302a6120ff3c3d3e3a3b20325858303e5aff3c233222000d5c6031272023625cffff31633d3c5c63268058203b3c63613b3e32263c2d	sqli:0	sqli:1	narrowed # comment whitelist: the sc fingerprint Go suppresses (admin'# shape)
+c	speed:sqli: benign samples	false_positives.txt:222	37222023322043495243554c4152204e4545444c45	sqli:0	sqli:1	narrowed # comment whitelist (admin'# shape)
+c	speed:sqli: benign samples	false_positives.txt:226	222332204d4f4d22	sqli:0	sqli:1	narrowed # comment whitelist (admin'# shape)
+c	speed:sqli: benign samples	false_positives.txt:232	42414d424f4f2043484152434f414c20534f41502031202723	sqli:0	sqli:1	narrowed # comment whitelist (admin'# shape)
+c	speed:sqli: benign samples	false_positives.txt:302	464f4f20424152272320424c4148	sqli:0	sqli:1	narrowed # comment whitelist (admin'# shape)
+c	speed:sqli: benign samples	false_positives.txt:40	343020414e4420464142	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:171	3720414e442048414c46	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:174	303020414e442033	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:175	31302e303020414e4420554e444552	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:177	3130204f52204c455353	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:223	392f504c55475320414e442054554e4e454c53	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:sqli: benign samples	false_positives.txt:375	31393530206f722031393630	sqli:0	sqli:1	short numeric boolean: accepted false positive (tokens cannot tell it from 0 or 2)
+c	speed:xss: attack samples	xss-html5secorg.txt:232	74657374203833203c783a74656d706c61746520786d6c6e733a783d22687474703a2f2f7777772e776170666f72756d2e6f72672f323030312f776d6c2220783a6f6e74696d65723d222428783a756e657363296a2428793a657363617065296124287a3a6e6f65637329762428782961242879297324287a29637269707424783a616c657274283129223e3c783a74696d65722076616c75653d2231222f3e3c2f783a74656d706c6174653e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	speed:xss: attack samples	xss-html5secorg.txt:234	74657374203834203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d226a6176617363726970743a616c6572742831292f2f2378	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	speed:xss: attack samples	xss-html5secorg.txt:236	74657374203835203c7820786d6c6e733a65763d22687474703a2f2f7777772e77332e6f72672f323030312f786d6c2d6576656e7473222065763a6576656e743d226c6f6164222065763a68616e646c65723d22746573742e6576742378222f3e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	speed:xss: attack samples	xss-html5secorg.txt:468	74657374203133325f31203c736574206174747269627574654e616d653d22786c696e6b3a687265662220626567696e3d226163636573734b65792861292220746f3d222f2f6578616d706c652e636f6d2f3f6122202f3e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main
+c	speed:xss: attack samples	xss-xenotix.txt:1196	3c783a73637269707420786d6c6e733a783d22687474703a2f2f7777772e77332e6f72672f313939392f7868746d6c223e616c6572742831293b3c2f783a7363726970743e	xss:1	xss:0	prefixed XML/SVG element C overmatches; agrees with Go main

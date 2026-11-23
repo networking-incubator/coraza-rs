@@ -25,6 +25,9 @@ use std::{io::Write as _, path::Path, process::Command, time::Duration};
 #[path = "common/subprocess.rs"]
 mod oracle_subprocess;
 
+#[path = "common/reviewed.rs"]
+mod reviewed;
+
 use oracle_subprocess::run_with_timeout;
 
 const SEED: u64 = 0x947E_5A13_B06C_D281;
@@ -95,22 +98,30 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
         ["cdata-standalone-regression", "cdata-early-xss-regression"]
     );
     let responses = run_oracle(manifest_dir, &cases);
+    let reviewed_rows = reviewed::rows("go", "generated");
     let mut perfusion_failures = Vec::new();
-    let mut perfusion_exceptions = 0_usize;
+    let mut perfusion_exceptions = Vec::new();
     let mut perfusion_fingerprint_diagnostics = 0_usize;
 
     for (case, response) in cases.iter().zip(responses.iter()) {
         let expected = parse_result(case, response);
         let perfusion = perfusion_result(&case.input);
         perfusion_fingerprint_diagnostics += usize::from(expected.fingerprint != perfusion.fingerprint);
-        if is_reviewed_hash_comment_deviation(case, &expected, &perfusion) {
-            perfusion_exceptions += 1;
+        if is_reviewed_hash_comment_deviation(&reviewed_rows, case, &expected, &perfusion) {
+            perfusion_exceptions.push(case.id.as_str());
         } else if !results_match(&expected, &perfusion) {
             perfusion_failures.push((case.clone(), expected, perfusion));
         }
     }
 
-    assert_eq!(perfusion_exceptions, 7, "libperfusion Go exception inventory changed");
+    let mut reviewed_ids: Vec<&str> = reviewed_rows.iter().map(|row| row.id).collect();
+    reviewed_ids.sort_unstable();
+    perfusion_exceptions.sort_unstable();
+    assert_eq!(
+        perfusion_exceptions, reviewed_ids,
+        "libperfusion Go exception inventory changed"
+    );
+    let perfusion_exceptions = perfusion_exceptions.len();
 
     if perfusion_failures.is_empty() {
         eprintln!(
@@ -147,48 +158,29 @@ fn generated_raw_bytes_and_grammars_match_go_with_minimized_failures() {
     );
 }
 
-/// Generated inputs where the narrowed `#` comment whitelist makes
-/// libperfusion report the `sc` fingerprint that Go main suppresses.
-///
-/// Each one minimizes to `'#` or `"#`, the shape of the `admin'#`
-/// authentication bypass. The deviation is deliberate and is described in
-/// `tests/parity/mismatch-ledger.md`; the inputs are pinned by hex, so an
-/// unrelated new difference still fails the gate.
-const HASH_COMMENT_SQL_DEVIATIONS: [(&str, &str); 7] = [
-    (
-        "raw-0043",
-        "20233c5a622a0d603b3a302020583e3b266026ff323a805a5aff2522235920005a5c3222302623302f",
-    ),
-    ("raw-0060", "303d32ff0a003a22235a305a25005a2d23205c602aff20"),
-    ("raw-0075", "27232580630d3e266331ff58633dff632058632023203e592a316332"),
-    ("raw-0227", "2320800d3c3a3e253e2d25602223233d592d2259"),
-    (
-        "raw-0292",
-        "62272f260d603b5a5a61585c25ff0d26ff2080302f3032805c603b3b3b2a582223",
-    ),
-    (
-        "raw-0365",
-        "2f23800d6100603200303c2f3e235a32318030000a590a3c2f2d32ff632f20582f2560265a5a2060205a3b003e3e30ff63005932270a25592761ff275a003e630d3b3c6127610a2220233e003000592f0d00302d203a0d2062603e",
-    ),
-    (
-        "raw-0373",
-        "633a202a26300a302a6120ff3c3d3e3a3b20325858303e5aff3c233222000d5c6031272023625cffff31633d3c5c63268058203b3c63613b3e32263c2d",
-    ),
-];
-
 /// The pinned Go module's strchr NUL semantics (upstream #140) now match the
 /// C parser this port retains, so the former `raw-0265` `0X<NUL>#` deviation
 /// agrees and was removed rather than kept as a dead entry.
 ///
-/// The `'#`/`"#` fingerprint deviations listed in
-/// [`HASH_COMMENT_SQL_DEVIATIONS`], and only those.
-fn is_reviewed_hash_comment_deviation(case: &Case, expected: &PublicResult, actual: &PublicResult) -> bool {
-    HASH_COMMENT_SQL_DEVIATIONS
-        .iter()
-        .any(|(id, input_hex)| case.id == *id && hex(&case.input) == *input_hex)
-        && !expected.sqli
-        && actual.sqli
-        && actual.fingerprint == "7363:2"
+/// Generated inputs where the narrowed `#` comment whitelist makes
+/// libperfusion report the `sc` fingerprint that Go main suppresses: the
+/// `generated` rows of `tests/parity/reviewed-differences.tsv`, and only
+/// those. Each one minimizes to `'#` or `"#`, the shape of the `admin'#`
+/// authentication bypass; see `tests/parity/mismatch-ledger.md`.
+fn is_reviewed_hash_comment_deviation(
+    rows: &[reviewed::Reviewed],
+    case: &Case,
+    expected: &PublicResult,
+    actual: &PublicResult,
+) -> bool {
+    rows.iter().any(|row| {
+        row.id == case.id
+            && row.matches(
+                &case.input,
+                &format!("sqli:{}", u8::from(expected.sqli)),
+                &format!("sqli:{}", u8::from(actual.sqli)),
+            )
+    }) && actual.fingerprint == "7363:2"
         && expected.xss == actual.xss
 }
 

@@ -54,7 +54,7 @@ This repository uses GitHub Actions to block risky changes early.
 - Checks the committed fixture manifest against the Go module pinned in
   `xtask/tools/go.mod`.
 - Checks public SQLi fingerprints and XSS verdicts against the pinned C
-  reference revision in `tests/parity/manifest.json`.
+  reference revision in `tests/parity/differential.json`.
 - Compares detector verdicts and fingerprints, SQL token and fold streams, and
   HTML token streams with the Go oracle.
 - Runs on pull requests, pushes to `main` and release branches, and weekly.
@@ -199,12 +199,35 @@ make all
 ```
 
 The differential gates use the Go module pinned in `xtask/tools/go.mod` and a
-C checkout at the revision pinned in `libperfusion/tests/parity/manifest.json`.
+C checkout at the revision pinned in `libperfusion/tests/parity/differential.json`.
 Set `LIBINJECTION_DIR` to that checkout before running:
 
 ```console
 make parity-differential
 ```
+
+Each libperfusion pin file has one writer and one checker:
+
+| File | Records | Written by | Checked by (`make test`) |
+| --- | --- | --- | --- |
+| `libperfusion/tests/parity/manifest.json` | Go module version and checksum, fixture inventory | `cargo xtask corpus-refresh` | `cargo xtask corpus-check` |
+| `libperfusion/tests/parity/sqli_oracle.tsv` | Go oracle SQLi verdict and fingerprint per SQL fixture | `cargo xtask corpus-refresh` | `cargo xtask corpus-check` |
+| `libperfusion/data/tables.json` | C revision, upstream and local SQL/XSS table hashes and counts | `cargo xtask tables-refresh --upstream <checkout>` | `cargo xtask tables-check` |
+| `libperfusion/tests/parity/differential.json` | C reference revision (equal to `data/tables.json`), Go module version and checksum the source hashes describe (equal to `manifest.json`), Go oracle toolchain, SQL byte dispatch hash, Go source hashes (offline only the `LICENSE` hash; CI's `--go-source` run compares the rest with the module source) | `python3 libperfusion/tools/parity/check_manifest.py --update --go-source <dir>` | `make parity-manifest-check` |
+
+After bumping the module in `xtask/tools/go.mod`, run `cargo xtask
+corpus-refresh`, then `check_manifest.py --update --go-source <dir>` with the
+module directory (`cd xtask/tools && go list -m -f '{{.Dir}}'
+github.com/corazawaf/libinjection-go`); `make parity-manifest-check` fails until
+then. A table refresh at the same C revision needs only `cargo xtask
+tables-refresh --upstream <checkout>`. A C revision bump runs that refresh on a
+checkout of the new commit, sets `C_REFERENCE` in `check_manifest.py` to the
+same commit (`make parity-manifest-check` fails while the two differ), reruns
+`check_manifest.py --update --go-source <dir>`, and reruns `make
+parity-differential` against the new checkout. The CI parity job runs
+`check_manifest.py --go-source`, which compares the tables, the SQL dispatch,
+the fixtures and the Go source hashes with the module source. Offline, `make
+test` checks only the `LICENSE` hash among the Go source hashes.
 
 ## Signing requirements
 
