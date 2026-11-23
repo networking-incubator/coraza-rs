@@ -28,14 +28,17 @@
 //! ([`set_plugin_configuration`]), the request header and trailer maps and the response header map
 //! ([`set_request_headers`], [`set_request_trailers`], [`set_response_headers`]), the request and response body buffers
 //! ([`set_request_body`], [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]),
-//! and what the filter did: the status codes of local replies ([`local_reply_statuses`]), of response replacements
-//! ([`response_replacement_statuses`]) and the filter-state properties it published ([`published_property`]).
-//! Each test runs on its own thread, so the scripted state is isolated; call [`reset`] to
-//! clear it explicitly. Everything else stays a fixed stub that reports `Status::NotFound`.
+//! and what the filter did: the local replies it sent ([`local_replies`], [`local_reply_statuses`]) and the
+//! filter-state properties it published ([`published_property`]). Each test runs on its own thread, so the scripted
+//! state is isolated; call [`reset`] to clear it explicitly. A local reply is recorded and then refused with
+//! `Status::NotFound`, so every test also covers a host that cannot send it. The filter answers a response it refuses
+//! with a local reply and never rewrites one in place: replacing the response body, headers or trailers is recorded,
+//! and the test fails when it next reads the replies or the published properties (a stub cannot panic, since it is
+//! `extern "C"`). Everything else stays a fixed stub that reports `Status::NotFound`.
 
 // no_mangle is an attribute-level escape from the crate's unsafe-code guard. The scripted
-// host also needs two unsafe blocks, in `hand_out` and `proxy_get_property`, to read and
-// write the SDK's FFI pointers; each carries its own SAFETY comment.
+// host also needs unsafe blocks to read and write the SDK's FFI pointers; each carries its
+// own SAFETY comment.
 #![expect(
     unsafe_code,
     reason = "test-only hostcall stubs export symbols via no_mangle and exchange FFI pointers"
@@ -59,14 +62,27 @@ struct Host {
     response_headers: Option<Vec<(String, Vec<u8>)>>,
     /// Response body buffer, or `None` to report it missing.
     response_body: Option<Vec<u8>>,
-    /// The `:status` of every response header map the filter set, in order.
-    response_replacements: Vec<String>,
     /// Filter-state properties the filter published, by dotted path.
     published: BTreeMap<String, String>,
     /// Dotted property path to its scripted value or failure status.
     properties: BTreeMap<String, Result<Vec<u8>, Status>>,
-    /// Status codes of the local replies the filter sent.
-    local_replies: Vec<u32>,
+    /// The local replies the filter sent, in order.
+    local_replies: Vec<LocalReply>,
+    /// What of the response the filter rewrote in place, which it must never do.
+    response_rewrites: Vec<&'static str>,
+    /// How many serialized maps the filter sent that did not decode.
+    malformed_maps: usize,
+}
+
+/// A local reply the filter sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalReply {
+    /// Its status code.
+    pub(crate) status: u32,
+    /// Its headers, in the order the filter gave them.
+    pub(crate) headers: Vec<(String, Vec<u8>)>,
+    /// Its body.
+    pub(crate) body: Vec<u8>,
 }
 
 thread_local! {
@@ -78,10 +94,11 @@ thread_local! {
             request_trailers: None,
             response_headers: None,
             response_body: None,
-            response_replacements: Vec::new(),
             published: BTreeMap::new(),
             properties: BTreeMap::new(),
             local_replies: Vec::new(),
+            response_rewrites: Vec::new(),
+            malformed_maps: 0,
         })
     };
 }
@@ -95,10 +112,11 @@ pub(crate) fn reset() {
         host.request_trailers = None;
         host.response_headers = None;
         host.response_body = None;
-        host.response_replacements.clear();
         host.published.clear();
         host.properties.clear();
         host.local_replies.clear();
+        host.response_rewrites.clear();
+        host.malformed_maps = 0;
     });
 }
 
@@ -139,14 +157,25 @@ pub(crate) fn set_response_body(body: &[u8]) {
     HOST.with_borrow_mut(|host| host.response_body = Some(body.to_vec()));
 }
 
-/// The `:status` of every response header map the filter has set so far, in order: the replacements it made.
-pub(crate) fn response_replacement_statuses() -> Vec<String> {
-    HOST.with_borrow(|host| host.response_replacements.clone())
+/// Reads what the filter did, failing the test if it rewrote the response in place or sent a map that did not decode.
+fn observed<T>(read: impl FnOnce(&Host) -> T) -> T {
+    HOST.with_borrow(|host| {
+        assert!(
+            host.response_rewrites.is_empty(),
+            "the filter rewrote the {:?} in place instead of answering with a local reply",
+            host.response_rewrites
+        );
+        assert_eq!(
+            host.malformed_maps, 0,
+            "the filter sent a serialized map that does not decode"
+        );
+        read(host)
+    })
 }
 
 /// What the filter published at the filter-state property `path`, such as `io.coraza.waf.v1.inspection_complete`.
 pub(crate) fn published_property(path: &str) -> Option<String> {
-    HOST.with_borrow(|host| host.published.get(path).cloned())
+    observed(|host| host.published.get(path).cloned())
 }
 
 /// Scripts a property (dotted path, such as `source.address`) the host returns.
@@ -166,7 +195,12 @@ pub(crate) fn fail_property(path: &str, status: Status) {
 
 /// The status codes of every local reply sent so far, in order.
 pub(crate) fn local_reply_statuses() -> Vec<u32> {
-    HOST.with_borrow(|host| host.local_replies.clone())
+    observed(|host| host.local_replies.iter().map(|reply| reply.status).collect())
+}
+
+/// Every local reply sent so far, in order.
+pub(crate) fn local_replies() -> Vec<LocalReply> {
+    observed(|host| host.local_replies.clone())
 }
 
 /// Hands `data` to the SDK the way a host does: a heap allocation whose capacity equals its
@@ -244,11 +278,11 @@ extern "C" fn proxy_set_buffer_bytes(
     _buffer_data: *const u8,
     _buffer_size: usize,
 ) -> Status {
-    // A response replaced by the filter is scripted to succeed, so that the filter's reply can be observed.
-    match buffer_type {
-        BufferType::HttpResponseBody => Status::Ok,
-        _ => Status::NotFound,
+    // Envoy refuses a response body replacement outside the body callbacks, and the filter must not need one.
+    if buffer_type == BufferType::HttpResponseBody {
+        HOST.with_borrow_mut(|host| host.response_rewrites.push("response body"));
     }
+    Status::NotFound
 }
 
 #[no_mangle]
@@ -273,44 +307,63 @@ extern "C" fn proxy_get_header_map_pairs(
 }
 
 #[no_mangle]
-extern "C" fn proxy_set_header_map_pairs(map_type: MapType, map_data: *const u8, map_size: usize) -> Status {
-    match map_type {
-        MapType::HttpResponseHeaders => {
-            let status = if map_size == 0 {
-                None
-            } else {
-                // SAFETY: the SDK passes the serialized map it owns for the duration of the call.
-                let raw = unsafe { std::slice::from_raw_parts(map_data, map_size) };
-                status_of(raw)
-            };
-            HOST.with_borrow_mut(|host| host.response_replacements.push(status.unwrap_or_default()));
-            Status::Ok
-        },
-        MapType::HttpResponseTrailers => Status::Ok,
-        _ => Status::NotFound,
+extern "C" fn proxy_set_header_map_pairs(map_type: MapType, _map_data: *const u8, _map_size: usize) -> Status {
+    let rewritten = match map_type {
+        MapType::HttpResponseHeaders => Some("response headers"),
+        MapType::HttpResponseTrailers => Some("response trailers"),
+        _ => None,
+    };
+    if let Some(rewritten) = rewritten {
+        HOST.with_borrow_mut(|host| host.response_rewrites.push(rewritten));
     }
+    Status::NotFound
 }
 
-/// The `:status` value in a serialized header map, if it has one.
-fn status_of(raw: &[u8]) -> Option<String> {
+/// The header map a serialized Proxy-Wasm map holds, or `None` when it is malformed. No bytes at all is the empty map
+/// a host reads from a null pointer.
+fn deserialize_map(raw: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
     let word = |at: usize| -> Option<usize> {
         let bytes: [u8; 4] = raw.get(at..at.checked_add(4)?)?.try_into().ok()?;
         usize::try_from(u32::from_le_bytes(bytes)).ok()
     };
     let count = word(0)?;
     let mut offset = 4_usize.checked_add(count.checked_mul(8)?)?;
+    // The length table must fit before it sizes anything.
+    if offset > raw.len() {
+        return None;
+    }
+    let mut map = Vec::with_capacity(count);
     for index in 0..count {
         let name_len = word(4 + index * 8)?;
         let value_len = word(8 + index * 8)?;
         let name = raw.get(offset..offset.checked_add(name_len)?)?;
-        offset = offset.checked_add(name_len)?.checked_add(1)?;
-        let value = raw.get(offset..offset.checked_add(value_len)?)?;
-        offset = offset.checked_add(value_len)?.checked_add(1)?;
-        if name == b":status" {
-            return Some(String::from_utf8_lossy(value).into_owned());
+        offset = offset.checked_add(name_len)?;
+        // Each name and value ends with a NUL byte that its length leaves out.
+        if *raw.get(offset)? != 0 {
+            return None;
         }
+        offset = offset.checked_add(1)?;
+        let value = raw.get(offset..offset.checked_add(value_len)?)?;
+        offset = offset.checked_add(value_len)?;
+        if *raw.get(offset)? != 0 {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+        map.push((String::from_utf8_lossy(name).into_owned(), value.to_vec()));
     }
-    None
+    Some(map)
+}
+
+/// A copy of the `size` bytes at `data`, which the SDK may pass as a null pointer when there are none.
+fn copied(data: *const u8, size: usize) -> Vec<u8> {
+    if data.is_null() || size == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the SDK passes a pointer to `size` bytes it owns for the duration of the call.
+    unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
 }
 
 #[no_mangle]
@@ -318,13 +371,23 @@ extern "C" fn proxy_send_local_response(
     status_code: u32,
     _status_code_details_data: *const u8,
     _status_code_details_size: usize,
-    _body_data: *const u8,
-    _body_size: usize,
-    _headers_data: *const u8,
-    _headers_size: usize,
+    body_data: *const u8,
+    body_size: usize,
+    headers_data: *const u8,
+    headers_size: usize,
     _grpc_status: i32,
 ) -> Status {
-    HOST.with_borrow_mut(|host| host.local_replies.push(status_code));
+    let headers = deserialize_map(&copied(headers_data, headers_size));
+    let malformed = headers.is_none();
+    let reply = LocalReply {
+        status: status_code,
+        headers: headers.unwrap_or_default(),
+        body: copied(body_data, body_size),
+    };
+    HOST.with_borrow_mut(|host| {
+        host.malformed_maps += usize::from(malformed);
+        host.local_replies.push(reply);
+    });
     Status::NotFound
 }
 
@@ -373,7 +436,57 @@ extern "C" fn proxy_set_property(
 
 #[cfg(test)]
 mod tests {
-    use super::{proxy_log, proxy_set_property, LogLevel, Status};
+    use super::{
+        deserialize_map, local_replies, proxy_log, proxy_send_local_response, proxy_set_buffer_bytes,
+        proxy_set_header_map_pairs, proxy_set_property, reset, serialize_map, BufferType, LogLevel, MapType, Status,
+    };
+
+    #[test]
+    fn a_serialized_map_decodes_only_when_every_length_and_terminator_fits() {
+        let map = vec![("a".to_owned(), b"1".to_vec()), ("bc".to_owned(), Vec::new())];
+        let serialized = serialize_map(&map);
+        assert_eq!(deserialize_map(&serialized), Some(map));
+        assert_eq!(deserialize_map(&[]), Some(Vec::new()), "no bytes is the empty map");
+        assert_eq!(
+            deserialize_map(&serialize_map(&[])),
+            Some(Vec::new()),
+            "a zero count is the empty map"
+        );
+        // Missing last terminator, a non-NUL terminator after a name, and a table longer than the bytes.
+        let mut truncated = serialized.clone();
+        truncated.pop();
+        assert_eq!(deserialize_map(&truncated), None);
+        // The first name starts after the count and two length pairs, and its terminator follows it.
+        let mut bad_name_terminator = serialized;
+        bad_name_terminator.splice(4 + 2 * 8 + 1..4 + 2 * 8 + 2, *b"x");
+        assert_eq!(deserialize_map(&bad_name_terminator), None);
+        assert_eq!(deserialize_map(&u32::MAX.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn a_local_reply_with_a_malformed_header_map_fails_the_test_that_reads_the_host() {
+        reset();
+        let mut malformed = serialize_map(&[("a".to_owned(), b"1".to_vec())]);
+        malformed.pop();
+        let status = proxy_send_local_response(
+            403,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            malformed.as_ptr(),
+            malformed.len(),
+            -1,
+        );
+        assert_eq!(status, Status::NotFound);
+        assert!(
+            std::panic::catch_unwind(local_replies).is_err(),
+            "reading the host fails the test"
+        );
+        reset();
+        proxy_send_local_response(403, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0, -1);
+        assert_eq!(local_replies().len(), 1, "a reply with no headers is not malformed");
+    }
 
     #[test]
     fn stubs_report_a_checked_missing_host_instead_of_succeeding() {
@@ -387,5 +500,28 @@ mod tests {
             Status::NotFound,
             "a stub must not pretend the host stored a property"
         );
+    }
+
+    #[test]
+    fn a_response_rewritten_in_place_fails_only_the_test_that_reads_the_host() {
+        let rewrites: [fn() -> Status; 3] = [
+            || proxy_set_buffer_bytes(BufferType::HttpResponseBody, 0, 0, std::ptr::null(), 0),
+            || proxy_set_header_map_pairs(MapType::HttpResponseHeaders, std::ptr::null(), 0),
+            || proxy_set_header_map_pairs(MapType::HttpResponseTrailers, std::ptr::null(), 0),
+        ];
+        for rewrite in rewrites {
+            reset();
+            assert_eq!(rewrite(), Status::NotFound, "the stub returns instead of aborting");
+            assert!(
+                std::panic::catch_unwind(local_replies).is_err(),
+                "reading the host fails the test"
+            );
+        }
+        reset();
+        assert_eq!(
+            proxy_set_header_map_pairs(MapType::HttpRequestHeaders, std::ptr::null(), 0),
+            Status::NotFound
+        );
+        assert!(local_replies().is_empty(), "a request header rewrite is not recorded");
     }
 }

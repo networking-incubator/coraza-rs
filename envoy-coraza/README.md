@@ -116,6 +116,23 @@ each item against your policies before upgrading.
   [Body memory budget](#body-memory-budget) for which bodies reach it.
 * **The embedded CRS no longer honours rules 905100 and 905110**; see
   [Embedding the OWASP Core Rule Set](#embedding-the-owasp-core-rule-set).
+* **A refused response is a local reply**, sent when the filter decides,
+  instead of the upstream response rewritten in place: headers that filters
+  add on the response path are absent on it. Earlier builds could not rewrite
+  a response refused at its headers or before its last body chunk, such as a
+  `HEAD` or 204 response a rule denies, a compressed response of an inspected
+  type or one over 1 MiB, and Envoy's idle timer ended the stream with 504.
+  The reply ends the stream, so a request body that a policy without body
+  access was still sending, which earlier builds let through after a
+  response-phase denial, no longer reaches the backend. A `redirect` whose
+  target is empty, such as a macro that expanded to nothing, is answered 403
+  without `location`, where earlier builds sent the rule's 3xx without one.
+  For a gRPC request, Envoy answers the local reply with HTTP 200 and a
+  `grpc-status` (7, `PERMISSION_DENIED`, for a rule's 403) instead of the
+  configured HTTP status, as it already did for request-phase refusals:
+  HTTP-status-based monitoring no longer sees the rule's status (such as 403)
+  for a gRPC call refused on its response.
+  See [Refused responses](#refused-responses).
 
 ## Empty or missing configuration
 
@@ -273,16 +290,27 @@ the policy's `enforces` line, at `warn`, and each is named in a line of its own
 at `info`, with every such action it runs. Other `ctl` actions that narrow
 inspection, such as `ctl:ruleRemoveByTag` or `ctl:ruleRemoveById`, are not
 counted. A request whose body
-bytes went to the backend unread is reported as `inspection_complete=false`,
+bytes the filter released unread (a later Envoy filter could still hold them,
+so they may not have reached the backend) is reported as
+`inspection_complete=false`,
 `inspection_reason=request_body_not_inspected`, whatever ended the stream: when
 a response-phase rule then denies, `terminal_outcome=denied` shows the denial,
 as it does beside the `body_partially_inspected` of a truncated body. So is a
-request whose body had not ended when its response completed or a response-phase
-rule denied, since the rest may still follow: without response body inspection,
-phase 4 runs at the response headers, and a denial there does not stop the
-request body. A request that ends without body bytes, with an empty last DATA
-frame or with trailers alone, is not, and neither is one the filter refuses in
-the request phase before any of its body arrived.
+request whose body had not ended when its response completed, since the rest
+may still follow. A refusal is different: the filter's local reply, in the
+request or the response phase, ends the stream, so the rest of the body never
+reaches the backend. Over HTTP/1.1 Envoy sends the reply and closes the
+connection, over HTTP/2 it resets the stream, and in both Envoy resets the
+upstream request; the filter also holds whatever of the request still arrives,
+so a reply that could not be sent lets nothing through either. A rule can
+refuse at the response headers, before the request body: a phase-3 rule
+always, and a phase-4 rule that the engine runs early, because the response
+has no body or its body is not inspected, or because the rule reads only
+response-header variables. A request refused before the filter released any of
+its body bytes is reported as the refusal alone,
+such as `inspection_reason=denied`, `inspection_complete=true` for a rule's
+denial. A request that ends without body bytes, with an empty last DATA frame
+or with trailers alone, is not reported unread either.
 
 **This is a compatibility cost, not only a memory one**: a policy without a
 `SecRequestBodyAccess` line, a CRS-only one included, now holds every request
@@ -297,6 +325,71 @@ requests with 501, so turning the engine off for a host remains the way to let
 WebSockets through. A plain `CONNECT` carries no path, so the filter refuses it
 with 503 (`inspection_reason=incomplete`) in every engine mode; one whose
 authority selects no policy is handled as any such request (421 by default).
+
+## Refused responses
+
+The filter holds the headers of every response whose body it inspects until
+the body's verdict, so nothing of a response it refuses has reached the client.
+It refuses a response with a local reply at the moment it decides, at the
+response headers, in a body chunk, at the end of the body or at its trailers:
+
+* a rule that interrupts in phase 3 or 4, with the rule's status;
+* a response of an inspected type with a `Content-Encoding` other than
+  `identity`, even one with no body such as a `HEAD` response, a body over
+  1 MiB, or a body the memory budget stopped its parser in (see
+  [Body memory budget](#body-memory-budget)), with 502;
+* a body that the root's 64 MiB of retained body memory has no room for, with
+  503;
+* a `101` upgrade response, with 501;
+* a response the filter cannot read, with 502 or 503.
+
+Every reply carries `cache-control: no-store`. A reply with a body also
+carries `content-type: text/plain; charset=utf-8`; Envoy removes that header
+from a reply with an empty body, such as one for a `HEAD` request or a
+redirect. The body names its kind:
+`Upstream response blocked` for a rule, `Response inspection unavailable` for
+a response the filter could not inspect, and `Request feature is not supported`
+for a 101. A reply has no body for a `HEAD` request, a reply status of 204 or
+304, or a redirect. Envoy sends a
+local reply issued on the response path straight to the client, without
+running the encoder filters, so headers that other filters add on the response
+path, such as security headers, are absent on a refused response. The reply
+ends the stream, so a request body still arriving never reaches the backend
+(see [Request body access](#request-body-access)). After the reply the filter
+releases nothing more of the upstream response or of the request, even when
+the reply could not be sent. A phase-3 rule, and a phase-4 rule that the
+engine runs at the response headers (because the response has no body, its
+body is not inspected, or the rule reads only response-header variables),
+refuses the response there.
+
+For a gRPC request, one whose `content-type` is `application/grpc` or starts
+with `application/grpc+` (the match is case-sensitive, and
+`application/grpc;charset=utf-8` does not match, so its refusal keeps the HTTP
+status), Envoy turns every local reply into a trailers-only gRPC response:
+HTTP 200 with `grpc-status` set from the reply's status, so a rule's 403
+becomes `grpc-status: 7` (`PERMISSION_DENIED`) and the 502 of a body the filter
+could not read becomes `grpc-status: 14` (`UNAVAILABLE`). A client sees the
+refusal as a gRPC error, but monitoring that counts HTTP statuses sees 200, not
+the status the rule chose. Refusals in the request phase already behaved this
+way; a response-phase refusal now does too, since earlier builds rewrote a
+refused response in place, keeping the rule's HTTP status (or let it hang until
+Envoy's timeout).
+
+A `redirect` reply carries the rule's target as `location` only when the
+target is not empty and holds no control byte; otherwise the filter answers 403
+without `location`. The engine already percent-encodes control bytes that a
+macro brings into a target (see
+[Behavior changes](../coraza/README.md#behavior-changes)), so a target such as
+`/login?next=%{ARGS_GET.next}` cannot split the reply's headers, and an empty
+target is what a macro that expands to nothing leaves. For such a target the
+client gets 403 while the legacy interruption properties keep the engine's
+`action=redirect` and the rule's status.
+
+Envoy's own reply to a request the filter still holds, such as the 408 of
+`request_timeout` or `stream_idle_timeout`, reaches the client as Envoy wrote
+it. The filter reports that stream as `inspection_complete=false`,
+`inspection_reason=incomplete`, `terminal_outcome=incomplete`, and keeps the
+request held, so the rest of its body never reaches the backend.
 
 ## Body memory budget
 
@@ -327,7 +420,7 @@ direction:
   whole body, so a 16 MiB XML or URL-encoded body whose 8 MiB prefix the engine keeps is refused on an idle root.
 * **Response.** `RES_BODY_ERROR` is set, but `@recommended-conf` has no rule for it: rule 200002 reads only
   `REQBODY_ERROR`. The budget is a limit the connector imposes and not one of the policy's, so the connector itself
-  replaces a response whose parser stopped at it with 502, unless a rule denied it first. A response body that merely
+  answers a response whose parser stopped at it with a 502 local reply, unless a rule denied it first. A response body that merely
   does not parse (`RES_BODY_ERROR` for another reason) is left to the policy's rules, as before.
 
 The budget covers the body processors only. What rules allocate after the parse (macro expansion, matched values,

@@ -162,7 +162,8 @@ enum UnreadRequestBody {
     Absent,
     /// The headers did not end the request, so body bytes may still follow.
     Pending,
-    /// Body bytes went through.
+    /// The filter released body bytes; a later Envoy filter could still hold them, so they may not have reached the
+    /// backend.
     Passed,
 }
 
@@ -194,13 +195,13 @@ enum RequestMode {
     Replied,
 }
 
-/// Whether upstream response content must be replaced.
+/// Whether the connector has refused the upstream response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseMode {
     /// Preserve response bytes unless a later phase denies them.
     Inspect,
-    /// Replace the response body and headers before they reach the client.
-    Blocked,
+    /// A local reply answered the response: nothing upstream sends is released, whether or not the reply was sent.
+    Refused,
 }
 
 /// Request metadata collected from Envoy before opening the transaction.
@@ -349,9 +350,6 @@ pub(crate) struct CorazaHttp {
     request_engine_bytes: usize,
     response_engine_bytes: usize,
     response_mode: ResponseMode,
-    response_mutation_failed: bool,
-    response_block_body: &'static [u8],
-    response_interruption: Option<Interruption>,
 }
 
 impl CorazaHttp {
@@ -382,9 +380,6 @@ impl CorazaHttp {
             request_engine_bytes: 0,
             response_engine_bytes: 0,
             response_mode: ResponseMode::Inspect,
-            response_mutation_failed: false,
-            response_block_body: RESPONSE_BLOCK_BODY,
-            response_interruption: None,
         }
     }
 
@@ -419,31 +414,39 @@ impl CorazaHttp {
         }
     }
 
-    fn record_interruption(
-        generation: &Generation,
-        transaction: &Transaction,
-        interruption: &Interruption,
-        phase: InterruptionPhase,
-    ) -> bool {
-        observability::interruption(
-            generation.enable_filter_state_logs(),
-            transaction,
-            interruption,
-            phase,
-            generation.diagnostics(),
-        )
+    fn record_interruption(&mut self, interruption: &Interruption, phase: InterruptionPhase) {
+        if let (Some(generation), Some(transaction)) = (self.generation.as_deref(), self.tx.as_deref()) {
+            if observability::interruption(
+                generation.enable_filter_state_logs(),
+                transaction,
+                interruption,
+                phase,
+                generation.diagnostics(),
+            ) {
+                self.telemetry_publish_failed = true;
+            }
+        }
+    }
+
+    /// What a request callback answers once the stream no longer inspects it: only a request the filter already
+    /// released goes on. One it still held stays held, so a stream finalized on the response side (Envoy's own timeout
+    /// reply) or by the filter's own reply never lets an uninspected request through. After a refusal in either
+    /// direction nothing more of the request goes on, even when the reply could not be sent, so the unread rest of a
+    /// body never reaches the backend.
+    fn released_request_action(&self) -> Action {
+        if self.request_mode != RequestMode::Replied
+            && self.response_mode != ResponseMode::Refused
+            && matches!(self.lifecycle.request, RequestStage::Complete | RequestStage::Bypassed)
+        {
+            Action::Continue
+        } else {
+            Action::Pause
+        }
     }
 
     fn begin_request(&mut self, num_headers: usize, end_of_stream: bool) -> Action {
-        if self.request_mode == RequestMode::Replied {
-            return Action::Pause;
-        }
-        if !self.lifecycle.begin_request() {
-            return if matches!(self.lifecycle.request, RequestStage::Headers | RequestStage::Body) {
-                Action::Pause
-            } else {
-                Action::Continue
-            };
+        if self.request_mode == RequestMode::Replied || !self.lifecycle.begin_request() {
+            return self.released_request_action();
         }
         let Some(generation) = self.generation.clone() else {
             return self.reject_request(
@@ -625,7 +628,10 @@ impl CorazaHttp {
     }
 
     fn complete_request_body(&mut self, body_size: usize) -> Action {
-        if self.lifecycle.finalized || self.request_mode == RequestMode::Uninspected {
+        if self.lifecycle.finalized {
+            return self.released_request_action();
+        }
+        if self.request_mode == RequestMode::Uninspected {
             return Action::Continue;
         }
         if body_size < self.request_body_size {
@@ -756,11 +762,7 @@ impl CorazaHttp {
 
     fn request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
         if self.lifecycle.finalized {
-            return if self.request_mode == RequestMode::Replied {
-                Action::Pause
-            } else {
-                Action::Continue
-            };
+            return self.released_request_action();
         }
         if self.request_mode == RequestMode::Uninspected {
             return Action::Continue;
@@ -832,11 +834,7 @@ impl CorazaHttp {
 
     fn request_trailers(&mut self, num_trailers: usize) -> Action {
         if self.lifecycle.finalized {
-            return if self.request_mode == RequestMode::Replied {
-                Action::Pause
-            } else {
-                Action::Continue
-            };
+            return self.released_request_action();
         }
         if self.request_mode == RequestMode::Uninspected {
             return Action::Continue;
@@ -894,14 +892,10 @@ impl CorazaHttp {
     }
 
     fn response_headers(&mut self, num_headers: usize, end_of_stream: bool) -> Action {
-        if self.lifecycle.finalized {
-            return if self.response_mutation_failed {
-                Action::Pause
-            } else {
-                Action::Continue
-            };
+        if self.response_mode == ResponseMode::Refused {
+            return Action::Pause;
         }
-        if self.request_mode != RequestMode::Inspect || self.tx.is_none() {
+        if self.lifecycle.finalized || self.request_mode != RequestMode::Inspect || self.tx.is_none() {
             return Action::Continue;
         }
         if self.lifecycle.response != ResponseStage::Waiting {
@@ -912,8 +906,9 @@ impl CorazaHttp {
             };
         }
         if num_headers > MAX_HEADER_COUNT {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-headers",
@@ -922,8 +917,9 @@ impl CorazaHttp {
             );
         }
         let Ok(headers) = hostcalls::get_map_bytes(MapType::HttpResponseHeaders) else {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-headers-hostcall",
@@ -932,8 +928,9 @@ impl CorazaHttp {
             );
         };
         if !headers_within_limits(&headers, num_headers) {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-headers",
@@ -952,8 +949,9 @@ impl CorazaHttp {
                     .and_then(|value| str::from_utf8(&value).ok()?.parse::<u16>().ok())
             });
         let Some(status) = status else {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-status",
@@ -964,21 +962,25 @@ impl CorazaHttp {
         if (100..200).contains(&status) && status != 101 {
             return Action::Continue;
         }
-        if status == 101 {
+        if matches!(self.lifecycle.request, RequestStage::Headers | RequestStage::Body) {
+            // The filter still holds the request, so no upstream saw it: this is Envoy's own reply, such as the 408 of
+            // a timeout. It reaches the client as Envoy wrote it, and the held request stays held.
             self.request_mode = RequestMode::Replied;
-            self.finish_once(TerminalOutcome::Unsupported("response-upgrade"));
-            return Self::send_local_response(
+            self.finish_once(self.incomplete_outcome());
+            return Action::Continue;
+        }
+        if status == 101 {
+            return self.refuse_response(
                 501,
-                vec![
-                    ("content-type", "text/plain; charset=utf-8"),
-                    ("cache-control", "no-store"),
-                ],
-                Some(UNSUPPORTED_BODY),
+                None,
+                UNSUPPORTED_BODY,
+                TerminalOutcome::Unsupported("response-upgrade"),
             );
         }
         if !self.lifecycle.begin_response() {
-            return self.reject_response(
+            return self.refuse_response(
                 503,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::InvalidLifecycle {
                     phase: "response-headers-order",
@@ -1002,95 +1004,53 @@ impl CorazaHttp {
             .and_then(|tx| tx.process_response_headers(status, &self.request_protocol));
         self.mark_diagnostic_change(diagnostics_before);
         if let Some(interruption) = interruption {
-            if let (Some(generation), Some(transaction)) = (self.generation.clone(), self.tx.as_deref()) {
-                if Self::record_interruption(
-                    &generation,
-                    transaction,
-                    &interruption,
-                    InterruptionPhase::ResponseHeaders,
-                ) {
-                    self.telemetry_publish_failed = true;
-                }
-            }
-            self.response_mode = ResponseMode::Blocked;
-            self.response_interruption = Some(interruption.clone());
-            self.response_block_body = if interruption.action == "redirect" {
-                &[]
-            } else {
-                RESPONSE_BLOCK_BODY
-            };
-            if let Err(status) = self.set_response_block_headers(&interruption, self.response_block_body) {
-                self.finish_once(TerminalOutcome::Denied {
-                    phase: "response-headers",
-                    status: valid_status(interruption.status),
-                });
-                return self.response_mutation_action(Err(status));
-            }
+            return self.refuse_response_interruption(
+                &interruption,
+                "response-headers",
+                InterruptionPhase::ResponseHeaders,
+            );
         }
-        let body_access = self.tx.as_deref().is_some_and(Transaction::response_body_access);
-        let processable = self
+        let inspects_body = self
             .tx
             .as_deref()
-            .is_some_and(Transaction::is_response_body_processable);
-        if self.response_mode == ResponseMode::Inspect
-            && body_access
-            && processable
-            && has_unsupported_content_encoding(headers)
-        {
-            return self.reject_response(
+            .is_some_and(|tx| tx.response_body_access() && tx.is_response_body_processable());
+        if inspects_body && has_unsupported_content_encoding(headers) {
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Unsupported("response-content-encoding"),
             );
         }
-        if end_of_stream {
+        // Phase 4 runs now when no body will be inspected; otherwise the headers wait for the body's verdict.
+        if end_of_stream || !inspects_body {
             return self.complete_response_body(0);
-        }
-        if self.response_mode == ResponseMode::Inspect && !(body_access && processable) {
-            let action = self.complete_response_body(0);
-            return if self.response_mode == ResponseMode::Blocked {
-                Action::Pause
-            } else {
-                action
-            };
         }
         Action::Pause
     }
 
     fn response_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        if self.response_mode == ResponseMode::Refused {
+            return Action::Pause;
+        }
         if self.request_mode == RequestMode::Replied {
-            return if self.lifecycle.finalized && !self.response_mutation_failed {
+            return if self.lifecycle.finalized {
                 Action::Continue
             } else {
                 Action::Pause
             };
         }
-        if self.request_mode != RequestMode::Inspect {
-            return Action::Continue;
-        }
-        if self.lifecycle.finalized {
-            if self.response_mutation_failed {
-                return Action::Pause;
-            }
-            if self.response_mode == ResponseMode::Blocked {
-                return self.response_mutation_action(hostcalls::set_buffer(
-                    BufferType::HttpResponseBody,
-                    0,
-                    body_size,
-                    if end_of_stream { self.response_block_body } else { &[] },
-                ));
-            }
-            return Action::Continue;
-        }
-        if self.tx.is_none() {
-            return Action::Continue;
-        }
-        if self.lifecycle.response == ResponseStage::Complete {
+        if self.request_mode != RequestMode::Inspect
+            || self.lifecycle.finalized
+            || self.tx.is_none()
+            || self.lifecycle.response == ResponseStage::Complete
+        {
             return Action::Continue;
         }
         if !self.lifecycle.response_body() {
-            return self.reject_response(
+            return self.refuse_response(
                 503,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::InvalidLifecycle {
                     phase: "response-body-before-headers",
@@ -1099,8 +1059,9 @@ impl CorazaHttp {
             );
         }
         if body_size < self.response_body_size {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::InvalidLifecycle {
                     phase: "response-body-size-regressed",
@@ -1109,18 +1070,11 @@ impl CorazaHttp {
             );
         }
         self.response_body_size = body_size;
-        let body_access = self.tx.as_deref().is_some_and(Transaction::response_body_access);
-        let processable = self
-            .tx
-            .as_deref()
-            .is_some_and(Transaction::is_response_body_processable);
-        if self.response_mode == ResponseMode::Inspect
-            && body_access
-            && processable
-            && body_size > MAX_RESPONSE_BODY_BYTES
-        {
-            return self.reject_response(
+        // Only a body the policy inspects is held, so every body seen here is one.
+        if body_size > MAX_RESPONSE_BODY_BYTES {
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::BodyTooLarge {
                     phase: "response-body",
@@ -1130,8 +1084,9 @@ impl CorazaHttp {
         }
         self.response_host_bytes = body_size;
         if !self.update_accounting() {
-            return self.reject_response(
+            return self.refuse_response(
                 503,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::RetainedBodyBudgetExhausted { phase: "response-body" },
             );
@@ -1143,44 +1098,27 @@ impl CorazaHttp {
     }
 
     fn response_trailers(&mut self, num_trailers: usize) -> Action {
+        if self.response_mode == ResponseMode::Refused {
+            return Action::Pause;
+        }
         if self.request_mode == RequestMode::Replied {
-            return if self.lifecycle.finalized && !self.response_mutation_failed {
+            return if self.lifecycle.finalized {
                 Action::Continue
             } else {
                 Action::Pause
             };
         }
-        if self.request_mode != RequestMode::Inspect {
-            return Action::Continue;
-        }
-        if self.lifecycle.finalized {
-            if self.response_mutation_failed {
-                return Action::Pause;
-            }
-            if self.response_mode == ResponseMode::Blocked {
-                if self.response_mutation_action(hostcalls::set_buffer(
-                    BufferType::HttpResponseBody,
-                    0,
-                    self.response_body_size,
-                    self.response_block_body,
-                )) == Action::Pause
-                {
-                    return Action::Pause;
-                }
-                return self
-                    .response_mutation_action(hostcalls::set_map_bytes(MapType::HttpResponseTrailers, Vec::new()));
-            }
-            return Action::Continue;
-        }
-        if self.tx.is_none() {
-            return Action::Continue;
-        }
-        if self.lifecycle.response == ResponseStage::Complete {
+        if self.request_mode != RequestMode::Inspect
+            || self.lifecycle.finalized
+            || self.tx.is_none()
+            || self.lifecycle.response == ResponseStage::Complete
+        {
             return Action::Continue;
         }
         if !matches!(self.lifecycle.response, ResponseStage::Headers | ResponseStage::Body) {
-            return self.reject_response(
+            return self.refuse_response(
                 503,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::InvalidLifecycle {
                     phase: "response-trailers-order",
@@ -1189,8 +1127,9 @@ impl CorazaHttp {
             );
         }
         if num_trailers > MAX_HEADER_COUNT {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-trailers",
@@ -1199,8 +1138,9 @@ impl CorazaHttp {
             );
         }
         let Ok(trailers) = hostcalls::get_map_bytes(MapType::HttpResponseTrailers) else {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-trailers-hostcall",
@@ -1209,8 +1149,9 @@ impl CorazaHttp {
             );
         };
         if !headers_within_limits(&trailers, num_trailers) {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::Incomplete {
                     phase: "response-trailers",
@@ -1228,9 +1169,6 @@ impl CorazaHttp {
         if !self.lifecycle.complete_response() {
             return Action::Continue;
         }
-        if self.response_mode == ResponseMode::Blocked {
-            return self.complete_blocked_response(body_size);
-        }
 
         let body_access = self.tx.as_deref().is_some_and(Transaction::response_body_access);
         let processable = self
@@ -1240,20 +1178,10 @@ impl CorazaHttp {
         let fetch = |size| hostcalls::get_buffer(BufferType::HttpResponseBody, 0, size);
         let interruption = match self.inspect_response_body(body_size, body_access, processable, fetch) {
             Ok(interruption) => interruption,
-            Err(outcome) => return self.reject_response(503, RESPONSE_INCOMPLETE_BODY, outcome),
+            Err(outcome) => return self.refuse_response(503, None, RESPONSE_INCOMPLETE_BODY, outcome),
         };
         if let Some(interruption) = interruption {
-            if let (Some(generation), Some(transaction)) = (self.generation.clone(), self.tx.as_deref()) {
-                if Self::record_interruption(&generation, transaction, &interruption, InterruptionPhase::ResponseBody) {
-                    self.telemetry_publish_failed = true;
-                }
-            }
-            self.finish_once(TerminalOutcome::Denied {
-                phase: "response-body",
-                status: valid_status(interruption.status),
-            });
-            let result = self.replace_interruption(&interruption, body_size);
-            return self.response_mutation_action(result);
+            return self.refuse_response_interruption(&interruption, "response-body", InterruptionPhase::ResponseBody);
         }
         // The budget is the connector's own limit, not a policy's: a response its parser stopped in has been inspected
         // only in part, and no rule need read `RES_BODY_ERROR` (the recommended configuration's reads only
@@ -1263,8 +1191,9 @@ impl CorazaHttp {
             .as_ref()
             .is_some_and(|tx| tx.response_body_stopped_by_memory_budget())
         {
-            return self.reject_response(
+            return self.refuse_response(
                 502,
+                None,
                 RESPONSE_INCOMPLETE_BODY,
                 TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" },
             );
@@ -1343,41 +1272,27 @@ impl CorazaHttp {
         Ok(interruption)
     }
 
-    fn complete_blocked_response(&mut self, body_size: usize) -> Action {
-        drop(self.tx.as_mut().map(|tx| tx.process_response_body(&[])));
-        let Some(interruption) = self.response_interruption.clone() else {
-            return self.reject_response(
-                502,
-                RESPONSE_INCOMPLETE_BODY,
-                TerminalOutcome::InvalidLifecycle {
-                    phase: "response-block-missing-interruption",
-                    status: 502,
-                },
-            );
-        };
-        self.finish_once(TerminalOutcome::Denied {
-            phase: "response-headers",
-            status: valid_status(interruption.status),
-        });
-        let result = self.replace_interruption(&interruption, body_size);
-        self.response_mutation_action(result)
-    }
-
     fn send_local_response(status: u32, headers: Vec<(&str, &str)>, body: Option<&[u8]>) -> Action {
-        // Keep the request held if Envoy cannot construct the local reply.
+        // Keep the stream held if Envoy cannot construct the local reply.
         if let Err(status) = hostcalls::send_http_response(status, headers, body) {
             log_error(&format!("envoy-coraza: failed to send local response: {status:?}"));
         }
         Action::Pause
     }
 
-    fn response_mutation_action(&mut self, result: Result<(), Status>) -> Action {
-        if self.response_mutation_failed || result.is_err() {
-            self.response_mutation_failed = true;
-            Action::Pause
-        } else {
-            Action::Continue
+    /// Sends the local reply that refuses this stream, without a body for a `HEAD` request, a 204 or 304, or a
+    /// redirect.
+    fn send_refusal(&self, status: u16, location: Option<&str>, body: &[u8]) -> Action {
+        let mut headers = vec![
+            ("content-type", "text/plain; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ];
+        if let Some(location) = location {
+            headers.push(("location", location));
         }
+        let no_body =
+            location.is_some() || status == 204 || status == 304 || self.request_method.eq_ignore_ascii_case("HEAD");
+        Self::send_local_response(u32::from(status), headers, Some(if no_body { &[] } else { body }))
     }
 
     fn reject_interruption(
@@ -1386,44 +1301,17 @@ impl CorazaHttp {
         phase: &'static str,
         state_phase: InterruptionPhase,
     ) -> Action {
-        let status = valid_status(interruption.status);
-        let mut headers = vec![
-            ("content-type", "text/plain; charset=utf-8"),
-            ("cache-control", "no-store"),
-        ];
-        if interruption.action == "redirect" && !interruption.data.is_empty() {
-            headers.push(("location", interruption.data.as_str()));
-        }
-        let body = if interruption.action == "redirect" || self.request_method.eq_ignore_ascii_case("HEAD") {
-            &[][..]
-        } else {
-            REQUEST_BLOCK_BODY
-        };
+        let (status, location) = interruption_reply(interruption);
         self.request_mode = RequestMode::Replied;
-        if let (Some(generation), Some(transaction)) = (self.generation.clone(), self.tx.as_deref()) {
-            if Self::record_interruption(&generation, transaction, interruption, state_phase) {
-                self.telemetry_publish_failed = true;
-            }
-        }
+        self.record_interruption(interruption, state_phase);
         self.finish_once(TerminalOutcome::Denied { phase, status });
-        Self::send_local_response(u32::from(status), headers, Some(body))
+        self.send_refusal(status, location, REQUEST_BLOCK_BODY)
     }
 
     fn reject_request(&mut self, status: u16, body: &[u8], outcome: TerminalOutcome) -> Action {
         self.request_mode = RequestMode::Replied;
         self.finish_once(outcome);
-        Self::send_local_response(
-            u32::from(status),
-            vec![
-                ("content-type", "text/plain; charset=utf-8"),
-                ("cache-control", "no-store"),
-            ],
-            Some(if self.request_method.eq_ignore_ascii_case("HEAD") {
-                &[]
-            } else {
-                body
-            }),
-        )
+        self.send_refusal(status, None, body)
     }
 
     /// Fails the request closed after a hostcall error on a property that feeds inspection.
@@ -1445,63 +1333,35 @@ impl CorazaHttp {
         )
     }
 
-    fn reject_response(&mut self, status: u16, body: &'static [u8], outcome: TerminalOutcome) -> Action {
+    /// Refuses the upstream response with a local reply, which Envoy sends to the client in its place: the response
+    /// headers are still held, so nothing of the response has reached the client. From here on every response callback
+    /// pauses, also when the reply could not be sent, since what arrives is upstream's.
+    fn refuse_response(
+        &mut self,
+        status: u16,
+        location: Option<&str>,
+        body: &'static [u8],
+        outcome: TerminalOutcome,
+    ) -> Action {
+        self.response_mode = ResponseMode::Refused;
         self.finish_once(outcome);
-        let result = self.replace_response(status, body, self.response_body_size);
-        self.response_mutation_action(result)
+        self.send_refusal(status, location, body)
     }
 
-    fn set_response_block_headers(&self, interruption: &Interruption, body: &[u8]) -> Result<(), Status> {
-        let status = valid_status(interruption.status);
-        let status_text = status.to_string();
-        let body_length = body.len().to_string();
-        let mut headers: Vec<(&str, &[u8])> = vec![(":status", status_text.as_bytes()), ("cache-control", b"no-store")];
-        if interruption.action == "redirect" && !interruption.data.is_empty() {
-            headers.push(("location", interruption.data.as_bytes()));
-        } else if status != 204 && status != 304 && !self.request_method.eq_ignore_ascii_case("HEAD") {
-            headers.push(("content-type", b"text/plain; charset=utf-8"));
-            headers.push(("content-length", body_length.as_bytes()));
-        }
-        hostcalls::set_map_bytes(MapType::HttpResponseHeaders, headers)
-    }
-
-    fn replace_interruption(&mut self, interruption: &Interruption, prior_body_size: usize) -> Result<(), Status> {
-        let status = valid_status(interruption.status);
-        let body = if interruption.action == "redirect" {
-            &[][..]
-        } else {
-            RESPONSE_BLOCK_BODY
-        };
-        self.response_mode = ResponseMode::Blocked;
-        self.response_interruption = Some(interruption.clone());
-        self.response_block_body = body;
-        let no_body = status == 204 || status == 304 || self.request_method.eq_ignore_ascii_case("HEAD");
-        let response_body = if no_body || interruption.action == "redirect" {
-            &[][..]
-        } else {
-            body
-        };
-        self.response_block_body = response_body;
-        self.set_response_block_headers(interruption, response_body)?;
-        hostcalls::set_buffer(BufferType::HttpResponseBody, 0, prior_body_size, response_body)?;
-        hostcalls::set_map_bytes(MapType::HttpResponseTrailers, Vec::new())
-    }
-
-    fn replace_response(&mut self, status: u16, body: &'static [u8], prior_body_size: usize) -> Result<(), Status> {
-        let status = valid_status(status);
-        let no_body = status == 204 || status == 304 || self.request_method.eq_ignore_ascii_case("HEAD");
-        let response_body = if no_body { &[][..] } else { body };
-        self.response_mode = ResponseMode::Blocked;
-        self.response_block_body = response_body;
-        let interruption = Interruption {
-            rule_id: 0,
-            action: "deny".to_owned(),
+    fn refuse_response_interruption(
+        &mut self,
+        interruption: &Interruption,
+        phase: &'static str,
+        state_phase: InterruptionPhase,
+    ) -> Action {
+        let (status, location) = interruption_reply(interruption);
+        self.record_interruption(interruption, state_phase);
+        self.refuse_response(
             status,
-            data: String::new(),
-        };
-        self.set_response_block_headers(&interruption, response_body)?;
-        hostcalls::set_buffer(BufferType::HttpResponseBody, 0, prior_body_size, response_body)?;
-        hostcalls::set_map_bytes(MapType::HttpResponseTrailers, Vec::new())
+            location,
+            RESPONSE_BLOCK_BODY,
+            TerminalOutcome::Denied { phase, status },
+        )
     }
 
     fn finish_once(&mut self, outcome: TerminalOutcome) {
@@ -1531,19 +1391,13 @@ impl CorazaHttp {
         let (Some(generation), Some(final_outcome)) = (self.generation.clone(), self.final_outcome.clone()) else {
             return;
         };
-        // A request body that went through unread was not inspected, whatever ended the stream, as a truncated one
-        // is. One that had not come yet can still reach the backend after a response-phase ending: a phase-4 denial
-        // at response headers finalizes the stream while the request still flows. Only the filter's own reply in the
-        // request phase stops it.
+        // A request body the filter released unread was not inspected, whatever ended the stream, as a truncated one
+        // is; "released" is not "delivered", since a later Envoy filter could still hold the bytes, so this reports
+        // conservatively. One that had not come yet can still be released only after a response that completed: a
+        // refusal's local reply ends the stream, and the filter holds whatever of the request still arrives after it.
         let request_body_unread = match self.unread_request_body {
             UnreadRequestBody::Passed => true,
-            UnreadRequestBody::Pending => {
-                self.request_mode != RequestMode::Replied
-                    && matches!(
-                        final_outcome,
-                        TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
-                    )
-            },
+            UnreadRequestBody::Pending => final_outcome == TerminalOutcome::Completed,
             UnreadRequestBody::Absent => false,
         };
         let inspection_complete = matches!(
@@ -2062,6 +1916,23 @@ fn has_upgrade(headers: &[(String, Vec<u8>)]) -> bool {
     })
 }
 
+/// The status and `location` of the reply that refuses `interruption`. A redirect whose target cannot be a `location`
+/// value is refused with 403 instead: an empty target (a macro that expanded to nothing), or one an embedder built with
+/// a control byte.
+fn interruption_reply(interruption: &Interruption) -> (u16, Option<&str>) {
+    if interruption.action != "redirect" {
+        return (valid_status(interruption.status), None);
+    }
+    location_value(&interruption.data).map_or((403, None), |location| {
+        (valid_status(interruption.status), Some(location))
+    })
+}
+
+/// `data` as a `location` header value: not empty, and without a control byte, which could end the header line.
+fn location_value(data: &str) -> Option<&str> {
+    (!data.is_empty() && !data.bytes().any(|byte| byte.is_ascii_control())).then_some(data)
+}
+
 fn valid_status(status: u16) -> u16 {
     if (200..=599).contains(&status) {
         status
@@ -2088,11 +1959,12 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use coraza::types::RuleVariable;
-    use proxy_wasm::types::{Action, Status};
+    use proxy_wasm::types::Action;
 
     use super::{
         normalize_authority, request_authority, CorazaHttp, Cow, Ipv4Addr, Lifecycle, RequestMode, RequestStage,
-        ResponseStage, TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES,
+        ResponseMode, ResponseStage, TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES,
+        MAX_ROOT_RETAINED_BODY_BYTES,
     };
     use crate::{
         config::Config,
@@ -2117,22 +1989,25 @@ mod tests {
     }
 
     #[test]
-    fn failed_response_mutations_stay_paused() {
+    fn a_refused_response_stays_paused_whether_or_not_its_reply_was_sent() {
+        // The scripted host refuses every local reply, as Envoy does for a second one.
         let mut stream = CorazaHttp::new(None, Rc::new(Cell::new(0)));
-        assert_eq!(
-            stream.response_mutation_action(Err(Status::InternalFailure)),
-            Action::Pause
-        );
-        assert!(stream.response_mutation_failed);
-        assert_eq!(
-            stream.response_mutation_action(Ok(())),
-            Action::Pause,
-            "a later callback cannot release a response after a partial rewrite failed"
-        );
+        let outcome = TerminalOutcome::Incomplete {
+            phase: "response-headers",
+            status: 502,
+        };
+        assert_eq!(stream.refuse_response(502, None, b"", outcome.clone()), Action::Pause);
+        assert_eq!(stream.response_mode, ResponseMode::Refused);
+        assert_eq!(stream.final_outcome, Some(outcome));
+        assert_eq!(stream.response_headers(0, false), Action::Pause, "upstream headers");
+        assert_eq!(stream.response_body(35, false), Action::Pause, "upstream body");
+        assert_eq!(stream.response_body(35, true), Action::Pause, "upstream body end");
+        assert_eq!(stream.response_trailers(0), Action::Pause, "upstream trailers");
     }
 
     #[test]
-    fn finalized_local_reply_continues_but_failed_response_mutation_stays_paused() {
+    fn a_request_side_reply_passes_through_but_a_refused_response_stays_paused() {
+        // The filter's own request-side reply runs through its response callbacks.
         let mut local_reply = CorazaHttp::new(None, Rc::new(Cell::new(0)));
         local_reply.lifecycle.finalized = true;
         local_reply.request_mode = RequestMode::Replied;
@@ -2140,12 +2015,52 @@ mod tests {
         assert_eq!(local_reply.response_body(35, true), Action::Continue);
         assert_eq!(local_reply.response_trailers(0), Action::Continue);
 
-        let mut failed_mutation = CorazaHttp::new(None, Rc::new(Cell::new(0)));
-        failed_mutation.lifecycle.finalized = true;
-        failed_mutation.response_mutation_failed = true;
-        assert_eq!(failed_mutation.response_headers(0, true), Action::Pause);
-        assert_eq!(failed_mutation.response_body(35, true), Action::Pause);
-        assert_eq!(failed_mutation.response_trailers(0), Action::Pause);
+        let mut refused = CorazaHttp::new(None, Rc::new(Cell::new(0)));
+        refused.lifecycle.finalized = true;
+        refused.response_mode = ResponseMode::Refused;
+        assert_eq!(refused.response_headers(0, true), Action::Pause);
+        assert_eq!(refused.response_body(35, true), Action::Pause);
+        assert_eq!(refused.response_trailers(0), Action::Pause);
+    }
+
+    #[test]
+    fn a_finalized_request_goes_on_only_if_the_filter_already_released_it() {
+        let stages = [
+            RequestStage::New,
+            RequestStage::Headers,
+            RequestStage::Body,
+            RequestStage::Complete,
+            RequestStage::Bypassed,
+        ];
+        // A refused response holds the rest of the request too, whether or not its reply was sent.
+        let modes = [
+            (RequestMode::Inspect, ResponseMode::Inspect),
+            (RequestMode::Replied, ResponseMode::Inspect),
+            (RequestMode::Inspect, ResponseMode::Refused),
+        ];
+        for (stage, (mode, response)) in stages.into_iter().flat_map(|stage| modes.map(|mode| (stage, mode))) {
+            let finalized = || {
+                let mut stream = CorazaHttp::new(None, Rc::new(Cell::new(0)));
+                stream.lifecycle.request = stage;
+                stream.lifecycle.finalized = true;
+                stream.request_mode = mode;
+                stream.response_mode = response;
+                stream
+            };
+            let expected = if mode == RequestMode::Inspect
+                && response == ResponseMode::Inspect
+                && matches!(stage, RequestStage::Complete | RequestStage::Bypassed)
+            {
+                Action::Continue
+            } else {
+                Action::Pause
+            };
+            let label = format!("{stage:?} {mode:?} {response:?}");
+            assert_eq!(finalized().begin_request(0, true), expected, "{label} headers");
+            assert_eq!(finalized().request_body(3, true), expected, "{label} body");
+            assert_eq!(finalized().request_trailers(0), expected, "{label} trailers");
+            assert_eq!(finalized().complete_request_body(3), expected, "{label} phase 2");
+        }
     }
 
     #[test]
@@ -2822,7 +2737,11 @@ mod scripted_host_tests {
         types::{Action, Status},
     };
 
-    use super::{CorazaHttp, TerminalOutcome, MAX_REQUEST_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES};
+    use super::{
+        CorazaHttp, Interruption, InterruptionPhase, TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES,
+        MAX_RESPONSE_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES, REQUEST_BLOCK_BODY, RESPONSE_BLOCK_BODY,
+        RESPONSE_INCOMPLETE_BODY, UNSUPPORTED_BODY,
+    };
     use crate::{config::Config, policy::Generation, test_hostcalls};
 
     /// One mebibyte.
@@ -3561,12 +3480,12 @@ mod scripted_host_tests {
         let probe = get_beside(&config, 0);
         let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - held(&probe) - 16 * 1024;
         let mut stream = get_beside(&config, others);
-        assert_eq!(respond(&mut stream, &body), Action::Continue);
+        assert_eq!(respond(&mut stream, &body), Action::Pause);
 
         assert_eq!(
-            test_hostcalls::response_replacement_statuses(),
-            ["502"],
-            "the response is replaced, as the connector does for a response it cannot inspect"
+            test_hostcalls::local_reply_statuses(),
+            [502],
+            "the response is refused, as the connector does for a response it cannot inspect"
         );
         assert_eq!(
             stream.final_outcome,
@@ -3582,11 +3501,11 @@ mod scripted_host_tests {
         );
 
         // The same body with room to parse in is forwarded, and a body that is not JSON is a body error that the
-        // policy's rules decide, as they always did: nothing is replaced.
+        // policy's rules decide, as they always did: nothing is refused.
         for (others, body) in [(0, body.clone()), (0, b"[1,".to_vec())] {
             let mut stream = get_beside(&config, others);
             assert_eq!(respond(&mut stream, &body), Action::Continue);
-            assert!(test_hostcalls::response_replacement_statuses().is_empty(), "{body:?}");
+            assert!(test_hostcalls::local_reply_statuses().is_empty(), "{body:?}");
             assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
             assert_eq!(
                 test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
@@ -3785,7 +3704,7 @@ mod scripted_host_tests {
     }
 
     #[test]
-    fn a_response_the_budget_stopped_under_process_partial_is_replaced_not_forwarded() {
+    fn a_response_the_budget_stopped_under_process_partial_is_refused_not_forwarded() {
         // With ProcessPartial and a limit the body fits in, a parse the budget stopped is not reported as a truncation
         // that lets the response through.
         let body = json_list(200 * 1024);
@@ -3793,8 +3712,8 @@ mod scripted_host_tests {
         let probe = get_beside(&config, 0);
         let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - held(&probe) - 16 * 1024;
         let mut stream = get_beside(&config, others);
-        respond(&mut stream, &body);
-        assert_eq!(test_hostcalls::response_replacement_statuses(), ["502"]);
+        assert_eq!(respond(&mut stream, &body), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [502]);
         assert_eq!(
             stream.final_outcome,
             Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" })
@@ -3900,17 +3819,16 @@ mod scripted_host_tests {
         "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502\""]},
         "default_directives": "p", "enable_filter_state_logs": true}"#;
 
-    /// Whether every response replacement so far answered `status`, and there was one.
-    fn replaced_with(status: &str) -> bool {
-        let replacements = test_hostcalls::response_replacement_statuses();
-        !replacements.is_empty() && replacements.iter().all(|replacement| replacement == status)
+    /// Whether the stream answered with one local reply, of `status`.
+    fn refused_with(status: u32) -> bool {
+        test_hostcalls::local_reply_statuses() == [status]
     }
 
     #[test]
     fn a_response_phase_denial_after_an_unread_request_body_reports_both() {
         let (actions, published) = post_in_frames(BODY_OFF, &[(3, true)], b"201");
         assert_eq!(actions, [Action::Continue, Action::Continue], "the body is not held");
-        assert!(replaced_with("502"), "the denial replaces the response");
+        assert!(refused_with(502), "the denial refuses the response");
         assert_eq!(
             published,
             health("request_body_not_inspected", "denied", "false"),
@@ -3918,47 +3836,61 @@ mod scripted_host_tests {
         );
         // As a truncated body is reported beside the same denial.
         let (_, published) = post_in_frames(BODY_CUT, &[(3, true)], b"201");
-        assert!(replaced_with("502"), "the denial replaces the response");
+        assert!(refused_with(502), "the denial refuses the response");
         assert_eq!(published, health("body_partially_inspected", "denied", "false"));
         // Without the denial, the unread body is reported beside the completed stream.
         let (_, published) = post_in_frames(BODY_OFF, &[(3, true)], b"200");
-        assert!(
-            test_hostcalls::response_replacement_statuses().is_empty(),
-            "nothing is replaced"
-        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty(), "nothing is refused");
         assert_eq!(published, health("request_body_not_inspected", "completed", "false"));
-        // A response-phase denial before any body byte came does not stop the request, so its body may still follow.
+        // A response-phase denial before any body byte came ends the stream, so none of the body reaches the backend.
         let (_, published) = post_in_frames(BODY_OFF, &[], b"201");
-        assert!(replaced_with("502"), "the denial replaces the response");
-        assert_eq!(published, health("request_body_not_inspected", "denied", "false"));
+        assert!(refused_with(502), "the denial refuses the response");
+        assert_eq!(published, health("denied", "denied", "true"));
     }
 
     #[test]
-    fn a_denial_at_response_headers_before_the_request_body_reports_the_body_unread() {
-        // Without response body inspection, phase 4 runs at the response headers; a denial there finalizes the stream
-        // while the request body can still reach the backend.
+    fn a_response_refusal_holds_the_rest_of_an_unread_request_body() {
+        // Without response body inspection, phase 4 runs at the response headers. Its denial is a local reply that
+        // ends the stream, over HTTP/1.1 and HTTP/2 alike, so what the request body had not yet sent never reaches the
+        // backend; the filter holds it too, so it stays held when the reply could not be sent, as on this host.
         let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
             "SecAction \"id:6,phase:4,deny,status:502\""]},
             "default_directives": "p", "enable_filter_state_logs": true}"#;
+        let refuse = |post: &mut CorazaHttp| {
+            test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
+            assert_eq!(post.on_http_response_headers(2, false), Action::Pause);
+            assert!(
+                post.lifecycle.finalized,
+                "the denial ended the stream at the response headers"
+            );
+            assert!(refused_with(502), "the denial refuses the response");
+        };
+
+        // Refused before any body byte came: none went to the backend unread.
         let mut post = stream(config);
         let count = script_request("a.example", "http");
         assert_eq!(post.on_http_request_headers(count, false), Action::Continue);
-        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
-        assert_eq!(post.on_http_response_headers(2, false), Action::Pause);
-        assert!(
-            post.lifecycle.finalized,
-            "the denial ended the stream at the response headers"
-        );
-        assert!(replaced_with("502"), "the denial replaces the response");
-        let unread = health("request_body_not_inspected", "denied", "false");
-        assert_eq!(published(), unread);
+        refuse(&mut post);
+        let denied = health("denied", "denied", "true");
+        assert_eq!(published(), denied, "nothing of the body went through");
+        test_hostcalls::set_request_body(b"abc");
+        assert_eq!(post.on_http_request_body(3, true), Action::Pause, "the body is held");
+        assert_eq!(post.on_http_request_trailers(0), Action::Pause, "and its trailers");
+        assert_eq!(published(), denied);
+
+        // Refused after body bytes went through: those reached the backend unread, and the rest is held.
+        let mut post = stream(config);
+        let count = script_request("a.example", "http");
+        assert_eq!(post.on_http_request_headers(count, false), Action::Continue);
         test_hostcalls::set_request_body(b"abc");
         assert_eq!(
-            post.on_http_request_body(3, true),
+            post.on_http_request_body(3, false),
             Action::Continue,
-            "the body goes on unread"
+            "the body is not held"
         );
-        assert_eq!(published(), unread);
+        refuse(&mut post);
+        assert_eq!(published(), health("request_body_not_inspected", "denied", "false"));
+        assert_eq!(post.on_http_request_body(3, true), Action::Pause, "the rest is held");
 
         // A request-phase denial is the filter's own reply, so no body follows it.
         let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
@@ -4232,6 +4164,588 @@ mod scripted_host_tests {
             actions,
             [Action::Continue, Action::Continue, Action::Continue, Action::Continue],
             "streamed"
+        );
+    }
+
+    /// A policy that inspects `text/plain` response bodies, with `rules`.
+    fn response_policy(rules: &str) -> String {
+        format!(
+            r#"{{"directives_map": {{"p": ["SecRuleEngine On", "SecRequestBodyAccess On", "SecResponseBodyAccess On",
+            "SecResponseBodyMimeType text/plain", "SecResponseBodyLimit 1048576",
+            "SecRule ARGS \"@contains attack\" \"id:900,phase:2,deny,status:403\""{rules}]}},
+            "default_directives": "p", "enable_filter_state_logs": true}}"#
+        )
+    }
+
+    /// Response rules keyed on an `x-deny` response header: a phase-3 denial, a phase-4 denial decided in phase 3 as
+    /// the harness's `p4` policy does, a phase-4 body denial, a phase-3 redirect, and phase-3 denials with the
+    /// bodyless statuses 204 and 304.
+    const RESPONSE_RULES: &str = r#",
+        "SecRule RESPONSE_HEADERS:x-deny \"@streq 3\" \"id:1,phase:3,deny,status:502\"",
+        "SecRule RESPONSE_HEADERS:x-deny \"@streq 4\" \"id:2,phase:3,pass,nolog,setvar:tx.deny=1\"",
+        "SecRule TX:deny \"@eq 1\" \"id:3,phase:4,deny,status:502\"",
+        "SecRule RESPONSE_BODY \"@contains secret\" \"id:4,phase:4,deny,status:502\"",
+        "SecRule RESPONSE_HEADERS:x-deny \"@streq redirect\" \"id:5,phase:3,redirect:/blocked,status:302\"",
+        "SecRule RESPONSE_HEADERS:x-deny \"@streq 204\" \"id:6,phase:3,deny,status:204\"",
+        "SecRule RESPONSE_HEADERS:x-deny \"@streq 304\" \"id:7,phase:3,deny,status:304\"""#;
+
+    /// A stream over [`RESPONSE_RULES`] whose bodyless `method` request is complete, beside streams that hold
+    /// `others` bytes of the root, and that root.
+    fn requested_beside(method: &str, others: usize) -> (CorazaHttp, Rc<Cell<usize>>) {
+        let (mut stream, root) = stream_beside(&response_policy(RESPONSE_RULES), others);
+        test_hostcalls::reset();
+        let headers: [(&str, &[u8]); 4] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", method.as_bytes()),
+            (":path", b"/"),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+        assert_eq!(stream.on_http_request_headers(headers.len(), true), Action::Continue);
+        (stream, root)
+    }
+
+    /// [`requested_beside`] on an idle root.
+    fn requested(method: &str) -> CorazaHttp {
+        requested_beside(method, 0).0
+    }
+
+    /// The one local reply the stream sent.
+    fn only_reply(label: &str) -> test_hostcalls::LocalReply {
+        let replies = test_hostcalls::local_replies();
+        assert_eq!(replies.len(), 1, "{label}: {replies:?}");
+        replies.into_iter().next().expect("one reply")
+    }
+
+    /// Asserts that `stream` answered `action` with exactly one local reply, of `status` and `body`, that can be
+    /// cached by no one, and that no response callback after it lets anything through: what follows is upstream's.
+    fn refused_once(stream: &mut CorazaHttp, action: Action, status: u32, body: &[u8], label: &str) {
+        assert_eq!(action, Action::Pause, "{label}");
+        let reply = only_reply(label);
+        assert_eq!((reply.status, reply.body.as_slice()), (status, body), "{label}");
+        assert!(
+            reply
+                .headers
+                .contains(&("cache-control".to_owned(), b"no-store".to_vec())),
+            "{label}: {reply:?}"
+        );
+        assert!(
+            !reply.headers.iter().any(|(name, _)| name == "location"),
+            "{label}: {reply:?}"
+        );
+        assert!(stream.lifecycle.finalized, "{label}");
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
+        test_hostcalls::set_response_body(b"secret");
+        assert_eq!(stream.on_http_response_headers(2, false), Action::Pause, "{label}");
+        assert_eq!(stream.on_http_response_body(6, false), Action::Pause, "{label}");
+        assert_eq!(stream.on_http_response_body(6, true), Action::Pause, "{label}");
+        assert_eq!(stream.on_http_response_trailers(0), Action::Pause, "{label}");
+        assert_eq!(test_hostcalls::local_replies().len(), 1, "{label}: one reply only");
+    }
+
+    #[test]
+    fn every_refusal_at_the_response_headers_is_one_local_reply() {
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a [u8])], bool, u32, &'a [u8]);
+        let cases: [Case<'_>; 10] = [
+            (
+                "phase-3 denial",
+                "GET",
+                &[(":status", b"200"), ("content-type", b"text/plain"), ("x-deny", b"3")],
+                false,
+                502,
+                RESPONSE_BLOCK_BODY,
+            ),
+            (
+                "phase-3 denial of a HEAD response",
+                "HEAD",
+                &[(":status", b"200"), ("content-type", b"text/plain"), ("x-deny", b"3")],
+                true,
+                502,
+                b"",
+            ),
+            (
+                "phase-3 denial of a 204",
+                "GET",
+                &[(":status", b"204"), ("x-deny", b"3")],
+                true,
+                502,
+                RESPONSE_BLOCK_BODY,
+            ),
+            (
+                "phase-3 denial of a 304",
+                "GET",
+                &[(":status", b"304"), ("x-deny", b"3")],
+                true,
+                502,
+                RESPONSE_BLOCK_BODY,
+            ),
+            (
+                "phase-3 denial of an empty 200",
+                "GET",
+                &[(":status", b"200"), ("content-length", b"0"), ("x-deny", b"3")],
+                true,
+                502,
+                RESPONSE_BLOCK_BODY,
+            ),
+            (
+                "compressed body of an inspected type",
+                "GET",
+                &[
+                    (":status", b"200"),
+                    ("content-type", b"text/plain"),
+                    ("content-encoding", b"gzip"),
+                ],
+                false,
+                502,
+                RESPONSE_INCOMPLETE_BODY,
+            ),
+            (
+                "phase-4 denial of a body that is not inspected",
+                "GET",
+                &[
+                    (":status", b"200"),
+                    ("content-type", b"application/octet-stream"),
+                    ("x-deny", b"4"),
+                ],
+                false,
+                502,
+                RESPONSE_BLOCK_BODY,
+            ),
+            (
+                "phase-4 denial of a HEAD response",
+                "HEAD",
+                &[(":status", b"200"), ("content-type", b"text/plain"), ("x-deny", b"4")],
+                true,
+                502,
+                b"",
+            ),
+            ("upgrade", "GET", &[(":status", b"101")], false, 501, UNSUPPORTED_BODY),
+            (
+                "no status",
+                "GET",
+                &[("content-type", b"text/plain")],
+                false,
+                502,
+                RESPONSE_INCOMPLETE_BODY,
+            ),
+        ];
+        for (label, method, headers, end_of_stream, status, body) in cases {
+            let mut stream = requested(method);
+            test_hostcalls::set_response_headers(headers);
+            let action = stream.on_http_response_headers(headers.len(), end_of_stream);
+            refused_once(&mut stream, action, status, body, label);
+        }
+    }
+
+    #[test]
+    fn a_denial_with_status_204_or_304_is_answered_without_a_body() {
+        for status in [204_u32, 304] {
+            let mut stream = requested("GET");
+            let deny = status.to_string();
+            let headers: [(&str, &[u8]); 3] = [
+                (":status", b"200"),
+                ("content-type", b"text/plain"),
+                ("x-deny", deny.as_bytes()),
+            ];
+            test_hostcalls::set_response_headers(&headers);
+            let action = stream.on_http_response_headers(headers.len(), false);
+            refused_once(&mut stream, action, status, b"", &deny);
+        }
+    }
+
+    #[test]
+    fn response_headers_that_cannot_be_read_are_refused_with_one_local_reply() {
+        let mut stream = requested("GET");
+        let action = stream.on_http_response_headers(MAX_HEADER_COUNT + 1, false);
+        refused_once(&mut stream, action, 502, RESPONSE_INCOMPLETE_BODY, "too many headers");
+        // The scripted host has no response header map to hand over.
+        let mut stream = requested("GET");
+        let action = stream.on_http_response_headers(1, false);
+        refused_once(
+            &mut stream,
+            action,
+            502,
+            RESPONSE_INCOMPLETE_BODY,
+            "header hostcall failed",
+        );
+    }
+
+    #[test]
+    fn every_refusal_in_the_response_body_or_trailers_is_one_local_reply() {
+        let inspected: [(&str, &[u8]); 2] = [(":status", b"200"), ("content-type", b"text/plain")];
+        let begin = |method: &str| {
+            let mut stream = requested(method);
+            test_hostcalls::set_response_headers(&inspected);
+            assert_eq!(
+                stream.on_http_response_headers(2, false),
+                Action::Pause,
+                "held for its body"
+            );
+            stream
+        };
+
+        let mut stream = begin("GET");
+        test_hostcalls::set_response_body(b"a secret");
+        let action = stream.on_http_response_body(8, true);
+        refused_once(&mut stream, action, 502, RESPONSE_BLOCK_BODY, "phase-4 body denial");
+
+        let mut stream = begin("GET");
+        let action = stream.on_http_response_body(MAX_RESPONSE_BODY_BYTES + 1, false);
+        refused_once(
+            &mut stream,
+            action,
+            502,
+            RESPONSE_INCOMPLETE_BODY,
+            "over the connector's ceiling",
+        );
+
+        let mut stream = begin("GET");
+        assert_eq!(stream.on_http_response_body(10, false), Action::Pause, "held");
+        let action = stream.on_http_response_body(5, false);
+        refused_once(&mut stream, action, 502, RESPONSE_INCOMPLETE_BODY, "a body that shrank");
+
+        // The scripted host has no response body to hand over.
+        let mut stream = begin("GET");
+        let action = stream.on_http_response_body(8, true);
+        refused_once(
+            &mut stream,
+            action,
+            503,
+            RESPONSE_INCOMPLETE_BODY,
+            "body hostcall failed",
+        );
+
+        let (mut stream, root) = requested_beside("GET", 0);
+        test_hostcalls::set_response_headers(&inspected);
+        assert_eq!(
+            stream.on_http_response_headers(2, false),
+            Action::Pause,
+            "held for its body"
+        );
+        root.set(MAX_ROOT_RETAINED_BODY_BYTES);
+        let action = stream.on_http_response_body(8, false);
+        refused_once(
+            &mut stream,
+            action,
+            503,
+            RESPONSE_INCOMPLETE_BODY,
+            "a root without room",
+        );
+
+        let mut stream = requested("GET");
+        let action = stream.on_http_response_body(8, true);
+        refused_once(
+            &mut stream,
+            action,
+            503,
+            RESPONSE_INCOMPLETE_BODY,
+            "a body before its headers",
+        );
+
+        let mut stream = requested("GET");
+        let action = stream.on_http_response_trailers(0);
+        refused_once(
+            &mut stream,
+            action,
+            503,
+            RESPONSE_INCOMPLETE_BODY,
+            "trailers before headers",
+        );
+
+        let mut stream = begin("GET");
+        let action = stream.on_http_response_trailers(MAX_HEADER_COUNT + 1);
+        refused_once(&mut stream, action, 502, RESPONSE_INCOMPLETE_BODY, "too many trailers");
+
+        // The scripted host has no response trailer map to hand over.
+        let mut stream = begin("GET");
+        let action = stream.on_http_response_trailers(1);
+        refused_once(
+            &mut stream,
+            action,
+            502,
+            RESPONSE_INCOMPLETE_BODY,
+            "trailer hostcall failed",
+        );
+
+        // A HEAD request gets no body in its reply.
+        let mut stream = begin("HEAD");
+        let action = stream.on_http_response_body(MAX_RESPONSE_BODY_BYTES + 1, false);
+        refused_once(&mut stream, action, 502, b"", "HEAD over the connector's ceiling");
+    }
+
+    #[test]
+    fn a_response_of_the_connectors_ceiling_is_inspected_and_released() {
+        let mut stream = requested("GET");
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
+        assert_eq!(
+            stream.on_http_response_headers(2, false),
+            Action::Pause,
+            "held for its body"
+        );
+        test_hostcalls::set_response_body(&vec![b'a'; MAX_RESPONSE_BODY_BYTES]);
+        assert_eq!(
+            stream.on_http_response_body(MAX_RESPONSE_BODY_BYTES / 2, false),
+            Action::Pause
+        );
+        assert_eq!(
+            stream.on_http_response_body(MAX_RESPONSE_BODY_BYTES, true),
+            Action::Continue
+        );
+        assert!(test_hostcalls::local_replies().is_empty(), "nothing is refused");
+        assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+    }
+
+    #[test]
+    fn a_compressed_response_of_a_type_the_policy_does_not_inspect_passes() {
+        let mut stream = requested("GET");
+        test_hostcalls::set_response_headers(&[
+            (":status", b"200"),
+            ("content-type", b"application/octet-stream"),
+            ("content-encoding", b"gzip"),
+        ]);
+        assert_eq!(stream.on_http_response_headers(3, false), Action::Continue);
+        assert_eq!(stream.on_http_response_body(8, true), Action::Continue);
+        assert!(test_hostcalls::local_replies().is_empty(), "nothing is refused");
+        assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+    }
+
+    #[test]
+    fn a_redirect_reply_carries_its_target_and_no_body() {
+        let mut stream = requested("GET");
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("x-deny", b"redirect")]);
+        assert_eq!(stream.on_http_response_headers(2, false), Action::Pause);
+        let reply = only_reply("redirect");
+        assert_eq!((reply.status, reply.body.as_slice()), (302, &b""[..]));
+        assert!(
+            reply.headers.contains(&("location".to_owned(), b"/blocked".to_vec())),
+            "{reply:?}"
+        );
+    }
+
+    /// The local reply of a request-side redirect to `target`, built as an embedder could build it, and the stream's
+    /// terminal outcome.
+    fn request_redirect(target: &str) -> (test_hostcalls::LocalReply, Option<TerminalOutcome>) {
+        let mut stream = requested("GET");
+        let interruption = Interruption {
+            rule_id: 1,
+            action: "redirect".to_owned(),
+            status: 302,
+            data: target.to_owned(),
+        };
+        assert_eq!(
+            stream.reject_interruption(&interruption, "request-headers", InterruptionPhase::RequestHeaders),
+            Action::Pause
+        );
+        (only_reply(target), stream.final_outcome.take())
+    }
+
+    /// The legacy interruption properties the stream published: rule, phase, action and status.
+    fn legacy_interruption() -> [Option<String>; 4] {
+        ["rule_id", "phase", "action", "status"]
+            .map(|name| test_hostcalls::published_property(&format!("io.coraza.waf.{name}")))
+    }
+
+    /// The legacy interruption properties of rule 1 redirecting with 302 in `phase`.
+    fn redirect_properties(phase: &str) -> [Option<String>; 4] {
+        ["1", phase, "redirect", "302"].map(|value| Some(value.to_owned()))
+    }
+
+    #[test]
+    fn a_request_side_redirect_target_that_is_no_header_value_is_refused_with_403() {
+        let (reply, outcome) = request_redirect("/login?next=a%0D%0ASet-Cookie: x=1");
+        assert_eq!((reply.status, reply.body.as_slice()), (302, &b""[..]));
+        assert!(
+            reply
+                .headers
+                .contains(&("location".to_owned(), b"/login?next=a%0D%0ASet-Cookie: x=1".to_vec())),
+            "{reply:?}"
+        );
+        assert_eq!(
+            outcome,
+            Some(TerminalOutcome::Denied {
+                phase: "request-headers",
+                status: 302
+            })
+        );
+        assert_eq!(legacy_interruption(), redirect_properties("http_request_headers"));
+        for target in [
+            "/a\r\nSet-Cookie: x=1",
+            "/a\nb",
+            "/a\rb",
+            "/a\0b",
+            "/a\tb",
+            "/a\u{7f}b",
+            "",
+        ] {
+            let (reply, outcome) = request_redirect(target);
+            assert_eq!(
+                (reply.status, reply.body.as_slice()),
+                (403, REQUEST_BLOCK_BODY),
+                "{target:?}"
+            );
+            assert!(
+                !reply.headers.iter().any(|(name, _)| name == "location"),
+                "{target:?}: {reply:?}"
+            );
+            assert_eq!(
+                outcome,
+                Some(TerminalOutcome::Denied {
+                    phase: "request-headers",
+                    status: 403
+                }),
+                "{target:?}: the record names the status the client got"
+            );
+            assert_eq!(
+                legacy_interruption(),
+                redirect_properties("http_request_headers"),
+                "{target:?}: the interruption properties keep the rule's redirect and status"
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_side_redirect_target_that_is_no_header_value_is_refused_with_403() {
+        for (target, status, location, body) in [
+            ("/login?next=a%0D%0A", 302, Some(&b"/login?next=a%0D%0A"[..]), &b""[..]),
+            ("/a\r\nSet-Cookie: x=1", 403, None, RESPONSE_BLOCK_BODY),
+            ("/a\nb", 403, None, RESPONSE_BLOCK_BODY),
+            ("/a\0b", 403, None, RESPONSE_BLOCK_BODY),
+            ("", 403, None, RESPONSE_BLOCK_BODY),
+        ] {
+            let mut stream = requested("GET");
+            let interruption = Interruption {
+                rule_id: 1,
+                action: "redirect".to_owned(),
+                status: 302,
+                data: target.to_owned(),
+            };
+            assert_eq!(
+                stream.refuse_response_interruption(
+                    &interruption,
+                    "response-headers",
+                    InterruptionPhase::ResponseHeaders
+                ),
+                Action::Pause
+            );
+            let reply = only_reply(target);
+            assert_eq!((reply.status, reply.body.as_slice()), (status, body), "{target:?}");
+            let sent = reply
+                .headers
+                .iter()
+                .find(|(name, _)| name == "location")
+                .map(|(_, value)| value.as_slice());
+            assert_eq!(sent, location, "{target:?}");
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::Denied {
+                    phase: "response-headers",
+                    status: u16::try_from(status).expect("a status")
+                }),
+                "the record names the status the client got"
+            );
+            assert_eq!(
+                legacy_interruption(),
+                redirect_properties("http_response_headers"),
+                "{target:?}: the interruption properties keep the rule's redirect and status"
+            );
+        }
+    }
+
+    #[test]
+    fn the_request_body_stays_held_after_envoys_own_reply() {
+        let config = response_policy("");
+        let mut stream = stream(&config);
+        let body = b"x=attack";
+        begin_post(&mut stream, FORM, body);
+        assert_eq!(
+            stream.on_http_request_body(3, false),
+            Action::Pause,
+            "partial body is held"
+        );
+
+        // Envoy's own local reply (408 "stream timeout") runs through the encoder filters.
+        test_hostcalls::set_response_headers(&[(":status", b"408"), ("content-length", b"14")]);
+        assert_eq!(
+            stream.on_http_response_headers(2, false),
+            Action::Continue,
+            "Envoy's reply reaches the client"
+        );
+        assert_eq!(
+            stream.on_http_response_body(14, true),
+            Action::Continue,
+            "with its body"
+        );
+        assert!(
+            test_hostcalls::local_replies().is_empty(),
+            "the filter adds no reply of its own"
+        );
+        assert_eq!(
+            published(),
+            health("incomplete", "incomplete", "false"),
+            "the request body was never inspected"
+        );
+
+        // The client now sends the rest of the body: the attack.
+        assert_eq!(
+            stream.on_http_request_body(body.len(), true),
+            Action::Pause,
+            "phase 2 never ran on `x=attack`, so the request must not be released to the router"
+        );
+    }
+
+    #[test]
+    fn an_informational_response_while_the_request_is_held_is_not_taken_for_envoys_reply() {
+        let mut stream = stream(&response_policy(""));
+        begin_post(&mut stream, FORM, b"x=attack");
+        test_hostcalls::set_response_headers(&[(":status", b"100")]);
+        assert_eq!(stream.on_http_response_headers(1, false), Action::Continue);
+        assert!(!stream.lifecycle.finalized, "the request is still inspected");
+        assert_eq!(stream.on_http_request_body(8, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [403], "phase 2 ran and denied");
+    }
+
+    #[test]
+    fn the_request_trailers_stay_held_after_envoys_own_reply() {
+        let mut stream = stream(&response_policy(""));
+        begin_post(&mut stream, FORM, b"x=attack");
+        assert_eq!(stream.on_http_request_body(8, false), Action::Pause);
+        test_hostcalls::set_response_headers(&[(":status", b"408")]);
+        assert_eq!(stream.on_http_response_headers(1, false), Action::Continue);
+        assert_eq!(stream.on_http_request_trailers(0), Action::Pause);
+        assert_eq!(stream.on_http_request_headers(4, true), Action::Pause);
+    }
+
+    #[test]
+    fn a_phase4_header_rule_is_refused_at_the_response_headers() {
+        // Multiphase evaluation runs a phase-4 rule that reads only response headers in phase 3, so a response it
+        // denies is answered at its headers even when an inspected body follows.
+        let config = response_policy(
+            r#", "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:104,phase:4,deny,status:502\"""#,
+        );
+        let mut stream = stream(&config);
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        test_hostcalls::set_response_headers(&[
+            (":status", b"200"),
+            ("content-type", b"text/plain"),
+            ("x-deny-response", b"yes"),
+        ]);
+        let action = stream.on_http_response_headers(3, false);
+        refused_once(&mut stream, action, 502, RESPONSE_BLOCK_BODY, "phase-4 header rule");
+    }
+
+    #[test]
+    fn a_response_denied_at_its_headers_charges_nothing_for_its_discarded_body() {
+        let (mut stream, root) = requested_beside("GET", 0);
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain"), ("x-deny", b"3")]);
+        assert_eq!(stream.on_http_response_headers(3, false), Action::Pause);
+        // 48 MiB of a body that is already condemned: far past the 1 MiB response ceiling.
+        assert_eq!(stream.on_http_response_body(48 * MIB, false), Action::Pause);
+        assert_eq!(
+            root.get(),
+            0,
+            "a discarded response body holds nothing of the 64 MiB every stream of this root shares"
         );
     }
 }

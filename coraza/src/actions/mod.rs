@@ -20,7 +20,12 @@
 
 //! SecLang action compilation and transaction-phase runtime effects.
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
 use crate::{
     body_processors::BodyProcessorFactory,
@@ -218,7 +223,7 @@ impl CompiledAction {
                 } else {
                     302
                 };
-                tx.interrupt(rule.id, "redirect", status, &data);
+                tx.interrupt(rule.id, "redirect", status, &encode_control_bytes(&data));
             },
             "allow" => match self.argument.as_str() {
                 "" | "all" => tx.allow(AllowScope::All),
@@ -239,6 +244,23 @@ impl CompiledAction {
             _ => {},
         }
     }
+}
+
+/// `target` with every ASCII control byte (below 0x20, and 0x7f) percent-encoded in upper case, so that a redirect
+/// target expanded from request data cannot end the header line an embedder puts it in. Go Coraza keeps the bytes.
+fn encode_control_bytes(target: &str) -> Cow<'_, str> {
+    if !target.bytes().any(|byte| byte.is_ascii_control()) {
+        return Cow::Borrowed(target);
+    }
+    let mut encoded = String::with_capacity(target.len().saturating_add(8));
+    for character in target.chars() {
+        if character.is_ascii_control() {
+            write!(encoded, "%{:02X}", u32::from(character)).unwrap_or(());
+        } else {
+            encoded.push(character);
+        }
+    }
+    Cow::Owned(encoded)
 }
 
 /// Rule metadata populated while SecLang actions are compiled.
@@ -955,6 +977,52 @@ mod tests {
                 tx.interruption().map(|interruption| interruption.status),
                 Some(expected),
                 "configured status {configured:?}"
+            );
+        }
+    }
+
+    /// The interruption a `redirect` rule whose target expands `ARGS_GET.next` raises for `uri`.
+    fn redirect_data(uri: &str) -> Option<(String, String)> {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(
+                "SecRule ARGS_GET:next \"@rx .\" \"id:301,phase:1,redirect:/login?next=%{ARGS_GET.next},status:302\"",
+            )
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction();
+        tx.process_uri(uri, "GET", "HTTP/1.1");
+        tx.process_request_headers();
+        tx.interruption()
+            .map(|interruption| (interruption.action.clone(), interruption.data.clone()))
+    }
+
+    #[test]
+    fn control_bytes_from_a_macro_never_reach_the_redirect_target() {
+        // A target without control bytes is expanded as written, spaces and non-ASCII bytes included.
+        for (uri, target) in [
+            ("/r?next=/home", "/login?next=/home"),
+            ("/r?next=a%20b%C3%A9~", "/login?next=a b\u{e9}~"),
+        ] {
+            assert_eq!(
+                redirect_data(uri),
+                Some(("redirect".to_owned(), target.to_owned())),
+                "{uri}"
+            );
+        }
+        // Every byte below 0x20 and 0x7f is percent-encoded in upper case, so the redirect still works and no
+        // embedder can put the target in a header that it splits.
+        for (uri, target) in [
+            ("/r?next=a%0d%0aSet-Cookie:%20x=1", "/login?next=a%0D%0ASet-Cookie: x=1"),
+            ("/r?next=a%0aX:%201", "/login?next=a%0AX: 1"),
+            ("/r?next=a%0dX", "/login?next=a%0DX"),
+            ("/r?next=a%00b%09c%1f%7f", "/login?next=a%00b%09c%1F%7F"),
+            ("/r?next=a%7fb", "/login?next=a%7Fb"),
+        ] {
+            assert_eq!(
+                redirect_data(uri),
+                Some(("redirect".to_owned(), target.to_owned())),
+                "{uri}"
             );
         }
     }

@@ -51,13 +51,38 @@ request would reach the backend. A second request claims 127.0.0.1 in
 `X-Forwarded-For` from outside and is denied too.
 
 The backend counts requests by path and supports deterministic body, header,
-limit, empty-response, and trailer cases. The runner checks byte-exact request
-and large MIME-excluded response forwarding; phase-1 and phase-2 denial before
-backend receipt; response replacement without upstream body/header leaks;
+status, compressed, chunked, limit, empty-response, and trailer cases. The
+runner checks byte-exact request and large MIME-excluded response forwarding;
+phase-1 and phase-2 denial before backend receipt; response refusal without
+upstream body/header leaks;
 request and response body-limit behavior at `N-1`, `N`, and `N+1`; an actual
 `Expect: 100-continue` upload; empty and trailer-terminated messages; and
 phase-4 response-header denials for both MIME-excluded and body-access-off
 responses.
+
+The filter answers every response it refuses with a local reply when it
+decides (see
+[Refused responses](../../envoy-coraza/README.md#refused-responses)). The
+runner checks that each kind of refusal reaches the client within two seconds
+with its documented status and without a byte of the upstream response: a
+`HEAD` response, a 204, a 304 and an empty 200 that rule 104 denies at their
+headers; a gzip-encoded `text/plain` response (502); a phase-4 rule of the
+`p4.local` policy that denies on a `TX` variable a phase-3 rule set, for a body
+that policy does not inspect (502); an
+inspected body of 1 MiB + 1 byte sent in 64 KiB writes (502), beside one of
+exactly 1 MiB that passes; a response that rule 104 denies at its headers,
+which is 502 over plain HTTP and, for an HTTP/2 request with
+`content-type: application/grpc`, HTTP 200 with `grpc-status: 14` and
+`grpc-message: Upstream response blocked`; and, in the CRS run, a `HEAD`
+request for a 500 page on `crs2.local`, a CRS policy at paranoia level 2 where
+rule 959100 denies in phase 4 (403). The `redir.local` policy redirects with a
+target built from a query argument on the request side (rule 120) and on the
+response side (rule 121); the runner sends CR LF in that argument and checks
+that the 302 carries one `location` header, percent-encoded, and no injected
+`Set-Cookie`. Last, it holds a request body that rule 102 would deny until
+Envoy's 60-second timeout answers 408, checks that the client gets that 408,
+then sends the rest of the body and checks that the backend never receives the
+request; this case takes about a minute.
 
 Trailer callbacks complete body phases and leave Envoy's trailer maps untouched.
 The locally pinned Go Coraza v3.8.1 public transaction API has no request or
@@ -134,7 +159,7 @@ reads the legacy interruption properties through the exact one-element paths
 `wasm.io.coraza.waf.v1.<field>`. The switch defaults to `false`; when disabled,
 neither property namespace is published.
 
-Legacy interruption state is published before a local reply or response rewrite:
+Legacy interruption state is published before the local reply:
 `event`, `rule_id`, `phase`, `action`, `status`, and, when the matched rule is
 available, `severity`, `category`, and `client_ip`. The category is the first
 case-sensitive `attack-` tag with a valid lowercase suffix, or `other`. Values

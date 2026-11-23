@@ -165,6 +165,60 @@ loopback_dummy_connection() {
         printf %s "$status"'
 }
 
+# Sends a POST of 7 body bytes that rule 102 denies, but only the first 3, so that the filter holds the request, and
+# waits for Envoy's request or stream idle timeout to answer it. Then sends the rest, and prints the status the client
+# got and the seconds it waited for it.
+held_request_until_timeout() {
+    local url=$1
+    python3 - "$url" <<'PY'
+import socket
+import sys
+import time
+from urllib.parse import urlsplit
+
+url = urlsplit(sys.argv[1])
+connection = socket.create_connection((url.hostname, url.port), timeout=90)
+try:
+    started = time.monotonic()
+    connection.sendall(
+        (
+            f"POST {url.path} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\nq=b"
+        ).encode("ascii")
+    )
+    response = connection.recv(4096)
+    waited = time.monotonic() - started
+    try:
+        connection.sendall(b"lock")
+        time.sleep(1)
+    except OSError:
+        pass
+finally:
+    connection.close()
+status = response.split(b" ", 2)[1].decode("ascii") if response else "none"
+print(f"{status} {waited:.0f}")
+PY
+}
+
+# Requests what the filter refuses on the response path and checks that the client gets `expected` at once, with no
+# byte of what the backend sent: a refused response must neither hang until Envoy's idle timeout nor leak.
+check_refused_response() {
+    local expected=$1
+    local label=$2
+    shift 2
+    local result status seconds
+    result=$(curl --silent --show-error --max-time 10 --output "$temp_dir/refused" \
+        --dump-header "$temp_dir/refused-headers" --write-out '%{http_code} %{time_total}' "$@") \
+        || fail "$label: the request failed"
+    read -r status seconds <<<"$result"
+    check_status "$expected" "$status" "$label"
+    awk -v seconds="$seconds" 'BEGIN { exit !(seconds < 2) }' || fail "$label took ${seconds}s"
+    if grep --quiet --ignore-case --fixed-strings --regexp=LEAK-MARKER --regexp=secret \
+        "$temp_dir/refused" "$temp_dir/refused-headers"; then
+        fail "$label leaked upstream response bytes"
+    fi
+}
+
 check_status() {
     local expected=$1
     local actual=$2
@@ -475,6 +529,50 @@ if grep --quiet --fixed-strings 'LEAK-MARKER' "$temp_dir/response"; then
     fail 'phase-4 denial with body access off leaked upstream response body bytes'
 fi
 
+# A response refused before its last body chunk is answered with a local reply at once. Envoy refused the in-place
+# rewrite earlier builds attempted there, and its idle timer ended the stream.
+check_refused_response 502 'HEAD of a response denied at its headers' --head http://127.0.0.1:10001/large-header-deny
+check_refused_response 502 'denied 204' 'http://127.0.0.1:10001/status/204?deny=1'
+check_refused_response 502 'denied 304' 'http://127.0.0.1:10001/status/304?deny=1'
+check_refused_response 502 'denied empty 200' 'http://127.0.0.1:10001/text/0?deny=1'
+check_refused_response 502 'compressed body of an inspected type' http://127.0.0.1:10001/gzip
+check_refused_response 502 'phase-4 TX denial of a body that is not inspected' \
+    --header 'Host: p4.local' http://127.0.0.1:10001/large-header-deny
+check_refused_response 502 'inspected body of 1 MiB + 1 byte in 64 KiB writes' \
+    'http://127.0.0.1:10001/text/1048577?chunk=65536'
+status=$(request "$temp_dir/response" 'http://127.0.0.1:10001/text/1048576?chunk=65536')
+check_status 200 "$status" 'inspected body of exactly 1 MiB in 64 KiB writes'
+[[ $(stat --format=%s "$temp_dir/response") == 1048576 ]] || fail 'the 1 MiB body was not forwarded whole'
+
+# Envoy answers a local reply to a gRPC request (content-type application/grpc) with HTTP 200 and a grpc-status, here
+# 14 (UNAVAILABLE) for rule 104's 502, so a refused response keeps the status its rule chose only for plain HTTP.
+# Rule 104 denies at the response headers; earlier builds rewrote such a response in place, and kept 502. A
+# request-phase refusal also gives 200 with a grpc-status, but only a response-phase one carries this grpc-message.
+check_refused_response 502 'phase-4 header denial of a plain HTTP response' 'http://127.0.0.1:10001/text/20?deny=1'
+printf '\0\0\0\0\0' >"$temp_dir/grpc-message"
+check_refused_response 200 'phase-4 header denial of a gRPC response' --http2-prior-knowledge --request POST \
+    --header 'content-type: application/grpc' --header 'te: trailers' --data-binary "@$temp_dir/grpc-message" \
+    'http://127.0.0.1:10001/text/20?deny=1'
+grep --quiet --ignore-case '^grpc-status: 14' "$temp_dir/refused-headers" \
+    || fail 'the refused gRPC response did not carry grpc-status 14'
+grep --quiet --ignore-case '^grpc-message: Upstream response blocked' "$temp_dir/refused-headers" \
+    || fail 'the refused gRPC response did not carry the response-phase grpc-message'
+
+# A redirect target from a macro reaches the Location header percent-encoded, so CR and LF cannot split the reply.
+for target in 'r?next=a%0d%0aSet-Cookie:%20x=1' 'status/200?deny=1&u=a%0d%0aSet-Cookie:%20x=1'; do
+    check_refused_response 302 "redirect to a target with CR LF ($target)" \
+        --header 'Host: redir.local' "http://127.0.0.1:10001/$target"
+    [[ $(grep --count --ignore-case '^location:' "$temp_dir/refused-headers") == 1 ]] \
+        || fail "redirect ($target) did not carry exactly one location header"
+    if grep --quiet --ignore-case '^set-cookie:' "$temp_dir/refused-headers"; then
+        fail "redirect ($target) split its headers"
+    fi
+    grep --quiet --ignore-case --fixed-strings 'location: /' "$temp_dir/refused-headers" \
+        || fail "redirect ($target) lost its target"
+done
+grep --quiet --fixed-strings $'location: /blocked?u=a%0D%0ASet-Cookie: x=1\r' "$temp_dir/refused-headers" \
+    || fail 'the response-side redirect target was not percent-encoded'
+
 # A part with an empty header block, then a SQL injection in the next field: the
 # multipart parser used to stop at the empty part, so no rule saw the injection.
 printf '%b' "--X\r\n\r\nx\r\n--X\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n1' UNION SELECT password FROM users--\r\n--X--\r\n" \
@@ -545,6 +643,11 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     require_rule_log /crs-unterminated 200002
     [[ $(backend_count /crs-unterminated) == "$before" ]] \
         || fail 'embedded CRS policy sent an unparseable multipart body to the backend'
+
+    # At paranoia level 2, CRS rule 950100 scores a 500 and rule 959100 denies in phase 4, which runs at the
+    # response headers of a HEAD response.
+    check_refused_response 403 'CRS phase-4 denial of a HEAD response' --head --header 'Host: crs2.local' \
+        http://127.0.0.1:10001/status/500
 fi
 
 # A field-only multipart body must not need a temporary upload directory. This used
@@ -592,6 +695,15 @@ status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
     --header 'content-type: multipart/form-data; boundary=X' \
     --data-binary "@$temp_dir/multipart-field" http://127.0.0.1:10001/recommended-benign)
 check_status 200 "$status" 'recommended baseline passes a well-formed multipart body'
+
+# Envoy's own reply to a request the filter holds, here the 408 of its 60 s timeout, reaches the client, and the rest
+# of the request body, which rule 102 would deny, never reaches the backend. This case takes about a minute.
+before=$(backend_count /phase2-deny)
+read -r status waited < <(held_request_until_timeout http://127.0.0.1:10001/phase2-deny) || true
+check_status 408 "${status:-none}" 'timeout of a held request'
+(( waited <= 70 )) || fail "the timeout of a held request reached the client after ${waited}s"
+sleep 1
+[[ $(backend_count /phase2-deny) == "$before" ]] || fail 'a held request reached the backend after its timeout'
 
 envoy_logs >"$temp_dir/envoy.log"
 grep --quiet --fixed-strings 'test blocked' "$temp_dir/envoy.log" \
