@@ -4108,6 +4108,100 @@ mod scripted_host_tests {
         );
     }
 
+    /// Runs a GET that ends at its headers, with one `cookie` header of `n` cookies for each `n` in `per_header`,
+    /// through the stream to a 200 response unless the filter replies first; returns the local replies and the
+    /// published reason, outcome and completeness.
+    fn get_with_cookies(config: &str, per_header: &[usize]) -> (Vec<u32>, [Option<String>; 3]) {
+        let mut get = stream(config);
+        test_hostcalls::reset();
+        let mut first = 0;
+        let cookies: Vec<String> = per_header
+            .iter()
+            .map(|&count| {
+                let header = (first..first + count)
+                    .map(|index| format!("c{index}=v"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                first += count;
+                header
+            })
+            .collect();
+        let mut all: Vec<(&str, &[u8])> = vec![
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"GET"),
+            (":path", b"/"),
+        ];
+        all.extend(cookies.iter().map(|header| ("cookie", header.as_bytes())));
+        test_hostcalls::set_request_headers(&all);
+        script_connection_properties();
+        get.on_http_request_headers(all.len(), true);
+        if test_hostcalls::local_reply_statuses().is_empty() {
+            test_hostcalls::set_response_headers(&[(":status", b"200")]);
+            get.on_http_response_headers(1, true);
+        }
+        (test_hostcalls::local_reply_statuses(), published())
+    }
+
+    #[test]
+    fn more_than_the_argument_limit_of_cookies_is_refused_even_when_the_request_has_no_body() {
+        let policy = |directives: &str| {
+            format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On"{directives}]}}, "default_directives": "p",
+                "enable_filter_state_logs": true}}"#
+            )
+        };
+        let plain = policy("");
+        let refused = (vec![413], health("incomplete", "incomplete", "false"));
+        let passed = (vec![], health("complete", "completed", "true"));
+        // `SecArgumentsLimit` is 1000: the first cookie past it is dropped, and the filter refuses the request in
+        // every engine mode but `Off`, as it does for a body field past the limit.
+        assert_eq!(get_with_cookies(&plain, &[1000]), passed, "1000 cookies");
+        assert_eq!(get_with_cookies(&plain, &[1001]), refused, "1001 cookies");
+        assert_eq!(
+            get_with_cookies(&plain, &[500, 501]),
+            refused,
+            "cookies count across `cookie` headers, as HTTP/2 sends them"
+        );
+        assert_eq!(
+            get_with_cookies(&policy(r#", "SecRuleEngine DetectionOnly""#), &[1001]),
+            refused
+        );
+        assert_eq!(
+            get_with_cookies(&policy(r#", "SecRuleEngine Off""#), &[1001]).0,
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            get_with_cookies(&policy(r#", "SecArgumentsLimit 2000""#), &[1001]),
+            passed
+        );
+        // A body left unread under `SecRequestBodyAccess Off` does not excuse the cookies.
+        let cookies = (0..1001)
+            .map(|index| format!("c{index}=v"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            post_with(
+                &policy(r#", "SecRequestBodyAccess Off""#),
+                "/",
+                &[("cookie", cookies.as_bytes())],
+                b"a=b"
+            ),
+            refused,
+            "a request with a body, which is not read, still has its cookies counted"
+        );
+        // With the baseline, its rule 200004 answers 400 first.
+        assert_eq!(
+            get_with_cookies(WITH_BASELINE, &[1001]),
+            (vec![400], health("denied", "denied", "true"))
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.rule_id").as_deref(),
+            Some("200004")
+        );
+        assert_eq!(get_with_cookies(WITH_BASELINE, &[1000]), passed);
+    }
+
     #[test]
     fn the_readmes_path_scoped_opt_outs_let_through_only_the_bodies_of_the_paths_they_name() {
         // The upgrade notes' `ctl:requestBodyAccess=Off` rules, exactly.

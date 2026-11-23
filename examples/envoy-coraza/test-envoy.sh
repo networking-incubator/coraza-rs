@@ -696,6 +696,51 @@ status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
     --data-binary "@$temp_dir/multipart-field" http://127.0.0.1:10001/recommended-benign)
 check_status 200 "$status" 'recommended baseline passes a well-formed multipart body'
 
+# The host has no filesystem, so the engine refuses a file part with 413. A Go backend reads `multİpart/form-data`
+# (U+0130) as multipart too, so the ban must see it; recommended.local's limit does not cut this body.
+printf '%b' '--X\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\nhello\r\n--X--\r\n' \
+    >"$temp_dir/multipart-file"
+for content_type in 'multipart/form-data' $'mult\xc4\xb0part/form-data'; do
+    before=$(backend_count /recommended-upload)
+    status=$(request "$temp_dir/response" --header 'Host: recommended.local' \
+        --header "content-type: $content_type; boundary=X" \
+        --data-binary "@$temp_dir/multipart-file" http://127.0.0.1:10001/recommended-upload)
+    check_status 413 "$status" "upload refused for content type $content_type"
+    [[ $(backend_count /recommended-upload) == "$before" ]] \
+        || fail "an upload with content type $content_type reached the backend"
+done
+
+# More than `SecArgumentsLimit` (1000) cookies, which pass up to 1000. The default policy has no baseline, so the filter
+# refuses with 413; recommended.local's rule 200004 answers 400 first.
+cookie_header() {
+    printf 'Cookie:'
+    printf ' c%d=v;' $(seq "${2:-1}" "$1")
+}
+check_cookie_limit() {
+    local host=$1 path=$2 expected=$3 before
+    before=$(backend_count "$path")
+    status=$(request "$temp_dir/response" --header "Host: $host" --header "$(cookie_header 1000)" \
+        "http://127.0.0.1:10001$path")
+    check_status 200 "$status" "1000 cookies for $host"
+    status=$(request "$temp_dir/response" --header "Host: $host" --header "$(cookie_header 1001)" \
+        "http://127.0.0.1:10001$path")
+    check_status "$expected" "$status" "1001 cookies for $host"
+    [[ $(backend_count "$path") == $((before + 1)) ]] || fail "1001 cookies reached the backend for $host"
+}
+check_cookie_limit 127.0.0.1:10001 /cookie-limit-default 413
+check_cookie_limit recommended.local /cookie-limit-recommended 400
+require_rule_log /cookie-limit-recommended 200004
+# The limit counts cookies across `Cookie` headers: 500 + 500 pass, 500 + 501 do not.
+before=$(backend_count /cookie-limit-two-headers)
+for last in 1000 1001; do
+    status=$(request "$temp_dir/response" --header 'Host: 127.0.0.1:10001' \
+        --header "$(cookie_header 500)" --header "$(cookie_header "$last" 501)" \
+        http://127.0.0.1:10001/cookie-limit-two-headers)
+    check_status "$((last == 1000 ? 200 : 413))" "$status" "cookies up to c$last in two headers"
+done
+[[ $(backend_count /cookie-limit-two-headers) == $((before + 1)) ]] \
+    || fail "1001 cookies in two headers reached the backend"
+
 # Envoy's own reply to a request the filter holds, here the 408 of its 60 s timeout, reaches the client, and the rest
 # of the request body, which rule 102 would deny, never reaches the backend. This case takes about a minute.
 before=$(backend_count /phase2-deny)
