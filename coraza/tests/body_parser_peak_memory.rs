@@ -689,6 +689,19 @@ fn admitted_cases() -> Vec<Case> {
                 b"\"\r\n\r\n1\r\n--b--\r\n",
             ),
         ),
+        // A disposition parameter's name is lower-cased as Go's `strings.ToLower` does, which writes each byte that is
+        // not UTF-8 as the three bytes of U+FFFD.
+        case(
+            "multipart, a long parameter name that is not UTF-8",
+            "multipart",
+            "",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; ",
+                b"\xff",
+                64 * 1024,
+                b"=1\r\n\r\n1\r\n--b--\r\n",
+            ),
+        ),
         // The media type and the parser's markers are held while the parts are read.
         Case {
             content_type: format!(

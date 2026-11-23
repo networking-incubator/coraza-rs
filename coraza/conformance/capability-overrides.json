@@ -763,7 +763,9 @@
         "evaluator": "coraza/src/seclang/parser.rs:directive_sec_arguments_limit",
         "go_reference": null,
         "fixtures": [],
-        "differences": []
+        "differences": [
+          "Also bounds REQUEST_COOKIES: cookies from every Cookie header and Transaction::add_request_cookie count against the limit, and the first one past it is dropped with the rest of its header and sets ARGUMENTS_LIMIT_REACHED (coraza/src/transaction.rs:parse_request_cookies). Go applies the limit to arguments only and stores every cookie."
+        ]
       },
       "SecAuditEngine": {
         "state": "implemented",

@@ -78,9 +78,32 @@ pub(crate) fn push_lowercase_like_go(out: &mut Vec<u8>, text: &str) {
     }
 }
 
+/// Whether `text` lower-cased the way Go's `strings.ToLower` does is `lower`, without a lower-cased copy.
+///
+/// This is lower-casing, not case folding: U+017F (`ſ`) stays itself, as it does in Go, where
+/// `strings.EqualFold` would match it with `s`.
+pub(crate) fn lowercases_to(text: &str, lower: &str) -> bool {
+    // Only U+0130 and U+212A lower-case into ASCII, so an ASCII text, the common case, folds as ASCII.
+    if text.is_ascii() {
+        return text.eq_ignore_ascii_case(lower);
+    }
+    text.chars().map(lowercase_char).eq(lower.chars())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{lowercase_char, lowercase_like_go, push_lowercase_like_go, uppercase_char};
+    use super::{lowercase_char, lowercase_like_go, lowercases_to, push_lowercase_like_go, uppercase_char};
+
+    #[test]
+    fn compares_lower_cased_text_like_go() {
+        assert!(lowercases_to("Content-Type", "content-type"));
+        assert!(lowercases_to("Coo\u{212A}ie", "cookie"));
+        assert!(lowercases_to("US-ASC\u{130}\u{130}", "us-ascii"));
+        assert!(!lowercases_to("u\u{17F}-a\u{17F}cii", "us-ascii"));
+        assert!(!lowercases_to("us-asc\u{131}i", "us-ascii"));
+        assert!(!lowercases_to("cookies", "cookie"));
+        assert!(!lowercases_to("cooki", "cookie"));
+    }
 
     #[test]
     fn folds_u_0130_like_go() {

@@ -26,7 +26,10 @@
 
 use std::{cell::Cell, collections::LinkedList, mem::size_of};
 
-use super::{is_token_name, media_type};
+use super::{
+    is_token_name,
+    media_type::{self, to_lower, trim_space},
+};
 use crate::{
     body_processors::budget::{self, MemoryBudget},
     collection::{ALLOCATION_OVERHEAD_BYTES, allocation_bytes},
@@ -717,25 +720,6 @@ fn header<'a>(headers: &'a Headers, name: &str) -> Option<&'a [u8]> {
         .map(|(_, value)| value.as_slice())
 }
 
-/// `bytes` without the ASCII whitespace Go's `textproto` trims around a header
-/// name or value.
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    trim_ascii_end(bytes.get(start..).unwrap_or_default())
-}
-
-/// `bytes` without its trailing ASCII whitespace.
-fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(0, |index| index.saturating_add(1));
-    bytes.get(..end).unwrap_or_default()
-}
-
 /// Parse headers from header data, in order, each name as sent.
 ///
 /// Go's `textproto.ReadMIMEHeader` folds a line that starts with a space or a tab
@@ -995,14 +979,18 @@ fn extract_content_disposition(headers: &Headers) -> ContentDisposition {
 }
 
 /// The raw value of the first parameter named `name`, unquoted by Go Coraza's
-/// `findParam`: surrounding space is trimmed, and the quoted string, if any, is kept.
+/// `findParam`: surrounding white space is trimmed as `strings.TrimSpace` trims it, Unicode
+/// white space included, and the quoted string, if any, is kept.
+///
+/// Go compares the name with `strings.EqualFold`, which matches ASCII case alone for the names
+/// asked here: neither holds `k` or `s`, the only letters a non-ASCII character folds to.
 fn raw_param<'a>(header: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     split_header_params(header).into_iter().find_map(|part| {
-        let part = trim_ascii(part);
+        let part = trim_space(part);
         let equals = part.iter().position(|&byte| byte == b'=')?;
-        let key = trim_ascii(part.get(..equals).unwrap_or_default());
+        let key = trim_space(part.get(..equals).unwrap_or_default());
         key.eq_ignore_ascii_case(name)
-            .then(|| trim_ascii(part.get(equals.saturating_add(1)..).unwrap_or_default()))
+            .then(|| trim_space(part.get(equals.saturating_add(1)..).unwrap_or_default()))
     })
 }
 
@@ -1080,16 +1068,19 @@ struct HeaderParam {
 /// Parse header parameters like: `form-data; name="value"; filename="file.txt"`, in order
 ///
 /// As in Go Coraza, a `;` inside a quoted string doesn't end the parameter, and a
-/// quoted value is unquoted as Go's `mime` package does it.
+/// quoted value is unquoted as Go's `mime` package does it. Names and values are trimmed of
+/// Unicode white space and names lower-cased with `strings.ToLower`, as Go Coraza's
+/// `hasFilenameContinuation` and `hasDuplicateParam` read them, so `;\u{a0}filename=` names a
+/// file here as it does there and in `mime.ParseMediaType`.
 fn parse_header_params(header: &[u8]) -> Vec<HeaderParam> {
     let mut params = Vec::new();
 
     for part in split_header_params(header) {
-        let part = trim_ascii(part);
+        let part = trim_space(part);
 
         if let Some(equals) = part.iter().position(|&byte| byte == b'=') {
-            let name = trim_ascii(part.get(..equals).unwrap_or_default()).to_ascii_lowercase();
-            let value = trim_ascii(part.get(equals.saturating_add(1)..).unwrap_or_default());
+            let name = to_lower(trim_space(part.get(..equals).unwrap_or_default()));
+            let value = trim_space(part.get(equals.saturating_add(1)..).unwrap_or_default());
             let unquoted = unquote(value);
             params.push(HeaderParam {
                 name,
@@ -1585,6 +1576,71 @@ DATA\r\n\
         assert_eq!(disposition.name.as_slice(), b"upload");
         assert_eq!(disposition.filename.as_deref(), Some(&b"same.jpg"[..]));
         assert!(!disposition.malformed_extended_filename);
+        assert!(!disposition.repeats_param);
+    }
+
+    /// What a part whose `Content-Disposition` is `value` says.
+    fn disposition_of(value: &[u8]) -> ContentDisposition {
+        extract_content_disposition(&vec![("Content-Disposition".to_owned(), value.to_vec())])
+    }
+
+    #[test]
+    fn disposition_parameters_are_trimmed_of_the_white_space_go_trims() {
+        // `mime.ParseMediaType` and the `strings.TrimSpace` of Go Coraza's `findParam`, `hasFilenameContinuation` and
+        // `hasDuplicateParam` trim every one of these.
+        for space in media_type::GO_SPACES {
+            // Go reads `x.php` as the file name in each shape (`mime.ParseMediaType`, `findParam`).
+            for value in [
+                format!("form-data; name=\"f\";{space}filename=\"x.php\""),
+                format!("form-data; name=\"f\"; filename{space}=\"x.php\""),
+                format!("form-data; name=\"f\"; filename={space}x.php{space}"),
+                format!("form-data; name=\"f\"; filename=\"x.php\"{space}"),
+                format!("form-data; name=\"f\";{space}filename*=utf-8''x.php"),
+                format!("form-data; name=\"f\"; filename*={space}utf-8''x.php{space}"),
+            ] {
+                let disposition = disposition_of(value.as_bytes());
+                assert_eq!(disposition.name.as_slice(), b"f", "{value:?}");
+                assert_eq!(disposition.filename.as_deref(), Some(&b"x.php"[..]), "{value:?}");
+                assert!(!disposition.malformed_extended_filename, "{value:?}");
+                assert!(!disposition.repeats_param, "{value:?}");
+            }
+            // A quoted `filename*` is invalid quoting in Go however it is spaced.
+            let value = format!("form-data; name=\"f\";{space}filename*=\"utf-8''x.php\"{space}");
+            let disposition = disposition_of(value.as_bytes());
+            assert_eq!(disposition.filename.as_deref(), Some(&b"x.php"[..]), "{value:?}");
+            assert!(disposition.quoted_extended_filename, "{value:?}");
+            // A continuation is flagged, and both readings kept, as Go's `hasFilenameContinuation` does.
+            let value = format!("form-data; name=\"f\"; filename=\"a.txt\";{space}filename*0=\"x.php\"");
+            let disposition = disposition_of(value.as_bytes());
+            assert_eq!(disposition.filename.as_deref(), Some(&b"a.txt"[..]), "{value:?}");
+            assert_eq!(disposition.alt_filename.as_deref(), Some(&b"x.php"[..]), "{value:?}");
+            assert!(disposition.malformed_extended_filename, "{value:?}");
+            // A repeated name is a duplicate, which `mime.ParseMediaType` rejects.
+            let value = format!("form-data; name=\"f\"; filename=\"a.txt\";{space}filename=\"x.php\"");
+            let disposition = disposition_of(value.as_bytes());
+            assert_eq!(disposition.filename, None, "{value:?}");
+            assert!(disposition.malformed_extended_filename, "{value:?}");
+            assert!(disposition.repeats_param, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_disposition_finds_the_duplicate_names_go_finds() {
+        // Go's `hasDuplicateParam` compares `strings.ToLower(strings.TrimSpace(key))`, which maps U+0130 to `i` and
+        // every byte that is not UTF-8 to U+FFFD.
+        for value in [
+            b"form-data; F\xc4\xb0LENAME=a; filename=b".as_slice(),
+            b"form-data; a\xff=1; a\xfe=2",
+            b"form-data; a\xff=1; a\xef\xbf\xbd=2",
+            b"form-data; a\xe2\x82=1; a\xef\xbf\xbd\xef\xbf\xbd=2",
+        ] {
+            let disposition = disposition_of(value);
+            assert!(disposition.malformed_extended_filename, "{value:?}");
+            assert!(disposition.repeats_param, "{value:?}");
+        }
+        // U+0131 (dotless `ı`) has no lower-case mapping to `i`.
+        let disposition = disposition_of(b"form-data; f\xc4\xb1lename=a; filename=b");
+        assert!(disposition.malformed_extended_filename);
         assert!(!disposition.repeats_param);
     }
 
