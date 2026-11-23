@@ -559,6 +559,13 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   request in phase 1. A policy without rules 200004 and 200005 must deny on
   `ARGUMENTS_LIMIT_REACHED` itself; otherwise the dropped cookies are never
   inspected.
+- A `redirect` target has every ASCII control byte, below 0x20 and 0x7f,
+  percent-encoded in upper case in `Interruption::data`, so a target that a
+  macro expanded from request data, such as `redirect:/login?next=%{ARGS_GET.next}`
+  with `next=a%0d%0aSet-Cookie:%20x=1`, reads `/login?next=a%0D%0ASet-Cookie: x=1`
+  and cannot split the `Location` header an embedder puts it in. A target
+  without such bytes is unchanged. This is a deliberate deviation: Go Coraza
+  stores the raw bytes, and its HTTP middleware never sends a `Location` header.
 
 ## FTW integration
 

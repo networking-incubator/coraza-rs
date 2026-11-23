@@ -118,6 +118,18 @@ static_resources:
                                     "SecRuleEngine On",
                                     "SecRule ARGS_POST \"@detectSQLi\" \"id:110,phase:2,deny,status:403\""
                                   ],
+                                  "redirect": [
+                                    "SecRuleEngine On",
+                                    "SecRule ARGS_GET:next \"@rx .\" \"id:120,phase:1,redirect:/login?next=%{ARGS_GET.next},status:302\"",
+                                    "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:121,phase:3,redirect:/blocked?u=%{ARGS_GET.u},status:302\""
+                                  ],
+                                  "phase4": [
+                                    "SecRuleEngine On",
+                                    "SecResponseBodyAccess On",
+                                    "SecResponseBodyMimeType text/plain",
+                                    "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:130,phase:3,pass,nolog,setvar:tx.deny=1\"",
+                                    "SecRule TX:deny \"@eq 1\" \"id:131,phase:4,deny,status:502\""
+                                  ],
                                   "crs": [
                                     "Include @recommended-conf",
                                     "SecRuleEngine On",
@@ -127,11 +139,20 @@ static_resources:
                                     "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
                                     "Include crs/rules/*.conf"
+                                  ],
+                                  "crs-pl2": [
+                                    "Include @recommended-conf",
+                                    "SecRuleEngine On",
+                                    "SecResponseBodyLimit 1048576",
+                                    "SecResponseBodyMimeType text/plain text/html application/json",
+                                    "Include crs/crs-setup.conf",
+                                    "SecAction \"id:900000,phase:1,pass,t:none,nolog,setvar:tx.blocking_paranoia_level=2\"",
+                                    "Include crs/rules/*.conf"
                                   ]
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "recommended.local": "recommended", "crs.local": "crs"}
+                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "recommended.local": "recommended", "redir.local": "redirect", "p4.local": "phase4", "crs.local": "crs", "crs2.local": "crs-pl2"}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

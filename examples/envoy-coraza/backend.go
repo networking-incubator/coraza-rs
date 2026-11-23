@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,6 +73,62 @@ func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		writeBody(w, bytes.Repeat([]byte{'a'}, size))
+	case r.URL.Path == "/gzip":
+		// An inspected type the engine cannot read.
+		var compressed bytes.Buffer
+		zw := gzip.NewWriter(&compressed)
+		_, _ = zw.Write([]byte("secret upstream response body"))
+		_ = zw.Close()
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("X-Upstream-Secret", "upstream-header-marker")
+		writeBody(w, compressed.Bytes())
+	case strings.HasPrefix(r.URL.Path, "/text/"):
+		// /text/N[?chunk=K][&deny=1]: N bytes of text/plain starting with LEAK-MARKER, in K-byte flushed writes.
+		size, parseErr := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/text/"))
+		if parseErr != nil || size < 0 || size > 4*1024*1024 {
+			http.Error(w, "invalid body size", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("X-Upstream-Secret", "upstream-header-marker")
+		if r.URL.Query().Get("deny") != "" {
+			w.Header().Set("X-Deny-Response", "yes")
+		}
+		body := bytes.Repeat([]byte{'a'}, size)
+		copy(body, "LEAK-MARKER")
+		chunk, _ := strconv.Atoi(r.URL.Query().Get("chunk"))
+		if chunk <= 0 {
+			writeBody(w, body)
+			return
+		}
+		flusher, _ := w.(http.Flusher)
+		for len(body) > 0 {
+			n := min(chunk, len(body))
+			if _, writeErr := w.Write(body[:n]); writeErr != nil {
+				return
+			}
+			body = body[n:]
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	case strings.HasPrefix(r.URL.Path, "/status/"):
+		// /status/N[?deny=1]: a text/plain response with status N.
+		code, parseErr := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/status/"))
+		if parseErr != nil || code < 200 || code > 599 {
+			http.Error(w, "invalid status", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("X-Upstream-Secret", "upstream-header-marker")
+		if r.URL.Query().Get("deny") != "" {
+			w.Header().Set("X-Deny-Response", "yes")
+		}
+		w.WriteHeader(code)
+		if code != http.StatusNoContent && code != http.StatusNotModified && r.Method != http.MethodHead {
+			_, _ = w.Write([]byte("status body secret\n"))
+		}
 	default:
 		w.Header().Set("Content-Type", "text/plain")
 		writeBody(w, []byte("backend received "+r.URL.Path+" "+string(body)))
