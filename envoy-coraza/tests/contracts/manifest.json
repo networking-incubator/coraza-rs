@@ -1,0 +1,1933 @@
+{
+  "schema_version": 2,
+  "status": "open",
+  "contract_sha256": "fd11e9408df9f0476b15de8a2d98a828ef68686b84acb2d1638a52503ddb943c",
+  "pins": {
+    "upstream_connector": "b1770f5b0be397bd4ddc2c976ab6548a7a1eeb7f",
+    "pr20_head": "266b6ed6a471e26e5c6862a46beb974eb1a0fa52",
+    "pr20_merge": "e20b40ca25e3c50f212999e3decfde5503e630c3",
+    "tinygo_version": {
+      "upstream": "0.34.0",
+      "pr20": "0.34.0"
+    },
+    "build_flags": {
+      "entrypoint": "go run mage.go build",
+      "tinygo_command": "tinygo build -gc=custom -opt=2 -o build/mainraw.wasm -scheduler=none -target=wasip1 -tags='custommalloc nottinygc_envoy no_fs_access memoize_builders coraza.rule.multiphase_evaluation'",
+      "base_build_tags": [
+        "custommalloc",
+        "nottinygc_envoy",
+        "no_fs_access",
+        "memoize_builders"
+      ],
+      "multiphase_tag": "coraza.rule.multiphase_evaluation",
+      "initial_pages": 2100,
+      "patched_output": "build/main.wasm"
+    },
+    "multiphase_evaluation": {
+      "default": "enabled",
+      "build_tag": "coraza.rule.multiphase_evaluation",
+      "disabled_when": "MULTIPHASE_EVAL=false"
+    },
+    "crs_version": {
+      "upstream": "4.14.0",
+      "pr20": "4.28.0"
+    },
+    "crs_tree_sha256": {
+      "upstream": "bb3ad6265806b1a49c7b8f88bf4f3fce14b6504222e1387ae7229be625f3a8a9",
+      "pr20": "1538b8e9d3dc35bd862c29bb3865f67d21c9c86792a3507ad7a0996c64dd9d4d"
+    },
+    "sdk": {
+      "envoy_coraza_candidate": {
+        "crate": "proxy-wasm",
+        "source": "git",
+        "repository": "https://github.com/Kuadrant/proxy-wasm-rust-sdk",
+        "revision": "6ceedbbdd07a048a65d197c9bbb1f950884561fb"
+      },
+      "envoy_libperfusion": {
+        "crate": "proxy-wasm",
+        "source": "crates.io",
+        "version": "0.2.5",
+        "checksum": "de8f6564bd52c2f4ff79fa5d1bd3bc10d8f822162af8d527e121e46703496aa0"
+      }
+    },
+    "go_coraza": {
+      "upstream": {
+        "module": "github.com/corazawaf/coraza/v3",
+        "version": "v3.3.3"
+      },
+      "pr20": {
+        "require_module": "github.com/corazawaf/coraza/v3",
+        "effective_module": "github.com/networking-incubator/coraza/v3",
+        "version": "v3.7.0"
+      }
+    },
+    "detector": {
+      "upstream": {
+        "module": "github.com/corazawaf/libinjection-go",
+        "version": "v0.2.2"
+      },
+      "pr20": {
+        "require_module": "github.com/corazawaf/libinjection-go",
+        "effective_module": "github.com/networking-incubator/libinjection-go",
+        "version": "v0.3.2"
+      }
+    },
+    "go_sdk": {
+      "module": "github.com/tetratelabs/proxy-wasm-go-sdk",
+      "upstream": "v0.24.0",
+      "pr20": "v0.24.0"
+    },
+    "go_version_declarations": {
+      "upstream": {
+        "go_mod": "1.23.8",
+        "mage_minimum": "1.23",
+        "ci": "1.23"
+      },
+      "pr20": {
+        "go_mod": "1.23.12",
+        "mage_minimum": "1.23",
+        "ci": "1.23"
+      }
+    },
+    "embedded_rules_tree_sha256": {
+      "upstream": "d1722cae3744e9b9de88ec8602c8ea467e149cace66d14ec1ef6cd69b56a1aa6",
+      "pr20": "e7142c1f8e2c6ae5b28a6b6123c3cf8a558ab5e55bd4d6bb2bd25608e60fe124"
+    },
+    "source_provenance": {
+      "path": "envoy-coraza/tests/contracts/source-provenance.json",
+      "sha256": "39cf1adb7fa05de2ccedd435625db466e764584778f86f7e89bc4ec96c3d203d"
+    }
+  },
+  "hosts": [
+    {
+      "id": "standalone-envoy-1.40.0",
+      "kind": "standalone-envoy",
+      "image": "envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de",
+      "status": "pinned"
+    },
+    {
+      "id": "istio-1.30.5",
+      "kind": "istio-envoyfilter",
+      "istio_release": "1.30.5",
+      "envoy_version": "1.38.5-dev",
+      "proxy_image_digest": "sha256:324ec9f74e9194c43b16e859497d67567c93d3d1e5f0804a88ed48002e668f62",
+      "status": "pinned"
+    },
+    {
+      "id": "istio-1.30.7",
+      "kind": "istio-envoyfilter",
+      "istio_release": "1.30.7",
+      "envoy_version": "1.38.8-dev",
+      "proxy_image_digest": "sha256:340794767464f3d13c9e3df38cc663ecbc8264f00c7022dca53ad5c80336681f",
+      "status": "pinned"
+    }
+  ],
+  "observed_checkouts": [
+    {
+      "path": "/tmp/coraza-proxy-wasm-upstream-pinned",
+      "head": "b1770f5b0be397bd4ddc2c976ab6548a7a1eeb7f",
+      "dirty": false,
+      "use_as_pin": true,
+      "artifact_sha256": "54684cb3f8c9de10780ed5337875b183cf69b6b8a74d67db69e4f628e974212c",
+      "note": "Exact clean upstream source checkout; build outputs are ignored under build/."
+    },
+    {
+      "path": "/tmp/coraza-proxy-wasm-pr20-pinned",
+      "source_kind": "git archive",
+      "commit": "266b6ed6a471e26e5c6862a46beb974eb1a0fa52",
+      "use_as_pin": true,
+      "artifact_sha256": "4d2f5a15695bc56d4ba18fbc9eb0490c882798035a3ca139964a452c112c6bfe",
+      "note": "PR #20 source archive extracted from the immutable commit object with dirty sibling worktree contents excluded; artifact_sha256 digests the built build/main.wasm artifact, not the archive or source tree, so it is not commit- or tree-binding evidence (see the deferred pr20-source-commit-binding item)."
+    }
+  ],
+  "inventory": {
+    "upstream_configuration_keys": [
+      "directives_map",
+      "default_directives",
+      "per_authority_directives",
+      "metric_labels",
+      "rules (deprecated)",
+      "enable_filter_state_logs (PR #20)",
+      "unknown/duplicate configuration keys",
+      "rules: null",
+      "per_authority_directives invalid container type",
+      "per_authority_directives non-scalar value",
+      "root scalar JSON configuration",
+      "per_authority_directives missing policy reference",
+      "directives_map policy object value",
+      "object/array elements in directive arrays"
+    ],
+    "upstream_bundle_aliases": [
+      "@recommended-conf",
+      "@demo-conf",
+      "@ftw-conf",
+      "@crs-setup-conf",
+      "@crs-setup-demo-conf (deprecated)",
+      "@owasp_crs"
+    ],
+    "legacy_metrics": [
+      "waf_filter_tx_total",
+      "waf_filter_tx_interruptions{phase,rule_id,...}"
+    ],
+    "pr20_filter_state_fields": [
+      "event",
+      "rule_id",
+      "phase",
+      "action",
+      "status",
+      "severity",
+      "category",
+      "client_ip"
+    ],
+    "lifecycle_outcomes": [
+      "allow",
+      "request interruption",
+      "response interruption",
+      "DetectionOnly",
+      "engine Off",
+      "empty body",
+      "trailers",
+      "reset or abort",
+      "configuration reload",
+      "finalization failure",
+      "response headers",
+      "response trailers",
+      "response header/trailer rewrite",
+      "request body limit N-1/N/N+1",
+      "reset while headers are held"
+    ],
+    "required_engine_features": [
+      "multiphase evaluation",
+      "phase-3 response-header rule",
+      "rule chains and dynamic controls",
+      "phase-5 effects",
+      "regex and numbered capture behavior"
+    ],
+    "diagnostic_only_probes": [
+      "relative rule_data Include and @pmFromFile fixture input",
+      "@ipMatchFromFile rule_data and REMOTE_ADDR fixture input"
+    ],
+    "hostcall failures": [
+      "filter-state set_property failure"
+    ]
+  },
+  "cases": [
+    {
+      "id": "config-empty",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "config-whitespace",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "config-empty-object",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "config-deprecated-rules",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "config-directives-map-invalid-type",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-scalar-policy-directives-map",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-scalar-deprecated-rules",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-numeric-default-directives",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-directive-order",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-selection",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-missing-policy-reference",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-unknown-key-and-duplicate-key",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "bundle-aliases",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "rule-phase-one-deny",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels",
+          "type": "object"
+        },
+        {
+          "path": "metrics.waf_filter_tx_total.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.phase",
+          "type": "string"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.rule_id",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "rule-phase-two-body-deny",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels",
+          "type": "object"
+        },
+        {
+          "path": "metrics.waf_filter_tx_total.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.phase",
+          "type": "string"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.rule_id",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "rule-chain-and-ctl",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "rule_matches_complete",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches_later_deny_1006_absent",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "rule-multiphase-early-block",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "early_block.response_before_request_body_complete",
+          "type": "boolean"
+        },
+        {
+          "path": "early_block.rule_id",
+          "type": "string"
+        },
+        {
+          "path": "early_block.phase",
+          "type": "nonnegative_integer"
+        }
+      ]
+    },
+    {
+      "id": "rule-detection-only-and-off",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "http-benign-byte-exact",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "response.body_base64",
+          "type": "string"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.headers",
+          "type": "optional_header_pairs"
+        }
+      ]
+    },
+    {
+      "id": "http-duplicate-headers-cookies",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.headers",
+          "type": "optional_header_pairs"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "http-response-interruption",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "response.body_base64",
+          "type": "string"
+        },
+        {
+          "path": "response.headers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "response.trailers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "response.upstream_sensitive_pairs_withheld",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "http-empty-body-and-trailers",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.trailers",
+          "type": "optional_header_pairs"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "ops-reload-and-inflight-stream",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "reload.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "reload.inflight.response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "reload.followup.response.status",
+          "type": "http_status"
+        }
+      ]
+    },
+    {
+      "id": "ops-reset-abort-finalize-once",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "finalization.reset_calls",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "finalization.abort_calls",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "finalization.local_reply_calls",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "finalization.normal_finish_calls",
+          "type": "nonnegative_integer"
+        }
+      ]
+    },
+    {
+      "id": "pr20-filter-state-disabled",
+      "reference": "pr20",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "filter_state.present",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "pr20-filter-state-interruption-fields",
+      "reference": "pr20",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "filter_state",
+          "type": "object"
+        },
+        {
+          "path": "local_reply",
+          "type": "object"
+        },
+        {
+          "path": "filter_state.event",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.rule_id",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.phase",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.action",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.status",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.severity",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.category",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.client_ip",
+          "type": "string"
+        },
+        {
+          "path": "filter_state.publication_sequence",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "local_reply.sequence",
+          "type": "nonnegative_integer"
+        }
+      ]
+    },
+    {
+      "id": "pr20-category-tag-validation",
+      "reference": "pr20",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "filter_state",
+          "type": "object"
+        },
+        {
+          "path": "filter_state.category",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-case-variant",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-port-variant",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-metric-labels-and-metrics",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "metrics.waf_filter_tx_total.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.delta",
+          "type": "nonnegative_integer"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels",
+          "type": "object"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.phase",
+          "type": "string"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.rule_id",
+          "type": "string"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.suite",
+          "type": "string"
+        },
+        {
+          "path": "metrics.waf_filter_tx_interruptions.labels.env",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "bundle-demo-alias",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "bundle-ftw-alias",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "bundle-crs-setup-demo-alias",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "rule-engine-off",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "rule-phase-five-effect",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "logs",
+          "type": "array"
+        }
+      ]
+    },
+    {
+      "id": "rule-relative-rule-data-files",
+      "reference": "candidate",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "rule-data-ip-match-from-file",
+      "reference": "candidate",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "rule-regex-capture",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "captures",
+          "type": "object"
+        }
+      ]
+    },
+    {
+      "id": "ops-finalization-failure",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "finalization.result",
+          "type": "string"
+        },
+        {
+          "path": "finalization.calls",
+          "type": "nonnegative_integer"
+        }
+      ]
+    },
+    {
+      "id": "config-configured-default-policy",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-absent-default-no-first-policy",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-host-fallback",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        }
+      ]
+    },
+    {
+      "id": "http-response-headers-trailers",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "response.headers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "response.body_base64",
+          "type": "string"
+        },
+        {
+          "path": "response.trailers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "config-rules-null",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-map-invalid-type",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-authority-value-invalid-type",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-root-scalar",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        },
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "response.headers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "response.body_base64",
+          "type": "string"
+        },
+        {
+          "path": "response.trailers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.headers",
+          "type": "optional_header_pairs"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "config-missing-authority-policy-reference",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-directives-map-policy-object",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "config-directives-map-array-containers",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "configure.accepted",
+          "type": "boolean"
+        },
+        {
+          "path": "configure.error",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "id": "rule-phase-three-response-header-deny",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "response.headers",
+          "type": "header_pairs"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "response.body_base64",
+          "type": "string"
+        },
+        {
+          "path": "timing.response_headers_before_body_complete",
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "id": "http-request-body-limit-below",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "http-request-body-limit-at",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "http-request-body-limit-above",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.request.body_base64",
+          "type": "optional_string"
+        },
+        {
+          "path": "rule_matches",
+          "type": "rule_matches"
+        },
+        {
+          "path": "backend.request.method",
+          "type": "optional_string"
+        },
+        {
+          "path": "backend.request.path",
+          "type": "optional_string"
+        }
+      ]
+    },
+    {
+      "id": "ops-reset-while-headers-held",
+      "reference": "upstream",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "stream.headers_held",
+          "type": "boolean"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        },
+        {
+          "path": "finalization.reset_calls",
+          "type": "nonnegative_integer"
+        }
+      ]
+    },
+    {
+      "id": "ops-filter-state-hostcall-failure",
+      "reference": "pr20",
+      "hosts": [
+        "standalone-envoy-1.40.0",
+        "istio-1.30.5",
+        "istio-1.30.7"
+      ],
+      "required_outcome_fields": [
+        {
+          "path": "hostcalls.set_property.result",
+          "type": "string"
+        },
+        {
+          "path": "response.status",
+          "type": "http_status"
+        },
+        {
+          "path": "backend.received",
+          "type": "boolean"
+        }
+      ]
+    }
+  ],
+  "inventory_coverage": {
+    "directives_map": [
+      "config.policy-selection",
+      "config.directive-order",
+      "config.directives-map-invalid-type",
+      "config.directives-map-policy-scalar"
+    ],
+    "default_directives": [
+      "config.default-policy",
+      "config.configured-default",
+      "config.absent-default",
+      "config.default-directives-invalid-type"
+    ],
+    "per_authority_directives": [
+      "config.authority",
+      "config.authority-case",
+      "config.authority-port",
+      "config.authority-host-fallback"
+    ],
+    "metric_labels": [
+      "metrics.custom-labels"
+    ],
+    "rules (deprecated)": [
+      "config.deprecated-rules",
+      "config.deprecated-rules-scalar"
+    ],
+    "enable_filter_state_logs (PR #20)": [
+      "pr20.state-disabled",
+      "pr20.state-published"
+    ],
+    "unknown/duplicate configuration keys": [
+      "config.unknown-duplicate-keys"
+    ],
+    "@recommended-conf": [
+      "bundle.recommended"
+    ],
+    "@demo-conf": [
+      "bundle.demo"
+    ],
+    "@ftw-conf": [
+      "bundle.ftw"
+    ],
+    "@crs-setup-conf": [
+      "bundle.crs-setup"
+    ],
+    "@crs-setup-demo-conf (deprecated)": [
+      "bundle.crs-setup-demo"
+    ],
+    "@owasp_crs": [
+      "bundle.owasp"
+    ],
+    "waf_filter_tx_total": [
+      "metrics.tx-total",
+      "metrics.phase-two-interruption"
+    ],
+    "waf_filter_tx_interruptions{phase,rule_id,...}": [
+      "metrics.interruption",
+      "metrics.phase-two-interruption"
+    ],
+    "event": [
+      "pr20.state-published"
+    ],
+    "rule_id": [
+      "pr20.state-published"
+    ],
+    "phase": [
+      "pr20.state-published"
+    ],
+    "action": [
+      "pr20.state-published"
+    ],
+    "status": [
+      "pr20.state-published"
+    ],
+    "severity": [
+      "pr20.state-published"
+    ],
+    "category": [
+      "pr20.state-published",
+      "pr20.category-tag"
+    ],
+    "client_ip": [
+      "pr20.state-published"
+    ],
+    "allow": [
+      "lifecycle.allow",
+      "http.byte-exact",
+      "http.duplicate-headers"
+    ],
+    "request interruption": [
+      "lifecycle.request-interruption"
+    ],
+    "response interruption": [
+      "lifecycle.response-interruption"
+    ],
+    "DetectionOnly": [
+      "lifecycle.detection-only"
+    ],
+    "engine Off": [
+      "lifecycle.engine-off"
+    ],
+    "empty body": [
+      "lifecycle.empty-body"
+    ],
+    "trailers": [
+      "lifecycle.trailers"
+    ],
+    "reset or abort": [
+      "lifecycle.reset-abort"
+    ],
+    "configuration reload": [
+      "lifecycle.reload"
+    ],
+    "finalization failure": [
+      "lifecycle.finalization-failure"
+    ],
+    "multiphase evaluation": [
+      "engine.multiphase"
+    ],
+    "rule chains and dynamic controls": [
+      "engine.chains-controls"
+    ],
+    "phase-5 effects": [
+      "engine.phase-5"
+    ],
+    "regex and numbered capture behavior": [
+      "engine.regex-capture"
+    ],
+    "relative rule_data Include and @pmFromFile fixture input": [
+      "bundle.relative-data"
+    ],
+    "@ipMatchFromFile rule_data and REMOTE_ADDR fixture input": [
+      "rule-data.ip-match-from-file"
+    ],
+    "response headers": [
+      "lifecycle.response-headers"
+    ],
+    "response trailers": [
+      "lifecycle.response-trailers"
+    ],
+    "response header/trailer rewrite": [
+      "http.response-header-trailer-rewrite"
+    ],
+    "request body limit N-1/N/N+1": [
+      "http.request-body-limit.below",
+      "http.request-body-limit.at",
+      "http.request-body-limit.above"
+    ],
+    "reset while headers are held": [
+      "lifecycle.reset-while-held"
+    ],
+    "phase-3 response-header rule": [
+      "engine.phase-three"
+    ],
+    "filter-state set_property failure": [
+      "ops.hostcall-failure"
+    ],
+    "rules: null": [
+      "config.rules-null"
+    ],
+    "per_authority_directives invalid container type": [
+      "config.authority-map-invalid-type"
+    ],
+    "per_authority_directives non-scalar value": [
+      "config.authority-value-invalid-type"
+    ],
+    "root scalar JSON configuration": [
+      "config.root-scalar"
+    ],
+    "per_authority_directives missing policy reference": [
+      "config.authority-missing-policy-reference"
+    ],
+    "directives_map policy object value": [
+      "config.directives-map-policy-object"
+    ],
+    "object/array elements in directive arrays": [
+      "config.directives-map-array-containers"
+    ]
+  },
+  "deferred_inventory": [
+    {
+      "id": "wasm-loading",
+      "reason": "No host deployment fixture describes VM identifiers, config wrappers, or local and checksum-pinned remote artifact loading. Although the source CRS trees are pinned, no host fixture exercises include directives to verify the expanded bundle and rule order."
+    },
+    {
+      "id": "bundle-file-provenance",
+      "reason": "Exact per-file hashes, CRS version comments, and source commits are recorded in envoy-coraza/tests/contracts/source-provenance.json. The pinned upstream tree has 50 embedded files (CRS 4.14.0); PR #20 has 54 (CRS 4.28.0). File content explicitly declares Apache-2.0 for 28/50 upstream and 30/54 PR #20 files. The remaining 22 and 24 files lack a per-file license declaration in the pinned source; their license and full origin chain remain unverified, so no blanket license is inferred."
+    },
+    {
+      "id": "pr20-source-commit-binding",
+      "reason": "The PR #20 extraction has no .git metadata, and no retained archive bytes, archive digest, or export record binds the inspected tree to commit 266b6ed6a471e26e5c6862a46beb974eb1a0fa52. The source_commit field in source-provenance.json is metadata, not independent binding evidence."
+    },
+    {
+      "id": "connection-uri-variables",
+      "reason": "The candidate-only rule-data-ip-match-from-file diagnostic probe supplies client_ip for REMOTE_ADDR, but there is no upstream-parity case or broad connection-variable coverage such as REQUEST_FILENAME; REQUEST_URI matching is covered by other rule fixtures."
+    },
+    {
+      "id": "partial-inspection",
+      "reason": "The current fixture schema has no chunk schedule or incomplete-inspection outcome; this requires the lifecycle driver and stream implementation."
+    },
+    {
+      "id": "transforms",
+      "reason": "No fixture currently exercises a t: transform against a request value."
+    },
+    {
+      "id": "anomaly-score",
+      "reason": "No fixture asserts anomaly score accumulation, thresholds, or early blocking from score actions."
+    },
+    {
+      "id": "negative-rule-tests",
+      "reason": "No negative rule fixture demonstrates that a nonmatching request was fully inspected and allowed."
+    },
+    {
+      "id": "matched-rule",
+      "reason": "No general matched-rule record is required across all request outcomes; selected probes now require ordered IDs/actions, while broader matched-rule coverage remains open."
+    },
+    {
+      "id": "engine-error",
+      "reason": "Configuration-shape fixtures now require configure.accepted/error observations for root scalars, missing authority references, object policy values and container entries in directive arrays. No executable host runner currently captures those outcomes; chain-member disruptive-action compile rejection also remains unverified."
+    },
+    {
+      "id": "audit",
+      "reason": "A bounded local Proxy-Wasm audit callback exists, but the host driver has no normalized audit-log observation, so upstream and candidate audit behavior remains uncaptured."
+    },
+    {
+      "id": "startup-failure",
+      "reason": "No host driver starts Envoy with invalid plugin configuration and records the startup result."
+    },
+    {
+      "id": "reload-failure",
+      "reason": "The fixture covers successful reload only; no host driver records rejection and continued use of the old generation."
+    },
+    {
+      "id": "response-limit-boundaries",
+      "reason": "backend_response can carry fixed body bytes, but no response-body boundary case captures chunk scheduling, inspection completeness, or the host outcome when a response exceeds its inspection limit. Request-body N-1/N/N+1 cases are covered; response-limit behavior remains deferred."
+    },
+    {
+      "id": "http2-multiplexing",
+      "reason": "The fixture schema carries one request per case, so it cannot describe two distinct concurrent HTTP/2 streams or their per-stream results; this needs a multiplexing host driver."
+    },
+    {
+      "id": "multiple-workers",
+      "reason": "Worker count is Envoy process configuration rather than a request or plugin fixture input; the host runner must start and observe a multi-worker deployment."
+    },
+    {
+      "id": "hostcall-failure-matrix",
+      "reason": "A filter-state set_property failure is represented, but a complete hostcall matrix needs per-call fault injection and terminal outcomes that the lightweight fixture runner does not provide."
+    },
+    {
+      "id": "resource-exhaustion",
+      "reason": "Bounded memory-pressure and exhaustion behavior needs controlled Envoy limits, concurrent load, and host resource measurements; no fixture scenario models that campaign."
+    },
+    {
+      "id": "rule-data-bounds",
+      "reason": "The connector-only rule_data size/file/count bounds have no faithful upstream parity probe or candidate capture assertion yet."
+    },
+    {
+      "id": "rule-data-runtime-resolution",
+      "reason": "The candidate-only relative-file and @ipMatchFromFile probes record schema-checked observations but prescribe no candidate outcomes; upstream and PR #20 comparisons omit them, so runtime resolution and matching are not automated coverage."
+    },
+    {
+      "id": "crs-exclusions",
+      "reason": "The upstream and PR #20 CRS trees are pinned, but no fixture proves the effect and ordering of CRS exclusion rules."
+    },
+    {
+      "id": "fragmented-bodies",
+      "reason": "Fixtures do not define a multi-chunk body schedule; trailer termination is covered, but fragmented delivery and partial inspection are not."
+    },
+    {
+      "id": "filter-state-access-log",
+      "reason": "No real Envoy formatter and downstream access-log consumer fixture verifies filter-state visibility."
+    },
+    {
+      "id": "rule-data-validate-schema",
+      "reason": "The Envoy artifact does not enable Coraza's validate-schema feature, as recorded in the connector handoff; no candidate fixture can exercise @validateSchema resolution from rule_data. The separate rule-data-bounds item remains deferred."
+    },
+    {
+      "id": "websocket-tunnels",
+      "reason": "The fixture schema has no WebSocket upgrade or tunnel schedule, and no host capture establishes whether upgraded traffic is rejected or inspected."
+    },
+    {
+      "id": "connect-tunnels",
+      "reason": "The fixture schema cannot model CONNECT tunnel bytes or lifecycle, and no host capture establishes whether tunnels are rejected or inspected."
+    },
+    {
+      "id": "indefinite-streaming",
+      "reason": "Fixtures describe finite messages; an indefinite stream cannot be buffered to completion, and no host capture establishes an explicit incompatibility response."
+    },
+    {
+      "id": "grpc-message-decoding",
+      "reason": "The HTTP/2 gRPC trailer probe does not decode protobuf message frames or application fields; doing so requires a schema-aware decoder not represented by this fixture contract."
+    },
+    {
+      "id": "http3",
+      "reason": "The pinned deployment matrix has no verified HTTP/3 host/runtime entry or capture, so HTTP/3 behavior is unestablished."
+    },
+    {
+      "id": "arbitrary-filesystem-access",
+      "reason": "The WASM connector uses bounded in-memory rule_data and exposes no arbitrary filesystem source, but no candidate host fixture captures this incompatibility."
+    },
+    {
+      "id": "external-process-operators",
+      "reason": "The Envoy artifact disables Coraza's inspect-file feature, so @inspectFile is unavailable; the pinned upstream behavior and candidate rejection have no host capture. See the connector handoff."
+    },
+    {
+      "id": "dns-operators",
+      "reason": "The Envoy artifact disables Coraza's rbl feature, so @rbl is unavailable; the pinned upstream behavior and candidate rejection have no host capture. See the connector handoff."
+    },
+    {
+      "id": "custom-remote-audit-transports",
+      "reason": "The local Proxy-Wasm audit callback is not a custom remote transport; remote transports remain unimplemented, and no fixture captures an upstream-versus-candidate transport incompatibility."
+    }
+  ]
+}
