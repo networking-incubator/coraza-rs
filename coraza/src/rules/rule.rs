@@ -29,7 +29,7 @@ use crate::{
     operators::{OperatorOutcome, Outputs},
     rules::{
         RuleOperator, TransformationValue, VariableSpec,
-        multiphase::{is_multiphase_double_evaluation, multiphase_skip_variable},
+        multiphase::{CollectiveMatches, is_multiphase_double_evaluation, multiphase_skip_variable},
     },
     transaction::Transaction,
     types::{RulePhase, RuleVariable},
@@ -208,7 +208,7 @@ impl Rule {
         tx.debug_log(DebugLevel::Debug, "Evaluating rule", || {
             [DebugField::RuleId(self.metadata.id), DebugField::Phase(phase.as_int())]
         });
-        let mut collective_matched_values = Vec::new();
+        let mut collective_matched_values = CollectiveMatches::default();
         let mut inspection_refused = false;
         let matched_values = self.matches_chain(
             tx,
@@ -281,7 +281,7 @@ impl Rule {
         phase: RulePhase,
         top_level: bool,
         chain_level: usize,
-        collective_matched_values: &mut Vec<MatchData>,
+        collective_matched_values: &mut CollectiveMatches,
         inspection_refused: &mut bool,
     ) -> Vec<MatchData> {
         if !top_level {
@@ -378,7 +378,7 @@ impl Rule {
         phase: RulePhase,
         top_level: bool,
         chain_level: usize,
-        collective_matched_values: &mut Vec<MatchData>,
+        collective_matched_values: &mut CollectiveMatches,
         inspection_refused: &mut bool,
     ) -> Vec<MatchData> {
         let message = self.metadata.msg.as_ref().map(|value| value.expand_cow(tx));
@@ -653,7 +653,7 @@ impl Rule {
         tx: &mut Transaction,
         id: i32,
         chain_level: usize,
-        collective_matched_values: &mut Vec<MatchData>,
+        collective_matched_values: &mut CollectiveMatches,
         inspection_refused: &mut bool,
         matched_values: &mut Vec<MatchData>,
         variable: RuleVariable,
@@ -716,7 +716,7 @@ impl Rule {
 mod tests {
     use std::sync::Arc;
 
-    use super::Rule;
+    use super::{CollectiveMatches, Rule};
     use crate::{
         actions::{ActionImplementation, ActionType, CompiledAction, CustomAction, RuleMetadata},
         collection::MatchData,
@@ -914,7 +914,7 @@ mod tests {
             RulePhase::RequestHeaders,
             true,
             0,
-            &mut Vec::new(),
+            &mut CollectiveMatches::default(),
             &mut inspection_refused,
         );
 
