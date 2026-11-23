@@ -25,10 +25,10 @@
 //!
 //! Several hostcalls are programmable per test thread, so a test can drive the filter without
 //! fabricating anything it did not ask for: the plugin configuration buffer
-//! ([`set_plugin_configuration`]), the request and response header maps ([`set_request_headers`],
-//! [`set_response_headers`]), the request and response body buffers ([`set_request_body`],
-//! [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]), and what the
-//! filter did: the status codes of local replies ([`local_reply_statuses`]), of response replacements
+//! ([`set_plugin_configuration`]), the request header and trailer maps and the response header map
+//! ([`set_request_headers`], [`set_request_trailers`], [`set_response_headers`]), the request and response body buffers
+//! ([`set_request_body`], [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]),
+//! and what the filter did: the status codes of local replies ([`local_reply_statuses`]), of response replacements
 //! ([`response_replacement_statuses`]) and the filter-state properties it published ([`published_property`]).
 //! Each test runs on its own thread, so the scripted state is isolated; call [`reset`] to
 //! clear it explicitly. Everything else stays a fixed stub that reports `Status::NotFound`.
@@ -53,6 +53,8 @@ struct Host {
     request_headers: Option<Vec<(String, Vec<u8>)>>,
     /// Request body buffer, or `None` to report it missing.
     request_body: Option<Vec<u8>>,
+    /// Request trailer map, or `None` to report it missing.
+    request_trailers: Option<Vec<(String, Vec<u8>)>>,
     /// Response header map, or `None` to report it missing.
     response_headers: Option<Vec<(String, Vec<u8>)>>,
     /// Response body buffer, or `None` to report it missing.
@@ -73,6 +75,7 @@ thread_local! {
             plugin_configuration: None,
             request_headers: None,
             request_body: None,
+            request_trailers: None,
             response_headers: None,
             response_body: None,
             response_replacements: Vec::new(),
@@ -89,6 +92,7 @@ pub(crate) fn reset() {
         host.plugin_configuration = None;
         host.request_headers = None;
         host.request_body = None;
+        host.request_trailers = None;
         host.response_headers = None;
         host.response_body = None;
         host.response_replacements.clear();
@@ -105,14 +109,19 @@ pub(crate) fn set_plugin_configuration(configuration: Option<&[u8]>) {
 
 /// Scripts the request header map the host returns.
 pub(crate) fn set_request_headers(headers: &[(&str, &[u8])]) {
-    HOST.with_borrow_mut(|host| {
-        host.request_headers = Some(
-            headers
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
-                .collect(),
-        );
-    });
+    HOST.with_borrow_mut(|host| host.request_headers = Some(owned_map(headers)));
+}
+
+/// Scripts the request trailer map the host returns.
+pub(crate) fn set_request_trailers(trailers: &[(&str, &[u8])]) {
+    HOST.with_borrow_mut(|host| host.request_trailers = Some(owned_map(trailers)));
+}
+
+/// A header map the host owns.
+fn owned_map(map: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
+    map.iter()
+        .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
+        .collect()
 }
 
 /// Scripts the request body buffer the host returns.
@@ -122,14 +131,7 @@ pub(crate) fn set_request_body(body: &[u8]) {
 
 /// Scripts the response header map the host returns.
 pub(crate) fn set_response_headers(headers: &[(&str, &[u8])]) {
-    HOST.with_borrow_mut(|host| {
-        host.response_headers = Some(
-            headers
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
-                .collect(),
-        );
-    });
+    HOST.with_borrow_mut(|host| host.response_headers = Some(owned_map(headers)));
 }
 
 /// Scripts the response body buffer the host returns.
@@ -257,6 +259,7 @@ extern "C" fn proxy_get_header_map_pairs(
 ) -> Status {
     let serialized = HOST.with_borrow(|host| match map_type {
         MapType::HttpRequestHeaders => host.request_headers.as_deref().map(serialize_map),
+        MapType::HttpRequestTrailers => host.request_trailers.as_deref().map(serialize_map),
         MapType::HttpResponseHeaders => host.response_headers.as_deref().map(serialize_map),
         _ => None,
     });

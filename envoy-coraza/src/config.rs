@@ -17,7 +17,7 @@
 //! The accepted keys are the ones the upstream connector reads at
 //! `corazawaf/coraza-proxy-wasm@b1770f5` (`wasmplugin/config.go`), plus the
 //! fork's `enable_filter_state_logs` switch and this connector's own
-//! `rule_data` map.
+//! `rule_data` and `unmatched_authority` keys.
 //!
 //! # Accepted values
 //!
@@ -36,9 +36,16 @@
 //!   absent value selects no policy: the first configured policy is not used implicitly. The name is resolved during
 //!   compilation.
 //! * `per_authority_directives` maps an authority to a policy name. Every referenced policy must exist. An empty
-//!   authority or an empty policy name is rejected. An authority key whose port is the default for a scheme (`:80` or
+//!   authority or an empty policy name is rejected. A key must be in the normal form the request-time lookup uses
+//!   (`crate::stream::normalize_authority`): lowercase, a registered name of letters, digits, `-`, `.` and `_` without
+//!   a trailing dot, an IPv4 address in dotted-decimal form, or an IPv6 literal in its compressed form that is not
+//!   IPv4-mapped, and a port without leading zeros. An authority key whose port is the default for a scheme (`:80` or
 //!   `:443`) is rejected, because the request-time lookup strips that port: configure the bare host instead. Scalars
 //!   are coerced and non-scalars are rejected. At most [`MAX_AUTHORITIES`] authorities are accepted.
+//! * `unmatched_authority` is `"reject"` (the default when absent) or `"allow"`; any other value or type is rejected.
+//!   It decides what happens to a request whose authority selects no policy when the configuration has policies:
+//!   `"reject"` answers 421, `"allow"` passes it uninspected. A configuration with policies and neither
+//!   `default_directives` nor `per_authority_directives` is rejected at compile time unless it is `"allow"`.
 //! * Policy, authority and `rule_data` names are at most [`MAX_NAME_BYTES`] bytes; a configured name over the limit is
 //!   rejected rather than embedded in a log line.
 //! * The legacy flat `rules` key is unsupported. Its presence is rejected with guidance to use `directives_map` and
@@ -69,11 +76,22 @@
 //! that upstream would accept, or differ only in how a value is rendered; none
 //! turns a document upstream rejects into an accepted one.
 //!
-//! Runtime authority lookup lowercases the request authority and strips only its scheme's default port before
-//! selection, and uses Envoy's `request.host` property when `:authority` is absent. Upstream uses the raw authority
-//! string as an exact key and does not use that property fallback. Invalid or non-lowercase authority keys are
-//! rejected; bracketed IPv6 literals retain their brackets, and non-default ports remain part of the lookup key. A key
-//! carrying a default port can never be looked up, so it is rejected at parse time.
+//! Runtime authority lookup lowercases the request authority, strips one trailing dot of a registered name and the
+//! scheme's default port, writes an IPv6 literal in its compressed form, an IPv4-mapped one as the dotted-decimal
+//! IPv4 address it holds, and a port without leading zeros, and uses
+//! Envoy's `request.host` property when `:authority` is absent. A registered name is limited to letters, digits, `-`,
+//! `.` and `_` with no empty label: percent-encoding and sub-delimiters, such as the `,` Envoy joins repeated `Host`
+//! headers with, are refused with 400 rather than decoded, and so is a host of numbers only that is not a
+//! dotted-decimal IPv4 address (`010.0.0.1`, `10.1`, `167772161`, `0xa000001`). Selection looks up the normalized
+//! authority, then, when it carries a port, the bare host, then the default. Upstream uses the raw authority string as
+//! an exact key and does not use that property fallback. Keys that are invalid or not in that normal form are rejected;
+//! bracketed IPv6 literals retain their brackets, and a non-default port remains part of the lookup key. A key carrying
+//! a default port can never be looked up, so it is rejected at parse time.
+//!
+//! A request whose authority selects no policy is refused with 421 when the configuration has policies, unless it sets
+//! `"unmatched_authority": "allow"`; a configuration with policies and no selector is rejected unless it does.
+//! corazawaf/coraza-proxy-wasm logs a warning and continues for such a request; the networking-incubator fork answers
+//! 500. `{"directives_map": {}}` stays the one explicit pass-through.
 //!
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
@@ -117,16 +135,32 @@
 //!   `MAX_RULE_DATA_FILES`, `MAX_RULE_DATA_FILE_BYTES`, `MAX_RULE_DATA_TOTAL_BYTES`, `MAX_RULE_DATA_READ_BYTES` and
 //!   `MAX_NAME_BYTES` (4096, with the engine's 64-component rule) for rule-data names; `MAX_AUTHORITIES`; and
 //!   `MAX_REQUEST_BODY_LIMIT`/`MAX_RESPONSE_BODY_LIMIT`. The engine's `MAX_INCLUDED_FILES` is per top-level parse, so
-//!   here it applies per policy. CRS 4.30 sets no request-body limit, so its engine default (128 `MiB`) is over the
-//!   `MAX_REQUEST_BODY_LIMIT` WASM ceiling; a CRS policy must set `SecRequestBodyLimit` explicitly, as the embedded-CRS
-//!   example in `envoy-coraza/README.md` does. The rule caps are low because rule insertion scans for duplicate ids, so
-//!   collecting one policy is quadratic: 30,000 flat rules measured about 0.8 s natively (1.2 s with a realistic shape)
-//!   and 3.3 s of configure-plus-start in an Envoy 1.40 V8 worker, with 5.4 s at the generation cap. Re-measure before
-//!   raising them. Stock CRS is about 6,000 rules, so the cap is ample.
+//!   here it applies per policy. CRS 4.30 sets no request-body limit; the engine default (128 `MiB`) is over the
+//!   `MAX_REQUEST_BODY_LIMIT` WASM ceiling, so every policy starts at that ceiling instead (see the body access entry
+//!   below) and a `SecRequestBodyLimit` above it is rejected. The rule caps are low because rule insertion scans for
+//!   duplicate ids, so collecting one policy is quadratic: 30,000 flat rules measured about 0.8 s natively (1.2 s with
+//!   a realistic shape) and 3.3 s of configure-plus-start in an Envoy 1.40 V8 worker, with 5.4 s at the generation cap.
+//!   Re-measure before raising them. Stock CRS is about 6,000 rules, so the cap is ample.
 //! * The body ceilings are host policy, not policy syntax: they are installed as
 //!   `WafConfig::max_request_body_limit`/`max_response_body_limit` so a request-time `ctl:requestBodyLimit`,
 //!   `ctl:responseBodyLimit`, `ctl:requestBodyAccess=On` or `ctl:responseBodyAccess=On` cannot raise the effective
 //!   limit above what the host buffers, and cannot reintroduce body spill above a positive in-memory limit.
+//! * Request body access is on by default: every policy is compiled with `SecRequestBodyAccess On` and
+//!   `SecRequestBodyLimit` at `MAX_REQUEST_BODY_LIMIT` before its own directives, so a policy must say
+//!   `SecRequestBodyAccess Off` to leave bodies uninspected, which logs a configure-time warning; a rule that runs
+//!   `ctl:ruleEngine=Off`, `ctl:ruleEngine=DetectionOnly` or `ctl:requestBodyAccess=Off` is counted in the policy's
+//!   `enforces` line, logged at warning level, and named at info level. Go Coraza and coraza-proxy-wasm leave body
+//!   access off unless the policy turns it on, so a policy without the line streams request bodies there. Here it holds
+//!   each one until it ends, and refuses with 413 a body of `SecRequestBodyLimit` bytes or more (under `Reject` in
+//!   `SecRuleEngine On`) or over 16 `MiB`, a multipart body with a file part (in `SecRuleEngine On`: the engine's ban
+//!   on uploads, as this host has no filesystem) and a URL-encoded body, or a JSON body that a rule parses as JSON (CRS
+//!   does for `application/*+json` and AWS JSON types), over `SecArgumentsLimit` fields, and refuses with 415 every
+//!   request whose `Content-Encoding` is not `identity`. `SecRequestBodyAccess Off`, or a phase-1
+//!   `ctl:requestBodyAccess=Off` rule scoped to the paths concerned, lets them through unread, and `SecArgumentsLimit`
+//!   reads larger forms (see the README's upgrade notes). The built-in `@recommended-conf` does not set
+//!   `SecRuleEngine`, so the engine default `On` applies where upstream's file starts in `DetectionOnly`.
+//! * A request body that a body processor stopped reading at the memory budget the root left it is refused with 503, in
+//!   every engine mode, unless a rule denied it first. Upstream has no such budget.
 //! * The audit-engine lock is host policy too: `WafConfig::audit_engine_locked` is installed so a request-time
 //!   `ctl:auditEngine` cannot enable auditing when this build has no sink. Without it the engine would retain an audit
 //!   copy of the request body with nowhere to write it.
@@ -152,7 +186,7 @@ use serde_json::{Map, Value};
 ///
 /// `rules` is listed so its dedicated rejection is reported rather than the generic one, and `metric_labels` is
 /// accepted for upstream compatibility.
-pub(crate) const RECOGNISED_KEYS: [&str; 8] = [
+pub(crate) const RECOGNISED_KEYS: [&str; 9] = [
     "directives_map",
     "default_directives",
     "per_authority_directives",
@@ -161,6 +195,7 @@ pub(crate) const RECOGNISED_KEYS: [&str; 8] = [
     "metric_labels",
     "rules",
     "config_gzip_b64",
+    "unmatched_authority",
 ];
 
 /// Longest policy, authority or `rule_data` name, in bytes.
@@ -218,6 +253,16 @@ pub(crate) const RULE_DATA_LIMITS: RuleDataLimits = RuleDataLimits {
     total_bytes: MAX_RULE_DATA_TOTAL_BYTES,
 };
 
+/// What happens to a request whose authority selects no policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum UnmatchedAuthority {
+    /// Refused with 421 when the generation has policies.
+    #[default]
+    Reject,
+    /// Passed uninspected, as corazawaf/coraza-proxy-wasm does.
+    Allow,
+}
+
 /// A validated plugin configuration.
 #[derive(Debug, Default)]
 pub(crate) struct Config {
@@ -231,6 +276,8 @@ pub(crate) struct Config {
     pub(crate) enable_filter_state_logs: bool,
     /// File name to file bytes, for file-based rule operators.
     pub(crate) rule_data: BTreeMap<String, Vec<u8>>,
+    /// What happens to a request whose authority selects no policy.
+    pub(crate) unmatched_authority: UnmatchedAuthority,
 }
 
 /// A configuration that cannot be used.
@@ -281,7 +328,7 @@ pub(crate) enum ConfigError {
     TooManyAuthorities,
     /// An authority key is empty.
     EmptyAuthority,
-    /// An authority key is invalid or does not use its normalized lowercase form.
+    /// An authority key is invalid or not in the normal form request-time lookup uses.
     InvalidAuthority {
         /// Offending authority key.
         authority: String,
@@ -298,6 +345,8 @@ pub(crate) enum ConfigError {
         /// Authority the entry is for.
         authority: String,
     },
+    /// `unmatched_authority` is neither `"reject"` nor `"allow"`.
+    InvalidUnmatchedAuthority,
     /// A `rule_data` entry breaks a bound.
     RuleData {
         /// Offending file name.
@@ -383,7 +432,9 @@ impl Display for ConfigError {
             Self::EmptyAuthority => f.write_str("per_authority_directives has an empty authority"),
             Self::InvalidAuthority { authority } => write!(
                 f,
-                "per_authority_directives authority {} is invalid or not lowercase",
+                "per_authority_directives authority {} is invalid or not in normal form (lowercase, no trailing dot, a \
+                 compressed IPv6 literal, a dotted-decimal IPv4 address, also for an IPv4-mapped IPv6 literal, a port \
+                 without leading zeros)",
                 display_name(authority)
             ),
             Self::DefaultPortAuthority { authority, host } => write!(
@@ -415,6 +466,7 @@ impl Display for ConfigError {
                     display_name(authority)
                 )
             },
+            Self::InvalidUnmatchedAuthority => f.write_str("unmatched_authority must be \"reject\" or \"allow\""),
             Self::RuleData { name, reason } => write!(f, "rule_data {}: {reason}", display_name(name)),
             Self::EmptyBase64 => f.write_str("config_gzip_b64 must be a non-empty base64 string"),
             Self::InvalidBase64 => f.write_str("config_gzip_b64 is not standard padded base64; use `base64 -w0`"),
@@ -511,6 +563,11 @@ impl Config {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             rule_data: parse_rule_data(object)?,
+            unmatched_authority: match object.get("unmatched_authority").map(Value::as_str) {
+                None | Some(Some("reject")) => UnmatchedAuthority::Reject,
+                Some(Some("allow")) => UnmatchedAuthority::Allow,
+                Some(_) => return Err(ConfigError::InvalidUnmatchedAuthority),
+            },
         };
         Ok(config)
     }
@@ -834,7 +891,7 @@ fn parse_per_authority_directives(object: &Map<String, Value>) -> Result<BTreeMa
             {
                 return Err(ConfigError::DefaultPortAuthority {
                     authority: authority.clone(),
-                    host,
+                    host: host.into_owned(),
                 });
             }
         }
@@ -973,9 +1030,9 @@ mod tests {
 
     use super::{
         add_rule_data, check_json_value_count, check_rule_data_name, crc32, display_name, gzip_fixture, Config,
-        ConfigError, RuleDataLimits, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES, MAX_CONFIGURATION_BYTES,
-        MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES, MAX_RULE_DATA_FILE_BYTES,
-        RULE_DATA_LIMITS,
+        ConfigError, RuleDataLimits, UnmatchedAuthority, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES,
+        MAX_CONFIGURATION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES,
+        MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
     };
 
     /// Parses a document that must be accepted.
@@ -1329,12 +1386,35 @@ mod tests {
 
     #[test]
     fn per_authority_keys_must_be_valid_normalized_authorities() {
-        for authority in ["A.example", "a.example/path", "a.example:abc", "[invalid"] {
+        for authority in [
+            "A.example",
+            "a.example/path",
+            "a.example:abc",
+            "[invalid",
+            // The request-time lookup strips a trailing dot and compresses an IPv6 literal, so a key that keeps
+            // either could never be looked up.
+            "a.example.",
+            "a.example.:8080",
+            "[0:0:0:0:0:0:0:1]",
+            "[2001:DB8::1]",
+            // An IPv4-mapped literal is looked up as its IPv4 address.
+            "[::ffff:10.0.0.1]",
+            "a.example:08080",
+            // Not a registered name.
+            "a%2eexample",
+            "a.example,b.example",
+            "a..example",
+            // Numbers only: an IPv4 address in another spelling than dotted decimal.
+            "010.0.0.1",
+            "10.1",
+            "167772161",
+            "0xa000001",
+        ] {
             let error = parse_error(&format!(
                 r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#
             ));
             assert!(
-                error.contains("is invalid or not lowercase"),
+                error.contains("is invalid or not in normal form"),
                 "authority {authority:?} was accepted: {error}"
             );
         }
@@ -1345,6 +1425,9 @@ mod tests {
             "[2001:db8::1]:8443",
             "[2001:db8::1]",
             "a.example",
+            "10.0.0.1",
+            "10.0.0.1:8080",
+            "1.example",
         ] {
             let input =
                 format!(r#"{{"directives_map": {{"p": []}}, "per_authority_directives": {{"{authority}": "p"}}}}"#);
@@ -1370,6 +1453,48 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains("use the bare host"), "message was {message:?}");
             assert!(message.contains(&format!("{host:?}")), "message was {message:?}");
+        }
+    }
+
+    #[test]
+    fn unmatched_authority_defaults_to_reject_and_reads_allow() {
+        for (value, expected) in [
+            ("", UnmatchedAuthority::Reject),
+            (r#", "unmatched_authority": "reject""#, UnmatchedAuthority::Reject),
+            (r#", "unmatched_authority": "allow""#, UnmatchedAuthority::Allow),
+        ] {
+            let config = parse(&format!(
+                r#"{{"directives_map": {{"p": []}}, "default_directives": "p"{value}}}"#
+            ));
+            assert_eq!(config.unmatched_authority, expected, "{value:?}");
+        }
+        assert_eq!(
+            parse(r#"{"unmatched_authority": "allow"}"#).unmatched_authority,
+            UnmatchedAuthority::Allow,
+            "the key is recognised on its own"
+        );
+    }
+
+    #[test]
+    fn unmatched_authority_must_be_reject_or_allow() {
+        for value in [
+            r#""Allow""#,
+            r#""REJECT""#,
+            r#""""#,
+            r#""pass""#,
+            "true",
+            "1",
+            "null",
+            "[]",
+            "{}",
+        ] {
+            let error = parse_error(&format!(
+                r#"{{"directives_map": {{"p": []}}, "default_directives": "p", "unmatched_authority": {value}}}"#
+            ));
+            assert!(
+                error.starts_with("unmatched_authority must be \"reject\" or \"allow\""),
+                "{value} reported {error:?}"
+            );
         }
     }
 

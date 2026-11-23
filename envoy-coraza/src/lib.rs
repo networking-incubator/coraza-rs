@@ -141,6 +141,12 @@ impl RootContext for CorazaRoot {
                     for warning in generation.warnings() {
                         log_warn(warning);
                     }
+                    for notice in generation.notices() {
+                        log_warn(notice);
+                    }
+                    for switch in generation.switches() {
+                        log_info(switch);
+                    }
                 }
                 true
             },
@@ -178,7 +184,6 @@ fn log_warn(message: &str) {
 }
 
 /// Writes one informational line to the Envoy log.
-#[cfg(feature = "embed-crs")]
 fn log_info(message: &str) {
     hostcalls::log(LogLevel::Info, message).unwrap_or_default();
 }
@@ -236,8 +241,12 @@ mod tests {
         let mut root = root();
         root.apply(br#"{"directives_map": {"p": []}, "default_directives": "p"}"#)
             .expect("configuration is valid");
-        let rejected = root.apply(br#"{"directives_map": {"p": ["SecNotADirective x"]}}"#);
-        assert!(rejected.is_err(), "an invalid policy is rejected");
+        let rejected = root.apply(br#"{"directives_map": {"p": ["SecNotADirective x"]}, "default_directives": "p"}"#);
+        let error = rejected.expect_err("an invalid policy is rejected");
+        assert!(
+            error.contains("unknown directive \"SecNotADirective\""),
+            "the policy's own directive is the cause: {error}"
+        );
         assert!(
             root.current_generation()
                 .is_some_and(|generation| generation.select("a.example").is_some()),
@@ -269,10 +278,14 @@ mod tests {
         root.apply(br#"{"directives_map": {"p": []}, "default_directives": "p"}"#)
             .expect("configuration is valid");
         let compressed = STANDARD.encode(crate::config::gzip_fixture(
-            br#"{"directives_map": {"p": ["SecNotADirective x"]}}"#,
+            br#"{"directives_map": {"p": ["SecNotADirective x"]}, "default_directives": "p"}"#,
         ));
         let rejected = root.apply(format!(r#"{{"config_gzip_b64": "{compressed}"}}"#).as_bytes());
-        assert!(rejected.is_err(), "an invalid compressed policy is rejected");
+        let error = rejected.expect_err("an invalid compressed policy is rejected");
+        assert!(
+            error.contains("unknown directive \"SecNotADirective\""),
+            "the compressed policy's own directive is the cause: {error}"
+        );
         assert!(
             root.current_generation()
                 .is_some_and(|generation| generation.select("a.example").is_some()),
@@ -303,7 +316,7 @@ mod tests {
             "a second plugin has its own state"
         );
         second
-            .apply(br#"{"directives_map": {"q": []}}"#)
+            .apply(br#"{"directives_map": {"q": []}, "default_directives": "q"}"#)
             .expect("configuration is valid");
         assert!(
             first

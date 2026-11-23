@@ -27,7 +27,28 @@ are denied by CRS rule 949110 and that the unterminated multipart body is denied
 by rule 200002. The filter config sets
 `allow_on_headers_stop_iteration: true`; this HCM profile also requires
 `proxy_100_continue: false` because request headers stay paused while phase 1
-runs.
+runs. Both configurations set every Envoy setting marked "set" in the
+[Required Envoy configuration](../../envoy-coraza/README.md#required-envoy-configuration)
+table, such as `use_remote_address`, `strip_any_host_port` and `normalize_path`;
+that table lists every setting the filter depends on and what each one
+prevents. The runner fails when one of the
+settings that table says the example sets is missing, and checks that a
+client-supplied `X-Forwarded-For` does not reach
+`REMOTE_ADDR`, that respelled hosts (`reject.local.`, `reject.local:1`) keep
+their policy, that an invalid authority (`reject%2elocal`, two `Host` headers)
+is refused with 400, that dot segments and doubled slashes are resolved before
+the rules see the path, and that a header name with an underscore is refused.
+
+The built-in `@recommended-conf` no longer starts in `DetectionOnly`: a policy
+that includes it enforces unless it sets `SecRuleEngine DetectionOnly` itself.
+The example policies keep their explicit `SecRuleEngine On`. The `crs` policy's
+embedded CRS tree carries no rules 905100 and 905110. The CRS run checks that
+with the request rule 905110 exempts, an "internal dummy connection" `GET /`
+carrying a SQL injection, sent from inside the Envoy container so that its TCP
+peer, and `REMOTE_ADDR`, is 127.0.0.1: it is denied, and the `crs` policy's
+rule 107 logs that the rules saw the loopback address. With upstream's file the
+request would reach the backend. A second request claims 127.0.0.1 in
+`X-Forwarded-For` from outside and is denied too.
 
 The backend counts requests by path and supports deterministic body, header,
 limit, empty-response, and trailer cases. The runner checks byte-exact request
@@ -42,6 +63,47 @@ Trailer callbacks complete body phases and leave Envoy's trailer maps untouched.
 The locally pinned Go Coraza v3.8.1 public transaction API has no request or
 response trailer ingestion method and exports no `REQUEST_TRAILERS` or
 `RESPONSE_TRAILERS` variables, so trailer values are not Coraza rule inputs.
+
+## Upgrade notes: behaviour changes
+
+Read the connector's
+[upgrade notes](../../envoy-coraza/README.md#upgrade-notes-behaviour-changes)
+before reusing these files with other policies. For the request body:
+
+* A policy without a `SecRequestBodyAccess` line, such as `response-off` here,
+  now buffers and inspects request bodies. It holds a streaming request body
+  (gRPC streaming, a long chunked upload) until it ends, and refuses what
+  earlier builds streamed through uninspected; the reason is the
+  `inspection_reason` health property (see [Observability](#observability)),
+  and the filter logs no line for any of these:
+  * 413 for a body of `SecRequestBodyLimit` bytes or more under the default
+    `SecRequestBodyLimitAction Reject` in `SecRuleEngine On` (`denied`), and for
+    one over 16 MiB (`body_too_large`). A 20 MB upload to `off.local` that
+    earlier builds streamed through now gets 413;
+  * 413 for a multipart request with a file part in `SecRuleEngine On`
+    (`denied`, interruption `rule_id` 0): the filter has no filesystem, so the
+    engine refuses uploads. A multipart body its parser stopped in is refused
+    the same way;
+  * 413 for a URL-encoded body, or a JSON body that a rule parses as JSON (CRS
+    does for `application/*+json` and AWS JSON types), with more than
+    `SecArgumentsLimit` (1000) fields (`incomplete`);
+  * 415 for any request whose `Content-Encoding` is not `identity`
+    (`unsupported`).
+* `SecRequestBodyAccess Off` in a policy, or a phase-1
+  `ctl:requestBodyAccess=Off` rule scoped to the paths that need it, lets those
+  bodies through unread, reported as `request_body_not_inspected`, and is
+  logged at configure time. Do not key such a rule only on a request header
+  such as `Content-Type` or `Content-Encoding`: the client sends those, so any
+  client could switch inspection off; the connector's upgrade notes show
+  path-scoped rules. `SecArgumentsLimit` reads larger forms.
+  `SecRequestBodyLimit` goes up to 16777216, with the listener's
+  `per_connection_buffer_limit_bytes` and the route's
+  `request_body_buffer_limit` at least as large, as both files set them.
+* A policy that sets `SecRequestBodyLimit` above 16777216 without a
+  `SecRequestBodyAccess` line no longer loads: the filter logs
+  `rejected plugin configuration: policy "<name>" cannot run on this host:
+  SecRequestBodyLimit is <N> bytes, over the 16777216-byte WASM ceiling`. Lower
+  the limit, or add `SecRequestBodyAccess Off`.
 
 ## Compressed configuration
 
@@ -86,6 +148,7 @@ decimal `policy_generation`, `request_body_truncated`,
 `telemetry_publish_failed`. `inspection_reason` uses the closed set
 `complete`, `denied`, `unmatched_authority`, `engine_off`, `unsupported`,
 `incomplete`, `body_too_large`, `body_partially_inspected`,
+`body_memory_budget_stopped`, `request_body_not_inspected`,
 `retained_body_budget_exhausted`, `invalid_lifecycle`, `invalid_authority`,
 `upstream_failure_or_cancellation`, and `finalization_error`. The closed
 `terminal_outcome` set is `completed`, `denied`, `uninspected`, `unsupported`,

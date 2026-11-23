@@ -43,8 +43,29 @@ baseline a body the engine could not parse is neither inspected nor blocked:
   engine does not pick from the content type on its own.
 
 The file sets `SecRequestBodyInMemoryLimit` and `SecDataDir`, which need a
-filesystem. The envoy-coraza filter embeds a copy without those two directives
-as `@recommended-conf`.
+filesystem. The envoy-coraza filter embeds a copy without those two directives,
+and without its `SecRuleEngine DetectionOnly`, as `@recommended-conf`.
+
+### CRS rules 905100 and 905110
+
+CRS rules 905100 and 905110 are Apache exceptions that remove every CRS rule,
+and the audit record, for a loopback `REMOTE_ADDR` and the request line `GET /`
+(905100) or, with a `User-Agent` ending in `(internal dummy connection)`,
+`GET /` or `OPTIONS *` (905110). Behind a proxy the client may choose that
+address, and no proxy sends such requests itself. An embedder that loads the
+CRS removes them after the rules:
+
+```text
+Include /path/to/crs/crs-setup.conf
+Include /path/to/crs/rules/*.conf
+SecRuleRemoveById 905100 905110
+```
+
+The removal must come **after** `Include .../rules/*.conf`: placed before it,
+for example in `crs-setup.conf`, it removes nothing, because the rules do not
+exist yet. The envoy-coraza build with the embedded CRS already replaces the
+file that holds them with a comment-only stub; a deployment that supplies the
+CRS through `rule_data` adds the removal itself.
 
 ## Extension seams
 

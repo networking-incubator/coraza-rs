@@ -129,6 +129,42 @@ time.sleep(0.25)
 PY
 }
 
+# Sends `GET <path>` with two `Host: <host>` headers, which curl cannot, and prints the status code.
+duplicate_host_request() {
+    local url=$1
+    local host=$2
+    python3 - "$url" "$host" <<'PY'
+import socket
+import sys
+from urllib.parse import urlsplit
+
+url = urlsplit(sys.argv[1])
+host = sys.argv[2]
+connection = socket.create_connection((url.hostname, url.port), timeout=10)
+try:
+    connection.sendall(
+        f"GET {url.path} HTTP/1.1\r\nHost: {host}\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode("ascii")
+    )
+    response = b""
+    while chunk := connection.recv(4096):
+        response += chunk
+finally:
+    connection.close()
+print(response.split(b" ", 2)[1].decode("ascii"))
+PY
+}
+
+# Sends the request CRS rule 905110 exempts from inside the Envoy container, so that its TCP peer is 127.0.0.1, and
+# prints the status code.
+loopback_dummy_connection() {
+    # shellcheck disable=SC2016 # $status expands in the container's shell.
+    "${compose[@]}" exec -T envoy bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/10001
+        printf "GET / HTTP/1.1\r\nHost: crs.local\r\nUser-Agent: curl/8 (internal dummy connection)\r\nCookie: session=1 UNION SELECT password FROM users--\r\nConnection: close\r\n\r\n" >&3
+        read -r -t 10 _ status _ <&3
+        printf %s "$status"'
+}
+
 check_status() {
     local expected=$1
     local actual=$2
@@ -219,8 +255,16 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     export ENVOY_CORAZA_CONFIG="$script_dir/envoy-crs.yaml"
 fi
 
-grep --quiet --fixed-strings 'proxy_100_continue: false' "$ENVOY_CORAZA_CONFIG" \
-    || fail 'the HCM deployment invariant proxy_100_continue: false is missing'
+# Every setting envoy-coraza/README.md's "Required Envoy configuration" table says the example sets.
+for setting in 'failure_policy: FAIL_CLOSED' 'allow_on_headers_stop_iteration: true' 'proxy_100_continue: false' \
+    'use_remote_address: true' 'xff_num_trusted_hops: 0' 'strip_trailing_host_dot: true' 'strip_any_host_port: true' \
+    'normalize_path: true' 'merge_slashes: true' 'path_with_escaped_slashes_action: REJECT_REQUEST' \
+    'headers_with_underscores_action: REJECT_REQUEST' '- x-original-url' '- x-rewrite-url' \
+    'stream_idle_timeout: 60s' 'request_timeout: 60s' 'per_connection_buffer_limit_bytes: 16777216' \
+    'request_body_buffer_limit: 16777216'; do
+    grep --quiet --fixed-strings --regexp="$setting" "$ENVOY_CORAZA_CONFIG" \
+        || fail "$ENVOY_CORAZA_CONFIG lacks the required Envoy setting $setting"
+done
 
 "${compose[@]}" build backend
 "${compose[@]}" run --rm --no-deps envoy --mode validate -c /etc/envoy/envoy.yaml
@@ -280,6 +324,32 @@ check_status 403 "$status" 'phase-1 request denial'
 status=$(request "$temp_dir/response" http://127.0.0.1:10001/echo)
 check_status 200 "$status" 'allowed stream after request denial'
 
+# With use_remote_address, REMOTE_ADDR is the TCP peer: rule 106 denies 9.9.9.9, which a client can only claim.
+status=$(request "$temp_dir/response" --header 'X-Forwarded-For: 9.9.9.9' http://127.0.0.1:10001/echo)
+check_status 200 "$status" 'X-Forwarded-For does not choose REMOTE_ADDR'
+
+# Envoy resolves dot segments and merges slashes before the rules see the path, so rule 101 matches.
+for path in '/a/..;/phase1-deny' '//phase1-deny'; do
+    before=$(backend_count /phase1-deny)
+    status=$(request "$temp_dir/response" --path-as-is "http://127.0.0.1:10001$path")
+    check_status 403 "$status" "phase-1 denial of $path"
+    [[ $(backend_count /phase1-deny) == "$before" ]] || fail "$path reached the backend"
+done
+
+# A header name with an underscore is a different header to the rules and the same one to a CGI-style backend.
+before=$(backend_count /underscore)
+status=$(request "$temp_dir/response" --header 'X_Custom: 1' http://127.0.0.1:10001/underscore)
+check_status 400 "$status" 'header name with an underscore'
+[[ $(backend_count /underscore) == "$before" ]] || fail 'a header name with an underscore reached the backend'
+
+# An authority that is no registered name is refused rather than decoded or matched to another policy.
+before=$(backend_count /bad-authority)
+status=$(request "$temp_dir/response" --header 'Host: reject%2elocal' http://127.0.0.1:10001/bad-authority)
+check_status 400 "$status" 'percent-encoded authority'
+status=$(duplicate_host_request http://127.0.0.1:10001/bad-authority reject.local)
+check_status 400 "$status" 'two Host headers'
+[[ $(backend_count /bad-authority) == "$before" ]] || fail 'an invalid authority reached the backend'
+
 before=$(backend_count /phase1-deny)
 # Envoy rejects HTTP/1.0 requests without Host before they reach the filter.
 status=$(request "$temp_dir/no-authority" --http1.1 --header 'Host: unknown.local' \
@@ -316,6 +386,14 @@ for size in 31 32 33; do
     expected=200
     (( size >= 32 )) && expected=500
     check_status "$expected" "$status" "Reject response body at N=$size"
+done
+
+# Another spelling of reject.local still selects its policy.
+for host in reject.local. reject.local:1; do
+    status=$(request "$temp_dir/response" --header "Host: $host" \
+        --header 'content-type: application/x-www-form-urlencoded' \
+        --data-binary "@$temp_dir/request-33" http://127.0.0.1:10001/echo)
+    check_status 413 "$status" "Reject request body for Host: $host"
 done
 
 status=$(request "$temp_dir/response" --dump-header "$temp_dir/headers" \
@@ -413,6 +491,23 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     [[ $(backend_count /crs-sqli) == "$before" ]] \
         || fail 'embedded CRS sent a denied request to the backend'
     require_log '[id "949110"]'
+
+    # CRS rule 905110 removes every CRS rule for `GET /` from a loopback peer with a User-Agent ending in
+    # "(internal dummy connection)". The embedded tree carries a stub in its place, so such a request is inspected:
+    # with upstream's file this one would reach the backend. Rule 107 shows that the rules saw 127.0.0.1.
+    before=$(backend_count /)
+    status=$(loopback_dummy_connection)
+    check_status 403 "$status" 'embedded CRS inspects a dummy connection from a loopback peer'
+    require_rule_log / 107
+    [[ $(backend_count /) == "$before" ]] || fail 'a loopback dummy connection reached the backend uninspected'
+
+    # Nor can a client claim the loopback address in X-Forwarded-For.
+    before=$(backend_count /)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'X-Forwarded-For: 127.0.0.1' \
+        --user-agent 'curl/8 (internal dummy connection)' \
+        --cookie 'session=1 UNION SELECT password FROM users--' http://127.0.0.1:10001/)
+    check_status 403 "$status" 'embedded CRS inspects a dummy connection that claims a loopback address'
+    [[ $(backend_count /) == "$before" ]] || fail 'a dummy connection claiming loopback reached the backend uninspected'
 
     printf '{"name":"1%s OR %s1%s=%s1"}' "'" "'" "'" "'" >"$temp_dir/crs-json-sqli"
     before=$(backend_count /crs-json-sqli)
