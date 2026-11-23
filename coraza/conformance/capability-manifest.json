@@ -328,7 +328,8 @@
         "go_reference": "internal/operators/rx.go",
         "fixtures": [],
         "differences": [
-          "Go regexp and byte-regexp profiles have no exact Rust equivalent; syntax, Unicode folding and malformed-byte captures need shared fixtures."
+          "Go regexp and byte-regexp profiles have no exact Rust equivalent; syntax, Unicode folding and malformed-byte captures need shared fixtures.",
+          "A negated !@rx compiles as (?s), without the multi-line flag, so ^ and $ anchor the whole value; Go compiles every text pattern as (?sm). Byte-path patterns are dot-all and take the same multi-line choice, where Go compiles them without flags."
         ]
       },
       {
@@ -511,7 +512,9 @@
         "evaluator": "coraza/src/transformations/simple.rs:cmd_line",
         "go_reference": "internal/transformations/cmd_line.go",
         "fixtures": [],
-        "differences": []
+        "differences": [
+          "Removes the backtick, which Go keeps, except one backtick of a run whose next byte that is not removed or a backtick is ~, or that is all that is between a written ( and the next written ), or a written [ and the next written ], or whose last byte written before it is %."
+        ]
       },
       {
         "names": [

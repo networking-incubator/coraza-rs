@@ -52,10 +52,18 @@ pub(crate) fn parse_operator_in(input: &str, context: &OperatorContext<'_>) -> P
         .parse(input.trim())
         .map_err(|_error| CompileError::new("failed to parse operator syntax".to_owned()))?;
 
+    let negated = function.starts_with('!');
     let operator = OperatorEnum::with_context(name, argument, context)
+        .and_then(|operator| {
+            if negated {
+                operator.for_negated_rule(argument)
+            } else {
+                Ok(operator)
+            }
+        })
         .map_err(|error| CompileError::new(format!("failed to create @{name} operator: {error}")))?;
 
-    Ok(RuleOperator::new(operator, function.starts_with('!')))
+    Ok(RuleOperator::new(operator, negated))
 }
 
 /// Operator syntax after splitting its function name from its argument.
@@ -148,5 +156,40 @@ mod tests {
         for expression in ["@RX attack", "@rx attack", "@Rx attack"] {
             assert!(matches(expression, "an attack"), "{expression}");
         }
+    }
+
+    #[test]
+    fn negated_rx_anchors_the_whole_value() {
+        assert!(matches("@rx ^b$", "a\nb\nc"), "a positive rule keeps per-line anchors");
+        for expression in ["!@rx ^b$", "!@RX ^b$", "!^b$"] {
+            assert!(
+                matches(expression, "a\nb\nc"),
+                "{expression}: one matching line is not the value"
+            );
+            assert!(!matches(expression, "b"), "{expression}");
+        }
+    }
+
+    /// `!@rx ^[0-9]+$` is an allow-list: it must fire unless the whole value is digits.
+    #[test]
+    fn negated_anchored_rx_must_see_the_whole_value() {
+        let interrupting_rule = |value: &str| {
+            let mut parser = crate::seclang::Parser::new();
+            parser
+                .from_string("SecRuleEngine On\nSecRule ARGS:id \"!@rx ^[0-9]+$\" \"id:1,phase:1,deny\"")
+                .unwrap();
+            let waf = parser.compile().unwrap();
+            let mut tx = waf.new_transaction_with_id("negated-rx");
+            tx.add_get_argument("id", value);
+            tx.process_request_headers().map(|interruption| interruption.rule_id)
+        };
+        assert_eq!(interrupting_rule("123"), None, "digits pass");
+        assert_eq!(interrupting_rule("abc"), Some(1), "a non-number is refused");
+        assert_eq!(
+            interrupting_rule("123\n' OR 1=1--"),
+            Some(1),
+            "a harmless first line must not satisfy the allow-list"
+        );
+        assert_eq!(interrupting_rule("<script>\n1"), Some(1), "nor a harmless last line");
     }
 }

@@ -547,6 +547,28 @@ impl RuleVariable {
         self as u8
     }
 
+    /// The variables this one compiles to under multiphase evaluation, or `&[]` when it is not split.
+    ///
+    /// Each family keeps its own: `ARGS` splits into the value maps and `ARGS_NAMES` into the
+    /// names views, so a negation of one never reaches the other.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coraza::types::RuleVariable;
+    ///
+    /// let names = [RuleVariable::ArgsGetNames, RuleVariable::ArgsPostNames];
+    /// assert_eq!(RuleVariable::ArgsNames.multiphase_split(), names);
+    /// assert!(RuleVariable::ArgsGet.multiphase_split().is_empty());
+    /// ```
+    pub const fn multiphase_split(self) -> &'static [Self] {
+        match self {
+            Self::Args => &[Self::ArgsGet, Self::ArgsPost],
+            Self::ArgsNames => &[Self::ArgsGetNames, Self::ArgsPostNames],
+            _ => &[],
+        }
+    }
+
     /// Whether the variable accepts a collection key selector.
     pub const fn can_be_selected(self) -> bool {
         matches!(

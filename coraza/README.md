@@ -418,6 +418,14 @@ another operator:
   compiles its own schema instead of sharing Go's content-keyed memoizer. A
   `pattern` that cannot complete counts as a violation.
 
+`@rx` is dot-all: `.` matches a newline. A positive `@rx` is also multi-line,
+as in Go, so an anchored pattern matches when one line of the value does. A
+negated `!@rx` is not: `^` and `$` anchor the whole value, so
+`!@rx ^[0-9]+$` fires on `123` followed by a newline and `' OR 1=1--`, where Go
+stays silent. A negated rule that needs per-line anchors writes `(?m)`. A
+pattern with a `\xHH` escape that is not valid UTF-8 runs on raw bytes with the
+same flags; Go compiles that one without any flag.
+
 `Parser::register_operator` registers an embedder factory under a name, matched
 case-insensitively and consulted before the built-in names, so an embedder can
 add or override an operator. Registering the same name again replaces the
@@ -482,6 +490,11 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   (`inspect-file`), `Rbl` (`rbl`) and `ValidateSchema` (`validate-schema`). A
   match over `OperatorEnum` was already exhaustive over the built-in variants,
   so it needs the new arms, guarded by the same features.
+- `RuleVariable::multiphase_split` is a new public `const fn` that returns the
+  variables `ARGS` and `ARGS_NAMES` compile to under multiphase evaluation.
+  `OperatorEnum::for_negated_rule` is also new and public but hidden from
+  generated docs: it is for the rule parser and compiles the `argument` it is
+  given, not the operator's own pattern.
 - `CustomOperators` is now a struct with `insert`, `get`, `keys`, and
   `is_empty`, not a bare map.
 - `Transaction::finish` is new: it runs the logging phase, writes the audit

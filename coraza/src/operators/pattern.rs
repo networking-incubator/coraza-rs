@@ -32,7 +32,7 @@ use crate::{
     utils::strings::x2c,
 };
 
-/// Regular expression operator with Coraza's multiline and dotall defaults.
+/// Regular expression operator: dot-all, and multi-line unless the rule negates it.
 #[derive(Debug, Clone)]
 pub struct Rx {
     /// Compiled pattern.
@@ -49,18 +49,23 @@ enum CompiledRx {
 }
 
 impl CompiledRx {
-    /// Compile a pattern, enabling multiline and dotall behavior.
-    fn new(pattern: &str) -> Result<Self, regex::Error> {
+    /// Compile a pattern with dot-all, and with multi-line `^` and `$` when `multiline` is set.
+    ///
+    /// Both paths take the same flags. Go compiles text as `(?sm)` and a byte pattern raw.
+    fn new(pattern: &str, multiline: bool) -> Result<Self, regex::Error> {
         if spells_non_utf8_bytes(pattern) {
             // Byte-path Latin-1 folding under `(?i)` is not implemented.
             let pattern = unbrace_byte_escapes(&ascii_perl_classes(pattern));
             regex::bytes::RegexBuilder::new(&pattern)
                 .unicode(false)
+                .dot_matches_new_line(true)
+                .multi_line(multiline)
                 .build()
                 .map(Self::Bytes)
         } else {
             let pattern = ascii_perl_classes(pattern);
-            regex::Regex::new(&format!("(?sm){pattern}")).map(Self::Text)
+            let flags = if multiline { "(?sm)" } else { "(?s)" };
+            regex::Regex::new(&format!("{flags}{pattern}")).map(Self::Text)
         }
     }
 
@@ -442,14 +447,26 @@ impl Operator for Rx {
 /// Create a regular expression operator.
 ///
 /// The pattern is compiled verbatim when the rule loads, as Go's `newRX` does;
-/// `%{...}` is not expanded.
+/// `%{...}` is not expanded. `.` matches a newline, and `^` and `$` also match at
+/// each line, so an anchored pattern matches when one line of the value does.
 ///
 /// # Errors
 ///
 /// Returns an error for an invalid regular expression.
 pub fn rx(pattern: &str) -> Result<Rx, Box<dyn std::error::Error>> {
     Ok(Rx {
-        regex: CompiledRx::new(pattern)?,
+        regex: CompiledRx::new(pattern, true)?,
+    })
+}
+
+/// Create the regular expression operator of a negated rule (`!@rx`).
+///
+/// Unlike [`rx`], `^` and `$` anchor the whole value: a negated anchored pattern is an
+/// allow-list, and one matching line must not satisfy it. Without the multi-line flag a
+/// pattern only matches less, so the negated rule only fires more.
+pub(crate) fn rx_for_negated_rule(pattern: &str) -> Result<Rx, Box<dyn std::error::Error>> {
+    Ok(Rx {
+        regex: CompiledRx::new(pattern, false)?,
     })
 }
 
@@ -824,7 +841,7 @@ pub fn rest_path(template: &str) -> Result<RestPath, String> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "operator tests use fixed valid patterns")]
 mod tests {
-    use super::{Operator as _, Outputs, pm, rest_path, rx, strmatch, within};
+    use super::{Operator as _, Outputs, Rx, pm, rest_path, rx, rx_for_negated_rule, strmatch, within};
     use crate::transaction::Transaction;
 
     #[test]
@@ -836,12 +853,37 @@ mod tests {
     }
 
     #[test]
+    fn negated_rule_regex_anchors_the_whole_value_and_keeps_dotall() {
+        let tx = Transaction::new("operator-test");
+        let mut out = Outputs::default();
+        assert!(!rx_for_negated_rule("^b$").unwrap().evaluate(&tx, b"a\nb\nc", &mut out));
+        assert!(rx_for_negated_rule("^b$").unwrap().evaluate(&tx, b"b", &mut out));
+        assert!(
+            rx_for_negated_rule("hello.*world")
+                .unwrap()
+                .evaluate(&tx, b"hello\nworld", &mut out)
+        );
+        // The byte path takes the same flags.
+        assert!(rx(r"^\xff$").unwrap().evaluate(&tx, b"a\n\xff\nb", &mut out));
+        assert!(
+            !rx_for_negated_rule(r"^\xff$")
+                .unwrap()
+                .evaluate(&tx, b"a\n\xff\nb", &mut out)
+        );
+        assert!(
+            rx_for_negated_rule(r"\xff.*end")
+                .unwrap()
+                .evaluate(&tx, b"\xff\nend", &mut out)
+        );
+    }
+
+    #[test]
     fn regex_matches_non_utf8_byte_escapes() {
         let tx = Transaction::new("operator-test");
         let mut out = Outputs::default();
         assert!(rx(r"\xff").unwrap().evaluate(&tx, b"\xff", &mut out));
-        // Go's binaryregexp compiles the byte pattern raw, so dot does not cross a newline.
-        assert!(!rx(r"\xff.*end").unwrap().evaluate(&tx, b"\xff\nend", &mut out));
+        // Unlike Go's raw `binaryregexp`, the byte path is dot-all like the text path.
+        assert!(rx(r"\xff.*end").unwrap().evaluate(&tx, b"\xff\nend", &mut out));
         assert!(!rx(r"\xff").unwrap().evaluate(&tx, "\u{00ff}".as_bytes(), &mut out));
         assert!(rx(r"\\xff").unwrap().evaluate(&tx, br"\xff", &mut out));
     }
@@ -860,13 +902,140 @@ mod tests {
     }
 
     #[test]
-    fn byte_regexes_use_go_classes_and_default_flags() {
+    fn byte_regexes_use_go_classes_and_dotall() {
         let tx = Transaction::new("operator-test");
         let matches = |pattern: &str, input: &[u8]| rx(pattern).unwrap().evaluate(&tx, input, &mut Outputs::default());
 
         assert!(matches(r"\xff\S", b"\xff\x0b"), "Go's \\S includes vertical tab");
-        assert!(!matches(r"\xff.b", b"\xff\nb"));
+        assert!(matches(r"\xff.b", b"\xff\nb"));
         assert!(matches(r"\xff[a&&b]", b"\xff&"));
+    }
+
+    /// Values with a newline before, after and inside `bases`, as an attacker adds one.
+    fn with_newlines(bases: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut inputs = Vec::new();
+        for base in bases {
+            inputs.push(base.to_vec());
+            for (before, after) in [(&b"\n"[..], &b""[..]), (b"", b"\n"), (b"abc\n", b""), (b"", b"\nabc")] {
+                inputs.push([before, base, after].concat());
+            }
+            let mut middle = base.to_vec();
+            middle.insert(base.len() / 2, b'\n');
+            inputs.push(middle);
+            inputs.push(
+                base.iter()
+                    .map(|&byte| if byte == b' ' { b'\n' } else { byte })
+                    .collect(),
+            );
+        }
+        inputs
+    }
+
+    fn hits(operator: &Rx, input: &[u8]) -> bool {
+        operator.evaluate(&Transaction::new("operator-test"), input, &mut Outputs::default())
+    }
+
+    /// The distinct negated, anchored `@rx` patterns of CRS v4.30.0: dropping the multi-line flag
+    /// for a negated rule can only make the pattern match less, so the rule can only fire more.
+    #[test]
+    fn negated_rule_regex_never_matches_more_than_the_positive_one() {
+        const PATTERNS: [&str; 15] = [
+            r"(?i)^(?:connect (?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}\.?(?::[0-9]+)?|[\--9A-Z_a-z]+:[0-9]+)|options \*|[a-z]{3,10}[\s\x0b]+(?:[0-9A-Z_a-z]{3,7}?://[\--9A-Z_a-z]*(?::[0-9]+)?)?/[^#\?]*(?:\?[^\s\x0b#]*)?(?:#[^\s\x0b]*)?)[\s\x0b]+[\.-9A-Z_a-z]+$",
+            r#"(?i)^(?:&(?:(?:[acegilnorsuz]acut|[aeiou]grav|[aino]tild)e|[c-elnr-tz]caron|(?:[cgklnr-t]cedi|[aeiouy]um)l|[aceg-josuwy]circ|[au]ring|a(?:mp|pos)|nbsp|oslash);|[^"';=\x5c])*$"#,
+            r"^\d+$",
+            "^0?$",
+            "^OPTIONS$",
+            "^0$",
+            r#"^[\w/.+*-]+(?:\s?;\s*(?:action|boundary|charset|component|start(?:-info)?|type|version)\s?=\s?['"\w.()+,/:=?<>@#*-]+)*$"#,
+            r#"^(?:(?:\*|[^!"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*"?(?:iso-8859-15?|utf-8|windows-1252)\b"?|(?:[^\s\x0b-"\(\),/:-\?\[-\]c\{\}]|c(?:[^!"\(\),/:-\?\[-\]h\{\}]|h(?:[^!"\(\),/:-\?\[-\]a\{\}]|a(?:[^!"\(\),/:-\?\[-\]r\{\}]|r(?:[^!"\(\),/:-\?\[-\]s\{\}]|s(?:[^!"\(\),/:-\?\[-\]e\{\}]|e[^!"\(\),/:-\?\[-\]t\{\}]))))))[^!"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*(?:[\s\x0b]*,[\s\x0b]*(?:(?:\*|[^!"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*"?(?:iso-8859-15?|utf-8|windows-1252)\b"?|(?:[^\s\x0b-"\(\),/:-\?\[-\]c\{\}]|c(?:[^!"\(\),/:-\?\[-\]h\{\}]|h(?:[^!"\(\),/:-\?\[-\]a\{\}]|a(?:[^!"\(\),/:-\?\[-\]r\{\}]|r(?:[^!"\(\),/:-\?\[-\]s\{\}]|s(?:[^!"\(\),/:-\?\[-\]e\{\}]|e[^!"\(\),/:-\?\[-\]t\{\}]))))))[^!"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*)*$"#,
+            "^(?:OPTIONS|CONNECT)$",
+            r"^(?:(?:max-age=[0-9]+|min-fresh=[0-9]+|no-cache|no-store|no-transform|only-if-cached|max-stale(?:=[0-9]+)?)(?:\s*\,\s*|$)){1,7}$",
+            r"br|compress|deflate|(?:pack200-)?gzip|identity|\*|^$|aes128gcm|exi|zstd|x-(?:compress|gzip)",
+            r"^(?:\?[01])?$",
+            r"^[,\-0-9=A-Z_a-z]+$",
+            r"^(?:ey[\-0-9A-Z_a-z]+\.ey[\-0-9A-Z_a-z]+\.)?[\-0-9A-Z_a-z]+$",
+            "^404$",
+        ];
+        let inputs = with_newlines(&[
+            b"123",
+            b"0",
+            b"",
+            b"abc",
+            b"x' or 1=1-- .jpg",
+            b"x,0x41'",
+            b"1;--",
+            b"GET / HTTP/1.1",
+            b"OPTIONS",
+            b"text/html;q=0.9",
+            b"no-cache, max-age=0",
+            b"gzip",
+            b"?1",
+            b"eyJ.eyJ.sig",
+            b"404",
+        ]);
+        let mut differ = 0;
+        for pattern in PATTERNS {
+            let (positive, negated) = (rx(pattern).unwrap(), rx_for_negated_rule(pattern).unwrap());
+            for input in &inputs {
+                let (wide, whole) = (hits(&positive, input), hits(&negated, input));
+                assert!(
+                    !whole || wide,
+                    "{pattern}: matches only without the multi-line flag on {input:?}"
+                );
+                differ += usize::from(wide != whole);
+            }
+        }
+        assert!(differ > 0, "the inputs must exercise a value where the flags differ");
+    }
+
+    /// The CRS v4.30.0 `@rx` patterns that take the byte path: dot-all closes the 933180 newline
+    /// bypass, and each flag added on that path only widens what the pattern matches.
+    #[test]
+    fn byte_path_dotall_compiles_closes_933180_and_is_monotone() {
+        const CLASS: &str = r"[!-\+\-:->@\[\]\^`\{-~]|\x{c2}\x{b4}|\x{e2}\x80[\x98\x99]";
+        const REST: &str = r"[^!-\+\-:->@\[\]\^`\{-~]*?";
+        let sql_char_runs = [12, 8, 6, 3, 2].map(|count| format!("((?:(?:{CLASS}){REST}){{{count}}})"));
+        let php_call = r"\$+(?:[A-Z_a-z\x7f-\x{ff}][0-9A-Z_a-z\x7f-\x{ff}]*|[\s\x0b]*\{[^\}]+\})(?:[\s\x0b]|\[(?:[^\[\]]|\[[^\]]+\])+\]|\{[^\}]+\}|/(?:\*[^\*]*\*+(?:[^\*/][^\*]*\*+)*/|/[^\n\r]*[\n\r])|#[^\n\r]*[\n\r])*\(.*\)";
+        let mut patterns = vec![
+            php_call,
+            r"(?i)(?:a(?:cap|f[ps]|ttachment)|b(?:eshare|itcoin|lob)|c(?:a(?:llto|p)|id|vs|ompress.(?:zlib|bzip2))|d(?:a(?:v|ta)|ict|n(?:s|tp))|e(?:d2k|xpect)|f(?:(?:ee)?d|i(?:le|nger|sh)|tps?)|g(?:it|o(?:pher)?|lob)|h(?:323|ttps?)|i(?:ax|cap|(?:ma|p)ps?|rc[6s]?)|ja(?:bbe)?r|l(?:dap[is]?|ocal_file)|m(?:a(?:ilto|ven)|ms|umble)|n(?:e(?:tdoc|ws)|fs|ntps?)|ogg|p(?:aparazzi|h(?:ar|p)|op(?:2|3s?)|r(?:es|oxy)|syc)|r(?:mi|sync|tm(?:f?p)?|ar)|s(?:3|ftp|ips?|m(?:[bs]|tps?)|n(?:ews|mp)|sh(?:2(?:.(?:s(?:hell|(?:ft|c)p)|exec|tunnel))?)?|vn(?:\+ssh)?)|t(?:e(?:amspeak|lnet)|ftp|urns?)|u(?:dp|nreal|t2004)|v(?:entrilo|iew-source|nc)|w(?:ebcal|ss?)|x(?:mpp|ri)|zip):/?/?(?:[0-9]{7,10}|(?:0x[0-9a-f]{2}\.){3}0x[0-9a-f]{2}|0x(?:[0-9a-f]{8}|[0-9a-f]{16})|(?:0{1,4}[0-9]{1,3}\.){3}0{1,4}[0-9]{1,3}|[0-9]{1,3}\.(?:[0-9]{1,3}\.[0-9]{5}|[0-9]{8})|(?:\x5c\x5c[\-0-9a-z]\.?_?)+|\[[0-:a-f]+(?:[\.0-9]+|%[0-9A-Z_a-z]+)?\]|[a-z][\-\.0-9A-Z_a-z]{1,255}:[0-9]{1,5}(?:#?[\s\x0b]*&?@(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[a-z][\-\.0-9A-Z_a-z]{1,255}):[0-9]{1,5}/?)+|[\.0-9]{0,11}(?:\x{e2}(?:\x91[\xa0-\x{bf}]|\x92[\x80-\x{bf}]|\x93[\x80-\x{a9}\x{ab}-\x{bf}])|\x{e3}\x80\x82)+)",
+            r"\x{bc}[^>\x{be}]*[>\x{be}]|<[^\x{be}]*\x{be}",
+            r"\x{bc}[\s\x0b]*/[\s\x0b]*[^>\x{be}]*[>\x{be}]|<[\s\x0b]*/[\s\x0b]*[^\x{be}]*\x{be}",
+            r"\xac\xed\x00\x05",
+        ];
+        patterns.extend(sql_char_runs.iter().map(String::as_str));
+        let inputs = with_newlines(&[
+            b"$f('id')",
+            b"$_GET[a]($_GET[b])",
+            b"x,0x41'",
+            b"<script>alert(1)</script>",
+            b"\xbcscript\xbe",
+            b"gopher://127.0.0.1:70/x",
+            b"\xac\xed\x00\x05",
+            b"\xff\xfe\x80 \xc2\xb4 \xe2\x80\x98",
+            b"union select 1 from dual",
+        ]);
+        for pattern in &patterns {
+            // `(?-s)` restores the flagless compile this path used before.
+            let raw = rx_for_negated_rule(&format!("(?-s){pattern}")).unwrap();
+            let (dotall, both) = (rx_for_negated_rule(pattern).unwrap(), rx(pattern).unwrap());
+            for input in &inputs {
+                let (r, d, b) = (hits(&raw, input), hits(&dotall, input), hits(&both, input));
+                assert!(!r || d, "{pattern}: matches without dot-all only, on {input:?}");
+                assert!(
+                    !d || b,
+                    "{pattern}: matches without the multi-line flag only, on {input:?}"
+                );
+            }
+        }
+        assert!(
+            !hits(&rx(&format!("(?-s){php_call}")).unwrap(), b"$f(\n'id')"),
+            "the flagless compile missed it"
+        );
+        assert!(
+            hits(&rx(php_call).unwrap(), b"$f(\n'id')"),
+            "933180 sees a call split by a newline"
+        );
     }
 
     #[test]

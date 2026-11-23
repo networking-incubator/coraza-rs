@@ -408,6 +408,29 @@ impl OperatorEnum {
         }
     }
 
+    /// The operator of a negated rule (`!@NAME`), as the rule parser compiles it.
+    ///
+    /// A built-in `@rx` is rebuilt from `argument` without the multi-line flag, so `^` and
+    /// `$` anchor the whole value; every other operator, a registered custom `rx` included,
+    /// is returned unchanged.
+    ///
+    /// `argument` must be the argument `self` was built from: the regex is compiled from it,
+    /// not from the operator. Public only because `coraza-fuzz` compiles `operator_parser.rs`
+    /// by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid regular expression.
+    #[doc(hidden)]
+    pub fn for_negated_rule(self, argument: &str) -> Result<Self, String> {
+        match self {
+            Self::Rx(_) => pattern::rx_for_negated_rule(argument)
+                .map(Self::Rx)
+                .map_err(|error| error.to_string()),
+            operator => Ok(operator),
+        }
+    }
+
     /// Whether this host operator must fail closed when it cannot inspect a value.
     pub(crate) fn fails_closed_on_not_inspected(&self) -> bool {
         match self {

@@ -58,8 +58,9 @@ pub(crate) fn parse_variables_in(input: &str) -> ParseResult<Vec<VariableSpec>> 
 
 /// Parse variable expressions under the selected multiphase compilation mode.
 ///
-/// In multiphase, a negated selector excludes across the argument families the rule's
-/// variables are split into, as Go does when it compiles the rule for early phases.
+/// In multiphase, a negated selector excludes from the variables its own family is split
+/// into, as the runtime `ctl:ruleRemoveTarget*` path does: `!ARGS_NAMES:x` leaves the
+/// values of `x` inspected. Go's load-time path applies it to both families.
 pub(crate) fn parse_variables_in_mode(input: &str, multiphase: bool) -> ParseResult<Vec<VariableSpec>> {
     let mut variables = Vec::new();
     VariableList::parse(input)?.apply_to(&mut variables, multiphase);
@@ -107,17 +108,7 @@ impl VariableList {
                 Element::Exclude(variable, key) => {
                     for spec in variables.iter_mut().filter(|spec| {
                         spec.variable() == *variable
-                            || (multiphase
-                                && matches!(
-                                    (*variable, spec.variable()),
-                                    (
-                                        RuleVariable::Args | RuleVariable::ArgsNames,
-                                        RuleVariable::ArgsGet
-                                            | RuleVariable::ArgsPost
-                                            | RuleVariable::ArgsGetNames
-                                            | RuleVariable::ArgsPostNames
-                                    )
-                                ))
+                            || (multiphase && variable.multiphase_split().contains(&spec.variable()))
                     }) {
                         match key {
                             Some(VariableKey::String(key)) => spec.add_exception_string(key),
@@ -707,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn args_negation_excludes_cross_family_names_variants() {
+    fn args_negation_leaves_the_names_family_alone() {
         let list = VariableList::parse("ARGS_GET_NAMES|!ARGS:foo").expect("test variable list is valid");
         let mut variables = Vec::new();
         list.apply_to(&mut variables, true);
@@ -716,10 +707,91 @@ mod tests {
         assert_eq!(spec.variable(), RuleVariable::ArgsGetNames);
         let mut get_args = Map::new(RuleVariable::ArgsGet);
         get_args.add("foo", b"bar");
-        assert!(
-            spec.get_matches(Some(CollectionView::Names(RuleVariable::ArgsGetNames, &get_args)))
-                .is_empty()
+        let names = spec.get_matches(Some(CollectionView::Names(RuleVariable::ArgsGetNames, &get_args)));
+        assert_eq!(names.first().map(|matched| matched.value.as_slice()), Some(&b"foo"[..]));
+    }
+
+    /// The interrupting rule for one form POST through `rules`, compiled with or without multiphase.
+    fn interrupting_rule(rules: &str, multiphase: bool, uri: &str, body: &[u8]) -> Option<i32> {
+        let mut parser = crate::seclang::Parser::new();
+        parser.config_mut().multiphase_evaluation = multiphase;
+        parser.from_string(rules).expect("test rules compile");
+        let waf = parser.into_waf().expect("test WAF compiles");
+        let mut tx = waf.new_transaction();
+        tx.process_uri(uri, "POST", "HTTP/1.1");
+        tx.add_request_header("Host", "h");
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        if tx.process_request_headers().is_none() {
+            tx.process_request_body(body);
+        }
+        tx.interruption().map(|interruption| interruption.rule_id)
+    }
+
+    const NAMES_EXCLUSION: &str = "SecRule ARGS|ARGS_NAMES \"@contains attack\" \"id:1,phase:2,deny\"\n\
+                                   SecRuleUpdateTargetById 1 \"!ARGS_NAMES:/^profile/\"\n";
+
+    #[test]
+    fn baseline_names_exclusion_keeps_the_value_inspected() {
+        assert_eq!(
+            interrupting_rule(NAMES_EXCLUSION, false, "/?profile=attack", b""),
+            Some(1)
         );
+    }
+
+    #[test]
+    fn names_exclusion_keeps_the_value_inspected_under_multiphase() {
+        assert_eq!(
+            interrupting_rule(NAMES_EXCLUSION, true, "/?profile=attack", b""),
+            Some(1),
+            "a names-only exclusion must not stop inspection of the value"
+        );
+    }
+
+    #[test]
+    fn inline_names_exclusion_keeps_the_value_inspected_under_multiphase() {
+        let rules = "SecRule ARGS|ARGS_NAMES|!ARGS_NAMES:/^profile/ \"@contains attack\" \"id:1,phase:2,deny\"\n";
+        assert_eq!(interrupting_rule(rules, true, "/?profile=attack", b""), Some(1));
+    }
+
+    #[test]
+    fn value_exclusion_keeps_the_name_inspected_under_multiphase() {
+        let rules = "SecRule ARGS|ARGS_NAMES|!ARGS:/^c/ \"@contains attack\" \"id:1,phase:2,deny\"\n";
+        assert_eq!(
+            interrupting_rule(rules, true, "/?cattack=1", b""),
+            Some(1),
+            "a value exclusion must not stop inspection of the name"
+        );
+    }
+
+    const TAGGED_RULE: &str =
+        "SecRequestBodyAccess On\nSecRule ARGS_NAMES|ARGS \"@contains attack\" \"id:7,phase:2,deny,tag:'t'\"\n";
+
+    #[test]
+    fn tag_names_exclusion_keeps_get_and_post_values_inspected_under_multiphase() {
+        let rules = format!("{TAGGED_RULE}SecRuleUpdateTargetByTag t \"!ARGS_NAMES:/^filter\\[/\"\n");
+        for multiphase in [false, true] {
+            assert_eq!(
+                interrupting_rule(&rules, multiphase, "/?filter[a]=attack", b""),
+                Some(7),
+                "GET value, multiphase={multiphase}"
+            );
+            assert_eq!(
+                interrupting_rule(&rules, multiphase, "/", b"filter[a]=attack"),
+                Some(7),
+                "POST value, multiphase={multiphase}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_time_and_ctl_names_exclusions_agree_under_multiphase() {
+        let ctl = format!(
+            "SecAction \"id:1,phase:1,pass,nolog,ctl:ruleRemoveTargetById=7;ARGS_NAMES:/^filter\\[/\"\n{TAGGED_RULE}"
+        );
+        let update = format!("{TAGGED_RULE}SecRuleUpdateTargetById 7 \"!ARGS_NAMES:/^filter\\[/\"\n");
+        let by_ctl = interrupting_rule(&ctl, true, "/", b"filter[a]=attack");
+        assert_eq!(by_ctl, Some(7), "the ctl path maps by family");
+        assert_eq!(interrupting_rule(&update, true, "/", b"filter[a]=attack"), by_ctl);
     }
 
     #[test]
