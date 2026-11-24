@@ -51,6 +51,14 @@ impl Single {
     /// Set a value assembled from a prefix, separator, and suffix.
     pub(crate) fn set_joined(&mut self, prefix: &[u8], separator: &[u8], suffix: &[u8]) {
         self.data.clear();
+        // One growth, to what the whole needs: a charge for this buffer is for one, and three appends grow it up to
+        // three.
+        self.data.reserve(
+            prefix
+                .len()
+                .saturating_add(separator.len())
+                .saturating_add(suffix.len()),
+        );
         self.data.extend_from_slice(prefix);
         self.data.extend_from_slice(separator);
         self.data.extend_from_slice(suffix);

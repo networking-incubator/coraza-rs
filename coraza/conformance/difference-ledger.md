@@ -262,6 +262,34 @@ adding them requires a shared-corpus fixture first.
   lists every match. This is a deliberate deviation with no engine case ID or
   fixture hash yet.
 
+- Match text cap. Go Coraza keeps the whole expansion of a rule's `msg` and
+  `logdata` in every match, so CRS's `logdata`, which expands `%{MATCHED_VAR}`,
+  keeps a second copy of the matched value in each of them; this engine cuts
+  each to 4096 bytes at a character boundary in `MatchData`, and in `RULE:msg`
+  and `RULE:logdata`, and keeps `MatchData::value` and what `setvar` and
+  `capture` store whole (`coraza/src/rules/rule.rs`). What the audit log's part
+  `K` and `matched_rules()` report of a match whose text is longer is shorter
+  here. The cut applies without a memory budget too, and a rule that compares
+  with or copies `%{RULE.msg}` or `%{RULE.logdata}` reads the cut text, so its
+  verdict can differ from Go's for a longer one (CRS has no such rule).
+- Rule evaluation memory budget. Go Coraza has no memory budget. With
+  `Transaction::set_body_memory_budget` set, the rules of the body phase are
+  charged what they keep, before they allocate it, and a charge that does not
+  fit interrupts the transaction with status 503 and ends rule evaluation for
+  the transaction, including phase 5 logging rules, where Go evaluates every
+  rule (`coraza/src/transaction.rs`, `coraza/src/rules/rule.rs`). The actions
+  of the rule that was running that come after the charge do not run, and the
+  audit entry is written if the audit configuration selects it, judged without
+  the phase 5 rules. A host reads `rule_evaluation_stopped_by_memory_budget()`,
+  the signal in every engine mode: the returned interruption follows the engine
+  mode, so the return value of the body phase is `None` in `DetectionOnly`,
+  where the stop is the would-be interruption, and when a rule switched the
+  engine `Off` before the refused charge (`ctl:ruleEngine=Off`), where no
+  further rule runs either. The Envoy connector refuses from the flag in every
+  mode. What a custom body processor publishes is
+  taken from the budget the rules have left. Without a budget, the crate's
+  default, nothing differs.
+
 ## Rust-only multipart parser hardening budgets
 
 The multipart parser fails closed with `ParseError::Limit` when a body exceeds

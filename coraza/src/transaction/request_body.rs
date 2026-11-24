@@ -72,6 +72,7 @@ impl Transaction {
             return self.interruption.clone();
         }
 
+        let held_before = self.processor_memory_before_body();
         let mut ingest_error = false;
         if self.request_body_access && !body.is_empty() {
             // A conversion failure must not disable inspection: fail closed with the
@@ -147,7 +148,9 @@ impl Transaction {
             }
         }
 
+        self.arm_rule_budget(held_before, true);
         self.run_phase(RulePhase::RequestBody);
+        self.computed.rule_budget.disarm();
         if self.computed.unchecked_multipart_upload {
             self.computed.unchecked_multipart_upload = false;
             if self.interruption.is_none() {

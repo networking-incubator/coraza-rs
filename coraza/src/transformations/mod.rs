@@ -71,6 +71,17 @@ pub(crate) fn text_of(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// [`text_of`] for the first `room` bytes of the text, converting no more of `bytes` than they come from: a megabyte
+/// that is not UTF-8 is not made three megabytes of text to be cut at once.
+///
+/// A byte makes at least one byte of text, so a character that starts before `room` in the text starts before `room`
+/// in `bytes`, and it ends within three bytes past it. The text of the first `room + 3` bytes is therefore the whole
+/// text up to the first character that starts at or after `room`, which is all that a cut at the character boundary at
+/// or before `room` keeps: only the character that the end of the prefix splits can differ, and it starts there.
+pub(crate) fn text_of_prefix(bytes: &[u8], room: usize) -> std::borrow::Cow<'_, str> {
+    text_of(bytes.get(..room.saturating_add(3)).unwrap_or(bytes))
+}
+
 /// Text for regular expression matching that maps matches back to input bytes.
 ///
 /// Valid UTF-8 stays borrowed. Otherwise each invalid byte becomes one U+FFFD,
@@ -200,7 +211,54 @@ impl std::error::Error for TransformationError {}
 #[cfg(test)]
 #[expect(clippy::panic, reason = "reachability test uses fixed rules")]
 mod tests {
+    use super::{text_of, text_of_prefix};
     use crate::seclang::Parser;
+
+    /// What a cut at `room` keeps of `text`: its first `room` bytes, to the character boundary at or before them.
+    fn cut(text: &str, room: usize) -> &str {
+        text.get(..text.floor_char_boundary(room)).unwrap_or_default()
+    }
+
+    /// The text of a prefix is the whole text as far as a cut keeps it, for every value of up to six bytes made of
+    /// bytes that start, continue and spoil characters of one to four bytes, at every cut that can split one.
+    #[test]
+    fn the_text_of_a_prefix_is_the_whole_text_as_far_as_the_cut_keeps_it() {
+        const ALPHABET: [u8; 9] = [b'a', 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0xFF];
+        let mut value = Vec::new();
+        let mut checked = 0_usize;
+        // Counts in base 9, one digit per byte, for each length up to six.
+        for length in 0..=6_u32 {
+            for number in 0..ALPHABET.len().pow(length) {
+                value.clear();
+                let mut rest = number;
+                for _ in 0..length {
+                    value.extend(ALPHABET.get(rest % ALPHABET.len()));
+                    rest /= ALPHABET.len();
+                }
+                let whole = text_of(&value);
+                for room in 0..=4 {
+                    let prefix = text_of_prefix(&value, room);
+                    assert_eq!(cut(&prefix, room), cut(&whole, room), "{value:02x?} cut at {room}");
+                    // The caller cuts only a text longer than the room, so that must not depend on the prefix.
+                    assert_eq!(prefix.len() > room, whole.len() > room, "{value:02x?} cut at {room}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 2_000_000, "{checked}");
+    }
+
+    /// Only the bytes that survive the cut are converted: a value that fits in the room is converted whole, a longer
+    /// one is not.
+    #[test]
+    fn a_prefix_converts_only_the_bytes_that_survive_the_cut() {
+        let value = vec![0xFF; 1_000_000];
+        assert_eq!(text_of_prefix(&value, 4096).len(), 3 * (4096 + 3));
+        assert_eq!(text_of_prefix(&value, usize::MAX), text_of(&value));
+        assert_eq!(text_of_prefix(b"ab\xFF", 4096), "ab\u{fffd}");
+        // A valid value is cut inside a character at most, which costs the few bytes of one more.
+        assert!(text_of_prefix("\u{e9}".repeat(1_000_000).as_bytes(), 4096).len() <= 4096 + 6);
+    }
 
     /// Proves each new transformation is reachable from a `SecRule` and affects detection.
     #[test]

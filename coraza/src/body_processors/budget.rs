@@ -21,7 +21,10 @@
 //! here turn what a parser is about to store into the bytes [`crate::transaction::Transaction::body_memory_bytes`]
 //! would later count for it, so that the budget and the authoritative accounting agree.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+};
 
 use crate::collection::{Growth, Map, VALUE_ENTRY_BYTES, allocation_bytes, grown_list_capacity, key_bytes};
 
@@ -85,6 +88,245 @@ impl MemoryBudget {
     }
 }
 
+/// What the rules of a body phase may still hold, under the budget a connector set for it.
+///
+/// It is armed for the rules of one call of `process_request_body` or `process_response_body`, with what the budget
+/// has left once that body is parsed, and disarmed after them. While it is armed, rule evaluation charges what it
+/// allocates and keeps (a match with its text, the `TX` entries `setvar` and `capture` write, the values `MATCHED_VARS`
+/// copies) before it allocates it, and stops, fail closed, at the first charge that does not fit. Disarmed, which is
+/// the engine's behaviour without a connector budget, a charge is one branch that says yes.
+///
+/// A charge needs only `&self`, because rules select the values they inspect by borrowing the transaction, and the
+/// bytes of a match are charged while that borrow is held.
+#[derive(Debug, Default)]
+pub(crate) struct RuleBudget {
+    /// Whether a budget is in force.
+    armed: bool,
+    /// Bytes left while armed.
+    remaining: AtomicUsize,
+    /// Whether a charge did not fit, until the transaction is reset. It outlives the phase it ended, and arming the
+    /// budget again for a later body phase keeps it: rule evaluation is over for the transaction, the logging phase
+    /// included, since the request is already refused and a rule that ran would allocate with the budget spent.
+    stopped: AtomicBool,
+    /// What the rule being evaluated has charged for the matches it holds, which stay charged if it is recorded and
+    /// are given back if it is not.
+    pending: AtomicUsize,
+    /// What the rule being evaluated has charged for copies and lists that are gone when it ends.
+    scratch: AtomicUsize,
+    /// What is charged for the entries of `MATCHED_VARS`, given back when the next rule clears them, and the table
+    /// that held them before the budget was armed, which a clear keeps.
+    matched_vars: AtomicUsize,
+    /// The capture keys `TX:0` to `TX:9` that a rule removed since they were last made again, one bit for each. The
+    /// removal gave back what they held, so the next capture or the reset before the next rule charges them if it has
+    /// to make them again. It outlives the budget being armed, so later recreation is still accounted for.
+    removed_captures: u16,
+}
+
+impl RuleBudget {
+    /// Puts `remaining` bytes in force for the rules that follow. `matched_vars_table` is what the table of
+    /// `MATCHED_VARS` already holds: it is not charged, and clearing the entries does not give it back.
+    pub(crate) fn arm(&mut self, remaining: usize, matched_vars_table: usize) {
+        self.armed = true;
+        *self.remaining.get_mut() = remaining;
+        *self.pending.get_mut() = 0;
+        *self.scratch.get_mut() = 0;
+        *self.matched_vars.get_mut() = matched_vars_table;
+    }
+
+    /// Notes that a rule removed `TX:key`, which matters if a later capture or rule reset must remake that key.
+    pub(crate) fn note_removed(&mut self, key: &str) {
+        if let [digit @ b'0'..=b'9'] = key.as_bytes() {
+            self.removed_captures |= 1_u16.wrapping_shl(u32::from(digit.saturating_sub(b'0')));
+        }
+    }
+
+    /// The capture keys removed since the last call, one bit for each, lowest for `TX:0`: the next capture or rule
+    /// reset makes them again.
+    pub(crate) fn take_removed_captures(&mut self) -> u16 {
+        std::mem::take(&mut self.removed_captures)
+    }
+
+    /// Ends the budget of the rules of a phase; a stop stays reported.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Back to the state of a transaction that never had a budget.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Bytes left, which the rules of a test read.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining.load(Relaxed)
+    }
+
+    /// Whether a budget is in force.
+    pub(crate) const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Whether a charge was refused.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Relaxed)
+    }
+
+    /// Reserves `bytes` if they fit, and reports whether they did. A refused charge reserves nothing and stops the
+    /// evaluation, and nothing fits after it: what the evaluation was about to do next is not done.
+    pub(crate) fn charge(&self, bytes: usize) -> bool {
+        if !self.armed {
+            return true;
+        }
+        if self.stopped.load(Relaxed) {
+            return false;
+        }
+        let Some(left) = self.remaining.load(Relaxed).checked_sub(bytes) else {
+            self.stopped.store(true, Relaxed);
+            return false;
+        };
+        self.remaining.store(left, Relaxed);
+        true
+    }
+
+    /// Gives `bytes` back.
+    pub(crate) fn refund(&self, bytes: usize) {
+        if self.armed && bytes > 0 {
+            add(&self.remaining, bytes);
+        }
+    }
+
+    /// [`RuleBudget::charge`] for a match the rule being evaluated holds until it is recorded or dropped.
+    pub(crate) fn charge_pending(&self, bytes: usize) -> bool {
+        let fits = self.charge(bytes);
+        if fits && self.armed {
+            add(&self.pending, bytes);
+        }
+        fits
+    }
+
+    /// [`RuleBudget::charge`] for a copy or a list that is gone when the rule being evaluated ends.
+    pub(crate) fn charge_scratch(&self, bytes: usize) -> bool {
+        let fits = self.charge(bytes);
+        if fits && self.armed {
+            add(&self.scratch, bytes);
+        }
+        fits
+    }
+
+    /// [`RuleBudget::charge`] for what `MATCHED_VARS` copies: the peak of the change is charged, and what it frees
+    /// given back at once.
+    pub(crate) fn charge_matched_vars(&self, growth: Growth) -> bool {
+        self.charge_growth(growth, &self.matched_vars)
+    }
+
+    /// [`RuleBudget::charge`] for a list that grows while the rule being evaluated builds it, and is gone when the
+    /// rule ends: the peak of the growth, which holds the list beside the one it replaces, is charged before the
+    /// list grows, and the old one given back at once, so that the list never holds more than the budget allowed.
+    pub(crate) fn charge_scratch_growth(&self, growth: Growth) -> bool {
+        self.charge_growth(growth, &self.scratch)
+    }
+
+    /// Charges the peak of `growth`, gives back what it frees, and files the net under `held`.
+    fn charge_growth(&self, growth: Growth, held: &AtomicUsize) -> bool {
+        let fits = self.charge(growth.grown);
+        if fits && self.armed {
+            self.refund(growth.freed);
+            add(held, growth.grown.saturating_sub(growth.freed));
+        }
+        fits
+    }
+
+    /// Gives back what was charged for matches the rule being evaluated dropped.
+    pub(crate) fn release_pending(&self, bytes: usize) {
+        if self.armed {
+            self.refund(take(&self.pending, bytes));
+        }
+    }
+
+    /// Gives back what was charged for a copy the rule being evaluated has dropped before it is done.
+    pub(crate) fn release_scratch(&self, bytes: usize) {
+        if self.armed {
+            self.refund(take(&self.scratch, bytes));
+        }
+    }
+
+    /// The matches of the rule are recorded: what was charged for them stays charged.
+    pub(crate) fn keep_pending(&self) {
+        self.pending.store(0, Relaxed);
+    }
+
+    /// The rule is done: what it held that is gone is given back.
+    pub(crate) fn end_rule(&self) {
+        if self.armed {
+            self.refund(take(&self.pending, usize::MAX));
+            self.refund(take(&self.scratch, usize::MAX));
+        }
+    }
+
+    /// `MATCHED_VARS` was cleared, and keeps `kept` bytes (the table that held its entries): the rest is given back.
+    pub(crate) fn matched_vars_cleared(&self, kept: usize) {
+        if self.armed {
+            let charged = self.matched_vars.load(Relaxed);
+            self.refund(charged.saturating_sub(kept));
+            self.matched_vars.store(charged.min(kept), Relaxed);
+        }
+    }
+}
+
+/// Adds `bytes` to `counter`. Every charge comes from the one thread that evaluates the rules of a transaction, which
+/// holds it mutably, so a load and a store do: the counters are atomic only so that a transaction stays `Sync`, and
+/// the read-modify-write of an atomic would be paid on every charge.
+fn add(counter: &AtomicUsize, bytes: usize) {
+    counter.store(counter.load(Relaxed).saturating_add(bytes), Relaxed);
+}
+
+/// Takes up to `bytes` from `counter`, and returns what it took.
+fn take(counter: &AtomicUsize, bytes: usize) -> usize {
+    let held = counter.load(Relaxed);
+    let taken = held.min(bytes);
+    counter.store(held - taken, Relaxed);
+    taken
+}
+
+/// What pushing one element of `element` bytes onto a `Vec` of `len` elements and `capacity` slots allocates, and what
+/// it frees: nothing while there is room, and otherwise the list that replaces this one, which is held beside it for
+/// the moment of the copy.
+pub(crate) fn push_growth(len: usize, capacity: usize, element: usize) -> Growth {
+    reserve_growth(len, capacity, 1, element)
+}
+
+/// [`push_growth`] for `additional` elements reserved at once, as `Vec::reserve` grows a list: to what it needs or
+/// twice what it holds, whichever is more, and four slots at least.
+pub(crate) fn reserve_growth(len: usize, capacity: usize, additional: usize, element: usize) -> Growth {
+    let needed = len.saturating_add(additional);
+    if needed <= capacity {
+        return Growth::default();
+    }
+    let grown = capacity.saturating_mul(2).max(needed).max(4);
+    Growth {
+        grown: allocation_bytes(grown.saturating_mul(element)),
+        freed: allocation_bytes(capacity.saturating_mul(element)),
+    }
+}
+
+/// What `Map::set` of one value of `len` bytes under `key` allocates: the list of one that replaces the key's values,
+/// or starts them, the spelling of the key when it is not the one the map files it under, the value, and for a key the
+/// map does not hold the key itself and the growth of its table, whose old table is what `freed` is. What the values it
+/// replaces held is what `Map::set` returns, to be given back with it once they are gone.
+pub(crate) fn set_growth(map: &Map, key: &[u8], len: usize) -> Growth {
+    let lookup = map.lookup_key(key);
+    let key_part = if map.value_list_shape(&lookup).is_some() {
+        LIST_OF_ONE.plus(key_bytes(key, &lookup, false))
+    } else {
+        new_key_growth(map, key, &lookup, 0)
+    };
+    key_part.plus(Growth {
+        grown: allocation_bytes(len),
+        freed: 0,
+    })
+}
+
 /// `text` cut to its first `max` bytes at a character boundary, with a marker when something was cut: what an error
 /// message quotes under a budget, as the message is kept long after the buffers it quotes are given back.
 pub(crate) fn excerpt(text: &str, max: usize) -> Cow<'_, str> {
@@ -105,14 +347,23 @@ pub(crate) fn insert_growth(maps: &[&Map], key: &[u8], value_len: usize) -> Grow
 
 /// What `map` allocates for values of the lengths `lens` added under `key` in turn.
 pub(crate) fn values_growth(map: &Map, key: &[u8], lens: impl IntoIterator<Item = usize>) -> Growth {
-    let lookup = map.lookup_key(key);
-    let shape = map.value_list_shape(&lookup);
-    let spelling = key_bytes(key, &lookup, false);
+    values_growth_filed(map, key, &map.lookup_key(key), lens)
+}
+
+/// [`values_growth`] for a key that `map` files under `lookup`, which the caller has already worked out.
+pub(crate) fn values_growth_filed(
+    map: &Map,
+    key: &[u8],
+    lookup: &[u8],
+    lens: impl IntoIterator<Item = usize>,
+) -> Growth {
+    let shape = map.value_list_shape(lookup);
+    let spelling = key_bytes(key, lookup, false);
     lens.into_iter()
         .enumerate()
         .fold(Growth::default(), |sum, (added, len)| {
             let growth = match value_list_growth(shape, added) {
-                (_, true) => new_key_growth(map, key, &lookup, 0),
+                (_, true) => new_key_growth(map, key, lookup, 0),
                 (list, false) => list.plus(spelling),
             };
             sum.plus(growth).plus(Growth {
@@ -220,6 +471,122 @@ mod tests {
         assert_eq!(budget.remaining(), Some(6), "a refused charge reserves nothing");
         assert!(budget.charge(6), "exactly what is left fits");
         assert!(!budget.charge(1));
+    }
+
+    #[test]
+    fn a_rule_budget_charges_only_while_armed_and_gives_back_what_a_rule_did_not_keep() {
+        use super::RuleBudget;
+
+        let mut budget = RuleBudget::default();
+        assert!(
+            budget.charge(usize::MAX) && !budget.is_stopped(),
+            "disarmed, everything fits"
+        );
+
+        budget.arm(100, 0);
+        assert!(budget.charge_pending(30) && budget.charge_scratch(20) && budget.charge(10));
+        assert_eq!(budget.remaining.load(super::Relaxed), 40);
+        // The rule is recorded: its matches stay charged, its copies are given back.
+        budget.keep_pending();
+        budget.end_rule();
+        assert_eq!(budget.remaining.load(super::Relaxed), 60);
+        // The next rule is dropped: both are given back.
+        assert!(budget.charge_pending(25) && budget.charge_scratch(5));
+        budget.end_rule();
+        assert_eq!(budget.remaining.load(super::Relaxed), 60);
+        // A match dropped inside a rule gives its bytes back at once, once.
+        assert!(budget.charge_pending(40));
+        budget.release_pending(40);
+        budget.release_pending(40);
+        assert_eq!(budget.remaining.load(super::Relaxed), 60);
+        // A copy dropped before the rule is done gives back what it was charged, and no more than the rule holds.
+        assert!(budget.charge_scratch(30) && budget.charge_scratch(10));
+        budget.release_scratch(30);
+        assert_eq!(budget.remaining.load(super::Relaxed), 50);
+        budget.release_scratch(30);
+        assert_eq!(
+            budget.remaining.load(super::Relaxed),
+            60,
+            "the ten left are all it can give back"
+        );
+        budget.end_rule();
+        assert_eq!(budget.remaining.load(super::Relaxed), 60);
+
+        assert!(!budget.is_stopped());
+        assert!(!budget.charge(61), "sixty-one bytes do not fit in sixty");
+        assert!(budget.is_stopped(), "the refusal is remembered");
+        assert_eq!(budget.remaining.load(super::Relaxed), 60, "and reserved nothing");
+        assert!(!budget.charge(1), "nothing fits after a stop, however small");
+
+        budget.disarm();
+        assert!(
+            budget.charge(usize::MAX) && budget.is_stopped(),
+            "a stop outlives the phase"
+        );
+        budget.reset();
+        assert!(!budget.is_stopped() && !budget.is_armed());
+    }
+
+    #[test]
+    fn what_a_map_holds_for_a_key_is_given_back_when_a_rule_replaces_it() {
+        use super::set_growth;
+        use crate::{collection::Map, types::RuleVariable};
+
+        // New keys and rewritten ones, longer values and shorter, a key in capitals, one that is not UTF-8.
+        let keys: [&[u8]; 4] = [b"a", b"Beta", b"k\xff", b"0"];
+        let sizes = [0_usize, 1, 7, 300, 3, 70_000, 2];
+        let mut map = Map::new(RuleVariable::TX);
+        for round in 0..400 {
+            for key in keys {
+                let len = sizes.get(round % sizes.len()).copied().unwrap_or_default();
+                let growth = set_growth(&map, key, len);
+                let before = map.allocated_bytes();
+                let replaced = map.set(key, [vec![b'x'; len]]);
+                let after = map.allocated_bytes();
+                // What is charged for the write, net of what it replaces, is what the map then holds more, a
+                // little over where the replaced list's spare slots go.
+                let net = growth.grown.cast_signed() - (growth.freed + replaced).cast_signed();
+                let held = after.cast_signed() - before.cast_signed();
+                assert!(
+                    held <= net && net <= held + 64,
+                    "{key:?} at round {round}: {held} more held, {net} charged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_list_that_grows_is_charged_the_one_that_replaces_it_and_gives_back_the_old() {
+        use super::{push_growth, reserve_growth};
+
+        for (len, capacity) in [(0_usize, 0_usize), (3, 4), (4, 4), (9, 16), (16, 16), (1_000, 1_000)] {
+            let mut list: Vec<u64> = Vec::with_capacity(capacity);
+            list.resize(len, 0);
+            let growth = push_growth(len, list.capacity(), size_of::<u64>());
+            let held = super::allocation_bytes(list.capacity() * size_of::<u64>());
+            list.push(0);
+            let after = super::allocation_bytes(list.capacity() * size_of::<u64>());
+            assert_eq!(
+                growth.grown.saturating_sub(growth.freed),
+                after - held,
+                "{len} in {capacity}"
+            );
+            assert!(growth.freed == 0 || growth.freed == held, "{len} in {capacity}");
+        }
+        // Reserving several at once grows to what is needed, or twice what is held.
+        let mut list: Vec<u64> = Vec::new();
+        list.extend_from_slice(&[1, 2, 3]);
+        let growth = reserve_growth(list.len(), list.capacity(), 100, size_of::<u64>());
+        list.reserve(100);
+        assert_eq!(
+            growth.grown,
+            super::allocation_bytes(list.capacity() * size_of::<u64>())
+        );
+        assert_eq!(
+            reserve_growth(list.len(), list.capacity(), 1, size_of::<u64>()).grown,
+            0,
+            "there is room"
+        );
     }
 
     #[test]

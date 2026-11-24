@@ -36,7 +36,10 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use crate::transformations::{CustomTransformation, Transformation, TransformationError};
+use crate::{
+    collection::allocation_bytes,
+    transformations::{CustomTransformation, Transformation, TransformationError},
+};
 
 /// Built-in function pointers stay direct; dynamic dispatch is limited to custom entries.
 #[derive(Clone)]
@@ -168,6 +171,19 @@ impl TransformationChain {
             function: TransformationFunction::Custom(transformation),
         });
         Ok(())
+    }
+
+    /// Bytes a copy of this chain allocates: its list and the name of each transformation. A custom transformation is
+    /// shared with the original, not copied.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.transformations.iter().fold(
+            allocation_bytes(
+                self.transformations
+                    .capacity()
+                    .saturating_mul(size_of::<NamedTransformation>()),
+            ),
+            |total, transformation| total.saturating_add(allocation_bytes(transformation.name.capacity())),
+        )
     }
 
     /// Clear all transformations from the chain.

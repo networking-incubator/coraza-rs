@@ -22,7 +22,7 @@
 
 use std::{borrow::Cow, fmt};
 
-use crate::{transaction::Transaction, types::RuleVariable};
+use crate::{collection::allocation_bytes, transaction::Transaction, types::RuleVariable};
 
 /// A parsed parameter that can read values from a transaction at evaluation time.
 #[derive(Debug, Clone)]
@@ -106,10 +106,42 @@ impl Macro {
         }
         let mut result = String::with_capacity(self.original.len());
         for token in &self.tokens {
-            match token.variable {
-                Some(variable) => result.push_str(&tx.get_variable(variable, token.key.as_deref()).unwrap_or_default()),
-                None => result.push_str(&token.text),
+            // A value is borrowed from the transaction as it is appended, not copied before.
+            let text = match token.variable {
+                Some(variable) => tx.get_variable_cow(variable, token.key.as_deref()).unwrap_or_default(),
+                None => Cow::Borrowed(token.text.as_str()),
+            };
+            result.push_str(&text);
+        }
+        Cow::Owned(result)
+    }
+
+    /// [`Macro::expand_cow`] cut to `max` bytes at a character boundary: a variable that holds a megabyte makes a text
+    /// of `max` bytes, not one of a megabyte that is cut afterwards. A value that is not UTF-8 is converted only as
+    /// far as the cut (three source bytes past it at most); its temporary text can be up to three times that prefix,
+    /// then is cut and freed.
+    pub(crate) fn expand_capped(&self, tx: &Transaction, max: usize) -> Cow<'_, str> {
+        if !self.tokens.iter().any(|token| token.variable.is_some()) {
+            return Cow::Borrowed(
+                self.original
+                    .get(..self.original.floor_char_boundary(max))
+                    .unwrap_or_default(),
+            );
+        }
+        let mut result = String::with_capacity(self.original.len().min(max));
+        for token in &self.tokens {
+            let room = max.saturating_sub(result.len());
+            let expanded = match token.variable {
+                Some(variable) => tx
+                    .get_variable_cow_capped(variable, token.key.as_deref(), room)
+                    .unwrap_or_default(),
+                None => Cow::Borrowed(token.text.as_str()),
+            };
+            if expanded.len() > room {
+                result.push_str(expanded.get(..expanded.floor_char_boundary(room)).unwrap_or_default());
+                break;
             }
+            result.push_str(&expanded);
         }
         Cow::Owned(result)
     }
@@ -134,6 +166,20 @@ impl Macro {
     /// Return the unexpanded parameter.
     pub fn as_str(&self) -> &str {
         &self.original
+    }
+
+    /// Bytes a copy of this parameter allocates: its text, its list of tokens, and each token's text and key.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.tokens.iter().fold(
+            allocation_bytes(self.original.capacity()).saturating_add(allocation_bytes(
+                self.tokens.capacity().saturating_mul(size_of::<MacroToken>()),
+            )),
+            |total, token| {
+                total
+                    .saturating_add(allocation_bytes(token.text.capacity()))
+                    .saturating_add(token.key.as_ref().map_or(0, |key| allocation_bytes(key.capacity())))
+            },
+        )
     }
 
     /// Split the parameter into literal and variable-reference tokens.
@@ -277,6 +323,41 @@ mod tests {
             parameter.expand_for_operator(&tx),
             Cow::Owned(text) if text == "\u{fffd}"
         ));
+    }
+
+    /// The cut of a value that is not UTF-8 is the cut of its whole text, in whichever token of the parameter it falls.
+    #[test]
+    fn a_capped_expansion_is_the_whole_expansion_cut_at_a_character_boundary() {
+        let values: [&[u8]; 6] = [
+            b"",
+            b"plain",
+            b"caf\xC3\xA9",
+            b"a\xFFb",
+            &[0xFF; 9],
+            b"\xE2\x82\xAC\xE2\x82",
+        ];
+        for value in values {
+            let mut tx = Transaction::new("macro-test");
+            tx.set_tx_variable("v", value);
+            for text in [
+                "literal",
+                "%{TX.v}",
+                "x %{TX.v}",
+                "%{TX.v} y %{TX.v}",
+                "[%{TX.v}%{TX.v}]%{TX.missing}",
+            ] {
+                let parameter = Macro::new(text).unwrap();
+                let whole = parameter.expand(&tx);
+                for max in 0..=whole.len() + 2 {
+                    let kept = whole.get(..whole.floor_char_boundary(max)).unwrap_or_default();
+                    assert_eq!(
+                        parameter.expand_capped(&tx, max),
+                        kept,
+                        "{text:?} of {value:02x?} cut at {max}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

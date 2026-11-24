@@ -41,7 +41,7 @@ use common::smallest_budget;
 use coraza::{
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
-    types::RuleVariable,
+    types::{RuleEngineStatus, RuleVariable},
 };
 
 /// Forwards to the system allocator while tracking live and peak bytes, in two ways.
@@ -1376,5 +1376,387 @@ fn a_full_tx_table_is_estimated_as_held_when_a_key_is_rewritten_or_most_are_remo
             held + estimate <= chunks + estimated + ACCOUNTING_SLACK,
             "{label}: the transaction went from {chunks} to {held} bytes but estimates {estimate} to {estimated}"
         );
+    }
+}
+
+/// The rules of the rule-time cases, which a `Case` keeps as `&'static str`.
+fn leaked(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+/// A multipart body of `parts` parts, each with `per_part` part headers of four bytes (`a:b`), as a CRS rule on
+/// `MULTIPART_PART_HEADERS` selects them one by one.
+fn tiny_part_headers(parts: usize, per_part: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    for part in 0..parts {
+        body.extend_from_slice(format!("--b\r\nContent-Disposition: form-data; name=\"p{part}\"\r\n").as_bytes());
+        body.extend_from_slice(&b"a:b\r\n".repeat(per_part));
+        body.extend_from_slice(b"\r\n1\r\n");
+    }
+    body.extend_from_slice(b"--b--\r\n");
+    body
+}
+
+/// A form of 1,000 arguments, the default `SecArgumentsLimit`, whose names are `unit` repeated 4,000 times: 12 MB of
+/// body. With `%ff` the names are not UTF-8, so the text view the collection keeps of each is three times as long as
+/// the name, which a rule that selects them must borrow and not copy; with `%61` they are ASCII, which it always
+/// borrowed.
+fn long_names(unit: &str) -> Vec<u8> {
+    (0..1_000)
+        .flat_map(|index| format!("{}{index:05}=1&", unit.repeat(4_000)).into_bytes())
+        .collect()
+}
+
+/// Bodies a budget admits whose values rules then copy: what `msg` and `logdata`, `capture` and `setvar` make of one
+/// value, and what a match of every value of a long list keeps. Each comes with the size of its largest value.
+fn rule_time_cases() -> Vec<(Case, usize)> {
+    let value = vec![b'v'; 400_000];
+    let one_value = [b"k=".as_slice(), &value].concat();
+    let many = |label, rules: &'static str| {
+        case(
+            label,
+            "xml",
+            leaked(format!("{XML_LIMIT}\n{rules}")),
+            repeated(b"<r>", b"1<i/>", 500_000, b"</r>"),
+        )
+    };
+    let big = |case: Case| (case, 400_002);
+    let tiny = |case: Case| (case, 8);
+    vec![
+        big(case(
+            "one 400 KB value, msg and logdata expand it",
+            "urlencoded",
+            "SecRule ARGS_POST \"@rx .\" \"id:2,phase:2,pass,nolog,msg:'%{MATCHED_VAR}',logdata:'%{MATCHED_VAR} %{MATCHED_VAR}'\"",
+            one_value.clone(),
+        )),
+        big(case(
+            "one 400 KB value matched by 20 rules with capture",
+            "urlencoded",
+            leaked(
+                (2..22)
+                    .map(|id| {
+                        format!("SecRule ARGS_POST \"@rx ^(.*)$\" \"id:{id},phase:2,pass,nolog,capture,logdata:'%{{TX.0}}'\"\n")
+                    })
+                    .collect(),
+            ),
+            one_value.clone(),
+        )),
+        big(case(
+            "one 400 KB value, setvar copies it to 20 TX keys",
+            "urlencoded",
+            leaked(
+                (2..22)
+                    .map(|id| format!("SecRule ARGS_POST \"@rx .\" \"id:{id},phase:2,pass,nolog,setvar:tx.copy{id}=%{{MATCHED_VAR}}\"\n"))
+                    .collect(),
+            ),
+            one_value.clone(),
+        )),
+        big(case(
+            "one 400 KB value, capture with nested groups",
+            "urlencoded",
+            "SecRule ARGS_POST \"@rx ^(((((((((.*)))))))))$\" \"id:2,phase:2,pass,nolog,capture\"",
+            one_value.clone(),
+        )),
+        big(case(
+            "one 400 KB value, multiMatch through six transformations that change it",
+            "urlencoded",
+            "SecRule ARGS_POST \"@rx .\" \"id:2,phase:2,pass,nolog,multiMatch,t:lowercase,t:urlDecodeUni,t:removeWhitespace,t:uppercase,t:lowercase,t:replaceComments\"",
+            [b"k=".as_slice(), &b"Ab%20C".repeat(400_000 / 6)].concat(),
+        )),
+        tiny(many(
+            "100k xml values, a rule that never matches",
+            "SecRule XML:/* \"@rx zzz\" \"id:2,phase:2,pass,nolog\"",
+        )),
+        tiny(many(
+            "100k xml values, a rule that matches each",
+            "SecRule XML:/* \"@rx 1\" \"id:2,phase:2,pass,nolog,msg:'m',logdata:'%{MATCHED_VAR_NAME}'\"",
+        )),
+        tiny(many(
+            "100k xml values, transformed, no match",
+            "SecRule XML:/* \"@rx zzz\" \"id:2,phase:2,pass,nolog,t:urlDecodeUni,t:lowercase\"",
+        )),
+        // `MULTIPART_PART_HEADERS` is bounded by no argument limit, and a rule that only selects them (CRS 922xxx)
+        // is all it takes, in `DetectionOnly` too, where nothing denies earlier.
+        tiny(case(
+            "108k tiny multipart part headers, DetectionOnly, rules that never match",
+            "multipart",
+            "SecRuleEngine DetectionOnly\n\
+             SecRule MULTIPART_PART_HEADERS \"@rx zzz\" \"id:2,phase:2,pass,nolog\"\n\
+             SecRule MULTIPART_PART_HEADERS \"@rx zzz\" \"id:3,phase:2,pass,nolog,multiMatch,t:lowercase\"",
+            tiny_part_headers(12, 9_000),
+        )),
+    ]
+}
+
+#[test]
+fn the_part_header_flood_case_publishes_every_header_of_every_part() {
+    // The case is a flood of `MULTIPART_PART_HEADERS` only while the parser publishes them: a parse that kept fewer
+    // would make the sweep above measure a smaller selection than it says.
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let (case, _) = rule_time_cases()
+        .into_iter()
+        .find(|(case, _)| case.label.starts_with("108k tiny multipart part headers"))
+        .unwrap();
+    let mut tx = prepared(&case, None);
+    tx.process_request_body(&case.body);
+    let published = match tx.collection(RuleVariable::MultipartPartHeaders) {
+        Some(VariableCollection::Map(map)) => map.value_count(),
+        _ => 0,
+    };
+    // Twelve parts of the 9,000 headers the fixture writes and the `Content-Disposition` header of each part.
+    assert_eq!(published, 12 * (9_000 + 1));
+}
+
+/// The most a rule may allocate beyond what the budget charged it for while it works on one value, in copies of the
+/// value. They are gone when the value is done, and bounded by the policy and the largest value, never by how many
+/// values or rules there are. Measured, for a value the rule leaves whole:
+///
+/// - `capture` takes `G + min(G, 10) - 1` copies for a pattern of `G` groups, the whole match counted: `Rx` copies
+///   every group, then the operator's outputs keep the first ten. Nine nested groups that each hold the whole value
+///   make 19 (`G` = 10), and CRS 4.30.0's own capture rules have at most three groups. The constant is sized for this
+///   pattern.
+/// - `multiMatch` takes one per transformation that changes the value: 4.3 for six that all do.
+/// - These fixtures' `setvar` expansions take up to two copies (1.75 measured). Repeated references can take more.
+/// - `msg` and `logdata` take none: they are cut before they are copied, and a value that is not UTF-8 is converted
+///   only as far as the cut, not whole.
+///
+/// One rule that has them all (nine nested groups, `multiMatch`, `setvar`, `msg`, `logdata`) measures 19.8.
+const VALUE_COPIES_ALLOWED: usize = 21;
+
+/// What a case's rules may allocate beyond its budget that no charge covers: small structures a rule makes while it
+/// evaluates a value, whatever the number of values, such as the `Outputs` of an operator.
+const RULE_SLACK: usize = 16 * 1024;
+
+/// What a case's rules may allocate beyond its budget: the copies of its largest value, see the constant above.
+fn transient_allowance(largest_value: usize) -> usize {
+    VALUE_COPIES_ALLOWED * largest_value + RULE_SLACK
+}
+
+/// `case` without its rules, which a budget that admits the parse is found for.
+fn parse_only(case: &Case) -> Case {
+    Case {
+        configuration: if case.processor == "xml" { XML_LIMIT } else { "" },
+        content_type: case.content_type.clone(),
+        body: case.body.clone(),
+        ..*case
+    }
+}
+
+#[test]
+fn what_the_rules_of_a_body_keep_stays_within_the_budget_the_parser_was_given_and_the_phase_stops_at_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    for (case, largest_value) in rule_time_cases() {
+        let parse_only = parse_only(&case);
+        let parse_budget = smallest_budget(1 << 30, |budget| !measure(&parse_only, Some(budget)).errored);
+        let unbudgeted = measure(&case, None);
+        let (mut stopped, mut completed) = (0, 0);
+        for factor in [1, 2, 3, 4, 8, 16, 64] {
+            let budget = parse_budget * factor;
+            let mut tx = prepared(&case, Some(budget));
+            let measured = measure_body(&mut tx, &case.body, case.processor == "xml");
+            let copies = case.copies(&measured) * chunk(case.body.len());
+            let label = format!("{} at {budget}", case.label);
+
+            // What the transaction keeps is what the budget let it, by its own estimate and by the heap's.
+            assert!(
+                measured.retained <= copies + budget + ACCOUNTING_SLACK,
+                "{label}: the estimate {} passes the copies {copies} and the budget",
+                measured.retained
+            );
+            assert!(
+                measured.live_chunks <= copies + budget + SLACK / 16,
+                "{label}: the heap holds {} beyond the {copies} of copies, over the budget",
+                measured.live_chunks
+            );
+            let allowance = transient_allowance(largest_value);
+            assert!(
+                measured.peak_chunks <= copies + budget + allowance,
+                "{label}: the peak {} is over the copies {copies}, the budget and the {allowance} a value's copies allow ({} over)",
+                measured.peak_chunks,
+                measured.peak_chunks.saturating_sub(copies + budget + allowance)
+            );
+
+            if tx.rule_evaluation_stopped_by_memory_budget() {
+                stopped += 1;
+                let (expected, unexpected) = match tx.rule_engine() {
+                    RuleEngineStatus::On => (tx.interruption(), tx.would_be_interruption()),
+                    RuleEngineStatus::DetectionOnly => (tx.would_be_interruption(), tx.interruption()),
+                    RuleEngineStatus::Off => unreachable!("{label}: no rule can exhaust the budget in Off mode"),
+                };
+                assert!(
+                    expected.is_some() && unexpected.is_none(),
+                    "{label}: wrong interruption channel"
+                );
+                let interruption = expected.unwrap();
+                assert_eq!(
+                    (interruption.status, interruption.action.as_str(), interruption.rule_id),
+                    (503, "deny", 0),
+                    "{label}"
+                );
+                assert_eq!(interruption.data, "rule evaluation memory budget exhausted", "{label}");
+            } else {
+                completed += 1;
+                assert!(
+                    tx.interruption().is_none(),
+                    "{label}: nothing interrupts a phase that fits"
+                );
+                assert!(
+                    tx.would_be_interruption().is_none(),
+                    "{label}: a phase that fits has no would-be interruption"
+                );
+                assert_eq!(
+                    tx.matched_rules().len(),
+                    unbudgeted_rules(&case),
+                    "{label}: a phase that fits records what it does without a budget"
+                );
+            }
+        }
+        assert!(
+            stopped > 0 && completed > 0,
+            "{}: {stopped} stopped, {completed} completed",
+            case.label
+        );
+        assert!(unbudgeted.retained > 0, "{}", case.label);
+    }
+}
+
+/// How many rules `case` records when nothing limits it.
+fn unbudgeted_rules(case: &Case) -> usize {
+    let mut tx = prepared(case, None);
+    tx.process_request_body(&case.body);
+    tx.matched_rules().len()
+}
+
+#[test]
+fn the_names_a_rule_selects_are_the_text_the_collection_stores_and_not_a_copy_of_each() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    // 1,000 names of 4,000 bytes in a 12 MB body, which one rule selects and never matches. A name that is not UTF-8
+    // has a text view three times its length, which the collection keeps once, and the selection must borrow it:
+    // a copy of each held for the rule would be 12 MB past the budget, as a name of ASCII never was.
+    for unit in ["%61", "%ff"] {
+        let case = case(
+            "1,000 names of 4,000 bytes",
+            "urlencoded",
+            "SecRule ARGS \"@rx ^never$\" \"id:2,phase:2,pass,nolog,t:none\"",
+            long_names(unit),
+        );
+        // What the parse keeps, by the transaction's estimate less the copies of the body that sit beside it, and
+        // a mebibyte for the rule, whose list of 1,000 references is far less.
+        let parsed = measure(&parse_only(&case), None);
+        let copies = case.copies(&parsed) * chunk(case.body.len());
+        let budget = parsed.retained - copies + MIB;
+
+        let mut tx = prepared(&case, Some(budget));
+        let measured = measure_body(&mut tx, &case.body, false);
+        let label = format!("{unit} names at {budget}");
+        assert!(
+            !measured.errored && measured.values == 1_000,
+            "{label}: the body is parsed whole"
+        );
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget(), "{label}: the rule fits");
+        assert!(
+            measured.peak_chunks <= copies + budget + transient_allowance(8),
+            "{label}: the peak {} is {} over the copies {copies}, the budget and what a rule allocates for a value",
+            measured.peak_chunks,
+            measured
+                .peak_chunks
+                .saturating_sub(copies + budget + transient_allowance(8))
+        );
+    }
+}
+
+/// `count` rules that match the request's `Content-Type` and are shaped as CRS's are: transformations, a `msg` and a
+/// `logdata` that expand variables, eight tags, a version and a severity. Nothing is selected from the body, so what
+/// the phase keeps is the records of the rules. The operator keeps nothing per rule: a regular expression would add
+/// a cache of its own to the heap on first use.
+fn crs_shaped_rules(count: usize) -> &'static str {
+    leaked(
+        (1..=count)
+            .map(|id| {
+                format!(
+                    "SecRule REQUEST_HEADERS:Content-Type \"@contains /\" \"id:{},phase:2,pass,t:none,t:lowercase,\
+                     msg:'Remote Command Execution: Unix Shell Code Found number {id}',\
+                     logdata:'Matched Data: %{{TX.0}} found within %{{MATCHED_VAR_NAME}}: %{{MATCHED_VAR}}',\
+                     tag:'application-multi',tag:'language-shell',tag:'platform-unix',tag:'attack-rce',\
+                     tag:'paranoia-level/1',tag:'OWASP_CRS',tag:'OWASP_CRS/ATTACK-RCE',tag:'capec/1000/152/248/88',\
+                     ver:'OWASP_CRS/4.30.0',rev:'2',severity:'CRITICAL'\"\n",
+                    1000 + id
+                )
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn a_recorded_rule_is_charged_and_estimated_for_everything_its_record_keeps_metadata_included() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    for count in [100, 300] {
+        let case = case("crs-shaped rules", "urlencoded", crs_shaped_rules(count), Vec::new());
+        let mut unbudgeted = prepared(&case, None);
+        let measured = measure_body(&mut unbudgeted, &case.body, false);
+        // The rules and the one that chooses the body processor.
+        assert_eq!(unbudgeted.matched_rules().len(), count + 1);
+        // After the phase, the estimate the connector reads covers what the records hold...
+        assert_accounting_is_conservative(&format!("{count} records"), &measured);
+
+        // ...and the smallest budget that lets the phase finish, which pays for the records and what the phase needed
+        // beside them, is not less than what they keep: the heap is the authority, not the estimate.
+        let needed = smallest_budget(1 << 30, |budget| {
+            let mut tx = prepared(&case, Some(budget));
+            tx.process_request_body(&case.body);
+            !tx.rule_evaluation_stopped_by_memory_budget()
+        });
+        assert!(
+            needed + ACCOUNTING_SLACK >= measured.live_chunks,
+            "{count} records: the phase is charged {needed} bytes and keeps {}, {} per record uncharged",
+            measured.live_chunks,
+            measured.live_chunks.saturating_sub(needed) / count
+        );
+        // Nor is it much more: the list of records that grows is charged beside the one it replaces.
+        assert!(
+            needed <= measured.live_chunks + measured.live_chunks / 2,
+            "{count} records: the phase is charged {needed} bytes for the {} the records keep",
+            measured.live_chunks
+        );
+    }
+}
+
+#[test]
+fn msg_and_logdata_of_a_megabyte_that_is_not_utf8_copy_only_the_text_they_keep() {
+    // A megabyte of 0xFF is three megabytes as lossy text, four in the buffer that builds it. `msg` and `logdata` keep
+    // 4096 bytes of it, so the expansion converts the bytes that survive the cut and nothing past them.
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let body = [b"a=".as_slice(), "%FF".repeat(1_000_000).as_bytes()].concat();
+    let without = case(
+        "no msg",
+        "urlencoded",
+        "SecRule ARGS_POST \"@unconditionalMatch\" \"id:2,phase:2,pass,log\"",
+        body.clone(),
+    );
+    let with = case(
+        "msg and logdata",
+        "urlencoded",
+        "SecRule ARGS_POST \"@unconditionalMatch\" \"id:2,phase:2,pass,log,msg:'x %{ARGS_POST.a}',logdata:'%{MATCHED_VAR}'\"",
+        body,
+    );
+    for budget in [None, Some(64 << 20)] {
+        let baseline = measure(&without, budget).peak;
+        let mut tx = prepared(&with, budget);
+        let peak = measure_body(&mut tx, &with.body, false).peak;
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+        // The texts, their records and `RULE`'s copies of them are a few kilobytes: the expansion's own copy of the
+        // megabyte was four.
+        assert!(
+            peak <= baseline + 64 * 1024,
+            "{budget:?}: expanding msg and logdata holds {} bytes beyond a rule that has none",
+            peak.saturating_sub(baseline)
+        );
+        let matched = tx
+            .matched_rules()
+            .iter()
+            .find(|matched| matched.rule_id() == 2)
+            .unwrap();
+        assert_eq!(matched.data(), "\u{FFFD}".repeat(4096 / 3));
+        assert_eq!(matched.message(), format!("x {}", "\u{FFFD}".repeat((4096 - 2) / 3)));
     }
 }

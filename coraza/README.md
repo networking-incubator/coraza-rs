@@ -694,6 +694,95 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   matches. A parser that needs every match's expanded `msg` and `logdata` must
   read the JSON format. Native part `K` writes only the rule text, and
   JSONLegacy omits `logdata`.
+- The `message` and `data` of a `MatchData` are cut to 4096 bytes each, at a
+  character boundary: the expanded `msg` and `logdata` of a match, as the audit
+  log's part `K` and `matched_rules()` report them. CRS's `logdata` expands
+  `%{MATCHED_VAR}`, so every match of a large value kept a second copy of it, and
+  one more where `msg` expanded it too (a 400 KB value, 800 KB of text per match).
+  Go keeps both whole. `RULE:msg` and `RULE:logdata`, which hold the expansion
+  that is made before the rule's variables are selected, are cut alike. The
+  value of a match, `MatchData::value`, is kept whole, because the multiphase
+  duplicate check compares it by equality, and so is what `setvar` and `capture`
+  store, which rules read. The cut applies with or without a memory budget, and
+  it can change a verdict: a rule that compares with or copies `%{RULE.msg}` or
+  `%{RULE.logdata}` (an operator argument, a `setvar` value) reads the cut text,
+  so a rule such as `@streq %{RULE.logdata}` matches a 4,096-byte value and
+  misses a 4,097-byte one, where Go matches both. CRS has no rule that reads
+  `RULE:msg` or `RULE:logdata`, so its verdicts are unchanged.
+- A body memory budget (`Transaction::set_body_memory_budget`) now also bounds
+  what the rules of the body phase keep, which it did not: the processors were
+  charged and rule evaluation was not, so a body the budget admitted made the
+  rules allocate many times its size (a match keeps the value it matched, and a
+  rule that matches every value of a list keeps them all). With a budget set,
+  the rules of that call of `process_request_body` or `process_response_body`
+  draw on what the parse left of it, and charge, before they allocate it, each
+  match (value, key, message, data and its slot), the entry it adds to
+  `MATCHED_VARS`, the buffers `MATCHED_VAR` and `MATCHED_VAR_NAME` grow to, the
+  `TX` entries `setvar` and `capture` write and the `ENV` entries `setenv`
+  writes (each net of the value it replaces, or of the entry `setvar:!tx.key`
+  removes; a removed capture key `TX:0` to `TX:9` is charged if a later capture
+  or the next rule has to make it again), the path arguments an operator writes
+  into `ARGS_PATH` and `ARGS` (a spelling of the name that replaces another is
+  charged beside it, and the other is given back),
+  the matched rule's record (the rule's metadata the record copies, meaning its
+  text, `msg` and `logdata` templates, tags, version and file, and the
+  addresses, URI and id), and, until the rule is done, the list of the values it
+  selects, the list that holds them pending, the copy `multiMatch` makes of each
+  of them, and the copies the multiphase duplicate check keeps (a duplicate it
+  drops gives its copy back). The list of selected values is charged before each
+  growth of the list, so that a collection of any number of values
+  (`MULTIPART_PART_HEADERS`, which no argument limit bounds, is one) cannot make
+  a list larger than the budget has left; the list holds references to the
+  collection's own values and names, so a name that is not UTF-8 costs it no
+  more than any other. A charge that does not fit ends rule evaluation for the
+  transaction, including the phase 5 logging rules: the transaction is
+  interrupted with status 503 (`rule evaluation memory budget exhausted`; in
+  `DetectionOnly`, the would-be interruption, unless an earlier rule recorded
+  one), no rule of any later phase runs (the request is already refused, and a
+  rule that ran would allocate with the budget spent), nothing is charged or
+  evaluated after it (the actions of the rule that was running that come after
+  the charge, a `ctl` among them, do not run), and the rule that was running
+  records nothing and denies nothing: a stop at the rule's own record is the
+  503, never the rule's status, so the interruption never names a rule that
+  `matched_rules()` does not show. The audit entry is written when the
+  transaction finishes if the audit configuration selects it (`SecAuditEngine`,
+  and for `RelevantOnly` the relevance of the status of the interruption or
+  would-be interruption the transaction holds: the 503, unless an earlier rule
+  recorded one, as a would-be 403 in `DetectionOnly` stays 403, or the response
+  status when none was recorded, because the engine was switched `Off`),
+  judged without the phase 5 rules, which did not run; it carries the rules
+  recorded before the stop and, in the default mode, the interruption with rule
+  id 0. A parse that the budget stopped leaves the rules 64 KiB at least, so
+  that the rule that denies on the body error, the baseline's 200002, can still
+  record its match and answer.
+  `Transaction::rule_evaluation_stopped_by_memory_budget` reports it, in every
+  engine mode, for a host that lets a `DetectionOnly` transaction through. The
+  flag is the signal; the returned interruption follows the engine mode, so
+  under `DetectionOnly`, or when a rule switched the engine `Off` before the
+  refused charge, none is returned (and no further rule runs either). The Envoy
+  connector refuses from the flag in every mode. Below the budget the matches,
+  the scores and the verdict are those of a transaction with none; without a
+  budget, the crate's default, nothing is charged and nothing changes. What a
+  rule needs for one value while it evaluates it is not charged: it is gone when
+  the value is, and bounded by the policy and the largest value, never by the
+  number of values or of rules. A `capture` rule takes up to `G + min(G, 10)`
+  copies of the value (one per group of its pattern, `G` counting the whole
+  match, and the first ten again in the operator's outputs; nine nested groups
+  that each hold the whole value measure 19, and CRS 4.30.0's own `capture`
+  rules have at most three groups), a `multiMatch` rule one per transformation
+  that changes the value (4.3 for six). `setvar` expands its key and value and
+  `setenv` expands its value before the write is checked against the budget,
+  even if the write is refused. Each field's temporary size depends on its
+  expanded length: repeated references append the same value once per
+  reference. `msg` and `logdata` are cut before they are copied (a value that
+  is not UTF-8 is converted only as far as the cut, three source bytes past it
+  at most; the temporary text can be up to three times that prefix before it
+  is cut and freed). Custom body processors are not limited by the budget,
+  and have no parse stop or 64 KiB reserve, but what they publish (`ARGS_POST`,
+  `ARGS`, `FILES`) is taken from the budget before the rules draw on it, as
+  what a built-in processor publishes is: output near or above the budget
+  leaves the rules nothing, and the first charge of a rule stops rule
+  evaluation with the 503.
 
 ## FTW integration
 

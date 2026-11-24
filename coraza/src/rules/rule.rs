@@ -20,11 +20,11 @@
 
 //! Compiled SecLang rule data.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, mem::size_of};
 
 use crate::{
     actions::{ActionImplementation, ActionType, CompiledAction, RuleMetadata},
-    collection::{MatchData, MatchLocation},
+    collection::{MATCH_SLOT_BYTES, MatchData, MatchLocation, allocation_bytes},
     debug_log::{DebugEvent, DebugField, DebugLevel},
     operators::{OperatorOutcome, Outputs},
     rules::{
@@ -57,6 +57,9 @@ pub(crate) struct Rule {
     /// Following rules in a chain.
     pub(crate) chain: Vec<Rule>,
 }
+
+/// The most bytes of an expanded `msg` or `logdata` kept for one match.
+const MAX_MATCH_TEXT_BYTES: usize = 4096;
 
 /// A selected value deferred until its transaction borrow has ended.
 enum PendingMatch {
@@ -205,6 +208,13 @@ impl Rule {
 
     /// Evaluate this rule and its chain against a transaction.
     pub(crate) fn evaluate(&self, tx: &mut Transaction, phase: RulePhase) {
+        self.evaluate_and_record(tx, phase);
+        // What the rule held and did not record, its dropped matches and its copies, is given back.
+        tx.end_rule_memory();
+    }
+
+    /// [`Rule::evaluate`] up to what it must give back once it is done.
+    fn evaluate_and_record(&self, tx: &mut Transaction, phase: RulePhase) {
         tx.debug_log(DebugLevel::Debug, "Evaluating rule", || {
             [DebugField::RuleId(self.metadata.id), DebugField::Phase(phase.as_int())]
         });
@@ -219,6 +229,10 @@ impl Rule {
             &mut collective_matched_values,
             &mut inspection_refused,
         );
+        // The memory budget ended the evaluation: nothing is recorded for the rule, and no rule runs after it.
+        if tx.rule_memory_stopped() {
+            return;
+        }
         // A refused inspection leaves a chain incomplete: the links matched so
         // far are not a match of the rule, so nothing is recorded for it. A
         // rule without a chain keeps the values it matched before the refusal.
@@ -249,6 +263,11 @@ impl Rule {
                     _ => "custom",
                 });
             tx.record_match(rule, matched_values, disruptive_action);
+            // The record did not fit: the rule is not recorded, so it does not score or deny either, and the phase
+            // stops with the memory 503 instead of a denial that `matched_rules()` cannot show.
+            if tx.rule_memory_stopped() {
+                return;
+            }
             if let Some(severity) = self.metadata.severity {
                 tx.raise_highest_severity(severity);
             }
@@ -303,7 +322,7 @@ impl Rule {
                 collective_matched_values,
                 inspection_refused,
             );
-            if matched_values.is_empty() || *inspection_refused {
+            if matched_values.is_empty() || *inspection_refused || tx.rule_memory_stopped() {
                 return matched_values;
             }
             let own_matches = matched_values.len();
@@ -323,6 +342,11 @@ impl Rule {
                     collective_matched_values,
                     inspection_refused,
                 );
+                // The budget ended the evaluation: nothing is recorded for the rule, so the merge that would grow the
+                // list of its matches is not made.
+                if tx.rule_memory_stopped() {
+                    return Vec::new();
+                }
                 if *inspection_refused {
                     matched_values.extend(link_matches);
                     return matched_values;
@@ -334,7 +358,12 @@ impl Rule {
             }
             if !self.chain.is_empty() {
                 let (message, data) = self.describe_match(tx);
+                // Each match keeps its own copy of the text.
+                let text_bytes = allocation_bytes(message.len()).saturating_add(allocation_bytes(data.len()));
                 for matched in matched_values.iter_mut().take(own_matches) {
+                    if !tx.charge_rule_matches(text_bytes) {
+                        break;
+                    }
                     matched.message.clone_from(&message);
                     matched.data.clone_from(&data);
                 }
@@ -381,8 +410,18 @@ impl Rule {
         collective_matched_values: &mut CollectiveMatches,
         inspection_refused: &mut bool,
     ) -> Vec<MatchData> {
-        let message = self.metadata.msg.as_ref().map(|value| value.expand_cow(tx));
-        let log_data = self.metadata.log_data.as_ref().map(|value| value.expand_cow(tx));
+        // What `RULE` keeps of them is cut like what a match keeps: the expansion reads the previous rule's matched
+        // value, and the collection holds its buffers for as long as the transaction lives.
+        let message = self
+            .metadata
+            .msg
+            .as_ref()
+            .map(|value| value.expand_capped(tx, MAX_MATCH_TEXT_BYTES));
+        let log_data = self
+            .metadata
+            .log_data
+            .as_ref()
+            .map(|value| value.expand_capped(tx, MAX_MATCH_TEXT_BYTES));
         let severity = self.metadata.severity.map_or("unknown", |value| value.as_str());
         tx.set_rule_variables(id, message, &self.metadata.rev, log_data, severity);
 
@@ -393,13 +432,26 @@ impl Rule {
             // Go zero-values the match of an operatorless link instead of assigning
             // its chain depth (internal/corazawaf/rule.go:215-233).
             let mut matched = MatchData::new_empty();
+            if !tx.charge_rule_matches(MATCH_SLOT_BYTES) {
+                return Vec::new();
+            }
             if tx.multiphase_evaluation() {
                 collective_matched_values.push(matched.clone());
             }
             tx.record_matched_variable(&matched);
+            // The record did not fit: the evaluation is over, and the rule's actions do not run.
+            if tx.rule_memory_stopped() {
+                return Vec::new();
+            }
             self.run_nondisruptive_actions(tx);
+            if tx.rule_memory_stopped() {
+                return Vec::new();
+            }
             if self.chain.is_empty() {
                 (matched.message, matched.data) = self.describe_match(tx);
+                if !Self::charge_text(tx, &matched) {
+                    return Vec::new();
+                }
             }
             return vec![matched];
         };
@@ -413,12 +465,19 @@ impl Rule {
                 [DebugField::RuleId(id), DebugField::Variable(variable.variable().name())]
             });
             let pending = if self.metadata.multi_match {
-                tx.find_matches_for_rule(variable, id)
-                    .into_iter()
-                    .map(PendingMatch::Owned)
-                    .collect()
+                let owned = tx.find_matches_for_rule(variable, id);
+                // The list that holds them pending; a selection the budget cut short has stopped it.
+                if !tx.charge_rule_scratch(allocation_bytes(owned.len().saturating_mul(size_of::<PendingMatch>()))) {
+                    return matched_values;
+                }
+                owned.into_iter().map(PendingMatch::Owned).collect()
             } else {
+                // The list of the selected values is charged as it grows, and gone with the rule. A selection that
+                // did not fit the budget is cut short, and has stopped the evaluation.
                 let borrowed_values = tx.find_match_refs_for_rule(variable, id);
+                if tx.rule_memory_stopped() {
+                    return matched_values;
+                }
                 let mut pending = Vec::new();
                 let snapshot_rest = self.must_snapshot_match_values(variable.variable());
                 for (index, value) in borrowed_values.iter().enumerate() {
@@ -435,7 +494,17 @@ impl Rule {
                     }
 
                     let matched = (outcome == OperatorOutcome::Matched)
-                        .then(|| MatchData::new(value.variable(), value.key(), candidate.into_owned()));
+                        .then(|| Self::new_match(tx, value.variable(), value.key(), candidate))
+                        .flatten();
+                    // The list that holds this value and those after it is made at once, to the size it is charged:
+                    // it is gone with the rule, like the list of the selected values.
+                    let left = borrowed_values.len().saturating_sub(index);
+                    if tx.rule_budget_is_armed()
+                        && !tx.charge_rule_scratch(allocation_bytes(left.saturating_mul(size_of::<PendingMatch>())))
+                    {
+                        return matched_values;
+                    }
+                    pending.reserve_exact(left);
                     pending.push(PendingMatch::PreEvaluated {
                         variable: value.variable(),
                         outputs,
@@ -444,6 +513,13 @@ impl Rule {
                     });
                     for remaining in borrowed_values.iter().skip(index + 1) {
                         if snapshot_rest {
+                            // A copy of each value that is left, which lives as long as the rule does.
+                            if !tx.charge_rule_scratch(
+                                allocation_bytes(remaining.key().len())
+                                    .saturating_add(allocation_bytes(remaining.value().len())),
+                            ) {
+                                return matched_values;
+                            }
                             pending.push(PendingMatch::Owned(remaining.to_owned()));
                         } else if let Some(location) = remaining.location() {
                             pending.push(PendingMatch::Located {
@@ -488,7 +564,8 @@ impl Rule {
                             let mut outputs = Outputs::new(self.metadata.capture);
                             let outcome = operator.evaluate_outcome(tx, candidate.as_bytes(), &mut outputs);
                             let matched = (outcome == OperatorOutcome::Matched)
-                                .then(|| MatchData::new(value.variable, value.key.clone(), candidate.into_owned()));
+                                .then(|| Self::new_match(tx, value.variable, &value.key, candidate))
+                                .flatten();
                             if !self.apply_operator_result(
                                 tx,
                                 id,
@@ -518,7 +595,8 @@ impl Rule {
                             let mut outputs = Outputs::new(self.metadata.capture);
                             let outcome = operator.evaluate_outcome(tx, candidate.as_bytes(), &mut outputs);
                             let matched = (outcome == OperatorOutcome::Matched)
-                                .then(|| MatchData::new(value.variable(), value.key(), candidate.into_owned()));
+                                .then(|| Self::new_match(tx, value.variable(), value.key(), candidate))
+                                .flatten();
                             (value.variable(), outputs, outcome, matched)
                         };
                         if !self.apply_operator_result(
@@ -611,12 +689,18 @@ impl Rule {
         });
     }
 
-    /// Expand this rule's `msg` and `logdata` against the current matched variables.
+    /// Expand this rule's `msg` and `logdata` against the current matched variables, each cut to
+    /// [`MAX_MATCH_TEXT_BYTES`].
+    ///
+    /// CRS's `logdata` expands `%{MATCHED_VAR}`, so a match of a large value would keep a second copy of it in its
+    /// data, and one more in its message where that expands it too. Go keeps both whole; here they are what the
+    /// audit log's part `K` and `matched_rules()` report, and every match keeps its own. The matched value
+    /// (`MatchData::value`) is not cut: the multiphase duplicate check compares it by equality.
     fn describe_match(&self, tx: &Transaction) -> (String, String) {
         let expand = |value: &Option<crate::operators::Macro>| {
             value
                 .as_ref()
-                .map(|value| value.expand_cow(tx).into_owned())
+                .map(|value| value.expand_capped(tx, MAX_MATCH_TEXT_BYTES).into_owned())
                 .unwrap_or_default()
         };
         (expand(&self.metadata.msg), expand(&self.metadata.log_data))
@@ -661,7 +745,13 @@ impl Rule {
         outcome: OperatorOutcome,
         matched: Option<MatchData>,
     ) -> bool {
+        if tx.rule_memory_stopped() {
+            return false;
+        }
         tx.store_operator_outputs(&mut outputs);
+        if tx.rule_memory_stopped() {
+            return false;
+        }
         Self::log_operator_outcome(tx, id, variable, outcome);
         if outcome == OperatorOutcome::NotInspected
             && self
@@ -675,27 +765,90 @@ impl Rule {
         }
         if outcome == OperatorOutcome::Matched {
             let Some(mut matched) = matched else {
-                return true;
+                // No match was made when the budget refused it, and the evaluation is over.
+                return !tx.rule_memory_stopped();
             };
             matched.chain_level = chain_level;
-            if tx.multiphase_evaluation()
-                && is_multiphase_double_evaluation(tx, id, collective_matched_values, &matched)
-            {
-                return true;
+            if tx.multiphase_evaluation() {
+                // The duplicate check keeps a copy of every match until the rule is done.
+                if !tx.charge_rule_scratch(Self::match_bytes(&matched)) {
+                    return false;
+                }
+                if is_multiphase_double_evaluation(tx, id, collective_matched_values, &matched) {
+                    tx.release_rule_matches(Self::match_bytes(&matched));
+                    // The check dropped its copy of the key and value, which is freed: what stays is its slot in the
+                    // list, which keeps its room.
+                    tx.release_rule_scratch(Self::copied_bytes(&matched));
+                    return true;
+                }
             }
             tx.record_matched_variable(&matched);
+            if tx.rule_memory_stopped() {
+                return false;
+            }
             self.run_nondisruptive_actions(tx);
+            if tx.rule_memory_stopped() {
+                return false;
+            }
             if self.chain.is_empty() {
                 (matched.message, matched.data) = self.describe_match(tx);
+                if !Self::charge_text(tx, &matched) {
+                    return false;
+                }
             }
             matched_values.push(matched);
         }
         true
     }
 
+    /// What a match holds, beside its text: its slot in the list of matches, the key and the value.
+    fn match_bytes(matched: &MatchData) -> usize {
+        MATCH_SLOT_BYTES.saturating_add(Self::copied_bytes(matched))
+    }
+
+    /// What a copy of a match holds in the buffers it owns: the key and the value.
+    fn copied_bytes(matched: &MatchData) -> usize {
+        allocation_bytes(matched.key.capacity()).saturating_add(allocation_bytes(matched.value.capacity()))
+    }
+
+    /// The record of a match of `candidate`, or `None` when its bytes do not fit what the budget has left: they are
+    /// charged before the value is copied, since the copy of a large value is what the budget is there to prevent.
+    fn new_match(
+        tx: &Transaction,
+        variable: RuleVariable,
+        key: &str,
+        candidate: TransformationValue<'_>,
+    ) -> Option<MatchData> {
+        if tx.rule_budget_is_armed() {
+            let value_bytes = match &candidate {
+                TransformationValue::Borrowed(bytes) => bytes.len(),
+                TransformationValue::Owned(bytes) => bytes.capacity(),
+            };
+            let bytes = MATCH_SLOT_BYTES
+                .saturating_add(allocation_bytes(key.len()))
+                .saturating_add(allocation_bytes(value_bytes));
+            if !tx.charge_rule_matches(bytes) {
+                return None;
+            }
+        }
+        Some(MatchData::new(variable, key, candidate.into_owned()))
+    }
+
+    /// Reserves what the text of `matched` takes, which `describe_match` has just made; the text is cut to a size
+    /// that does not need to be reserved before it is, and what it expands from is gone when it is.
+    fn charge_text(tx: &Transaction, matched: &MatchData) -> bool {
+        tx.charge_rule_matches(
+            allocation_bytes(matched.message.capacity()).saturating_add(allocation_bytes(matched.data.capacity())),
+        )
+    }
+
     /// Run actions that apply as each rule in a chain matches.
     fn run_nondisruptive_actions(&self, tx: &mut Transaction) {
         for action in &self.actions {
+            // An action that did not fit the budget ended the evaluation: nothing runs after it.
+            if tx.rule_memory_stopped() {
+                break;
+            }
             if action.action_type() == ActionType::Nondisruptive {
                 tx.debug_log(DebugLevel::Debug, "Evaluating action", || {
                     [DebugField::RuleId(self.metadata.id), DebugField::Text(&action.name)]
@@ -716,7 +869,7 @@ impl Rule {
 mod tests {
     use std::sync::Arc;
 
-    use super::{CollectiveMatches, Rule};
+    use super::{CollectiveMatches, MAX_MATCH_TEXT_BYTES, Rule};
     use crate::{
         actions::{ActionImplementation, ActionType, CompiledAction, CustomAction, RuleMetadata},
         collection::MatchData,
@@ -872,6 +1025,86 @@ mod tests {
             tx.get_variable(RuleVariable::Env, Some("second")).as_deref(),
             Some("miss")
         );
+    }
+
+    /// The text a match keeps of its expanded `msg` and `logdata`, which CRS's `logdata` fills with the matched value.
+    fn match_text_of(rules: &str, value: &[u8]) -> Vec<(usize, usize)> {
+        let waf = build_waf(rules);
+        let mut tx = waf.new_transaction_with_id("match-text");
+        tx.add_get_argument("q", value);
+        assert!(tx.process_request_headers().is_none());
+        tx.matched_rules()
+            .iter()
+            .flat_map(|rule| rule.matches.iter().map(|item| (item.message.len(), item.data.len())))
+            .collect()
+    }
+
+    #[test]
+    fn the_expanded_msg_and_logdata_a_match_keeps_are_capped_where_the_matched_value_is_not() {
+        let rules = "SecRule ARGS:q \"@rx .\" \
+                     \"id:980,phase:1,pass,msg:'%{MATCHED_VAR}',logdata:'%{MATCHED_VAR} %{MATCHED_VAR}'\"";
+        let value = vec![b'v'; 400_000];
+        let waf = build_waf(rules);
+        let mut tx = waf.new_transaction_with_id("match-text-cap");
+        tx.add_get_argument("q", &value);
+        assert!(tx.process_request_headers().is_none());
+
+        let matched = tx.matched_rules().first().unwrap().matches.first().unwrap();
+        assert_eq!(
+            matched.value.len(),
+            400_000,
+            "the value is kept whole: the duplicate check compares it"
+        );
+        assert_eq!(matched.message.len(), MAX_MATCH_TEXT_BYTES);
+        assert_eq!(matched.data.len(), MAX_MATCH_TEXT_BYTES);
+        assert!(
+            matched.message.bytes().all(|byte| byte == b'v'),
+            "the first bytes are kept"
+        );
+        // What the RULE collection exposes of the same expansions is capped alike.
+        for key in ["msg", "logdata"] {
+            let text = tx.get_variable(RuleVariable::Rule, Some(key)).unwrap();
+            assert!(
+                text.len() <= MAX_MATCH_TEXT_BYTES,
+                "RULE:{key} holds {} bytes",
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cap_on_the_expanded_text_cuts_between_characters_and_leaves_what_fits_alone() {
+        let rules = "SecRule ARGS:q \"@rx .\" \"id:981,phase:1,pass,msg:'%{MATCHED_VAR}',logdata:'x%{MATCHED_VAR}'\"";
+        // Three-byte characters: a cut at 4096 would land inside one, so it falls back to 4095.
+        let euro = "\u{20ac}".repeat(2_000);
+        assert_eq!(match_text_of(rules, euro.as_bytes()), [(4095, 4096)]);
+        // Exactly the cap, and below it: nothing is cut.
+        assert_eq!(match_text_of(rules, &vec![b'v'; MAX_MATCH_TEXT_BYTES]), [(4096, 4096)]);
+        assert_eq!(
+            match_text_of(rules, &vec![b'v'; MAX_MATCH_TEXT_BYTES - 1]),
+            [(4095, 4096)]
+        );
+        assert_eq!(match_text_of(rules, b"hit"), [(3, 4)]);
+        // A constant text over the cap is cut too: what a match keeps is bounded, whatever its source.
+        let long_msg = format!(
+            "SecRule ARGS:q \"@rx .\" \"id:982,phase:1,pass,msg:'{}'\"",
+            "m".repeat(5_000)
+        );
+        assert_eq!(match_text_of(&long_msg, b"hit"), [(MAX_MATCH_TEXT_BYTES, 0)]);
+    }
+
+    #[test]
+    fn the_msg_and_logdata_of_every_link_of_a_chain_are_capped() {
+        let rules = "SecRule ARGS:q \"@rx .\" \"id:983,phase:1,pass,chain,msg:'%{MATCHED_VAR}',logdata:'%{MATCHED_VAR}'\"\n\
+                     SecRule ARGS:q \"@rx .\" \"t:none,msg:'%{MATCHED_VAR}'\"";
+        let texts = match_text_of(rules, &vec![b'v'; 400_000]);
+        assert!(!texts.is_empty());
+        for (message, data) in texts {
+            assert!(
+                message <= MAX_MATCH_TEXT_BYTES && data <= MAX_MATCH_TEXT_BYTES,
+                "{message} {data}"
+            );
+        }
     }
 
     #[test]
