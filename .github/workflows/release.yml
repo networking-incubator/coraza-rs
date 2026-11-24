@@ -101,12 +101,14 @@ jobs:
         if: github.event_name != 'push'
         run: echo "GORELEASER_CURRENT_TAG=v0.0.0-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
 
-      # Only the newest vX.Y.Z release may publish the shared `latest` image
-      # tags, so a delayed or backported older tag cannot move them backwards.
+      # Only the newest final vX.Y.Z release may publish the shared `latest`
+      # image tags, so a delayed or backported older tag — or any prerelease
+      # tag (vX.Y.Z-rc.N, which sort before their final tag) — cannot move
+      # them backwards.
       - name: Check whether to publish latest image tags
         if: github.event_name == 'push'
         run: |
-          newest="$(git tag --list 'v[0-9]*' | grep -v -- '-nightly\.' | sort -V | tail -1)"
+          newest="$(git tag --list 'v[0-9]*' | grep -v -- '-' | sort -V | tail -1)"
           if [ "$newest" = "${GITHUB_REF_NAME}" ]; then
             echo "PUSH_LATEST=true" >> "$GITHUB_ENV"
           else

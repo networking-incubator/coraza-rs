@@ -277,7 +277,10 @@ assets and packages each into a scratch Docker image
 (`ghcr.io/networking-incubator/coraza-rs` and `...-crs`, usable directly as
 Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
 nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
-tag is the newest one, so an older backported tag cannot move it backwards).
+tag is the newest final one, so an older backported tag or a prerelease tag
+cannot move it backwards). GitHub releases are marked as prereleases for any
+semver prerelease tag (`vX.Y.Z-rc.N`, and the nightlies) and as regular
+releases for final `vX.Y.Z` tags.
 
 OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
 the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the
