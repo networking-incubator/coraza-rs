@@ -246,6 +246,21 @@ adding them requires a shared-corpus fixture first.
   kept, the ones that fit the limit included, so the collection can end below
   the limit: at a limit of two, a text value and then a start tag with two
   attributes leave just the text value (`coraza/src/body_processors/xml/mod.rs`).
+- Error line match pairs and URI. Go Coraza's `MatchedRule.ErrorLog` appends a
+  `[msg_match_N ...] [data_match_N ...]` pair for every match after the first
+  that has a message or data (`internal/corazarules/rule_match.go`,
+  `writeExtraRuleDetails`) and copies the whole request URI, and under audit
+  part `H` each message carries that line, so with part `K` the entry is
+  quadratic in the matches of one rule (the Go oracle writes 242 MB at 2000
+  matches) and proportional to the URI length times the matches. This engine
+  lists the first eight pairs of matches that have a message or data and ends
+  the line with ` [+N more matches]` for the others, and cuts `[uri]` at 1 KiB
+  with a ` [+N uri bytes]` marker after it; the first match's `msg` and `data`
+  stay cut at 280 bytes as in Go, and part `B` has the whole request line
+  (`MatchedRule::error_log` in `coraza/src/audit_log.rs`). A rule with at most
+  nine matches and a URI of at most 1 KiB is unchanged, and part `K` still
+  lists every match. This is a deliberate deviation with no engine case ID or
+  fixture hash yet.
 
 ## Rust-only multipart parser hardening budgets
 

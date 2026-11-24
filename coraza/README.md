@@ -257,6 +257,19 @@ above). Body capture is bounded by the configured request and response body
 limits. Review the selected parts and storage permissions before enabling audit
 logging for sensitive traffic.
 
+The error line of a rule (`MatchedRule::error_log`, and part `H`'s per-message
+error line) cuts the first match's `msg` and `data` at 280 bytes, as Go does,
+and the request `[uri]` at 1 KiB, followed by `[+N uri bytes]` when it was cut
+(the whole request line stays in part `B`). For the other matches that have a
+message or data it lists the first eight `[msg_match_N ...] [data_match_N ...]`
+pairs and, when more remain, ends with `[+N more matches]`. Go lists every pair
+and the whole URI. Part `K` still lists every match. Every message of a rule
+carries this line, so without these limits `H` and `K` together made the entry
+quadratic in the matches of one rule and, with a long URI, the URI length times
+the matches. With them each line has a bounded size and the entry grows
+linearly with the rule's matches Q (about 0.8 KB per match in the test shape,
+1.9 MB for 1000 matches of one rule with a 60 KB path).
+
 ## Custom transformations
 
 Implement `coraza::transformations::CustomTransformation` and register it with
@@ -667,6 +680,18 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   the direction's body error. Go Coraza has no limit on XML values, and each is
   one more evaluation of every rule that reads XML. Deployments with large SOAP
   or feed uploads raise `SecArgumentsLimit`.
+- The error line of a rule that matched many values lists the first eight
+  `[msg_match_N ...] [data_match_N ...]` pairs after its first match and ends
+  with `[+N more matches]` for the rest, and cuts the request `[uri]` at 1 KiB
+  with a `[+N uri bytes]` marker (the whole request line is in part `B`). This
+  applies to `MatchedRule::error_log` and to the error line of each message
+  under audit part `H`; part `K` still lists every match with its own `msg` and
+  `logdata`. A rule with at most nine matches and a URI of at most 1 KiB reads
+  as before. This is a deliberate deviation: Go Coraza lists every match and
+  the whole URI in the line, and with parts `H` and `K` together that made the
+  audit entry quadratic in the matches of one rule (245,930,171 bytes for 2000
+  matches in the test shape) and proportional to the URI length times the
+  matches. A parser of the error line that needs every match reads part `K`.
 
 ## FTW integration
 
