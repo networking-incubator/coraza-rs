@@ -127,6 +127,10 @@ pub(crate) enum Incomplete {
     MalformedBody,
     /// The host did not provide the held body buffer.
     BodyUnavailable,
+    /// The host did not provide the message headers.
+    HeadersUnavailable,
+    /// The host did not provide the message trailers.
+    TrailersUnavailable,
     /// The message uses an unbounded or opaque streaming protocol.
     StreamingBody,
 }
@@ -140,7 +144,9 @@ impl Incomplete {
             | Self::MalformedEncoding
             | Self::EncodedValueRemains
             | Self::MalformedBody
-            | Self::BodyUnavailable => 400,
+            | Self::BodyUnavailable
+            | Self::HeadersUnavailable
+            | Self::TrailersUnavailable => 400,
             Self::BodyTooLarge | Self::FieldLimit | Self::FieldTooLarge => 413,
         }
     }
@@ -1196,6 +1202,22 @@ mod tests {
     /// Copies a static test fixture into the SDK's owned body type.
     fn scan_body(inspection: &mut Inspection, bytes: &[u8], format: &super::BodyFormat) {
         inspection.body(bytes.to_vec(), format);
+    }
+
+    /// A host that withholds a message part is a client error, not a pass.
+    #[test]
+    fn unavailable_host_data_marks_inspection_incomplete() {
+        for reason in [
+            Incomplete::BodyUnavailable,
+            Incomplete::HeadersUnavailable,
+            Incomplete::TrailersUnavailable,
+        ] {
+            let mut inspection = Inspection::new(&Config::default());
+            assert!(inspection.incomplete().is_none());
+            inspection.mark_incomplete(reason);
+            assert_eq!(inspection.incomplete(), Some(reason));
+            assert_eq!(reason.status_code(), 400);
+        }
     }
 
     /// Checks decoded query and form representations.
