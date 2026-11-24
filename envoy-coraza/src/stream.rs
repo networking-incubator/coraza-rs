@@ -99,7 +99,8 @@ pub(crate) enum TerminalOutcome {
     BodyTooLarge { phase: &'static str, status: u16 },
     /// Coraza processed the configured prefix and allowed the request to continue.
     BodyPartiallyInspected { phase: &'static str },
-    /// A body processor stopped at the memory budget the root left it, so only what it had parsed was inspected.
+    /// A body processor or the rules of the body phase stopped at the memory budget the root left them, so only what
+    /// the parser had parsed was inspected, or the rules after the stop were not evaluated.
     BodyMemoryBudgetStopped { phase: &'static str },
     /// The per-root retained-body cap was exhausted.
     RetainedBodyBudgetExhausted { phase: &'static str },
@@ -680,6 +681,20 @@ impl CorazaHttp {
             Ok(interruption) => interruption,
             Err(outcome) => return self.reject_request(503, REQUEST_INCOMPLETE_BODY, outcome),
         };
+        // The rules of the phase were stopped by the budget the root left them: the rules after the stop were not
+        // evaluated, so the request is refused whatever the engine mode, as the engine's own interruption would say
+        // in the default mode and a would-be one in `DetectionOnly` does not.
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.rule_evaluation_stopped_by_memory_budget())
+        {
+            return self.reject_request(
+                503,
+                REQUEST_INCOMPLETE_BODY,
+                TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" },
+            );
+        }
         if let Some(interruption) = interruption {
             return self.reject_interruption(&interruption, "request-body", InterruptionPhase::RequestBody);
         }
@@ -1200,10 +1215,23 @@ impl CorazaHttp {
             .as_deref()
             .is_some_and(Transaction::is_response_body_processable);
         let fetch = |size| hostcalls::get_buffer(BufferType::HttpResponseBody, 0, size);
-        let interruption = match self.inspect_response_body(body_size, body_access, processable, fetch) {
+        let inspected = self.inspect_response_body(body_size, body_access, processable, fetch);
+        let rules_stopped = self
+            .tx
+            .as_deref()
+            .is_some_and(Transaction::rule_evaluation_stopped_by_memory_budget);
+        let interruption = match inspected {
             Ok(interruption) => interruption,
+            // The check of the root after the phase can fail first when the rules were stopped (the reserve a stopped
+            // parse leaves them can outlast the body copies that are released), which is still the stop of the rules.
+            Err(_) if rules_stopped => return self.refuse_response_budget_stopped(),
             Err(outcome) => return self.refuse_response(503, None, RESPONSE_INCOMPLETE_BODY, outcome),
         };
+        // The rules of the phase were stopped by the budget the root left them: the response is replaced, whatever the
+        // engine mode, as a request is refused.
+        if rules_stopped {
+            return self.refuse_response_budget_stopped();
+        }
         if let Some(interruption) = interruption {
             return self.refuse_response_interruption(&interruption, "response-body", InterruptionPhase::ResponseBody);
         }
@@ -1215,12 +1243,7 @@ impl CorazaHttp {
             .as_ref()
             .is_some_and(|tx| tx.response_body_stopped_by_memory_budget())
         {
-            return self.refuse_response(
-                502,
-                None,
-                RESPONSE_INCOMPLETE_BODY,
-                TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" },
-            );
+            return self.refuse_response_budget_stopped();
         }
         if self.tx.as_ref().is_some_and(|tx| tx.response_body_stats().truncated) {
             self.outcome
@@ -1370,6 +1393,16 @@ impl CorazaHttp {
         self.response_mode = ResponseMode::Refused;
         self.finish_once(outcome);
         self.send_refusal(status, location, body)
+    }
+
+    /// Refuses a response that the memory budget stopped the inspection of, whether its parser or its rules.
+    fn refuse_response_budget_stopped(&mut self) -> Action {
+        self.refuse_response(
+            502,
+            None,
+            RESPONSE_INCOMPLETE_BODY,
+            TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" },
+        )
     }
 
     fn refuse_response_interruption(
@@ -2604,6 +2637,17 @@ mod tests {
             "the terminal result stays distinct"
         );
         assert_eq!(denied.terminal_name(), "denied");
+
+        // A stop of the memory budget in the response phase is the same: the earlier reason is kept, and the terminal
+        // outcome says the stream ended incomplete.
+        let mut stream = CorazaHttp::new(None, Rc::new(Cell::new(0_usize)));
+        stream.outcome = Some(partial.clone());
+        let stopped = TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" };
+        assert_eq!(stream.finish_state(stopped.clone(), |_| false), Some(false));
+        assert_eq!(stream.outcome.as_ref(), Some(&partial));
+        assert_eq!(stream.final_outcome.as_ref(), Some(&stopped));
+        assert_eq!(stopped.inspection_reason(), "body_memory_budget_stopped");
+        assert_eq!(stopped.terminal_name(), "incomplete");
     }
 
     #[test]
@@ -3586,6 +3630,132 @@ mod scripted_host_tests {
                 test_hostcalls::published_property("io.coraza.waf.v1.inspection_complete").as_deref(),
                 Some("true")
             );
+        }
+    }
+
+    /// `count` rules, as CRS's are, that match every value of a list and keep it, its name and a message and data
+    /// that expand it, in the form of the policy's JSON.
+    fn flood_rules(count: usize, variable: &str, phase: u8) -> String {
+        (0..count)
+            .map(|index| {
+                format!(
+                    r#", "SecRule {variable} \"@rx .\" \"id:{},phase:{phase},t:none,pass,nolog,msg:'Matched',logdata:'%{{MATCHED_VAR_NAME}}: %{{MATCHED_VAR}}'\"""#,
+                    3000 + index
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_flood_of_matches_the_root_cannot_hold_is_stopped_by_the_rules_budget_in_every_engine_mode() {
+        // A list of about 200,000 values the parser fits in the root, which thirty rules would each match, keeping
+        // about 90 MB of matches per rule where the root has 39 MiB left. Without a limit on what rules keep,
+        // the first rule would have allocated that before the check after the phase refused it.
+        let body = xml_list(MIB);
+        for mode in ["", r#", "SecRuleEngine DetectionOnly""#] {
+            let config = policy(LIMITS, &format!("{mode}{}", flood_rules(30, "XML:/*", 2)));
+            let (mut stream, root) = stream_beside(&config, 0);
+            let size = begin_post(&mut stream, "text/xml", &body);
+            assert_eq!(stream.on_http_request_body(size, true), Action::Pause, "{mode:?}");
+            assert_eq!(test_hostcalls::local_reply_statuses(), [503], "{mode:?}");
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" }),
+                "{mode:?}: the budget the rules were given stopped them, not the check after them"
+            );
+            // The stop is reported: the engine's transaction was finished, and the telemetry says why it was refused.
+            for (property, expected) in [
+                ("inspection_complete", "false"),
+                ("inspection_reason", "body_memory_budget_stopped"),
+                ("terminal_outcome", "incomplete"),
+            ] {
+                assert_eq!(
+                    test_hostcalls::published_property(&format!("io.coraza.waf.v1.{property}")).as_deref(),
+                    Some(expected),
+                    "{mode:?}: {property}"
+                );
+            }
+            assert_eq!(root.get(), 0, "{mode:?}: the stream's charges are released with it");
+        }
+
+        // The same rules on an ordinary document are evaluated as before: nothing is refused.
+        let config = policy(LIMITS, &flood_rules(30, "XML:/*", 2));
+        let (mut stream, root) = stream_beside(&config, 0);
+        let ordinary = b"<r><a>1</a><b c=\"2\">3</b></r>";
+        let size = begin_post(&mut stream, "text/xml", ordinary);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert!(root.get() <= MAX_ROOT_RETAINED_BODY_BYTES);
+
+        // A flood the root can hold is evaluated whole, and what its matches keep is what the root's accounting then
+        // holds for the stream, within the 64 MiB.
+        let config = policy(LIMITS, &flood_rules(2, "XML:/*", 2));
+        let (mut stream, root) = stream_beside(&config, 0);
+        let body = xml_list(MIB / 8);
+        let size = begin_post(&mut stream, "text/xml", &body);
+        assert_eq!(stream.on_http_request_body(size, true), Action::Continue);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert!(
+            (8 * MIB..=MAX_ROOT_RETAINED_BODY_BYTES).contains(&root.get()),
+            "the matches are held in the root: {} bytes",
+            root.get()
+        );
+    }
+
+    #[test]
+    fn a_response_whose_rules_the_root_cannot_hold_is_replaced_in_every_engine_mode() {
+        // About 100,000 values the response parser fits, which thirty rules of phase 4 match each.
+        let body = json_list(200 * 1024);
+        for mode in ["", r#", "SecRuleEngine DetectionOnly""#] {
+            let config = policy(LIMITS, &format!("{mode}{}", flood_rules(30, "RESPONSE_ARGS", 4)));
+            let mut stream = get_beside(&config, 0);
+            assert_eq!(respond(&mut stream, &body), Action::Pause, "{mode:?}");
+            assert_eq!(test_hostcalls::local_reply_statuses(), [502], "{mode:?}");
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" }),
+                "{mode:?}"
+            );
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+                Some("body_memory_budget_stopped"),
+                "{mode:?}"
+            );
+        }
+
+        // An ordinary response under the same rules is forwarded.
+        let config = policy(LIMITS, &flood_rules(30, "RESPONSE_ARGS", 4));
+        let mut stream = get_beside(&config, 0);
+        assert_eq!(respond(&mut stream, b"[1,2,3]"), Action::Continue);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+    }
+
+    #[test]
+    fn a_response_whose_rules_the_budget_stopped_is_a_502_even_when_the_retention_check_after_the_phase_fails_first() {
+        // A small response, and a root with a few kilobytes to spare beside it: the parse leaves the rules the 64 KiB
+        // reserve, thirty rules match every value and the budget stops them, and what they kept is still held when the
+        // phase ends, which is more than the root has left (the check after the phase fails too).
+        let body = json_list(512);
+        for mode in ["", r#", "SecRuleEngine DetectionOnly""#] {
+            let config = policy(LIMITS, &format!("{mode}{}", flood_rules(30, "RESPONSE_ARGS", 4)));
+            let base = held(&get_beside(&config, 0));
+            for slack in [8 * 1024, 32 * 1024] {
+                let others = MAX_ROOT_RETAINED_BODY_BYTES - 4 * body.len() - base - slack;
+                let mut stream = get_beside(&config, others);
+                assert_eq!(respond(&mut stream, &body), Action::Pause, "{mode:?} {slack}");
+                assert_eq!(test_hostcalls::local_reply_statuses(), [502], "{mode:?} {slack}");
+                assert_eq!(
+                    stream.final_outcome,
+                    Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "response-body" }),
+                    "{mode:?} {slack}: the stop of the rules is the reason, not the check that came after it"
+                );
+                assert_eq!(
+                    test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+                    Some("body_memory_budget_stopped"),
+                    "{mode:?} {slack}"
+                );
+            }
         }
     }
 

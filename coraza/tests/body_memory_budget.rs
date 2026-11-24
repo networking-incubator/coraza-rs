@@ -23,10 +23,18 @@
 
 mod common;
 
-use std::fmt::Write as _;
+use std::{
+    fmt::Write as _,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use common::smallest_budget;
 use coraza::{
+    actions::{ActionType, CustomAction, RuleMetadata},
+    operators::{Operator, Outputs},
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
     types::RuleVariable,
@@ -35,7 +43,11 @@ use coraza::{
 
 /// The engine with `rules` beside a body policy that parses by `Content-Type`, XML and JSON as CRS selects them.
 fn waf(rules: &str) -> Waf {
-    let mut parser = Parser::new();
+    waf_in(Parser::new(), rules)
+}
+
+/// [`waf`] built by `parser`, which a test may have given a callback.
+fn waf_in(mut parser: Parser, rules: &str) -> Waf {
     parser
         .from_string(&format!(
             "SecRequestBodyAccess On\n\
@@ -926,4 +938,1075 @@ fn only_a_processor_that_stopped_for_the_budget_says_so_whatever_the_body_quotes
         assert!(message.contains(reported), "{content_type:.40}: {message}");
         assert!(tx.request_body_stopped_by_memory_budget(), "{content_type:.40}");
     }
+}
+
+/// `count` rules that each match the one large field of a form, keep the value in their match and copy it to a `TX`
+/// key of their own, and a last rule that says whether the phase got to it.
+fn copying_rules(count: usize, mode: &str) -> String {
+    let rules: String = (0..count)
+        .map(|index| {
+            format!(
+                "SecRule ARGS_POST \"@rx .\" \"id:{},phase:2,pass,nolog,msg:'copy',setvar:tx.copy{index}=%{{MATCHED_VAR}}\"\n",
+                100 + index
+            )
+        })
+        .collect();
+    format!("SecRuleEngine {mode}\n{rules}SecAction \"id:999,phase:2,pass,nolog,setvar:tx.reached=1\"\n")
+}
+
+/// A transaction of `waf` that has read a form of one field of `size` bytes, under `budget`, and its body processed.
+fn form_after_rules(
+    waf: &Waf,
+    size: usize,
+    budget: Option<usize>,
+) -> (Transaction, Option<coraza::transaction::Interruption>) {
+    let mut tx = request(waf, "application/x-www-form-urlencoded", budget);
+    let interruption = tx.process_request_body(format!("k={}", "v".repeat(size)).as_bytes());
+    (tx, interruption)
+}
+
+#[test]
+fn rules_that_would_keep_more_than_the_budget_has_left_stop_the_phase_and_nothing_runs_after_the_stop() {
+    const SIZE: usize = 20_000;
+    let parse_only = waf("");
+    let (reference, _) = form_after_rules(&parse_only, SIZE, None);
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+
+    // What forty such rules retain, without a budget: all of them match, and each leaves a copy in TX.
+    let with_rules = waf(&copying_rules(40, "On"));
+    let (unlimited, interruption) = form_after_rules(&with_rules, SIZE, None);
+    assert!(interruption.is_none() && !unlimited.rule_evaluation_stopped_by_memory_budget());
+    assert_eq!(unlimited.matched_rules().len(), 41);
+    let retained = unlimited.body_memory_bytes() - reference.body_memory_bytes();
+    assert!(
+        retained > 40 * SIZE,
+        "{retained}: forty copies of the value and forty matches of it"
+    );
+
+    // A budget with room for what they retain lets them finish, as having none does.
+    let (fits, interruption) = form_after_rules(&with_rules, SIZE, Some(parse + 2 * retained));
+    assert!(interruption.is_none() && !fits.rule_evaluation_stopped_by_memory_budget());
+    assert_eq!(fits.matched_rules().len(), 41);
+    assert_eq!(
+        fits.get_variable(RuleVariable::TX, Some("copy39")),
+        unlimited.get_variable(RuleVariable::TX, Some("copy39")),
+        "the values the rules set are the same"
+    );
+    assert_eq!(
+        fits.get_variable(RuleVariable::TX, Some("reached")).as_deref(),
+        Some("1")
+    );
+
+    // With room for about half of them the phase stops: 503, nothing records or runs after it, and what is held
+    // stays within what the budget allowed.
+    let (stopped, interruption) = form_after_rules(&with_rules, SIZE, Some(parse + retained / 2));
+    let interruption = interruption.unwrap();
+    assert_eq!(
+        (interruption.status, interruption.rule_id, interruption.action.as_str()),
+        (503, 0, "deny")
+    );
+    assert_eq!(interruption.data, "rule evaluation memory budget exhausted");
+    assert!(stopped.rule_evaluation_stopped_by_memory_budget());
+    let recorded = stopped.matched_rules().len();
+    assert!((5..35).contains(&recorded), "{recorded} of the 41 rules were recorded");
+    assert_eq!(
+        stopped.get_variable(RuleVariable::TX, Some("reached")),
+        None,
+        "no rule ran after the stop"
+    );
+    assert!(
+        stopped.body_memory_bytes() <= reference.body_memory_bytes() + parse + retained / 2,
+        "the transaction holds {} against the {} the budget allowed",
+        stopped.body_memory_bytes(),
+        reference.body_memory_bytes() + parse + retained / 2
+    );
+    assert_eq!(
+        stopped
+            .get_variable(RuleVariable::TX, Some(&format!("copy{}", recorded - 1)))
+            .map(|value| value.len()),
+        Some(SIZE),
+        "what the rules before the stop did is kept"
+    );
+
+    // A budget that cannot hold even the first match stops at it.
+    let (first, interruption) = form_after_rules(&with_rules, SIZE, Some(parse));
+    assert!(interruption.is_some() && first.rule_evaluation_stopped_by_memory_budget());
+    assert_eq!(first.matched_rules().len(), 0);
+}
+
+#[test]
+fn in_detection_only_the_stop_is_a_recorded_would_be_interruption_and_the_phase_still_stops() {
+    const SIZE: usize = 20_000;
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+    let with_rules = waf(&copying_rules(40, "DetectionOnly"));
+    let (stopped, interruption) = form_after_rules(&with_rules, SIZE, Some(parse + 100_000));
+    assert!(interruption.is_none(), "DetectionOnly interrupts nothing");
+    let would_be = stopped.would_be_interruption().unwrap();
+    assert_eq!(
+        (would_be.status, would_be.data.as_str()),
+        (503, "rule evaluation memory budget exhausted")
+    );
+    assert!(stopped.rule_evaluation_stopped_by_memory_budget(), "the host can tell");
+    assert!(stopped.matched_rules().len() < 40);
+    assert_eq!(
+        stopped.get_variable(RuleVariable::TX, Some("reached")),
+        None,
+        "no rule ran after the stop"
+    );
+}
+
+/// Rules shaped as CRS's are: a capture, a `logdata` that expands what matched, scores added with `setvar`, a chain
+/// that holds back until its second link matches, and a blocking rule that reads the score.
+const SCORING_RULES: &str = "\
+SecAction \"id:901,phase:1,pass,nolog,setvar:tx.anomaly_score=0,setvar:tx.hits=0\"\n\
+SecRule ARGS|XML:/*|ARGS_NAMES \"@rx (?i)select\\s+(\\w+)\" \"id:942100,phase:2,pass,capture,t:none,t:urlDecodeUni,\
+msg:'SQL Injection',logdata:'Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}',\
+setvar:tx.anomaly_score=+5,setvar:tx.hits=+1,setvar:'tx.sqli_%{MATCHED_VAR_NAME}=%{TX.1}'\"\n\
+SecRule ARGS \"@rx ^\\w+$\" \"id:920100,phase:2,pass,chain,msg:'Short word',logdata:'%{MATCHED_VAR}'\"\n\
+  SecRule ARGS \"@rx secret\" \"t:none,setvar:tx.anomaly_score=+2\"\n\
+SecRule TX:ANOMALY_SCORE \"@ge 5\" \"id:949110,phase:2,deny,status:403,msg:'Blocked',logdata:'%{TX.ANOMALY_SCORE}'\"\n";
+
+#[test]
+fn a_budget_that_fits_changes_neither_what_matches_nor_the_scores_nor_the_verdict() {
+    let with_rules = waf(SCORING_RULES);
+    let long_attack = format!("a=select {}&b=ok&c=secret", "x".repeat(30_000));
+    let json = r#"{"user":"select name","note":"hello","items":["select 1","fine","secret"]}"#;
+    let xml = "<r><a>select q</a><b secret=\"1\">fine</b><c>select z</c></r>";
+    let requests: [(&str, &str); 7] = [
+        ("application/x-www-form-urlencoded", "a=hello&b=world"),
+        ("application/x-www-form-urlencoded", "a=select+name&b=word&c=secret"),
+        (
+            "application/x-www-form-urlencoded",
+            "q=select%20a&r=select%20b&s=fine&t=secret",
+        ),
+        ("application/x-www-form-urlencoded", &long_attack),
+        ("application/json", json),
+        ("text/xml", xml),
+        ("application/x-www-form-urlencoded", ""),
+    ];
+    let (mut matches, mut blocked) = (0, 0);
+    for (content_type, body) in requests {
+        let run = |budget: Option<usize>| {
+            let mut tx = request(&with_rules, content_type, budget);
+            let interruption = tx.process_request_body(body.as_bytes());
+            (tx, interruption)
+        };
+        let (plain, plain_interruption) = run(None);
+        matches += plain
+            .matched_rules()
+            .iter()
+            .map(|rule| rule.matches.len())
+            .sum::<usize>();
+        blocked += usize::from(plain_interruption.is_some());
+        for budget in [1 << 20, 64 << 20] {
+            let (budgeted, interruption) = run(Some(budget));
+            let label = format!("{content_type} {body:.30} at {budget}");
+            assert!(!budgeted.rule_evaluation_stopped_by_memory_budget(), "{label}");
+            assert_eq!(interruption, plain_interruption, "{label}");
+            assert_eq!(budgeted.matched_rules().len(), plain.matched_rules().len(), "{label}");
+            for (left, right) in budgeted.matched_rules().iter().zip(plain.matched_rules()) {
+                assert_eq!(left.rule.id(), right.rule.id(), "{label}");
+                assert_eq!(left.matches, right.matches, "{label}: rule {}", left.rule.id());
+            }
+            for key in ["anomaly_score", "hits", "0", "1"] {
+                assert_eq!(
+                    budgeted.get_variable(RuleVariable::TX, Some(key)),
+                    plain.get_variable(RuleVariable::TX, Some(key)),
+                    "{label}: TX:{key}"
+                );
+            }
+            assert_eq!(
+                budgeted.body_memory_bytes(),
+                plain.body_memory_bytes(),
+                "{label}: the same is held"
+            );
+        }
+    }
+    assert!(
+        matches >= 10 && (3..7).contains(&blocked),
+        "{matches} matches, {blocked} blocked: the rules do their work"
+    );
+}
+
+#[test]
+fn what_a_rule_held_and_did_not_record_is_given_back_when_it_is_done() {
+    const SIZE: usize = 20_000;
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+    // Room for the copies one match makes of the value (its record, its entry in `MATCHED_VARS`, `MATCHED_VAR`) and
+    // not for a hundred of them.
+    let budget = parse + 5 * SIZE;
+
+    // Two hundred chains whose first link matches the value and whose second link never does: each holds the
+    // value's match while it is evaluated, and records nothing.
+    let chained: String = (0..200)
+        .map(|index| {
+            format!(
+                "SecRule ARGS_POST \"@rx .\" \"id:{},phase:2,pass,nolog,chain\"\n  SecRule ARGS_POST \"@rx NEVER\" \"t:none\"\n",
+                100 + index
+            )
+        })
+        .collect();
+    let (tx, interruption) = form_after_rules(&waf(&chained), SIZE, Some(budget));
+    assert!(
+        interruption.is_none() && !tx.rule_evaluation_stopped_by_memory_budget(),
+        "dropped matches are given back"
+    );
+    assert!(tx.matched_rules().is_empty());
+
+    // The same rules without the second link keep their matches, and the budget does not hold them.
+    let kept: String = (0..200)
+        .map(|index| {
+            format!(
+                "SecRule ARGS_POST \"@rx .\" \"id:{},phase:2,pass,nolog\"\n",
+                100 + index
+            )
+        })
+        .collect();
+    let (tx, interruption) = form_after_rules(&waf(&kept), SIZE, Some(budget));
+    assert!(interruption.is_some() && tx.rule_evaluation_stopped_by_memory_budget());
+    assert!(tx.matched_rules().len() < 20, "{} recorded", tx.matched_rules().len());
+
+    // A rule that matches twenty thousand values records each, and copies each to `MATCHED_VARS`: four megabytes do
+    // not hold them.
+    let many = "SecArgumentsLimit 100000\nSecRule ARGS_POST \"@rx .\" \"id:5,phase:2,pass,nolog\"\n";
+    let mut tx = request(&waf(many), "application/x-www-form-urlencoded", Some(parse + 4_000_000));
+    tx.process_request_body(&pairs(20_000));
+    assert!(
+        tx.rule_evaluation_stopped_by_memory_budget(),
+        "twenty thousand matches of one rule are over four megabytes"
+    );
+}
+
+#[test]
+fn the_rules_of_a_response_body_phase_are_bounded_alike() {
+    const SIZE: usize = 20_000;
+    let rules = copying_rules(40, "On")
+        .replace("phase:2", "phase:4")
+        .replace("ARGS_POST", "RESPONSE_BODY");
+    let with_rules = waf(&format!("SecResponseBodyMimeType text/plain\n{rules}"));
+    let respond = |budget: Option<usize>| {
+        let mut tx = with_rules.new_transaction();
+        tx.process_request_headers();
+        tx.process_request_body(b"");
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.set_body_memory_budget(budget);
+        let interruption = tx.process_response_body("v".repeat(SIZE).as_bytes());
+        (tx, interruption)
+    };
+
+    let (unlimited, interruption) = respond(None);
+    assert!(interruption.is_none() && !unlimited.rule_evaluation_stopped_by_memory_budget());
+    assert_eq!(unlimited.matched_rules().len(), 41);
+    let (fits, interruption) = respond(Some(100 << 20));
+    assert!(interruption.is_none() && !fits.rule_evaluation_stopped_by_memory_budget());
+    assert_eq!(fits.matched_rules().len(), 41);
+
+    let (stopped, interruption) = respond(Some(400_000));
+    let interruption = interruption.unwrap();
+    assert_eq!(
+        (interruption.status, interruption.data.as_str()),
+        (503, "rule evaluation memory budget exhausted")
+    );
+    assert!(stopped.rule_evaluation_stopped_by_memory_budget());
+    assert!(
+        (1..20).contains(&stopped.matched_rules().len()),
+        "{} recorded",
+        stopped.matched_rules().len()
+    );
+    assert_eq!(stopped.get_variable(RuleVariable::TX, Some("reached")), None);
+}
+
+#[test]
+fn a_parse_the_budget_stopped_leaves_the_rules_room_to_deny_on_the_body_error() {
+    const SIZE: usize = 20_000;
+    // The baseline's rule 200002, which answers a body error before the connector does.
+    let rules = "SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,t:none,deny,status:400,msg:'Failed to parse request body',\
+                 logdata:'%{reqbody_error_msg}',setvar:tx.anomaly_score=+5\"\n";
+    let parse_only = waf("");
+    let with_rules = waf(rules);
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+    // A budget the parse cannot finish in leaves the rules nothing of their own: the denial still gets through.
+    let (tx, interruption) = form_after_rules(&with_rules, SIZE, Some(parse - 1));
+    assert!(request_body_errored(&tx) && tx.request_body_stopped_by_memory_budget());
+    let interruption = interruption.unwrap();
+    assert_eq!((interruption.status, interruption.rule_id), (400, 200_002));
+    assert!(
+        !tx.rule_evaluation_stopped_by_memory_budget(),
+        "the rule that answers is not the stop"
+    );
+    assert_eq!(
+        tx.get_variable(RuleVariable::TX, Some("anomaly_score")).as_deref(),
+        Some("5")
+    );
+}
+
+/// Every way a rule holds the values it selects, each as a policy: the copies `multiMatch` makes at each stage, the
+/// snapshot of `TX` that its own `setvar`s must not change, a chain evaluated in more than one phase, and values that
+/// match nothing.
+fn selection_policies() -> Vec<(&'static str, String)> {
+    let copies = copying_rules(3, "On");
+    vec![
+        (
+            "multiMatch",
+            "SecRule ARGS_POST \"@rx v\" \"id:300,phase:2,pass,nolog,multiMatch,t:lowercase,t:urlDecodeUni,msg:'mm',\
+             setvar:tx.mm=+1\"\n"
+                .to_owned(),
+        ),
+        (
+            "a rule that selects TX, whose own setvar must not change what it selects",
+            format!("{copies}SecRule TX:/^copy/ \"@rx v\" \"id:301,phase:2,pass,nolog,setvar:tx.seen=+1\"\n"),
+        ),
+        (
+            "a chain",
+            "SecRule ARGS_POST \"@rx v\" \"id:302,phase:2,pass,nolog,chain,msg:'%{MATCHED_VAR_NAME}'\"\n  \
+             SecRule ARGS_POST \"@rx vv\" \"t:none,setvar:tx.chained=+1\"\n"
+                .to_owned(),
+        ),
+        (
+            "no match",
+            "SecRule ARGS_POST \"@rx NEVER\" \"id:303,phase:2,pass,nolog\"\n".to_owned(),
+        ),
+    ]
+}
+
+#[test]
+fn every_way_a_rule_holds_the_values_it_selects_is_charged_and_changes_nothing_below_the_budget() {
+    const SIZE: usize = 5_000;
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+    // `multiphase_evaluation` is what the connector compiles with: the duplicate check copies each match.
+    for multiphase in [false, true] {
+        for (label, rules) in selection_policies() {
+            let mut parser = Parser::new();
+            parser.config_mut().multiphase_evaluation = multiphase;
+            parser
+                .from_string(&format!(
+                    "SecRequestBodyAccess On\nSecRequestBodyLimit 134217728\nSecArgumentsLimit 100000\nSecRuleEngine On\n{rules}"
+                ))
+                .unwrap();
+            let with_rules = parser.into_waf().unwrap();
+            let (plain, _) = form_after_rules(&with_rules, SIZE, None);
+            let (fits, interruption) = form_after_rules(&with_rules, SIZE, Some(parse + (50 << 20)));
+            assert!(
+                interruption.is_none() && !fits.rule_evaluation_stopped_by_memory_budget(),
+                "{label} (multiphase {multiphase})"
+            );
+            assert_eq!(fits.matched_rules().len(), plain.matched_rules().len(), "{label}");
+            for key in ["mm", "seen", "chained", "copy2"] {
+                assert_eq!(
+                    fits.get_variable(RuleVariable::TX, Some(key)),
+                    plain.get_variable(RuleVariable::TX, Some(key)),
+                    "{label}: TX:{key}"
+                );
+            }
+            // What the rules hold is charged: a budget with no room for the value's copies stops them, unless the
+            // policy matches nothing, which holds nothing.
+            let (tight, _) = form_after_rules(&with_rules, SIZE, Some(parse + SIZE));
+            assert_eq!(
+                tight.rule_evaluation_stopped_by_memory_budget(),
+                !plain.matched_rules().is_empty(),
+                "{label} (multiphase {multiphase})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rule_whose_own_record_does_not_fit_stops_the_phase_and_never_denies() {
+    // The record of a match copies the URI, so a long one makes the record the large charge of the rule.
+    let uri = format!("/x?{}", "u".repeat(30_000));
+    for mode in ["On", "DetectionOnly"] {
+        let with_rules = waf(&format!(
+            "SecRuleEngine {mode}\n\
+             SecRule ARGS_POST \"@rx .\" \"id:10,phase:2,deny,status:403,msg:'x',setvar:tx.marker=1\"\n\
+             SecAction \"id:11,phase:2,pass,nolog,setvar:tx.after=1\"\n"
+        ));
+        let mut stopped_at_the_record = 0;
+        for budget in (0..120_000).step_by(512) {
+            let mut tx = with_rules.new_transaction();
+            tx.process_uri(&uri, "POST", "HTTP/1.1");
+            tx.set_body_memory_budget(Some(budget));
+            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            tx.process_request_headers();
+            let interruption = tx.process_request_body(b"a=1");
+            let label = format!("{mode} at {budget}");
+            if tx.request_body_stopped_by_memory_budget() {
+                // The parse did not fit: no rule saw an argument.
+                continue;
+            }
+            let reported = interruption.as_ref().or_else(|| tx.would_be_interruption());
+            let recorded = tx.matched_rules().iter().any(|rule| rule.rule.id() == 10);
+            if tx.rule_evaluation_stopped_by_memory_budget() {
+                let reported = reported.unwrap();
+                // A rule recorded before the stop keeps the denial it made (DetectionOnly goes on to the next rule,
+                // and the first would-be interruption stands); a rule stopped at its own record denies nothing.
+                let expected = if recorded { (403, 10) } else { (503, 0) };
+                assert_eq!((reported.status, reported.rule_id), expected, "{label}");
+                if !recorded {
+                    assert_eq!(
+                        tx.get_variable(RuleVariable::TX, Some("after")),
+                        None,
+                        "{label}: no rule ran after"
+                    );
+                }
+                // The marker is the rule's own action, which runs once its match is found and before its record is
+                // made: a stop with the marker set and no record is a stop at the record or at its text, and one
+                // without it came earlier, at the selection or at the match.
+                stopped_at_the_record +=
+                    usize::from(!recorded && tx.get_variable(RuleVariable::TX, Some("marker")).is_some());
+            } else {
+                assert!(recorded, "{label}: nothing stopped, so the rule ran");
+                assert_eq!(
+                    reported.map(|item| (item.status, item.rule_id)),
+                    Some((403, 10)),
+                    "{label}"
+                );
+            }
+            // Whatever the engine reports names a rule it has recorded, or the stop.
+            if let Some(reported) = reported.filter(|item| item.rule_id == 10) {
+                assert!(recorded, "{label}: {} is not in matched_rules()", reported.rule_id);
+            }
+        }
+        assert!(
+            stopped_at_the_record > 0,
+            "{mode}: no budget stopped the rule at its record, the case does not test it"
+        );
+    }
+}
+
+#[test]
+fn a_selection_the_budget_cannot_hold_stops_the_phase_before_the_list_is_made_plain_or_multimatch() {
+    // Twenty thousand arguments: a list of references to them is megabytes, and no rule here ever matches.
+    let body = pairs(20_000);
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        let mut tx = request(&parse_only, "application/x-www-form-urlencoded", Some(budget));
+        tx.process_request_body(&body);
+        !request_body_errored(&tx)
+    });
+    for (label, transformations) in [("plain", "t:lowercase"), ("multiMatch", "multiMatch,t:lowercase")] {
+        let with_rules = waf(&format!(
+            "SecRule ARGS_POST \"@rx zzz\" \"id:5,phase:2,pass,nolog,{transformations}\"\n\
+             SecAction \"id:6,phase:2,pass,nolog,setvar:tx.reached=1\"\n"
+        ));
+        let run = |budget: usize| {
+            let mut tx = request(&with_rules, "application/x-www-form-urlencoded", Some(budget));
+            let interruption = tx.process_request_body(&body);
+            (tx, interruption)
+        };
+        // Room for the parse and a little more: the list does not fit, and nothing after the rule runs.
+        let (stopped, interruption) = run(parse + 100_000);
+        let interruption = interruption.unwrap();
+        assert_eq!(
+            (interruption.status, interruption.rule_id),
+            (503, 0),
+            "{label}: the selection stops the phase"
+        );
+        assert!(stopped.rule_evaluation_stopped_by_memory_budget(), "{label}");
+        assert_eq!(stopped.get_variable(RuleVariable::TX, Some("reached")), None, "{label}");
+        // Room for it: the rule runs as it does without a budget.
+        let (fits, interruption) = run(parse + 100_000_000);
+        assert!(
+            interruption.is_none() && !fits.rule_evaluation_stopped_by_memory_budget(),
+            "{label}"
+        );
+        assert_eq!(
+            fits.get_variable(RuleVariable::TX, Some("reached")).as_deref(),
+            Some("1"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn a_stopped_transaction_runs_no_rule_of_a_later_phase_and_still_writes_its_audit_entry() {
+    const SIZE: usize = 20_000;
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        !request_body_errored(&form_after_rules(&parse_only, SIZE, Some(budget)).0)
+    });
+    for mode in ["On", "DetectionOnly"] {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&entries);
+        let mut parser = Parser::new();
+        parser.on_audit_log(move |entry| sink.lock().unwrap().push(entry.clone()));
+        // Rule 20 is recorded before the stop and is audited; the actions of the later phases would each set a variable
+        // and be audited too, if they ran.
+        let with_rules = waf_in(
+            parser,
+            &format!(
+                "SecAuditEngine RelevantOnly\nSecAuditLogParts ABHKZ\n\
+                 SecAction \"id:20,phase:2,pass,log,auditlog,msg:'before the stop'\"\n{}\
+                 SecAction \"id:30,phase:3,pass,log,auditlog,msg:'response headers',setvar:tx.phase3=1\"\n\
+                 SecAction \"id:40,phase:4,pass,log,auditlog,msg:'response body',setvar:tx.phase4=1\"\n\
+                 SecAction \"id:50,phase:5,pass,log,auditlog,msg:'logging',setvar:tx.phase5=1\"\n",
+                copying_rules(40, mode)
+            ),
+        );
+        let mut tx = request(&with_rules, "application/x-www-form-urlencoded", Some(parse + 100_000));
+        tx.process_request_body(format!("k={}", "v".repeat(SIZE)).as_bytes());
+        assert!(tx.rule_evaluation_stopped_by_memory_budget(), "{mode}");
+
+        // The stop ends rule evaluation for the transaction, the response phases and the logging phase with it.
+        tx.add_response_header("Content-Type", "text/plain");
+        tx.process_response_headers(200, "HTTP/1.1");
+        tx.set_body_memory_budget(Some(parse + 100_000));
+        tx.process_response_body(b"hello");
+        tx.finish().unwrap();
+        for phase in ["phase3", "phase4", "phase5"] {
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some(phase)), None, "{mode}: {phase}");
+        }
+        let recorded: Vec<i32> = tx.matched_rules().iter().map(|rule| rule.rule.id()).collect();
+        assert!(recorded.contains(&20), "{mode}: {recorded:?}");
+        assert!(
+            !recorded.iter().any(|id| matches!(id, 30 | 40 | 50 | 999)),
+            "{mode}: {recorded:?}"
+        );
+
+        // The engine still writes the entry, with the rules recorded before the stop and the stop itself: the
+        // interruption of the rule evaluation, which has no rule id.
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "{mode}: one audit entry");
+        let entry = entries.first().unwrap();
+        assert!(entry.messages.iter().any(|message| message.rule_id == 20), "{mode}");
+        assert!(
+            !entry
+                .messages
+                .iter()
+                .any(|message| matches!(message.rule_id, 30 | 40 | 50)),
+            "{mode}"
+        );
+        assert_eq!(entry.transaction.is_interrupted, mode == "On", "{mode}");
+        assert_eq!(
+            entry.transaction.interruption_rule_id,
+            (mode == "On").then_some(0),
+            "{mode}: the stop has no rule"
+        );
+        let stop = tx.interruption().or_else(|| tx.would_be_interruption()).unwrap();
+        assert_eq!((stop.status, stop.rule_id), (503, 0), "{mode}");
+        drop(entries);
+
+        // The stop is the transaction's own: the ones that take its pooled state evaluate every phase, with a budget
+        // that fits and without one.
+        drop(tx);
+        for budget in [None, Some(parse + 100_000_000), None] {
+            let mut tx = request(&with_rules, "application/x-www-form-urlencoded", budget);
+            tx.process_request_body(format!("k={}", "v".repeat(SIZE)).as_bytes());
+            assert!(!tx.rule_evaluation_stopped_by_memory_budget(), "{mode}: {budget:?}");
+            tx.finish().unwrap();
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some("phase5")).as_deref(),
+                Some("1"),
+                "{mode}: {budget:?}: the logging rules run"
+            );
+        }
+    }
+}
+
+/// An action that says it ran, without a charge of its own: `tx.set_tx_variable` is not a rule's write.
+struct Witness;
+
+impl CustomAction for Witness {
+    fn action_type(&self) -> ActionType {
+        ActionType::Nondisruptive
+    }
+
+    fn evaluate(&self, _rule: &RuleMetadata, tx: &mut Transaction) {
+        tx.set_tx_variable("witness", "1");
+    }
+}
+
+/// An action that says it was reached, as [`Witness`] says it ran, to tell a rule the budget stopped before an action
+/// from one it stopped at that action.
+struct Marker;
+
+impl CustomAction for Marker {
+    fn action_type(&self) -> ActionType {
+        ActionType::Nondisruptive
+    }
+
+    fn evaluate(&self, _rule: &RuleMetadata, tx: &mut Transaction) {
+        tx.set_tx_variable("marker", "1");
+    }
+}
+
+/// [`waf`] with the `witness` and `marker` actions.
+fn waf_with_witness(rules: &str) -> Waf {
+    let mut parser = Parser::new();
+    parser
+        .register_action("witness", Arc::new(|_| Ok(Box::new(Witness))))
+        .unwrap();
+    parser
+        .register_action("marker", Arc::new(|_| Ok(Box::new(Marker))))
+        .unwrap();
+    waf_in(parser, rules)
+}
+
+/// Whether the rules of the phase stopped, as the parse of its body did not.
+fn rules_stopped(tx: &Transaction) -> bool {
+    !tx.request_body_stopped_by_memory_budget() && tx.rule_evaluation_stopped_by_memory_budget()
+}
+
+/// Whether the budget held both the parse of the body and the rules of its phase. A budget the parser stopped at leaves
+/// the rules a reserve and nothing to see, so they do not stop either: a search for the smallest budget that the
+/// rules do not stop at lands on one that is too small for the parse unless it asks for both.
+fn within_budget(tx: &Transaction) -> bool {
+    !tx.request_body_stopped_by_memory_budget() && !tx.rule_evaluation_stopped_by_memory_budget()
+}
+
+/// Whether the rule `id` was recorded, which is to say that it ran and matched.
+fn rule_recorded(tx: &Transaction, id: i32) -> bool {
+    tx.matched_rules().iter().any(|rule| rule.rule.id() == id)
+}
+
+#[test]
+fn a_rule_the_budget_stopped_runs_none_of_its_remaining_actions() {
+    const SIZE: usize = 50_000;
+    // The action after the `setvar` is the witness, which no charge refuses, so only a check can keep it from running.
+    // The marker before it is what tells a stop at the `setvar` from one at the selection or the match, which never
+    // reach it and keep the witness from running without any check.
+    let witnessed = waf_with_witness(
+        "SecRule ARGS_POST \"@rx .\" \"id:30,phase:2,pass,nolog,marker,setvar:tx.big=%{MATCHED_VAR},witness\"",
+    );
+    let (mut refused, mut ran) = (0, 0);
+    for budget in (0..400_000).step_by(1_024) {
+        let (tx, _) = form_after_rules(&witnessed, SIZE, Some(budget));
+        let witness = tx.get_variable(RuleVariable::TX, Some("witness")).is_some();
+        let reached_setvar = tx.get_variable(RuleVariable::TX, Some("marker")).is_some();
+        if tx.get_variable(RuleVariable::TX, Some("big")).is_some() {
+            // The `setvar` fit, so the rule went on to the witness.
+            assert!(witness, "{budget}: the action after a write that fit runs");
+            ran += 1;
+        } else if reached_setvar && rules_stopped(&tx) {
+            assert!(!witness, "{budget}: the write did not fit, and the action after it ran");
+            refused += 1;
+        }
+    }
+    assert!(
+        refused > 0 && ran > 0,
+        "{refused} budgets refused the write and {ran} let it through: the sweep does not test the stop"
+    );
+}
+
+#[test]
+fn a_stop_after_a_ctl_that_switched_the_engine_off_sets_the_flag_and_returns_no_interruption() {
+    const SIZE: usize = 50_000;
+    // The `ctl` runs before the write that is refused: the engine ignores every interruption once off, as for any rule.
+    let engine_off = waf_with_witness(
+        "SecRuleEngine On\n\
+         SecRule ARGS_POST \"@rx .\" \"id:32,phase:2,pass,nolog,ctl:ruleEngine=Off,setvar:tx.big=%{MATCHED_VAR}\"",
+    );
+    let mut refused = 0;
+    for budget in (0..400_000).step_by(1_024) {
+        let (tx, interruption) = form_after_rules(&engine_off, SIZE, Some(budget));
+        if !rules_stopped(&tx)
+            || tx.rule_engine() != coraza::types::RuleEngineStatus::Off
+            || tx.get_variable(RuleVariable::TX, Some("big")).is_some()
+        {
+            continue;
+        }
+        assert!(
+            interruption.is_none(),
+            "{budget}: the engine is off, so nothing is returned"
+        );
+        refused += 1;
+    }
+    assert!(
+        refused > 0,
+        "no budget stopped the rule after its ctl: the sweep does not test the case"
+    );
+}
+
+#[test]
+fn a_ctl_after_the_charge_that_stopped_the_rule_cannot_hide_the_503() {
+    const SIZE: usize = 50_000;
+    // In `On` mode `ctl:ruleEngine=Off` is the way a rule would lose the interruption: the engine ignores it once off.
+    let engine_off = waf_with_witness(
+        "SecRuleEngine On\n\
+         SecRule ARGS_POST \"@rx .\" \"id:31,phase:2,pass,nolog,setvar:tx.big=%{MATCHED_VAR},ctl:ruleEngine=Off\"",
+    );
+    let mut refused = 0;
+    for budget in (0..400_000).step_by(1_024) {
+        let (tx, interruption) = form_after_rules(&engine_off, SIZE, Some(budget));
+        if !rules_stopped(&tx) || tx.get_variable(RuleVariable::TX, Some("big")).is_some() {
+            continue;
+        }
+        // The write was refused, and the stop is what the engine returns: the `ctl` never ran.
+        assert_eq!(
+            interruption.map(|item| (item.status, item.rule_id)),
+            Some((503, 0)),
+            "{budget}: the stop was dropped from the return value"
+        );
+        assert_eq!(
+            tx.rule_engine(),
+            coraza::types::RuleEngineStatus::On,
+            "{budget}: the ctl after the refused write ran"
+        );
+        refused += 1;
+    }
+    assert!(
+        refused > 0,
+        "no budget refused the write: the sweep does not test the stop"
+    );
+}
+
+#[test]
+fn an_operatorless_rule_whose_record_is_refused_runs_none_of_its_actions() {
+    let witnessed = waf_with_witness("SecAction \"id:20,phase:2,pass,nolog,witness\"");
+    let (mut stopped, mut ran) = (0, 0);
+    for budget in 0..20_000 {
+        let (tx, _) = form_after_rules(&witnessed, 1, Some(budget));
+        let witness = tx.get_variable(RuleVariable::TX, Some("witness")).is_some();
+        // The entry of `MATCHED_VARS` is the record that rule makes before its actions.
+        let recorded = values_of(&tx, RuleVariable::MatchedVars).len();
+        if rules_stopped(&tx) && recorded == 0 {
+            assert!(!witness, "{budget}: the record was refused, and the actions ran");
+            stopped += 1;
+        } else if !rules_stopped(&tx) {
+            assert!(witness, "{budget}: nothing stopped, so the rule ran");
+            ran += 1;
+        }
+    }
+    assert!(
+        stopped > 0 && ran > 0,
+        "{stopped} stopped and {ran} ran: the sweep does not test the stop"
+    );
+}
+
+#[test]
+fn a_chain_the_budget_stopped_in_a_link_records_nothing_and_nothing_runs_after_it() {
+    const SIZE: usize = 20_000;
+    let chained = waf_with_witness(
+        "SecRule ARGS_POST \"@rx .\" \"id:10,phase:2,pass,nolog,chain\"\n\
+         SecRule ARGS_POST \"@rx .\" \"setvar:tx.copy=%{MATCHED_VAR},witness\"\n\
+         SecAction \"id:11,phase:2,pass,nolog,setvar:tx.after=1\"",
+    );
+    let (mut stopped, mut finished) = (0, 0);
+    for budget in (0..200_000).step_by(512) {
+        let (tx, interruption) = form_after_rules(&chained, SIZE, Some(budget));
+        if tx.request_body_stopped_by_memory_budget() {
+            continue;
+        }
+        let recorded: Vec<i32> = tx.matched_rules().iter().map(|rule| rule.rule.id()).collect();
+        if tx.rule_evaluation_stopped_by_memory_budget() {
+            assert_eq!(
+                interruption.map(|item| (item.status, item.rule_id)),
+                Some((503, 0)),
+                "{budget}"
+            );
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("after")), None, "{budget}");
+            assert!(
+                !recorded.contains(&10),
+                "{budget}: a chain that was cut records nothing"
+            );
+            stopped += 1;
+        } else {
+            assert_eq!(recorded, [10, 11], "{budget}");
+            finished += 1;
+        }
+    }
+    assert!(stopped > 0 && finished > 0, "{stopped} stopped and {finished} finished");
+}
+
+/// An operator that matches, takes two captures of its input, and writes one path argument.
+struct CaptureAndPath;
+
+impl Operator for CaptureAndPath {
+    fn evaluate(&self, _tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+        out.capture(0, input);
+        out.capture(1, input);
+        out.add_path_argument("pathkey", "pathvalue");
+        true
+    }
+}
+
+/// An operator that matches and writes `per_run` path arguments of `size` bytes: the same key each time, or a key
+/// of its own.
+struct PathWriter {
+    size: usize,
+    distinct: bool,
+    per_run: usize,
+    count: AtomicUsize,
+}
+
+impl Operator for PathWriter {
+    fn evaluate(&self, _tx: &Transaction, _input: &[u8], out: &mut Outputs) -> bool {
+        for _ in 0..self.per_run {
+            let key = if self.distinct {
+                format!("path{}", self.count.fetch_add(1, Ordering::Relaxed))
+            } else {
+                "path".to_owned()
+            };
+            out.add_path_argument(&key, &"p".repeat(self.size));
+        }
+        true
+    }
+}
+
+#[test]
+fn the_path_arguments_of_an_operator_whose_captures_were_refused_are_not_written() {
+    const SIZE: usize = 50_000;
+    let mut parser = Parser::new();
+    parser.register_operator("captureandpath", Arc::new(|_| Ok(Box::new(CaptureAndPath))));
+    let with_operator = waf_in(
+        parser,
+        "SecRule ARGS_POST:k \"@captureandpath x\" \"id:50,phase:2,pass,nolog,capture\"",
+    );
+    let (mut cut, mut whole) = (0, 0);
+    for budget in (0..600_000).step_by(512) {
+        let (tx, _) = form_after_rules(&with_operator, SIZE, Some(budget));
+        if tx.request_body_stopped_by_memory_budget() {
+            continue;
+        }
+        // The captures a rule has not written are kept as empty values, so a capture is written when it holds the
+        // value.
+        let capture = |index: &str| {
+            tx.get_variable(RuleVariable::TX, Some(index))
+                .is_some_and(|value| value.len() == SIZE)
+        };
+        let path = tx.get_variable(RuleVariable::ArgsPath, Some("pathkey")).is_some();
+        if capture("0") && !capture("1") {
+            assert!(
+                !path,
+                "{budget}: the second capture did not fit, and the path argument was written"
+            );
+            cut += 1;
+        }
+        if path {
+            assert!(
+                capture("0") && capture("1"),
+                "{budget}: a path argument without its captures"
+            );
+            whole += 1;
+        }
+    }
+    assert!(
+        cut > 0 && whole > 0,
+        "{cut} cut after one capture and {whole} whole: the sweep does not test the stop"
+    );
+}
+
+#[test]
+fn the_path_arguments_a_rule_writes_are_charged_and_a_rewritten_one_is_charged_once() {
+    const SIZE: usize = 50_000;
+    // The operator writes `per_run` arguments each time it runs, and `limit` is what `SecArgumentsLimit` allows.
+    let needed = |operator: Option<(bool, usize, usize)>, limit: usize| {
+        let mut parser = Parser::new();
+        if let Some((distinct, size, per_run)) = operator {
+            parser.register_operator(
+                "pathwriter",
+                Arc::new(move |_| {
+                    Ok(Box::new(PathWriter {
+                        size,
+                        distinct,
+                        per_run,
+                        count: AtomicUsize::new(0),
+                    }))
+                }),
+            );
+        }
+        let rules = if operator.is_some() {
+            "SecRule ARGS_POST \"@pathwriter x\" \"id:60,phase:2,pass,nolog\""
+        } else {
+            "SecRule ARGS_POST \"@rx zzz\" \"id:60,phase:2,pass,nolog\""
+        };
+        let with_rules = waf_in(parser, &format!("SecArgumentsLimit {limit}\n{rules}"));
+        // Three arguments, so the operator runs three times.
+        let body = b"a=1&b=2&c=3";
+        let run = |budget| {
+            let mut tx = request(&with_rules, "application/x-www-form-urlencoded", Some(budget));
+            tx.process_request_body(body);
+            tx
+        };
+        let budget = smallest_budget(1 << 30, |budget| within_budget(&run(budget)));
+        // The operator that writes the arguments always matches, so its rule is recorded where the search ends.
+        assert!(
+            operator.is_none() || rule_recorded(&run(budget), 60),
+            "the rule ran at {budget}"
+        );
+        (budget, run(1 << 30))
+    };
+    let (none, _) = needed(None, 100_000);
+    let (distinct, tx) = needed(Some((true, SIZE, 1)), 100_000);
+    // `ARGS_PATH` and `ARGS` each keep their own copy of every value.
+    assert_eq!(values_of(&tx, RuleVariable::ArgsPath).len(), 3);
+    assert!(
+        distinct >= none + 3 * SIZE,
+        "three path arguments of {SIZE} bytes need {} more than none, which is less than their values",
+        distinct - none
+    );
+    // The same key written three times holds one value, whose buffer the next rewrites.
+    let (same, tx) = needed(Some((false, SIZE, 1)), 100_000);
+    assert_eq!(values_of(&tx, RuleVariable::ArgsPath).len(), 1);
+    assert!(
+        same >= none + SIZE,
+        "{} more than none for one value of {SIZE}",
+        same - none
+    );
+    assert!(
+        same + SIZE <= distinct,
+        "a rewritten path argument is charged once: {same} against {distinct} for three"
+    );
+    // An argument past `SecArgumentsLimit` is dropped, and takes nothing: one run writes four, and two are kept.
+    let (limited, tx) = needed(Some((true, SIZE, 4)), 2);
+    assert_eq!(values_of(&tx, RuleVariable::ArgsPath).len(), 2);
+    let (unlimited, _) = needed(Some((true, SIZE, 4)), 100_000);
+    assert!(
+        limited >= none + 2 * SIZE && limited + 2 * SIZE <= unlimited,
+        "the dropped arguments are charged: {limited} against {unlimited} without the limit"
+    );
+}
+
+#[test]
+fn setenv_is_charged_like_setvar_and_a_rewritten_variable_is_charged_once() {
+    const SIZE: usize = 50_000;
+    let body = format!("a={}", "v".repeat(SIZE));
+    let needed = |actions: &str| {
+        let with_rules = waf(&format!(
+            "SecRule ARGS_POST \"@rx .\" \"id:60,phase:2,pass,nolog{actions}\""
+        ));
+        let run = |budget| {
+            let mut tx = request(&with_rules, "application/x-www-form-urlencoded", Some(budget));
+            tx.process_request_body(body.as_bytes());
+            tx
+        };
+        let budget = smallest_budget(1 << 30, |budget| within_budget(&run(budget)));
+        assert!(rule_recorded(&run(budget), 60), "the rule ran at {budget}");
+        (budget, run(1 << 30))
+    };
+    let (none, _) = needed("");
+    let (three, tx) = needed(",setenv:e1=%{MATCHED_VAR},setenv:e2=%{MATCHED_VAR},setenv:e3=%{MATCHED_VAR}");
+    assert_eq!(
+        tx.get_variable(RuleVariable::Env, Some("e3")).map(|value| value.len()),
+        Some(SIZE)
+    );
+    assert!(
+        three >= none + 3 * SIZE,
+        "three variables of {SIZE} bytes need {} more than none, which is less than their values",
+        three - none
+    );
+    // One variable written three times holds one value: the budget needs the peak of a rewrite, which is two.
+    let (same, _) = needed(",setenv:e=%{MATCHED_VAR},setenv:e=%{MATCHED_VAR},setenv:e=%{MATCHED_VAR}");
+    // The rule's record, a few kilobytes, is charged after its actions, when the variable holds one value, so it is
+    // not part of the peak of a rewrite as it is of the baseline's.
+    assert!(
+        same + 4 * 1024 >= none + 2 * SIZE,
+        "{} more than none for the peak of a rewrite",
+        same.saturating_sub(none)
+    );
+    assert!(
+        same + SIZE / 2 <= three,
+        "a rewritten variable is given back what it replaced: {same} against {three} for three"
+    );
+    // What was refused is not written.
+    let refused = (0..three)
+        .step_by(4_096)
+        .map(|budget| {
+            let mut tx = request(&waf(
+                "SecRule ARGS_POST \"@rx .\" \"id:60,phase:2,pass,nolog,setenv:e1=%{MATCHED_VAR},setenv:e2=%{MATCHED_VAR},setenv:e3=%{MATCHED_VAR}\"",
+            ), "application/x-www-form-urlencoded", Some(budget));
+            tx.process_request_body(body.as_bytes());
+            tx
+        })
+        .filter(rules_stopped)
+        // The stop is at the write that was refused: the first variable holds its value and the second is not there,
+        // and not a stop before any `setenv` ran, which leaves `e2` absent as well.
+        .filter(|tx| tx.get_variable(RuleVariable::Env, Some("e1")).map(|value| value.len()) == Some(SIZE))
+        .filter(|tx| tx.get_variable(RuleVariable::Env, Some("e2")).is_none())
+        .inspect(|tx| assert!(tx.get_variable(RuleVariable::Env, Some("e3")).is_none()))
+        .count();
+    assert!(refused > 0, "no budget stopped between the variables");
+}
+
+#[test]
+fn a_removed_tx_entry_gives_its_bytes_back_to_the_rules() {
+    const SIZE: usize = 50_000;
+    let body = format!("a={}", "v".repeat(SIZE));
+    let needed = |pairs: usize| {
+        let rules: String = (0..pairs)
+            .map(|index| {
+                format!(
+                    "SecRule ARGS_POST \"@rx .\" \"id:{},phase:2,pass,nolog,setvar:tx.big=%{{MATCHED_VAR}}\"\n\
+                     SecAction \"id:{},phase:2,pass,nolog,setvar:!tx.big\"\n",
+                    100 + 2 * index,
+                    101 + 2 * index
+                )
+            })
+            .collect();
+        let with_rules = waf(&rules);
+        let run = |budget| {
+            let mut tx = request(&with_rules, "application/x-www-form-urlencoded", Some(budget));
+            tx.process_request_body(body.as_bytes());
+            tx
+        };
+        let budget = smallest_budget(1 << 30, |budget| within_budget(&run(budget)));
+        let tx = run(budget);
+        assert!(rule_recorded(&tx, 100), "the rule that sets the entry ran at {budget}");
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("big")), None);
+        budget
+    };
+    // Each pair keeps the value in the record of its first rule, and nothing in `TX`: a removal that gives nothing
+    // back kept a second copy charged for every pair, which is the whole of the value.
+    let (one, eight) = (needed(1), needed(8));
+    let per_pair = (eight - one) / 7;
+    assert!(
+        per_pair < SIZE + SIZE / 2,
+        "a pair of rules costs {per_pair} bytes, and the value it sets and removes is {SIZE}"
+    );
+}
+
+#[test]
+fn a_multiphase_duplicate_gives_back_the_copy_it_was_checked_by() {
+    const SIZE: usize = 10_000;
+    let rules = "SecRule REQUEST_HEADERS:x \"@rx .\" \"id:40,phase:2,pass,nolog,chain\"\n\
+                 SecRule ARGS \"@rx .\" \"\"";
+    let mut parser = Parser::new();
+    parser.config_mut().multiphase_evaluation = true;
+    let multiphase = waf_in(parser, rules);
+    // Phase 1 records the chain on `x` and an argument, and phase 2 sees the same arguments again: each is a
+    // duplicate of a match already recorded, whose copy the check made and dropped.
+    let needed = |duplicates: usize| {
+        let query: Vec<String> = (0..duplicates)
+            .map(|index| format!("q{index}={}", "g".repeat(SIZE)))
+            .collect();
+        let run = |budget| {
+            let mut tx = multiphase.new_transaction();
+            tx.process_uri(format!("/?{}", query.join("&")), "POST", "HTTP/1.1");
+            tx.set_body_memory_budget(Some(budget));
+            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            tx.add_request_header("x", "1");
+            tx.process_request_headers();
+            tx.process_request_body(b"p=1");
+            tx
+        };
+        let budget = smallest_budget(1 << 30, |budget| {
+            let tx = run(budget);
+            !tx.rule_evaluation_stopped_by_memory_budget() && !tx.request_body_stopped_by_memory_budget()
+        });
+        // The chain is recorded in both phases, the second time with the arguments that are not duplicates.
+        let tx = run(budget);
+        assert_eq!(tx.matched_rules().iter().filter(|rule| rule.rule.id() == 40).count(), 2);
+        budget
+    };
+    let (one, forty) = (needed(1), needed(40));
+    let per_duplicate = (forty - one) / 39;
+    // The match of a duplicate is given back, and the record keeps the URI that holds the argument once more: one
+    // value's worth each. A copy kept charged until the rule ends is a second.
+    assert!(
+        per_duplicate < SIZE + SIZE / 2,
+        "each duplicate costs {per_duplicate} bytes, and its value is {SIZE}"
+    );
 }

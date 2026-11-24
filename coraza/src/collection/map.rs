@@ -332,6 +332,34 @@ impl KeyValue {
     }
 }
 
+/// A value of a map with its stable position, and the key it was added under in the two forms the collection
+/// stores, so that a caller that wants the key as text borrows it and never makes it.
+pub(crate) struct IndexedValue<'a> {
+    /// Index of the map entry in insertion order.
+    pub(crate) entry_index: usize,
+    /// Index of the value under the entry's key.
+    pub(crate) value_index: usize,
+    /// The key bytes, exactly as stored.
+    pub(crate) key: &'a [u8],
+    /// The key as text, invalid UTF-8 replaced with U+FFFD: the view the map computed once when it stored the key.
+    pub(crate) key_text: &'a str,
+    /// The value bytes.
+    pub(crate) value: &'a [u8],
+}
+
+impl<'a> IndexedValue<'a> {
+    /// The value `kv`, which is the `value_index`th under the `entry_index`th key of its map.
+    fn new(entry_index: usize, value_index: usize, map_key: &'a Key, kv: &'a KeyValue) -> Self {
+        Self {
+            entry_index,
+            value_index,
+            key: kv.key_bytes(map_key),
+            key_text: kv.key_text(map_key),
+            value: kv.value(),
+        }
+    }
+}
+
 /// Bytes of one value's entry in its key's list.
 pub(crate) const VALUE_ENTRY_BYTES: usize = size_of::<KeyValue>();
 
@@ -496,8 +524,9 @@ impl Map {
             .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_bytes(map_key), kv.value())))
     }
 
-    /// Every key and value with its stable map-entry/value position.
-    pub(crate) fn iter_bytes_indexed(&self) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
+    /// Every key, as bytes and as the lossy text view described on [`Map::iter`], and value, with its stable
+    /// map-entry/value position.
+    pub(crate) fn iter_bytes_indexed(&self) -> impl Iterator<Item = IndexedValue<'_>> + '_ {
         self.data
             .iter()
             .enumerate()
@@ -505,7 +534,7 @@ impl Map {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
+                    .map(move |(value_index, kv)| IndexedValue::new(entry_index, value_index, map_key, kv))
             })
     }
 
@@ -520,8 +549,8 @@ impl Map {
             .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_text(map_key), kv.value())))
     }
 
-    /// Values under a folded key with their stable map-entry/value position.
-    pub(crate) fn iter_key_bytes_indexed(&self, key: &[u8]) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
+    /// Values under a folded key with their stable map-entry/value position, see [`Map::iter_bytes_indexed`].
+    pub(crate) fn iter_key_bytes_indexed(&self, key: &[u8]) -> impl Iterator<Item = IndexedValue<'_>> + '_ {
         let lookup = self.lookup_key(key);
         self.data
             .get_full(lookup.as_ref())
@@ -530,7 +559,7 @@ impl Map {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
+                    .map(move |(value_index, kv)| IndexedValue::new(entry_index, value_index, map_key, kv))
             })
     }
 
@@ -546,8 +575,8 @@ impl Map {
             .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_bytes(map_key), kv.value())))
     }
 
-    /// Values under an exact key with their stable map-entry/value position.
-    pub(crate) fn iter_key_exact_indexed(&self, key: &[u8]) -> impl Iterator<Item = (usize, usize, &[u8], &[u8])> + '_ {
+    /// Values under an exact key with their stable map-entry/value position, see [`Map::iter_bytes_indexed`].
+    pub(crate) fn iter_key_exact_indexed(&self, key: &[u8]) -> impl Iterator<Item = IndexedValue<'_>> + '_ {
         self.data
             .get_full(key)
             .into_iter()
@@ -555,16 +584,16 @@ impl Map {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
+                    .map(move |(value_index, kv)| IndexedValue::new(entry_index, value_index, map_key, kv))
             })
     }
 
-    /// Return one selected value by its stable map-entry/value position.
-    pub(crate) fn value_at(&self, entry_index: usize, value_index: usize, names: bool) -> Option<(&[u8], &[u8])> {
+    /// Return one selected value by its stable map-entry/value position: its key as text, as
+    /// [`IndexedValue::key_text`] gives it, and its value, or its key bytes when `names`.
+    pub(crate) fn value_at(&self, entry_index: usize, value_index: usize, names: bool) -> Option<(&str, &[u8])> {
         let (map_key, values) = self.data.get_index(entry_index)?;
-        let value = values.get(value_index)?;
-        let key = value.key_bytes(map_key);
-        Some((key, if names { key } else { value.value() }))
+        let value = IndexedValue::new(entry_index, value_index, map_key, values.get(value_index)?);
+        Some((value.key_text, if names { value.key } else { value.value }))
     }
 
     /// The keys and values whose (lookup) key matches `regex`.
@@ -578,11 +607,8 @@ impl Map {
             .flat_map(|(map_key, values)| values.iter().map(move |kv| (kv.key_text(map_key), kv.value())))
     }
 
-    /// Keys and values matching `regex`, with stable map-entry/value positions.
-    pub(crate) fn iter_regex_bytes_indexed<'a>(
-        &'a self,
-        regex: &'a Regex,
-    ) -> impl Iterator<Item = (usize, usize, &'a [u8], &'a [u8])> {
+    /// Keys and values matching `regex`, with stable map-entry/value positions, see [`Map::iter_bytes_indexed`].
+    pub(crate) fn iter_regex_bytes_indexed<'a>(&'a self, regex: &'a Regex) -> impl Iterator<Item = IndexedValue<'a>> {
         self.data
             .iter()
             .enumerate()
@@ -591,7 +617,7 @@ impl Map {
                 values
                     .iter()
                     .enumerate()
-                    .map(move |(value_index, kv)| (entry_index, value_index, kv.key_bytes(map_key), kv.value()))
+                    .map(move |(value_index, kv)| IndexedValue::new(entry_index, value_index, map_key, kv))
             })
     }
 
@@ -637,10 +663,14 @@ impl Map {
 
     /// Appends `value` to the values of the exact key bytes.
     pub(crate) fn add_bytes(&mut self, key: &[u8], value: impl AsRef<[u8]>) {
-        let value = value.as_ref();
         let lookup = self.lookup_key(key);
-        let kv = KeyValue::new(key, lookup.as_ref(), value);
-        self.push_value(&lookup, kv);
+        self.add_filed(key, &lookup, value.as_ref());
+    }
+
+    /// [`Map::add_bytes`] for a key whose lookup form, see [`Map::lookup_key`], the caller has already worked out.
+    pub(crate) fn add_filed(&mut self, key: &[u8], lookup: &[u8], value: &[u8]) {
+        let kv = KeyValue::new(key, lookup, value);
+        self.push_value(lookup, kv);
     }
 
     /// Appends `value`, which the map takes without copying, to the values of the exact key bytes.
@@ -696,8 +726,8 @@ impl Map {
     }
 
     /// Replaces the values of `key`, which keeps its position in insertion order if it is
-    /// already present.
-    pub(crate) fn set<V: AsRef<[u8]>>(&mut self, key: impl AsRef<[u8]>, values: impl IntoIterator<Item = V>) {
+    /// already present. Returns the bytes the values it replaced held, as [`Map::allocated_bytes`] counts them.
+    pub(crate) fn set<V: AsRef<[u8]>>(&mut self, key: impl AsRef<[u8]>, values: impl IntoIterator<Item = V>) -> usize {
         let key = key.as_ref();
         let lookup = self.lookup_key(key);
         let key_values: Vec<KeyValue> = values
@@ -706,16 +736,27 @@ impl Map {
             .collect();
         let added = key_values.len();
         // Not `insert` for a held key, see `index_table_bytes`.
-        let replaced = if let Some(held) = self.data.get_mut(lookup.as_ref()) {
-            std::mem::replace(held, key_values).len()
+        let (replaced, freed) = if let Some(held) = self.data.get_mut(lookup.as_ref()) {
+            let old = std::mem::replace(held, key_values);
+            (old.len(), Self::held_bytes(old.capacity(), &old))
         } else {
             self.data.insert(Key::from_slice(lookup.as_ref()), key_values);
-            0
+            (0, 0)
         };
         self.values = self
             .values
             .saturating_sub(count_of(replaced))
             .saturating_add(count_of(added));
+        freed
+    }
+
+    /// The bytes a list of values in `capacity` slots holds: the list and each value's buffers.
+    #[inline(never)]
+    fn held_bytes(capacity: usize, values: &[KeyValue]) -> usize {
+        values.iter().fold(
+            allocation_bytes(capacity.saturating_mul(size_of::<KeyValue>())),
+            |total, value| total.saturating_add(value.allocated_bytes()),
+        )
     }
 
     /// Replaces the value at `index` of `key`, or appends it if `index` is past the end.
@@ -746,6 +787,43 @@ impl Map {
                 );
                 self.values = self.values.saturating_add(1);
             },
+        }
+    }
+
+    /// What [`Map::remove`] of `key` frees, as [`Map::allocated_bytes`] counts it: the key, the list of its values and
+    /// their buffers. The table that held them is kept, as it is by a removal.
+    pub(crate) fn removal_frees(&self, key: &[u8]) -> usize {
+        let lookup = self.lookup_key(key);
+        self.data.get_full(lookup.as_ref()).map_or(0, |(_, map_key, values)| {
+            map_key
+                .allocated_bytes()
+                .saturating_add(Self::held_bytes(values.capacity(), values))
+        })
+    }
+
+    /// The capacity of the buffer that holds the value at `index` of `key`, or 0 when there is none.
+    pub(crate) fn value_capacity(&self, key: &[u8], index: usize) -> usize {
+        let lookup = self.lookup_key(key);
+        self.data
+            .get(lookup.as_ref())
+            .and_then(|values| values.get(index))
+            .map_or(0, |value| value.value.capacity())
+    }
+
+    /// What [`Map::set_index`] of `key` at `index` allocates for the spelling of the key besides the value, and what it
+    /// frees: when the spelling of a value it rewrites differs, the new one is allocated beside the old one, which is
+    /// freed once it is replaced (and the map key's own spelling costs nothing). Nothing for a value it does not hold.
+    pub(crate) fn rewrite_spelling_growth(&self, key: &[u8], index: usize) -> Growth {
+        let lookup = self.lookup_key(key);
+        match self.data.get_full(lookup.as_ref()) {
+            Some((_, map_key, values)) => match values.get(index) {
+                Some(value) if value.key_bytes(map_key) != key => key_bytes(key, lookup.as_ref(), false).plus(Growth {
+                    grown: 0,
+                    freed: value.spelling.allocated_bytes(),
+                }),
+                _ => Growth::default(),
+            },
+            None => Growth::default(),
         }
     }
 
@@ -983,7 +1061,7 @@ pub(crate) fn map_capacity_bytes(capacity: usize) -> usize {
 pub(crate) struct Growth {
     /// Bytes to charge before the change.
     pub(crate) grown: usize,
-    /// Bytes of `grown` to give back after it.
+    /// Bytes to give back after it: what `grown` held beside the allocation it replaces, and what the change frees.
     pub(crate) freed: usize,
 }
 
@@ -1465,10 +1543,12 @@ mod tests {
         assert_eq!(values, [&b"a"[..], b"b", b"c", b"d"]);
         // The entries are keyed by the lower-case form, as before.
         assert_eq!(map.entries().keys().collect::<Vec<_>>(), ["user-agent"]);
-        assert_eq!(map.value_at(0, 2, true), Some((&b"USER-AGENT"[..], &b"USER-AGENT"[..])));
-        assert_eq!(map.value_at(0, 1, false), Some((&b"user-agent"[..], &b"b"[..])));
-        let indexed: Vec<&[u8]> = map.iter_bytes_indexed().map(|(_, _, key, _)| key).collect();
+        assert_eq!(map.value_at(0, 2, true), Some(("USER-AGENT", &b"USER-AGENT"[..])));
+        assert_eq!(map.value_at(0, 1, false), Some(("user-agent", &b"b"[..])));
+        let indexed: Vec<&[u8]> = map.iter_bytes_indexed().map(|value| value.key).collect();
         assert_eq!(indexed, bytes);
+        let indexed: Vec<&str> = map.iter_bytes_indexed().map(|value| value.key_text).collect();
+        assert_eq!(indexed, spellings, "the text of a key is the stored spelling, borrowed");
         let regex = Regex::new("^user-agent$").unwrap();
         let matched: Vec<&str> = map.iter_regex(&regex).map(|(key, _)| key).collect();
         assert_eq!(
@@ -1519,7 +1599,13 @@ mod tests {
         assert_eq!(bytes, [&b"a\xff"[..], b"a\xff", b"a\xfe"]);
         assert_eq!(exact.iter().count(), 3);
         assert_eq!(exact.iter_key_exact(b"a\xff").count(), 2);
-        assert_eq!(exact.value_at(0, 1, true), Some((&b"a\xff"[..], &b"a\xff"[..])));
+        assert_eq!(exact.value_at(0, 1, true), Some(("a\u{fffd}", &b"a\xff"[..])));
+        assert_eq!(exact.value_at(0, 1, false), Some(("a\u{fffd}", &b"2"[..])));
+        let texts: Vec<&str> = exact.iter_bytes_indexed().map(|value| value.key_text).collect();
+        assert_eq!(
+            texts, ["a\u{fffd}"; 3],
+            "distinct byte keys keep their own entries and share their text"
+        );
     }
 
     #[test]
@@ -1534,6 +1620,42 @@ mod tests {
         map.set_index("foo", 0, "4");
         assert_eq!(map.iter().collect::<Vec<_>>(), [("foo", &b"4"[..])]);
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn a_rewrite_allocates_a_spelling_only_when_the_one_it_replaces_differs() {
+        let mut map = Map::new(RuleVariable::Rule);
+        map.set_index("foo", 0, "1");
+        let spelling = |map: &Map, key: &[u8], index: usize| map.rewrite_spelling_growth(key, index);
+        // The value shares the map key, so another spelling is a new allocation, and it replaces nothing that was one.
+        assert_eq!(
+            spelling(&map, b"Foo", 0),
+            Growth {
+                grown: allocation_bytes(3),
+                freed: 0
+            }
+        );
+        assert_eq!(spelling(&map, b"foo", 0), Growth::default());
+        // It was written, and the stored spelling is now the one that differs from the map key.
+        map.set_index("Foo", 0, "2");
+        assert_eq!(spelling(&map, b"Foo", 0), Growth::default());
+        // A third spelling is allocated beside it, and the one it replaces is freed.
+        let replaced = Growth {
+            grown: allocation_bytes(3),
+            freed: allocation_bytes(3),
+        };
+        assert_eq!(spelling(&map, b"FOO", 0), replaced);
+        // Going back to the map key's own spelling allocates nothing and frees the one that was stored, a value or a
+        // key that is not there neither.
+        assert_eq!(
+            spelling(&map, b"foo", 0),
+            Growth {
+                grown: 0,
+                freed: allocation_bytes(3)
+            }
+        );
+        assert_eq!(spelling(&map, b"Foo", 1), Growth::default());
+        assert_eq!(spelling(&map, b"bar", 0), Growth::default());
     }
 
     #[test]
@@ -1741,6 +1863,30 @@ mod tests {
             map.new_key_table_growth(0),
             "the fifth new key grows the table again"
         );
+    }
+
+    #[test]
+    fn a_removal_frees_what_the_key_and_its_values_held_and_a_value_buffer_reports_its_capacity() {
+        use super::Map;
+        use crate::types::RuleVariable;
+
+        let mut map = Map::new(RuleVariable::TX);
+        // Keys in capitals and not UTF-8, one value and many, empty and long.
+        let keys: [&[u8]; 4] = [b"a", b"Beta", b"k\xff", b"gamma"];
+        for (round, key) in keys.iter().cycle().take(40).enumerate() {
+            map.add_bytes(key, vec![b'x'; round * 37]);
+        }
+        assert!(map.value_capacity(b"a", 0) == 0 && map.value_capacity(b"a", 1) >= 37 * 4);
+        assert_eq!(map.value_capacity(b"a", 99), 0, "no such value");
+        assert_eq!(map.value_capacity(b"absent", 0), 0, "no such key");
+        assert_eq!(map.removal_frees(b"absent"), 0);
+        for key in keys {
+            let held = map.allocated_bytes();
+            let frees = map.removal_frees(key);
+            map.truncate_values(key, 0);
+            assert!(frees > 0, "{key:?}");
+            assert_eq!(held - map.allocated_bytes(), frees, "{key:?}");
+        }
     }
 
     #[test]

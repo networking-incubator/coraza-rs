@@ -66,6 +66,7 @@ impl Transaction {
             return self.interruption.clone();
         }
 
+        let held_before = self.processor_memory_before_body();
         let mut ingest_error = false;
         let processable = self.response_body_access && self.is_response_body_processable();
         if processable {
@@ -124,7 +125,9 @@ impl Transaction {
             }
         }
 
+        self.arm_rule_budget(held_before, false);
         self.run_phase(RulePhase::ResponseBody);
+        self.computed.rule_budget.disarm();
         self.interruption.clone()
     }
 

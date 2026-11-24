@@ -29,6 +29,7 @@ use std::{
 
 use crate::{
     body_processors::BodyProcessorFactory,
+    collection::allocation_bytes,
     operators::{Macro, MacroError},
     rules::TransformationChain,
     transaction::{AllowScope, Transaction},
@@ -343,6 +344,35 @@ impl RuleMetadata {
             raw: String::new(),
             warnings: Vec::new(),
         }
+    }
+
+    /// Bytes a copy of this metadata allocates beyond its own size, which is what a matched-rule record keeps of the
+    /// rule: its original text, `msg` and `logdata` macros, tags, version, revision, file, transformations, marker
+    /// label and warnings.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let strings = |list: &[String]| {
+            list.iter().fold(0_usize, |total, text| {
+                total.saturating_add(allocation_bytes(text.capacity()))
+            })
+        };
+        [
+            allocation_bytes(self.raw.capacity()),
+            allocation_bytes(self.file.capacity()),
+            allocation_bytes(self.rev.capacity()),
+            allocation_bytes(self.ver.capacity()),
+            self.sec_mark
+                .as_ref()
+                .map_or(0, |mark| allocation_bytes(mark.capacity())),
+            self.msg.as_ref().map_or(0, Macro::allocated_bytes),
+            self.log_data.as_ref().map_or(0, Macro::allocated_bytes),
+            allocation_bytes(self.tags.capacity().saturating_mul(size_of::<String>())),
+            strings(&self.tags),
+            allocation_bytes(self.warnings.capacity().saturating_mul(size_of::<String>())),
+            strings(&self.warnings),
+            self.transformations.allocated_bytes(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add)
     }
 
     /// Returns the rule id.
@@ -841,6 +871,44 @@ mod tests {
         assert_eq!(metadata.severity, Some(RuleSeverity::Critical));
         assert_eq!(metadata.tags, ["attack"]);
         assert_eq!(metadata.transformations.names(), ["lowercase"]);
+    }
+
+    #[test]
+    fn a_rules_metadata_counts_each_buffer_a_record_of_the_rule_keeps() {
+        let context = ActionCompileContext::default();
+        let mut metadata = RuleMetadata::new();
+        assert_eq!(metadata.allocated_bytes(), 0, "nothing is allocated for a bare rule");
+        let mut last = 0;
+        for (name, argument) in [
+            ("msg", "Remote Command Execution: Unix Shell Code Found"),
+            (
+                "logdata",
+                "Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}",
+            ),
+            ("tag", "application-multi"),
+            ("tag", "language-shell"),
+            ("ver", "OWASP_CRS/4.30.0"),
+            ("rev", "2"),
+            ("t", "lowercase"),
+        ] {
+            assert!(
+                compile_action(name, argument, &mut metadata, context)
+                    .unwrap()
+                    .is_none()
+            );
+            let bytes = metadata.allocated_bytes();
+            assert!(bytes > last, "{name}: {bytes} bytes after {last}");
+            last = bytes;
+        }
+        metadata.file = "rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf".to_owned();
+        metadata.raw = "SecRule ARGS \"@rx x\" \"id:1\"".to_owned();
+        metadata.warnings.push("a warning".to_owned());
+        metadata.sec_mark = Some("END".to_owned());
+        assert!(metadata.allocated_bytes() > last + 96);
+        // A clone, which is made with no room to spare, allocates what the contents need, and no more than the
+        // original.
+        let cloned = metadata.clone().allocated_bytes();
+        assert!((1..=metadata.allocated_bytes()).contains(&cloned), "{cloned}");
     }
 
     #[test]

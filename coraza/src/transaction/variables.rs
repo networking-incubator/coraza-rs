@@ -20,14 +20,15 @@
 
 //! Transaction variable storage and lookup.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, mem::size_of};
 
-use super::{TX_CAPTURE_KEYS, Transaction};
+use super::{TX_CAPTURE_KEYS, Transaction, TransactionInner};
 use crate::{
-    collection::{Map, MatchData, MatchLocation, MatchRef, Single},
+    body_processors::budget,
+    collection::{Growth, Map, MatchData, MatchLocation, MatchRef, Single, allocation_bytes},
     operators::Outputs,
     rules::{CollectionView, VariableSpec},
-    transformations::text_of,
+    transformations::{text_of, text_of_prefix},
     types::RuleVariable,
     utils::lowercase::lowercase_char,
 };
@@ -317,9 +318,20 @@ impl Transaction {
 
     /// Borrow a valid UTF-8 variable value for read-only operator parameter expansion.
     pub(crate) fn get_variable_cow(&self, variable: RuleVariable, key: Option<&str>) -> Option<Cow<'_, str>> {
+        self.get_variable_cow_capped(variable, key, usize::MAX)
+    }
+
+    /// [`Transaction::get_variable_cow`] for the first `room` bytes of the text, see [`text_of_prefix`]: a value that is
+    /// not UTF-8 is converted as far as it is read, not whole.
+    pub(crate) fn get_variable_cow_capped(
+        &self,
+        variable: RuleVariable,
+        key: Option<&str>,
+        room: usize,
+    ) -> Option<Cow<'_, str>> {
         match (self.collection(variable)?, key) {
-            (VariableCollection::Single(single), None) => Some(single.get()),
-            (VariableCollection::Map(map), Some(key)) => map.first(key).map(text_of),
+            (VariableCollection::Single(single), None) => Some(text_of_prefix(single.get_bytes(), room)),
+            (VariableCollection::Map(map), Some(key)) => map.first(key).map(|value| text_of_prefix(value, room)),
             (VariableCollection::Names(_, map), Some(key)) => map
                 .iter_key(key)
                 .next()
@@ -345,10 +357,21 @@ impl Transaction {
     /// (`internal/corazawaf/transaction.go:681-712`, v3.8.1): a removed key is not counted,
     /// and a count-mode match is never dropped.
     pub(crate) fn find_matches_for_rule(&self, spec: &VariableSpec, id: i32) -> Vec<MatchData> {
-        self.find_match_refs_for_rule(spec, id)
-            .into_iter()
-            .map(MatchRef::into_owned)
-            .collect()
+        let selected = self.find_match_refs_for_rule(spec, id);
+        // A copy of every value, which lives as long as the rule does: charged before they are made. A selection
+        // that did not fit the budget was cut short and stopped it, which fails this charge too: nothing is copied.
+        let budget = &self.computed.rule_budget;
+        if budget.is_armed()
+            && !budget.charge_scratch(selected.iter().fold(0_usize, |total, value| {
+                total
+                    .saturating_add(size_of::<MatchData>())
+                    .saturating_add(allocation_bytes(value.key().len()))
+                    .saturating_add(allocation_bytes(value.value().len()))
+            }))
+        {
+            return Vec::new();
+        }
+        selected.into_iter().map(MatchRef::into_owned).collect()
     }
 
     /// Select borrowed values and defer copying until a rule can match them.
@@ -359,16 +382,18 @@ impl Transaction {
                 VariableCollection::Map(map) => CollectionView::Map(map),
                 VariableCollection::Names(variable, map) => CollectionView::Names(variable, map),
             });
-            return spec.get_match_refs(collection);
+            return spec.get_match_refs(collection, &self.computed.rule_budget);
         }
         let collection = self.collection(spec.variable()).map(|collection| match collection {
             VariableCollection::Single(single) => CollectionView::Single(single),
             VariableCollection::Map(map) => CollectionView::Map(map),
             VariableCollection::Names(variable, map) => CollectionView::Names(variable, map),
         });
-        spec.get_match_refs_filter(collection, |variable, key| {
-            self.is_rule_target_removed(id, variable, key)
-        })
+        spec.get_match_refs_filter(
+            collection,
+            |variable, key| self.is_rule_target_removed(id, variable, key),
+            &self.computed.rule_budget,
+        )
     }
 
     /// Fetch one selected value by its stable source position.
@@ -387,7 +412,7 @@ impl Transaction {
                 let (key, value) = map.value_at(entry_index, value_index, names)?;
                 Some(MatchRef {
                     variable,
-                    key: String::from_utf8_lossy(key),
+                    key,
                     value: Cow::Borrowed(value),
                     location: Some(location),
                 })
@@ -398,7 +423,7 @@ impl Transaction {
                 };
                 Some(MatchRef {
                     variable,
-                    key: Cow::Borrowed(""),
+                    key: "",
                     value: Cow::Borrowed(single.get_bytes()),
                     location: Some(location),
                 })
@@ -418,42 +443,132 @@ impl Transaction {
         {
             let mut captures = outputs.take_captures();
             if let Some((index, value)) = captures.next() {
+                let removed = self.computed.rule_budget.take_removed_captures();
+                if removed != 0 && !self.make_removed_capture_keys(removed) {
+                    return;
+                }
                 // Clear the captures of the value matched previously in this rule. Go leaves
                 // them alone: its `resetCaptures` is only used by its tests, so this is a
                 // deliberate deviation, and the seeded keys make it allocation-free.
                 for key in TX_CAPTURE_KEYS.iter().take(10) {
                     self.tx.set_index(key, 0, "");
                 }
-                self.set_tx_variable(&index.to_string(), value);
+                self.set_tx_variable_in_rule(&index.to_string(), value);
                 for (index, value) in captures {
-                    self.set_tx_variable(&index.to_string(), value);
+                    self.set_tx_variable_in_rule(&index.to_string(), value);
                 }
             }
         }
+        // A capture the budget refused ended the evaluation: nothing the operator made is written after it, and no
+        // write after a path argument it refused, which would set `ARGUMENTS_LIMIT_REACHED` for an argument at the
+        // limit.
         for (key, value) in outputs.take_path_arguments() {
+            if self.computed.rule_budget.is_stopped() {
+                break;
+            }
             self.set_path_argument(&key, value.as_bytes());
         }
     }
 
     /// Replace the first stored path argument and its corresponding ARGS value.
     fn set_path_argument(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        let value = value.as_ref();
         let args_index = self
             .args_path_indices
             .iter()
             .find(|(path_key, _)| path_key.as_slice() == key.as_bytes())
             .map(|(_, index)| *index);
+        // What a rule writes is charged before it is, nothing is written when it does not fit.
+        if self.computed.rule_budget.is_armed() && !self.charge_path_argument(key, value.len(), args_index) {
+            return;
+        }
         let Some(args_index) = args_index else {
             self.add_path_argument(key, value);
             return;
         };
-        self.args_path.set_index(key, 0, value.as_ref());
+        self.args_path.set_index(key, 0, value);
         self.args.set_index(key, args_index, value);
+    }
+
+    /// Reserves what [`Transaction::set_path_argument`] allocates for a value of `len` bytes under `key`, whose value
+    /// in `ARGS` is at `args_index` if it holds one: the value in each of `ARGS_PATH` and `ARGS` with the entries that
+    /// keep it and the key beside the list of indices for a new argument, only the growth of the buffers for one that
+    /// is rewritten. Kept out of line, as the other charges of a write are.
+    #[inline(never)]
+    fn charge_path_argument(&self, key: &str, len: usize, args_index: Option<usize>) -> bool {
+        let key = key.as_bytes();
+        let growth = match args_index {
+            // The value is rewritten in its buffer, and under the spelling of the name it is written with: a new one
+            // is allocated beside the one it replaces, which is given back once it is gone (it was charged, or it was
+            // there before the budget was armed, which counted it).
+            Some(index) => Growth {
+                grown: buffer_growth(self.args_path.value_capacity(key, 0), len)
+                    .saturating_add(buffer_growth(self.args.value_capacity(key, index), len)),
+                freed: 0,
+            }
+            .plus(self.args_path.rewrite_spelling_growth(key, 0))
+            .plus(self.args.rewrite_spelling_growth(key, index)),
+            // An argument past the limit is dropped, and takes nothing.
+            None if self.args_path.value_count() >= self.config.argument_limit => return true,
+            None => budget::insert_growth(&[&self.args_path, &self.args], key, len)
+                .plus(budget::push_growth(
+                    self.args_path_indices.len(),
+                    self.args_path_indices.capacity(),
+                    size_of::<(Vec<u8>, usize)>(),
+                ))
+                .plus(Growth {
+                    grown: allocation_bytes(key.len()),
+                    freed: 0,
+                }),
+        };
+        let budget = &self.computed.rule_budget;
+        if !budget.charge(growth.grown) {
+            return false;
+        }
+        budget.refund(growth.freed);
+        true
     }
 
     /// Replace the value of a transaction variable.
     pub fn set_tx_variable(&mut self, key: &str, value: impl AsRef<[u8]>) {
         self.matched_vars_dirty = true;
         self.tx.set(key, [value]);
+    }
+
+    /// [`Transaction::set_tx_variable`] for what a rule writes (`setvar`, `capture`): with a budget in force the
+    /// entry is charged first, the list that replaces the key's values and the value beside the ones they replace,
+    /// and what they replace is given back once they are. Nothing is written when the charge does not fit.
+    pub(crate) fn set_tx_variable_in_rule(&mut self, key: &str, value: impl AsRef<[u8]>) {
+        if self.computed.rule_budget.is_armed() {
+            self.set_tx_variable_within_budget(key, value.as_ref());
+        } else {
+            self.set_tx_variable(key, value);
+        }
+    }
+
+    /// The charged write of [`Transaction::set_tx_variable_in_rule`], kept out of line so that the write without a
+    /// budget does not carry it.
+    #[inline(never)]
+    fn set_tx_variable_within_budget(&mut self, key: &str, value: &[u8]) {
+        let Some(inner) = self.inner.as_deref_mut() else {
+            return;
+        };
+        if set_within_budget(&mut inner.tx, &inner.computed.rule_budget, key, value) {
+            inner.matched_vars_dirty = true;
+        }
+    }
+
+    /// Write one `ENV` value for `setenv`: with a budget in force it is charged as the write of a `TX` entry is, and
+    /// nothing is written when the charge does not fit.
+    pub(crate) fn set_env_variable_in_rule(&mut self, key: &str, value: &[u8]) {
+        if !self.computed.rule_budget.is_armed() {
+            self.env.set(key, [value]);
+            return;
+        }
+        let Some(inner) = self.inner.as_deref_mut() else {
+            return;
+        };
+        set_within_budget(&mut inner.env, &inner.computed.rule_budget, key, value);
     }
 
     /// Record the value and variable name matched by an operator.
@@ -463,6 +578,9 @@ impl Transaction {
         };
         inner.matched_vars_dirty = true;
         let variable = matched.variable.name().as_bytes();
+        if inner.computed.rule_budget.is_armed() && !charge_matched_var_name(inner, variable, &matched.key) {
+            return;
+        }
         if matched.key.is_empty() {
             inner.matched_var_name.set(variable);
         } else {
@@ -470,10 +588,36 @@ impl Transaction {
                 .matched_var_name
                 .set_joined(variable, b":", matched.key.as_bytes());
         }
-        inner
-            .matched_vars
-            .add_bytes(inner.matched_var_name.get_bytes(), &matched.value);
-        inner.matched_var.set(&matched.value);
+        if inner.computed.rule_budget.is_armed() {
+            record_matched_value_within_budget(inner, &matched.value);
+        } else {
+            inner
+                .matched_vars
+                .add_bytes(inner.matched_var_name.get_bytes(), &matched.value);
+            inner.matched_var.set(&matched.value);
+        }
+    }
+
+    /// Makes the capture keys of `removed` (one bit for each, lowest for `TX:0`) that are not there, which a rule
+    /// removed and a later capture or `reset_matched_vars` may need to make again: each is charged first, what it takes
+    /// is the key and its list of one empty value, and a key the budget has no room for is not made. Returns whether
+    /// they all were. Kept out of line, as the other charges of a write are.
+    #[inline(never)]
+    pub(super) fn make_removed_capture_keys(&mut self, removed: u16) -> bool {
+        let mut bit = 1_u16;
+        for key in TX_CAPTURE_KEYS.iter().take(10) {
+            if removed & bit != 0 && self.tx.first(key).is_none() {
+                let growth = budget::set_growth(&self.tx, key.as_bytes(), 0);
+                let budget = &self.computed.rule_budget;
+                if !budget.charge(growth.grown) {
+                    return false;
+                }
+                budget.refund(growth.freed);
+                self.tx.set_index(key, 0, "");
+            }
+            bit = bit.wrapping_shl(1);
+        }
+        true
     }
 
     /// Update `RULE` values before evaluating a compiled rule.
@@ -498,9 +642,97 @@ impl Transaction {
     }
 }
 
+/// [`Map::set`] of one value for a rule under a budget: the list that replaces the key's values, the value and the
+/// key's entry are charged first, and the list and values they replace given back once they are gone. Nothing is
+/// written when the charge does not fit.
+fn set_within_budget(map: &mut Map, budget: &budget::RuleBudget, key: &str, value: &[u8]) -> bool {
+    let growth = budget::set_growth(map, key.as_bytes(), value.len());
+    if !budget.charge(growth.grown) {
+        return false;
+    }
+    let replaced = map.set(key, [value]);
+    budget.refund(growth.freed.saturating_add(replaced));
+    true
+}
+
+/// What a buffer of `held` bytes allocates to hold `needed`: nothing when it does, and otherwise what it grows to,
+/// which is what is needed or twice what it holds.
+fn buffer_growth(held: usize, needed: usize) -> usize {
+    if needed > held {
+        allocation_bytes(needed.max(held.saturating_mul(2))).saturating_sub(allocation_bytes(held))
+    } else {
+        0
+    }
+}
+
+/// Reserves what `MATCHED_VAR_NAME` grows by for the name of `variable` and `key`: one buffer that keeps the capacity
+/// of the longest key, like `MATCHED_VAR`'s, so it stays charged as `MATCHED_VAR`'s does: it is not one of the entries
+/// of `MATCHED_VARS` that the next rule's clearing frees. Kept out of line, as the charges of a matched value are.
+#[inline(never)]
+fn charge_matched_var_name(inner: &TransactionInner, variable: &[u8], key: &str) -> bool {
+    let needed = variable.len() + if key.is_empty() { 0 } else { 1 + key.len() };
+    let growth = buffer_growth(inner.matched_var_name.allocated_bytes(), needed);
+    growth == 0 || inner.computed.rule_budget.charge(growth)
+}
+
+/// The copies of a matched value that rule evaluation keeps, charged to the rule budget before they are made, kept out
+/// of line so that recording a match without a budget does not carry it. The entry in `MATCHED_VARS` is a second copy
+/// of the value, which the next rule's clearing frees; `MATCHED_VAR` is a third, which is rewritten in place and keeps
+/// the capacity of the largest value.
+#[inline(never)]
+fn record_matched_value_within_budget(inner: &mut TransactionInner, value: &[u8]) {
+    let name = inner.matched_var_name.get_bytes();
+    let budget = &inner.computed.rule_budget;
+    let var_growth = buffer_growth(inner.matched_var.allocated_bytes(), value.len());
+    let lookup = inner.matched_vars.lookup_key(name);
+    let growth = budget::values_growth_filed(&inner.matched_vars, name, &lookup, [value.len()]);
+    let added = budget.charge_matched_vars(growth);
+    if added {
+        inner.matched_vars.add_filed(name, &lookup, value);
+    }
+    if added && (var_growth == 0 || budget.charge(var_growth)) {
+        inner.matched_var.set(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BodyProcessor;
+    use super::{BodyProcessor, MatchData, RuleVariable, allocation_bytes, buffer_growth};
+    use crate::transaction::Transaction;
+
+    /// `MATCHED_VAR_NAME` is charged for what it grows by, to the byte: a name longer than the buffer that holds the
+    /// last one is built by three appends, which grew it twice, the second time past what was charged.
+    #[test]
+    fn the_matched_variable_name_buffer_grows_by_what_it_is_charged() {
+        let (forty, two_hundred, long) = ("k".repeat(40), "k".repeat(200), "k".repeat(5_000));
+        let sequences: [&[(RuleVariable, &str)]; 4] = [
+            &[(RuleVariable::RequestHeaders, "a")],
+            &[
+                (RuleVariable::Args, "a"),
+                (RuleVariable::RequestHeadersNames, "x"),
+                (RuleVariable::RequestCookiesNames, "y"),
+            ],
+            &[
+                (RuleVariable::Args, "a"),
+                (RuleVariable::Args, &forty),
+                (RuleVariable::RequestHeaders, &two_hundred),
+                (RuleVariable::Args, &long),
+            ],
+            &[(RuleVariable::RequestHeaders, ""), (RuleVariable::Args, "a")],
+        ];
+        for sequence in sequences {
+            let mut tx = Transaction::new("matched-var-name-growth");
+            tx.computed.rule_budget.arm(1 << 30, 0);
+            for (variable, key) in sequence {
+                let held = tx.matched_var_name.allocated_bytes();
+                let needed = variable.name().len() + if key.is_empty() { 0 } else { 1 + key.len() };
+                let charged = buffer_growth(held, needed);
+                tx.record_matched_variable(&MatchData::new(*variable, *key, b"v".to_vec()));
+                let grown = allocation_bytes(tx.matched_var_name.allocated_bytes()) - allocation_bytes(held);
+                assert_eq!(grown, charged, "{}:{} after {held} bytes", variable.name(), key.len());
+            }
+        }
+    }
 
     #[test]
     fn content_type_selection_folds_case_like_go() {

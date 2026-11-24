@@ -117,6 +117,31 @@ each item against your policies before upgrading.
 * **A request body the memory budget stopped is refused with 503** in every
   engine mode, `DetectionOnly` included; see
   [Body memory budget](#body-memory-budget) for which bodies reach it.
+* **Rules that would keep more than the memory budget has left are stopped**:
+  the request is refused with 503, or the response replaced with 502, in every
+  engine mode (`inspection_reason=body_memory_budget_stopped`), and no rule of a
+  later phase runs, the phase 5 logging rules included. Earlier builds
+  compared only what the transaction still held after the rules, and let the
+  rules allocate what they needed on the way, so they passed a body that this
+  one refuses when the copies its rules make do not fit what the root has left.
+  CRS's `multiMatch` rules copy every `ARGS` value up front, and that copy is
+  charged. A benign URL-encoded body of more than about 10.7 MiB (a sixth of the
+  root's 64 MiB: the copies of the body that the host and the connector hold,
+  what the parse keeps and that copy do not fit the root together) is therefore
+  refused with 503 at CRS paranoia level 1, where earlier builds passed it: 900
+  prose fields pass up to 11,197,689 bytes and stop from 11,198,589, and the
+  recommended `SecRequestBodyLimit` is 12.5 MiB, so the bodies from 10.7 to
+  12.5 MiB are the ones affected. This is deliberate: a body that size is where
+  the root's memory runs out, and a false positive is preferred to the engine
+  allocating past it. The root's budget is the constant
+  `MAX_ROOT_RETAINED_BODY_BYTES` in `envoy-coraza/src/stream.rs` (64 MiB), not
+  a setting: a deployment that must pass such bodies raises it and rebuilds
+  (`make build-envoy-wasm`), and pays for it in linear memory, which a worker
+  never gives back. The `msg` and `logdata` a match keeps, in the audit log's
+  part `K` and in `RULE:msg` and `RULE:logdata`, are cut to 4096 bytes, which
+  changes the verdict of a rule that compares with or copies `%{RULE.msg}` or
+  `%{RULE.logdata}` for a longer text (CRS has no such rule). See
+  [Body memory budget](#body-memory-budget).
 * **Cookies count against `SecArgumentsLimit`**: a request with more than
   `SecArgumentsLimit` cookies (1000 by default), counted across all its
   `Cookie` headers, is refused with 413 in any engine mode but `Off`,
@@ -352,6 +377,8 @@ response headers, in a body chunk, at the end of the body or at its trailers:
   `identity`, even one with no body such as a `HEAD` response, a body over
   1 MiB, or a body the memory budget stopped its parser in (see
   [Body memory budget](#body-memory-budget)), with 502;
+* a response whose rules the memory budget stopped (see
+  [Body memory budget](#body-memory-budget)), with 502;
 * a body that the root's 64 MiB of retained body memory has no room for, with
   503;
 * a `101` upgrade response, with 501;
@@ -437,8 +464,52 @@ direction:
   answers a response whose parser stopped at it with a 502 local reply, unless a rule denied it first. A response body that merely
   does not parse (`RES_BODY_ERROR` for another reason) is left to the policy's rules, as before.
 
-The budget covers the body processors only. What rules allocate after the parse (macro expansion, matched values,
-`TX` updates) is not charged in advance, so the check after the phase is what bounds it.
+The rules of the body phase draw on what the parse left of the budget (`Transaction::set_body_memory_budget` documents
+the engine side). Before it allocates them, the engine charges what the rules keep: every match with the value it
+matched and its key, both whole, and its expanded `msg` and `logdata`, each cut to 4096 bytes, and the matched rule's
+record with the metadata it copies (the rule's text, its `msg` and `logdata` templates, tags, version and file); the
+entry a match adds to `MATCHED_VARS`, until the next rule clears it, and the buffers `MATCHED_VAR` and
+`MATCHED_VAR_NAME` grow to, which the transaction keeps; what `setvar` and `capture` write to `TX` and `setenv` writes
+to `ENV`, net of the value they replace or the entry `setvar:!tx.key` removes; the path arguments an operator writes;
+and, until the rule is done, the lists of the values it selects, the copies it makes for the multiphase duplicate check,
+the snapshots a rule makes of what its own actions may change, and the copy `multiMatch` makes of each value it selects
+(CRS's `multiMatch` rules make it of every `ARGS` value, which stops a benign URL-encoded body of more than about 10.7
+MiB at paranoia level 1; see [Upgrade notes](#upgrade-notes-behaviour-changes) for what to do about it). The list of
+selected values is charged before each growth of the list, so that a collection of any number of values
+(`MULTIPART_PART_HEADERS`, which `SecArgumentsLimit` does not bound, is one) cannot make a list larger than the budget
+has left; the list holds references to the collection's own values and names, so a name that is not UTF-8 costs it no
+more than any other. A rule that matches and is not recorded, such as a chain whose second link fails, gives its matches
+back. The charge that does not fit ends rule evaluation for the transaction, including the phase 5 logging rules (the
+request is refused already, and a rule that ran would allocate with the budget spent): nothing is charged or evaluated
+after it, the rule that was running records nothing and denies nothing, and the connector refuses the request with 503,
+or replaces the response with 502, in every engine mode, `DetectionOnly` included (`inspection_complete=false`,
+`inspection_reason=body_memory_budget_stopped`, `terminal_outcome=incomplete`; a request whose retained body the root
+cannot also hold is refused with the same 503 and reported `inspection_reason=retained_body_budget_exhausted`). The
+engine writes its audit entry for
+the transaction if the audit configuration selects it (`SecAuditEngine`, and for `RelevantOnly` the relevance of the
+status of the interruption or would-be interruption the transaction holds: the 503, unless an earlier rule recorded one,
+as a would-be 403 in `DetectionOnly` stays 403, or the response status when none was recorded, because the engine was
+switched `Off`), judged without the phase 5 rules, which did not run; it carries the rules recorded before the stop and,
+in the default mode, the interruption with rule id 0 and status 503, and does not mark a `DetectionOnly` transaction as
+interrupted, as for any would-be interruption: the telemetry above is how the stop is seen there. The
+`inspection_reason` is chosen in this order: `finalization_error`, `request_body_not_inspected` (a request body released
+unread, or one a processor failed on), the first outcome the stream recorded, such as the `body_partially_inspected` of
+a body `ProcessPartial` cut, and last the outcome that ended the stream. A stop in the request phase is reported
+`body_memory_budget_stopped`, since it is refused before the cut is recorded; a stop in the response phase after any
+earlier reason keeps that reason, and `terminal_outcome=incomplete` with `inspection_complete=false` shows the stop, as
+`terminal_outcome=denied` shows a denial there. A parse that the budget stopped leaves the rules 64 KiB, so that the
+rule that denies on the body error still answers first, as above. A request that fits is evaluated as without a budget,
+with the same matches and scores. What is not charged is what a rule needs for one value while it evaluates it, which is
+gone when it is done and bounded by the policy and the largest value, never by the number of values or rules: a
+`capture` rule takes up to `G + min(G, 10)` copies of the value (`G` groups in its pattern, the whole match counted, and
+the first ten again in the operator's outputs; nine nested groups that each hold the whole value measure 19, CRS
+4.30.0's `capture` rules have at most three groups), a `multiMatch` rule one per transformation that changes the value
+(4.3 for six), `setvar` and `setenv` at most two, `msg` and `logdata` none. This connector registers no custom body
+processor; one an embedder adds is not limited by the budget, but what it publishes is taken from what the rules have
+left, with no 64 KiB reserve. Before the budget bounded the rules, they could keep many times the body (a 4 MiB value
+that matched CRS grew the VM to 155 MiB at level 1, 224,000 XML values that matched 838 MiB), memory that Wasm linear
+memory never gives back, and the check after the phase only compared what the transaction still held with the root, when
+the rules had already allocated and freed the rest.
 
 The budget is not all that bounds an XML body: its values count against `SecArgumentsLimit`, and a document with
 more stops at the limit as it stops at the budget, keeping the values before it, but with `ARGUMENTS_LIMIT_REACHED`
@@ -480,8 +551,9 @@ connector refuses that with 503 as it does any budget stop, in every engine mode
 budget does not turn such a refusal into a pass. The 503 is the connector's answer where no rule denies first: with
 `@recommended-conf` enforcing, rule 200002 reads `REQBODY_ERROR`, which the stop sets, and can answer 400 first.
 
-The check after the parse stays the authority on what was retained and answers 503. Without a budget, which is the
-engine's default, the processors refuse only what Go Coraza refuses, and the XML that the
+The check after the parse stays the authority on what was retained and answers 503; a response whose rules the budget
+stopped is still replaced with 502 when that check fails first. Without a budget, which is the engine's default, the
+processors refuse only what Go Coraza refuses, and the XML that the
 [crate's behavior changes](../coraza/README.md#behavior-changes) list.
 
 ## Embedding the OWASP Core Rule Set

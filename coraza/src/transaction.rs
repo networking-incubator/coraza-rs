@@ -52,8 +52,11 @@ use crate::{
         AuditFile, AuditLog, AuditLogCallback, AuditLogger, AuditMessage, AuditMessageData, AuditProducer,
         AuditRequest, AuditResponse, AuditTransaction, ErrorLog, Failure, mime_type_of,
     },
-    body_processors::{BodyProcessor as CustomBodyProcessor, BodyProcessorFactory, budget::MemoryBudget},
-    collection::{Map, MatchData, Single, allocation_bytes},
+    body_processors::{
+        BodyProcessor as CustomBodyProcessor, BodyProcessorFactory,
+        budget::{self, MemoryBudget, RuleBudget},
+    },
+    collection::{MATCH_SLOT_BYTES, Map, MatchData, Single, allocation_bytes, map_capacity_bytes},
     config::{UploadKeepFiles, WafConfig},
     debug_log::{DebugEvent, DebugField, DebugLevel, DebugLogger, noop_logger},
     operators::{DynamicPmMatcher, Macro, Outputs},
@@ -127,6 +130,8 @@ struct ComputedVariables {
     body_memory_budget: Option<usize>,
     /// Whether a request and a response body processor stopped on that budget.
     body_budget_stopped: [bool; 2],
+    /// What the rules of a body phase may still hold under that budget, see [`RuleBudget`].
+    rule_budget: RuleBudget,
     /// Whether a multipart parser stopped before the end of a body where uploads are refused, which leaves parts it
     /// did not read: the refusal follows the rules of the body phase, which may name the failure first.
     unchecked_multipart_upload: bool,
@@ -420,6 +425,10 @@ struct TransactionPoolState {
     retained_bytes: usize,
 }
 
+/// What a parse that the memory budget stopped leaves the rules of its phase at least, to record the match of the rule
+/// that denies on the body error.
+const RULE_RESERVE_AFTER_STOP_BYTES: usize = 64 * 1024;
+
 /// Maximum number of finished states retained by one WAF.
 // shortcut: raise the 16-state cap only after profiling worker concurrency.
 const MAX_POOL_SIZE: usize = 16;
@@ -683,6 +692,7 @@ impl TransactionInner {
         self.computed.custom_body_processors = None;
         self.computed.body_memory_budget = None;
         self.computed.body_budget_stopped = [false; 2];
+        self.computed.rule_budget.reset();
         self.computed.unchecked_multipart_upload = false;
     }
 
@@ -1074,6 +1084,7 @@ impl Transaction {
                 custom_body_processors: None,
                 body_memory_budget: None,
                 body_budget_stopped: [false; 2],
+                rule_budget: RuleBudget::default(),
                 unchecked_multipart_upload: false,
             }),
             request_method: Single::new(RuleVariable::RequestMethod),
@@ -1264,10 +1275,46 @@ impl Transaction {
             uri: self.request_uri.get().into_owned(),
             transaction_id: self.unique_id.get().into_owned(),
         };
+        if self.computed.rule_budget.is_armed() && !self.charge_matched_rule(&matched) {
+            // The evaluation was stopped, and the rule that was running records nothing.
+            return;
+        }
         if let Some(error_log) = self.error_log.as_ref().filter(|_| matched.rule.log) {
             error_log.write(&matched);
         }
         self.matched_rules.push(matched);
+        self.computed.rule_budget.keep_pending();
+    }
+
+    /// Reserves what recording `matched` takes beyond its matches, which the rule charged as it found them: its
+    /// slot in the list of matched rules, and what `matched_rules_memory_bytes` counts of the copies it holds.
+    #[inline(never)]
+    fn charge_matched_rule(&self, matched: &MatchedRule) -> bool {
+        let growth = budget::push_growth(
+            self.matched_rules.len(),
+            self.matched_rules.capacity(),
+            size_of::<MatchedRule>(),
+        );
+        // The rule charged a slot for each match it found, which does not cover the room a short list was made with.
+        let list = allocation_bytes(matched.matches.capacity().saturating_mul(size_of::<MatchData>()))
+            .saturating_sub(matched.matches.len().saturating_mul(MATCH_SLOT_BYTES));
+        let held = [
+            matched.client_ip.capacity(),
+            matched.server_ip.capacity(),
+            matched.uri.capacity(),
+            matched.transaction_id.capacity(),
+        ]
+        .into_iter()
+        .fold(
+            matched.rule.allocated_bytes().saturating_add(list),
+            |total, capacity| total.saturating_add(allocation_bytes(capacity)),
+        );
+        // The list that grows is held beside the one it replaces for the moment of the copy.
+        if !self.computed.rule_budget.charge(growth.grown.saturating_add(held)) {
+            return false;
+        }
+        self.computed.rule_budget.refund(growth.freed);
+        true
     }
 
     /// Update the transaction's most severe matched rule.
@@ -1327,6 +1374,49 @@ impl Transaction {
     /// cached dynamic `@pm` matchers, and match data. Collection backing capacities are
     /// counted, so this is a conservative estimate for connector retained-body budgets.
     pub fn body_memory_bytes(&self) -> usize {
+        let dynamic_pm_bytes = self
+            .dynamic_pm_matcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, DynamicPmMatcher::retained_memory_bytes);
+        [
+            self.processor_memory_bytes(),
+            self.tx.allocated_bytes(),
+            self.env.allocated_bytes(),
+            self.matched_vars.allocated_bytes(),
+            self.matched_var.allocated_bytes(),
+            self.matched_var_name.allocated_bytes(),
+            self.path_arguments_memory_bytes(),
+            self.request_body.allocated_bytes(),
+            self.response_body.allocated_bytes(),
+            self.request_body_buffer.allocated_bytes(),
+            self.response_body_buffer.allocated_bytes(),
+            dynamic_pm_bytes,
+            self.matched_rules_memory_bytes(),
+        ]
+        .into_iter()
+        .fold(0_usize, usize::saturating_add)
+    }
+
+    /// The path arguments, which the rules of a body phase can write: `ARGS_PATH`, and the list of the places of its
+    /// values in `ARGS` with the keys it keeps.
+    fn path_arguments_memory_bytes(&self) -> usize {
+        self.args_path_indices.iter().fold(
+            self.args_path.allocated_bytes().saturating_add(allocation_bytes(
+                self.args_path_indices
+                    .capacity()
+                    .saturating_mul(size_of::<(Vec<u8>, usize)>()),
+            )),
+            |total, (key, _)| total.saturating_add(allocation_bytes(key.capacity())),
+        )
+    }
+
+    /// What the body processors fill, in the units of [`Transaction::body_memory_bytes`]: the parsed collections, the
+    /// paths of the temporary uploads, and the messages of their errors, which a body can make as long as the name or
+    /// value that is quoted in them and which are kept for as long as the transaction is. The copies of a body, the
+    /// buffers, `TX` and what rules keep are not part of it.
+    fn processor_memory_bytes(&self) -> usize {
         let maps = [
             &self.args,
             &self.args_post,
@@ -1342,35 +1432,17 @@ impl Transaction {
             &self.multipart_filename_charset,
             &self.multipart_filename_language,
             &self.multipart_part_headers,
-            &self.tx,
-            &self.matched_vars,
         ];
-        // The messages of body processor errors, which a body can make as long as the name or value that is quoted
-        // in them: they are kept for as long as the transaction is.
-        let singles = [
-            &self.request_body,
-            &self.response_body,
+        let errors = [
             &self.reqbody_error_msg,
             &self.reqbody_processor_error_msg,
             &self.res_body_error_msg,
             &self.res_body_processor_error_msg,
         ];
-        let dynamic_pm_bytes = self
-            .dynamic_pm_matcher
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or(0, DynamicPmMatcher::retained_memory_bytes);
         maps.into_iter()
             .map(Map::allocated_bytes)
-            .chain(singles.into_iter().map(Single::allocated_bytes))
-            .chain([
-                self.request_body_buffer.allocated_bytes(),
-                self.response_body_buffer.allocated_bytes(),
-                self.uploaded_paths_bytes(),
-                dynamic_pm_bytes,
-                self.matched_rules_memory_bytes(),
-            ])
+            .chain(errors.into_iter().map(Single::allocated_bytes))
+            .chain([self.uploaded_paths_bytes()])
             .fold(0_usize, usize::saturating_add)
     }
 
@@ -1403,7 +1475,51 @@ impl Transaction {
     /// [`Transaction::process_request_body`] and [`Transaction::process_response_body`] made after it is set, and
     /// is a limit on that call's output alone: set it to what the host can still spare beyond what the
     /// transaction already holds, and read [`Transaction::body_memory_bytes`] afterwards for what it does
-    /// hold. Custom body processors are unaffected: they have the byte budget of the body limit.
+    /// hold. Custom body processors are not limited by it: they have the byte budget of the body limit, and no
+    /// parse stop or 65,536-byte reserve applies to them. What one publishes is taken from the budget before the rules
+    /// of the phase draw on it, so output near or above the budget leaves the rules nothing, and the first charge
+    /// of a rule stops rule evaluation with the 503 described below.
+    ///
+    /// The rules of the body phase draw on what is left of the budget once the body is parsed. Rule evaluation
+    /// retains what it matches: each match keeps the value it matched, its expanded `msg` and `logdata`, and an
+    /// entry in `MATCHED_VARS`, and `setvar`, `setenv` and `capture` write into `TX` and `ENV`, and an operator
+    /// that writes path arguments into `ARGS_PATH` and `ARGS`. With a budget set these are charged before they are
+    /// allocated, the matches of a rule that is recorded, the entries of `TX` and `ENV`, the path arguments, and the
+    /// buffers of `MATCHED_VAR` and `MATCHED_VAR_NAME` until the transaction ends, the rest until the rule or the next
+    /// one is done. The list of the values a rule selects is
+    /// charged before each growth of the list, so a collection of any number of values cannot make one larger than
+    /// the budget has left, and the list holds references to the collection's own values and names, with none copied.
+    /// A charge that does not fit ends rule evaluation for the transaction, including the phase 5
+    /// logging rules: the transaction is interrupted with status 503 and the message `rule evaluation memory budget
+    /// exhausted` (in `DetectionOnly` that is the recorded would-be interruption, unless an earlier rule recorded
+    /// one), no rule of any later phase runs, nothing is charged or evaluated after it (the actions of the rule that
+    /// was running that come after the charge, a `ctl` among them, do not run), the rule that was running
+    /// records nothing and denies nothing, and [`Transaction::rule_evaluation_stopped_by_memory_budget`] reports it.
+    /// That flag is the signal in every engine mode; the returned interruption follows the engine mode, so under
+    /// `DetectionOnly`, or when a rule switched the engine `Off` before the refused charge, none is returned (no
+    /// further rule runs either). The Envoy connector refuses from the flag in every mode.
+    /// The request is refused already, and a rule that ran after the stop would allocate with the budget spent. The
+    /// audit entry is written when the transaction finishes if the audit configuration selects it (`SecAuditEngine`,
+    /// and for `RelevantOnly` the relevance of the status of the interruption or would-be interruption the transaction
+    /// holds: the 503, unless an earlier rule recorded one, as a would-be 403 in `DetectionOnly` stays 403, or the
+    /// response status when none was recorded, because the engine was switched `Off`), judged without the phase 5
+    /// rules, which did not run. It carries the rules recorded before the stop and, as for any interruption, rule id 0
+    /// for this one. A parse that the budget stopped leaves the rules 65,536 bytes at least, so that the rule that
+    /// denies on the body error can record its match and answer. What a rule needs for one value while it evaluates it
+    /// is not charged: it is gone when the value is done, and bounded by the policy and the largest value, never by the
+    /// number of values or rules. A `capture` rule takes up to `G + min(G, 10)` copies of the value, one per group of
+    /// its pattern (`G` counts the whole match) and the first ten again in the operator's outputs; a `multiMatch` rule
+    /// one per transformation that changes the value. `setvar` expands its key and value and `setenv` expands its
+    /// value before checking the write budget, even if the write is refused. Each field's temporary size depends on
+    /// its expanded length: repeated references append the same value once per reference.
+    /// `msg` and `logdata` are cut before they are copied (a value that is not UTF-8 is converted only as far as
+    /// the cut, three source bytes past it at most; its temporary text can be up to three times that prefix, then is
+    /// cut and freed). Nothing is charged without a budget, and the scores a rule sets below the budget are the same
+    /// as without one.
+    ///
+    /// The `msg` and `logdata` a match and `RULE:msg` and `RULE:logdata` keep are cut to 4096 bytes, with or without
+    /// a budget (see the crate's behaviour changes). A rule that compares with or copies `%{RULE.msg}` or
+    /// `%{RULE.logdata}` sees the cut text, so its verdict can differ from Go's for a longer one; CRS has no such rule.
     ///
     /// It never loosens the processors' own limits: the stricter applies.
     pub fn set_body_memory_budget(&mut self, bytes: Option<usize>) {
@@ -1420,6 +1536,98 @@ impl Transaction {
     /// [`Transaction::request_body_stopped_by_memory_budget`] for the response body.
     pub fn response_body_stopped_by_memory_budget(&self) -> bool {
         self.computed.body_budget_stopped[1]
+    }
+
+    /// Whether rule evaluation stopped because what the rules of a body phase would retain does not fit what is left
+    /// of the budget set by [`Transaction::set_body_memory_budget`]. It is set in every engine mode, whereas the
+    /// returned interruption follows the engine mode (see there: none under `DetectionOnly`, or after a rule
+    /// switched the engine `Off` before the refused charge); a host that lets a transaction through must not let
+    /// this one through, since no rule after the stop was evaluated, those of the logging phase included.
+    pub fn rule_evaluation_stopped_by_memory_budget(&self) -> bool {
+        self.computed.rule_budget.is_stopped()
+    }
+
+    /// What the processors hold before a body phase, to take from the budget what they added: nothing is read
+    /// without a budget.
+    fn processor_memory_before_body(&self) -> usize {
+        if self.computed.body_memory_budget.is_some() {
+            self.processor_memory_bytes()
+        } else {
+            0
+        }
+    }
+
+    /// Puts what the budget has left once the body is parsed in force for the rules of the phase: the budget, less
+    /// what the processors added to what `held_before` was. A parse that the budget stopped leaves the rules at
+    /// least [`RULE_RESERVE_AFTER_STOP_BYTES`], so that the rule that denies on the body error can record its match
+    /// and answer, as the baseline's rule 200002 does; a host that refuses the stop itself does not rely on it.
+    fn arm_rule_budget(&mut self, held_before: usize, request: bool) {
+        if let Some(budget) = self.computed.body_memory_budget {
+            let parsed = self.processor_memory_bytes().saturating_sub(held_before);
+            let left = budget.saturating_sub(parsed);
+            let stopped = self
+                .computed
+                .body_budget_stopped
+                .get(usize::from(!request))
+                .copied()
+                .unwrap_or_default();
+            // The table of `MATCHED_VARS` is there already: the entries a rule adds are charged, and given back when
+            // the next rule clears them, but the table they were in is not.
+            let table = map_capacity_bytes(self.matched_vars.key_table_capacity());
+            self.computed.rule_budget.arm(
+                if stopped {
+                    left.max(RULE_RESERVE_AFTER_STOP_BYTES)
+                } else {
+                    left
+                },
+                table,
+            );
+        }
+    }
+
+    /// Whether rule evaluation has to stop: a charge did not fit.
+    pub(crate) fn rule_memory_stopped(&self) -> bool {
+        self.computed.rule_budget.is_stopped()
+    }
+
+    /// Whether a budget is in force for the rules being evaluated: what a charge would cost need not be worked out
+    /// without one.
+    pub(crate) fn rule_budget_is_armed(&self) -> bool {
+        self.computed.rule_budget.is_armed()
+    }
+
+    /// Reserves `bytes` for the matches of the rule being evaluated, which stay charged if it is recorded.
+    pub(crate) fn charge_rule_matches(&self, bytes: usize) -> bool {
+        self.computed.rule_budget.charge_pending(bytes)
+    }
+
+    /// Reserves `bytes` for a copy or a list that is gone when the rule being evaluated is done.
+    pub(crate) fn charge_rule_scratch(&self, bytes: usize) -> bool {
+        self.computed.rule_budget.charge_scratch(bytes)
+    }
+
+    /// Gives back what was charged for a match the rule being evaluated dropped.
+    pub(crate) fn release_rule_matches(&self, bytes: usize) {
+        self.computed.rule_budget.release_pending(bytes);
+    }
+
+    /// Gives back what was charged for a copy the rule being evaluated dropped before it was done.
+    pub(crate) fn release_rule_scratch(&self, bytes: usize) {
+        self.computed.rule_budget.release_scratch(bytes);
+    }
+
+    /// A rule is done: what it held that is not kept is given back.
+    pub(crate) fn end_rule_memory(&self) {
+        self.computed.rule_budget.end_rule();
+    }
+
+    /// Ends the phase when a charge did not fit: the transaction is interrupted, and `true` is returned.
+    fn interrupt_for_rule_memory(&mut self) -> bool {
+        let stopped = self.computed.rule_budget.is_stopped();
+        if stopped {
+            self.interrupt(0, "deny", 503, "rule evaluation memory budget exhausted");
+        }
+        stopped
     }
 
     /// Records a stop for the memory budget when `budget_stopped` says so: an error's text can quote the body.
@@ -1477,8 +1685,7 @@ impl Transaction {
             allocation_bytes(self.matched_rules.capacity().saturating_mul(size_of::<MatchedRule>())),
             |total, rule| {
                 let strings = [
-                    allocation_bytes(rule.rule.raw.capacity()),
-                    rule.rule.tags.iter().map(|tag| allocation_bytes(tag.capacity())).sum(),
+                    rule.rule.allocated_bytes(),
                     allocation_bytes(rule.client_ip.capacity()),
                     allocation_bytes(rule.server_ip.capacity()),
                     allocation_bytes(rule.uri.capacity()),
@@ -1995,6 +2202,7 @@ impl Transaction {
             if self.rule_engine == RuleEngineStatus::Off
                 || (phase != RulePhase::Logging && self.interruption.is_some())
                 || self.is_allowed(phase)
+                || self.rule_memory_stopped()
             {
                 break;
             }
@@ -2018,8 +2226,14 @@ impl Transaction {
                 continue;
             }
 
-            self.reset_matched_vars();
+            // A capture key the budget had no room to make again ends the phase before the rule runs.
+            if self.reset_matched_vars() {
+                break;
+            }
             rule.evaluate(self, phase);
+            if self.interrupt_for_rule_memory() {
+                break;
+            }
         }
         self.skip = 0;
         // `skipAfter` is phase-scoped (Go's own action documentation says so). Clearing
@@ -2120,7 +2334,15 @@ impl Transaction {
             return;
         }
         if remove {
+            // What the entry held is given back once it is gone, as a rewrite gives back what it replaces.
+            let freed = if self.computed.rule_budget.is_armed() {
+                self.tx.removal_frees(key.as_bytes())
+            } else {
+                0
+            };
             self.tx.remove(&key);
+            self.computed.rule_budget.refund(freed);
+            self.computed.rule_budget.note_removed(&key);
             return;
         }
         let Ok(value) = Macro::new(value) else {
@@ -2141,7 +2363,7 @@ impl Transaction {
                 Err(_) if number.is_empty() => 0,
                 Err(_) if number.starts_with("tx.") => return,
                 Err(_) => {
-                    self.set_tx_variable(&key, value.as_bytes());
+                    self.set_tx_variable_in_rule(&key, value.as_bytes());
                     return;
                 },
             };
@@ -2157,10 +2379,10 @@ impl Transaction {
             } else {
                 current.saturating_sub(operand)
             };
-            self.set_tx_variable(&key, result.to_string());
+            self.set_tx_variable_in_rule(&key, result.to_string());
             return;
         }
-        self.set_tx_variable(&key, value.as_bytes());
+        self.set_tx_variable_in_rule(&key, value.as_bytes());
     }
 
     /// Set a transaction-scoped `ENV` value without changing the process environment.
@@ -2171,8 +2393,8 @@ impl Transaction {
         let Ok(value) = Macro::new(value) else {
             return;
         };
-        let value = value.expand_cow(self).into_owned();
-        self.env.set(key.trim(), [value]);
+        let value = value.expand_cow(self);
+        self.set_env_variable_in_rule(key.trim(), value.as_bytes());
     }
 
     /// Set the request URI supplied by the connector.
@@ -2429,16 +2651,29 @@ impl Transaction {
     /// (`internal/corazawaf/transaction.go:477`, v3.8.1) but only its tests call it, so a
     /// Go rule can read the previous rule's captures. Clearing `TX:0`..`TX:9` before every
     /// rule keeps one rule's match from leaking into the next. The keys are seeded by the
-    /// constructor, so this rewrite allocates nothing.
-    fn reset_matched_vars(&mut self) {
+    /// constructor, so this rewrite allocates nothing, unless a rule removed one (`setvar:!tx.0`), which gave back what
+    /// it held: the key made again is charged, and one the budget has no room for is not made, which reads as empty.
+    /// Returns whether that ended the rules, and the transaction is interrupted.
+    fn reset_matched_vars(&mut self) -> bool {
         if !self.matched_vars_dirty {
-            return;
+            return false;
         }
         self.matched_vars.reset();
+        // Its entries are gone and the table that held them is not.
+        self.computed
+            .rule_budget
+            .matched_vars_cleared(self.matched_vars.allocated_bytes());
+        let removed = self.computed.rule_budget.take_removed_captures();
+        if removed != 0 && !self.make_removed_capture_keys(removed) {
+            // The rules are over, and what is left of the keys is not read.
+            self.matched_vars_dirty = false;
+            return self.interrupt_for_rule_memory();
+        }
         for key in TX_CAPTURE_KEYS.iter().take(10) {
             self.tx.set_index(key, 0, "");
         }
         self.matched_vars_dirty = false;
+        false
     }
 
     /// Whether an argument was dropped because the configured limit was reached.
@@ -2953,11 +3188,13 @@ mod tests {
 
     use super::{
         BodyIngestionStats, DynamicPmMatcher, MAX_CACHED_DYNAMIC_PM_BYTES, MAX_DYNAMIC_PM_PATTERN_BYTES,
-        MAX_POOL_RETAINED_BYTES, RuleGroup, Transaction, TransactionPool, VariableCollection,
+        MAX_POOL_RETAINED_BYTES, MatchedRule, RuleGroup, Transaction, TransactionPool, VariableCollection,
         body_buffer::{BufferFailure, inject_failure},
     };
     use crate::{
         Waf,
+        actions::RuleMetadata,
+        collection::{MATCH_SLOT_BYTES, MatchData, allocation_bytes, map_capacity_bytes},
         config::{UploadKeepFiles, WafConfig},
         operators::Outputs,
         rules::VariableSpec,
@@ -3130,6 +3367,56 @@ mod tests {
         let expected = vec![(vec![0xFE], b"b".to_vec()), (vec![0xFF], b"a".to_vec())];
         assert_eq!(byte_entries(&tx, RuleVariable::ArgsPost), expected);
         assert_eq!(byte_entries(&tx, RuleVariable::Args), expected);
+    }
+
+    #[test]
+    fn a_matched_variable_name_stays_charged_while_the_transaction_holds_its_buffer() {
+        // A form of one 200,000-byte name whose value matches: `MATCHED_VAR_NAME` grows to the name, and keeps it.
+        const BUDGET: usize = 100_000_000;
+        let charged_after = |clearing_rule: bool| {
+            let mut parser = crate::seclang::Parser::new();
+            let rules = format!(
+                "SecRequestBodyAccess On\nSecRequestBodyLimit 134217728\nSecRequestBodyInMemoryLimit 134217728\n\
+                 SecRule ARGS_POST \"@rx ^v$\" \"id:1,phase:2,pass,nolog\"\n{}",
+                if clearing_rule {
+                    "SecAction \"id:2,phase:2,pass,nolog\""
+                } else {
+                    ""
+                }
+            );
+            parser.from_string(&rules).unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id("name");
+            tx.set_body_memory_budget(Some(BUDGET));
+            tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+            tx.process_request_headers();
+            tx.process_request_body(format!("{}=v", "k".repeat(200_000)).as_bytes());
+            assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+            (
+                BUDGET - tx.computed.rule_budget.remaining(),
+                tx.matched_var_name.allocated_bytes(),
+                tx.matched_vars.allocated_bytes(),
+            )
+        };
+        let (before, name, entries) = charged_after(false);
+        let (after, kept_name, kept_entries) = charged_after(true);
+        // The next rule clears the entries of `MATCHED_VARS` and gives them back, and nothing else: the buffer that
+        // holds the name is still there, and still charged, as the buffer of `MATCHED_VAR` is.
+        assert!(
+            name > 200_000 && kept_name == name,
+            "{name} and {kept_name} bytes of name"
+        );
+        let freed = entries - kept_entries;
+        assert!(
+            freed > 200_000,
+            "the clearing frees the entry, which holds a copy of the name: {freed}"
+        );
+        // The second rule charges the record of its own match, which is not what is asked here.
+        assert!(
+            before - after <= freed,
+            "the clearing gave back {} bytes and freed {freed}: the buffer of the name is held, and not charged",
+            before.saturating_sub(after)
+        );
     }
 
     #[test]
@@ -7038,6 +7325,502 @@ payload\r\n\
         assert_eq!(tx.body_memory_bytes() - before, expected);
         tx.uploaded_paths.clear();
         assert!(tx.body_memory_bytes() - before < 10 * 500, "only the list is left");
+    }
+
+    #[test]
+    fn the_rules_of_a_body_phase_draw_on_what_the_parse_left_of_the_budget_and_only_while_it_runs() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecRequestBodyAccess On\nSecRequestBodyLimit 1048576")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("rule-budget-armed");
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        tx.set_body_memory_budget(Some(1_000_000));
+        // Nothing is charged before a body phase, and a budget that no phase has armed is not in force.
+        assert!(!tx.computed.rule_budget.is_armed());
+
+        let held = tx.processor_memory_bytes();
+        let body = format!("a=1&b=2&c={}", "x".repeat(5_000));
+        tx.process_request_body(body.as_bytes());
+        // The phase has ended, so the budget is out of force, with what it left once the parse took its share.
+        assert!(!tx.computed.rule_budget.is_armed());
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+        let parsed = tx.processor_memory_bytes() - held;
+        assert!(parsed > 5_000, "the parse holds the value, {parsed}");
+        assert_eq!(tx.computed.rule_budget.remaining(), 1_000_000 - parsed);
+
+        // Without a budget nothing is armed at all.
+        let mut tx = waf.new_transaction_with_id("rule-budget-unset");
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+        tx.process_request_headers();
+        tx.process_request_body(body.as_bytes());
+        assert_eq!(tx.computed.rule_budget.remaining(), 0);
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn what_a_rule_writes_to_tx_is_charged_net_of_what_it_replaces_and_a_refused_write_is_not_made() {
+        let mut tx = Transaction::new("rule-budget-tx");
+        tx.computed.rule_budget.arm(100_000, 0);
+        // A counter rewritten ten thousand times holds one value at a time.
+        for round in 0..10_000 {
+            tx.set_tx_variable_in_rule("hits", round.to_string());
+        }
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("hits")).as_deref(), Some("9999"));
+        assert!(
+            100_000 - tx.computed.rule_budget.remaining() < 500,
+            "the key is charged once: {} bytes",
+            100_000 - tx.computed.rule_budget.remaining()
+        );
+        // A big value replaces a small one: both are alive for the moment of the write, and only the new stays.
+        let before = tx.computed.rule_budget.remaining();
+        tx.set_tx_variable_in_rule("hits", vec![b'x'; 40_000]);
+        assert!(before - tx.computed.rule_budget.remaining() >= 40_000 - 64);
+        tx.set_tx_variable_in_rule("hits", "1");
+        assert!(
+            before - tx.computed.rule_budget.remaining() < 100,
+            "what the small value held is given back"
+        );
+        // A value that does not fit is not written, and stops the evaluation.
+        tx.set_tx_variable_in_rule("big", vec![b'y'; 200_000]);
+        assert_eq!(tx.get_variable(RuleVariable::TX, Some("big")), None);
+        assert!(tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn the_values_matched_variables_copies_are_given_back_when_the_next_rule_clears_them() {
+        let mut tx = Transaction::new("rule-budget-matched-vars");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        for key in ["one", "two", "three"] {
+            tx.record_matched_variable(&MatchData::new(RuleVariable::Args, key, vec![b'v'; 10_000]));
+        }
+        assert!(
+            1_000_000 - tx.computed.rule_budget.remaining() >= 40_000,
+            "three copies in `MATCHED_VARS`, one in `MATCHED_VAR`: {}",
+            1_000_000 - tx.computed.rule_budget.remaining()
+        );
+        tx.reset_matched_vars();
+        let kept = 1_000_000 - tx.computed.rule_budget.remaining();
+        // What stays is the table that held the entries and `MATCHED_VAR`'s buffer, which is rewritten in place.
+        assert!(kept < 10_000 + 2_000, "{kept} bytes stay charged");
+        for round in 0..100 {
+            tx.record_matched_variable(&MatchData::new(RuleVariable::Args, "one", vec![b'v'; 10_000]));
+            tx.reset_matched_vars();
+            assert!(
+                1_000_000 - tx.computed.rule_budget.remaining() <= kept + 64,
+                "round {round}"
+            );
+        }
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn a_capture_key_that_a_rule_removes_is_charged_again_when_the_next_rule_makes_it() {
+        let mut tx = Transaction::new("rule-budget-capture-keys");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        tx.reset_matched_vars();
+        let armed = tx.computed.rule_budget.remaining();
+        // A removal gives back the key and its list, and the reset that follows makes both again: what the budget has
+        // left is what it had, however many rules do it, and whether or not the keys held a value.
+        for rule in 0..1_000 {
+            for key in 0..10 {
+                tx.apply_setvar(&format!("!tx.{key}"));
+            }
+            tx.reset_matched_vars();
+            assert_eq!(tx.computed.rule_budget.remaining(), armed, "rule {rule}");
+        }
+        tx.apply_setvar("tx.0=a value that takes a buffer of its own");
+        let with_value = tx.computed.rule_budget.remaining();
+        assert!(with_value < armed);
+        tx.apply_setvar("!tx.0");
+        tx.reset_matched_vars();
+        assert_eq!(
+            tx.computed.rule_budget.remaining(),
+            armed,
+            "the value is given back, the key is held"
+        );
+        // A key that the same rule writes again is made by that write, which charges it once: the reset does not.
+        tx.apply_setvar("!tx.0");
+        tx.apply_setvar("tx.0=x");
+        tx.reset_matched_vars();
+        assert!(
+            armed - tx.computed.rule_budget.remaining() < 64,
+            "the key and its list are charged once, the value is all that is held more: {} bytes",
+            armed - tx.computed.rule_budget.remaining()
+        );
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn a_capture_charges_a_removed_key_each_time_it_makes_it_again() {
+        let mut tx = Transaction::new("rule-budget-capture-keys-in-rule");
+        tx.apply_setvar("!tx.1");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        let armed = tx.computed.rule_budget.remaining();
+
+        for round in 0..100 {
+            let mut outputs = Outputs::new(true);
+            outputs.capture(1, b"x");
+            tx.store_operator_outputs(&mut outputs);
+            assert!(
+                tx.computed.rule_budget.remaining() <= armed,
+                "round {round}: a recreated capture key cannot add credit"
+            );
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")).as_deref(), Some("x"));
+            tx.apply_setvar("!tx.1");
+        }
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn a_capture_key_recreation_refusal_stops_the_phase_and_uses_engine_mode() {
+        struct RefuseCaptureRecreation(Arc<AtomicUsize>);
+        impl crate::operators::Operator for RefuseCaptureRecreation {
+            fn evaluate(&self, tx: &Transaction, input: &[u8], out: &mut Outputs) -> bool {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 1 {
+                    assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")), None);
+                    // Let the second match fit, with one byte too little to recreate `TX:1`.
+                    let match_charge = MATCH_SLOT_BYTES + 2 * allocation_bytes(1);
+                    let capture_key_charge = crate::body_processors::budget::set_growth(&tx.tx, b"1", 0).grown;
+                    let remaining = tx.computed.rule_budget.remaining();
+                    let left_for_capture_key = match_charge + capture_key_charge - 1;
+                    assert!(
+                        remaining >= left_for_capture_key,
+                        "left {remaining}, need {left_for_capture_key}"
+                    );
+                    assert!(tx.computed.rule_budget.charge(remaining - left_for_capture_key));
+                }
+                out.capture(1, input);
+                true
+            }
+        }
+
+        for engine in [RuleEngineStatus::On, RuleEngineStatus::DetectionOnly] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut parser = crate::seclang::Parser::new();
+            *parser.config_mut() = WafConfig {
+                rule_engine: engine,
+                ..WafConfig::default()
+            };
+            parser.register_operator("refusecapture", {
+                let calls = Arc::clone(&calls);
+                Arc::new(move |_: &str| {
+                    let operator: Box<dyn crate::operators::Operator> =
+                        Box::new(RefuseCaptureRecreation(Arc::clone(&calls)));
+                    Ok(operator)
+                })
+            });
+            parser
+                .from_string(
+                    "SecRule ARGS \"@refusecapture\" \"id:2,phase:2,pass,nolog,capture,setvar:!tx.1,setvar:tx.after=+1\"\n\
+                     SecAction \"id:3,phase:2,pass,nolog,setvar:tx.later=1\"",
+                )
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id("rule-budget-capture-key-refused");
+            tx.add_get_argument("a", "x");
+            tx.add_get_argument("b", "x");
+            tx.computed.rule_budget.arm(1_000_000, 0);
+            tx.run_phase(RulePhase::RequestBody);
+
+            assert_eq!(calls.load(Ordering::Relaxed), 2, "{engine:?}");
+            assert!(tx.rule_evaluation_stopped_by_memory_budget(), "{engine:?}");
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("1")), None, "{engine:?}");
+            assert_eq!(
+                tx.get_variable(RuleVariable::TX, Some("after")).as_deref(),
+                Some("1"),
+                "{engine:?}"
+            );
+            assert_eq!(tx.get_variable(RuleVariable::TX, Some("later")), None, "{engine:?}");
+            assert!(
+                !tx.matched_rules().iter().any(|rule| rule.rule_id() == 2),
+                "{engine:?}: the refused rule is not recorded"
+            );
+            match engine {
+                RuleEngineStatus::On => {
+                    assert_eq!(tx.interruption().map(|value| value.status), Some(503));
+                    assert!(tx.would_be_interruption().is_none());
+                },
+                RuleEngineStatus::DetectionOnly => {
+                    assert!(tx.interruption().is_none());
+                    assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(503));
+                },
+                RuleEngineStatus::Off => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_capture_key_the_budget_has_no_room_to_make_again_ends_the_phase_before_the_next_rule() {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string("SecAction \"id:2,phase:2,pass,nolog,setvar:tx.second=1\"")
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        for room in [true, false] {
+            let mut tx = waf.new_transaction_with_id("rule-budget-capture-key-refused");
+            tx.computed.rule_budget.arm(1_000_000, 0);
+            // A rule removed a key, which gave back what it held, and whatever it did after took that and the rest.
+            tx.apply_setvar("!tx.0");
+            if !room {
+                let left = tx.computed.rule_budget.remaining();
+                assert!(tx.computed.rule_budget.charge(left));
+            }
+            tx.run_phase(RulePhase::RequestBody);
+            let second = tx.get_variable(RuleVariable::TX, Some("second"));
+            if room {
+                assert_eq!(second.as_deref(), Some("1"));
+                assert_eq!(tx.get_variable(RuleVariable::TX, Some("0")).as_deref(), Some(""));
+                assert!(tx.interruption().is_none());
+            } else {
+                // The key is not made, which reads as empty, the rule does not run, and the transaction is refused.
+                assert!(tx.rule_evaluation_stopped_by_memory_budget());
+                assert_eq!(tx.get_variable(RuleVariable::TX, Some("0")), None);
+                assert_eq!(second, None);
+                assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(503));
+            }
+        }
+    }
+
+    #[test]
+    fn a_matched_vars_table_that_existed_before_the_budget_was_armed_is_not_charged_or_refunded() {
+        // What the entries of one rule hold, as `MATCHED_VARS` is cleared after it, in a transaction that had
+        // `earlier` matches in `MATCHED_VARS` before its rules got a budget.
+        let held_after_each_clear = |earlier: usize| {
+            let mut tx = Transaction::new("rule-budget-matched-vars-table");
+            for index in 0..earlier {
+                tx.record_matched_variable(&MatchData::new(
+                    RuleVariable::RequestHeaders,
+                    format!("h{index}"),
+                    b"x".to_vec(),
+                ));
+            }
+            tx.set_body_memory_budget(Some(1_000_000));
+            tx.arm_rule_budget(tx.processor_memory_bytes(), true);
+            tx.reset_matched_vars();
+            (0..6)
+                .map(|_| {
+                    tx.record_matched_variable(&MatchData::new(RuleVariable::Args, "a", vec![b'v'; 100]));
+                    tx.reset_matched_vars();
+                    1_000_000 - tx.computed.rule_budget.remaining()
+                })
+                .collect::<Vec<_>>()
+        };
+        let fresh = held_after_each_clear(0);
+        let first = fresh.first().copied().unwrap();
+        assert!(
+            fresh.iter().all(|bytes| *bytes == first),
+            "one rule at a time holds the same each time: {fresh:?}"
+        );
+        for earlier in [7, 200] {
+            let held = held_after_each_clear(earlier);
+            // The table was there before, so what this arming holds is no more than a transaction with no table
+            // that grew one: the entries of the rules are given back whole, not up to the size of the old table.
+            assert!(
+                held.iter().all(|bytes| *bytes <= first),
+                "{earlier} earlier matches: {held:?} against {fresh:?}"
+            );
+        }
+
+        // A table that grows in this arming stays charged, so that nothing it grew by is given back.
+        let mut tx = Transaction::new("rule-budget-matched-vars-growth");
+        for index in 0..3 {
+            tx.record_matched_variable(&MatchData::new(
+                RuleVariable::RequestHeaders,
+                format!("h{index}"),
+                b"x".to_vec(),
+            ));
+        }
+        let old_table = map_capacity_bytes(tx.matched_vars.key_table_capacity());
+        tx.set_body_memory_budget(Some(1_000_000));
+        tx.arm_rule_budget(tx.processor_memory_bytes(), true);
+        tx.reset_matched_vars();
+        for index in 0..40 {
+            tx.record_matched_variable(&MatchData::new(
+                RuleVariable::Args,
+                format!("a{index}"),
+                vec![b'v'; 100],
+            ));
+        }
+        tx.reset_matched_vars();
+        let new_table = map_capacity_bytes(tx.matched_vars.key_table_capacity());
+        assert!(new_table > old_table, "the table grew");
+        assert!(
+            1_000_000 - tx.computed.rule_budget.remaining() >= new_table - old_table,
+            "the growth of the table stays charged: {} bytes held, {} grown",
+            1_000_000 - tx.computed.rule_budget.remaining(),
+            new_table - old_table
+        );
+    }
+
+    #[test]
+    fn rewriting_a_path_argument_under_a_new_spelling_of_its_name_is_charged_for_the_spelling() {
+        let name = "x".repeat(10_000);
+        let (lower, upper) = (format!("route{name}"), format!("Route{name}"));
+        let mut tx = Transaction::new("rule-budget-path-spelling");
+        tx.add_path_argument(&lower, "aaaa");
+        tx.add_path_argument(&upper, "bbbb");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        let held = |tx: &Transaction| tx.args_path.allocated_bytes() + tx.args.allocated_bytes();
+        let charged = |tx: &Transaction| 1_000_000 - tx.computed.rule_budget.remaining();
+
+        // The first value of the name is stored under the lowercase spelling, and the operator writes the other.
+        let before = held(&tx);
+        let mut outputs = Outputs::default();
+        outputs.add_path_argument(&upper, "cccc");
+        tx.store_operator_outputs(&mut outputs);
+        let grown = held(&tx) - before;
+        assert!(grown >= 10_000, "the rewrite allocates the new spelling: {grown}");
+        assert!(
+            charged(&tx) >= grown,
+            "{} bytes charged for a rewrite that allocated {grown}",
+            charged(&tx)
+        );
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+
+        // The same spelling again allocates nothing, and is charged nothing.
+        let charged_before = charged(&tx);
+        let mut outputs = Outputs::default();
+        outputs.add_path_argument(&upper, "dddd");
+        tx.store_operator_outputs(&mut outputs);
+        assert_eq!(charged(&tx), charged_before);
+
+        // A spelling the budget has no room for is not written.
+        let mut tx = Transaction::new("rule-budget-path-spelling-refused");
+        tx.add_path_argument(&lower, "aaaa");
+        tx.add_path_argument(&upper, "bbbb");
+        tx.computed.rule_budget.arm(1_000, 0);
+        let mut outputs = Outputs::default();
+        outputs.add_path_argument(&upper, "cccc");
+        tx.store_operator_outputs(&mut outputs);
+        assert!(tx.rule_evaluation_stopped_by_memory_budget());
+        assert_eq!(tx.args_path.first(&lower), Some(&b"aaaa"[..]));
+    }
+
+    #[test]
+    fn rewriting_a_path_argument_between_spellings_of_its_name_holds_one_of_them_and_is_charged_for_one() {
+        let name = "x".repeat(1_000);
+        let (lower, upper, shout) = (format!("route{name}"), format!("Route{name}"), format!("ROUTE{name}"));
+        let mut tx = Transaction::new("rule-budget-path-spellings");
+        for key in [&lower, &upper, &shout] {
+            tx.add_path_argument(key, "aaaa");
+        }
+        // 64 KiB holds a few dozen spellings of this name, and the loop writes hundreds.
+        tx.computed.rule_budget.arm(64 * 1024, 0);
+        let held = |tx: &Transaction| tx.args_path.allocated_bytes() + tx.args.allocated_bytes();
+        let charged = |tx: &Transaction| 64 * 1024 - tx.computed.rule_budget.remaining();
+        let start = held(&tx);
+        for round in 0..200 {
+            for key in [&upper, &shout, &lower, &shout, &upper, &lower] {
+                let mut outputs = Outputs::default();
+                outputs.add_path_argument(key, "cccc");
+                tx.store_operator_outputs(&mut outputs);
+                // A spelling that is replaced is given back, and one that is allocated is never given back before it
+                // is gone: the budget holds what the maps hold more than they did, to the byte.
+                assert_eq!(
+                    charged(&tx),
+                    held(&tx) - start,
+                    "round {round}, writing {:?}",
+                    key.get(..6)
+                );
+            }
+        }
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+    }
+
+    #[test]
+    fn a_path_argument_written_after_the_stop_does_not_set_the_argument_limit_flag() {
+        let config = WafConfig {
+            argument_limit: 1,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("rule-budget-path-limit", Arc::new(config));
+        tx.add_path_argument("a", "1");
+        tx.computed.rule_budget.arm(100, 0);
+        // The first write does not fit and stops the evaluation; the second is a new argument at the limit, which
+        // nothing charges and which would set the flag.
+        let mut outputs = Outputs::default();
+        outputs.add_path_argument("a", &"y".repeat(10_000));
+        outputs.add_path_argument("b", "1");
+        tx.store_operator_outputs(&mut outputs);
+        assert!(tx.rule_evaluation_stopped_by_memory_budget());
+        assert!(
+            !tx.arguments_limit_reached(),
+            "the flag is not set by a write after the stop"
+        );
+        assert_eq!(tx.get_variable(RuleVariable::ArgsPath, Some("a")).as_deref(), Some("1"));
+
+        // Without a stop the limit is reported as before.
+        let config = WafConfig {
+            argument_limit: 1,
+            ..WafConfig::default()
+        };
+        let mut tx = Transaction::with_config("rule-budget-path-limit-fits", Arc::new(config));
+        tx.add_path_argument("a", "1");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        let mut outputs = Outputs::default();
+        outputs.add_path_argument("b", "1");
+        tx.store_operator_outputs(&mut outputs);
+        assert!(!tx.rule_evaluation_stopped_by_memory_budget());
+        assert!(tx.arguments_limit_reached());
+    }
+
+    #[test]
+    fn the_name_of_a_matched_variable_is_charged_for_its_buffer_and_a_name_that_does_not_fit_is_not_written() {
+        let mut tx = Transaction::new("rule-budget-name");
+        tx.computed.rule_budget.arm(1_000_000, 0);
+        tx.record_matched_variable(&MatchData::new(
+            RuleVariable::ArgsNames,
+            "k".repeat(50_000),
+            b"v".to_vec(),
+        ));
+        // The name is held twice: in `MATCHED_VAR_NAME`'s buffer and as the key of the entry in `MATCHED_VARS`.
+        assert!(
+            1_000_000 - tx.computed.rule_budget.remaining() >= 2 * 50_000,
+            "{} bytes charged",
+            1_000_000 - tx.computed.rule_budget.remaining()
+        );
+        tx.computed.rule_budget.arm(10_000, 0);
+        tx.record_matched_variable(&MatchData::new(
+            RuleVariable::ArgsNames,
+            "j".repeat(200_000),
+            b"v".to_vec(),
+        ));
+        assert!(tx.rule_evaluation_stopped_by_memory_budget());
+        assert!(
+            tx.matched_var_name.get_bytes().len() < 100_000,
+            "a name the budget refused is not written"
+        );
+    }
+
+    #[test]
+    fn a_matched_rule_that_does_not_fit_is_not_recorded_and_one_that_does_is_kept_charged() {
+        let waf = Waf::default();
+        let rule = |id| {
+            let mut metadata = RuleMetadata::new();
+            metadata.id = id;
+            metadata.raw = "SecRule ARGS \"@rx x\" \"id:1\"".repeat(10);
+            metadata
+        };
+        let mut tx = waf.new_transaction_with_id("rule-budget-record");
+        tx.computed.rule_budget.arm(100_000, 0);
+        tx.record_match(
+            rule(1),
+            vec![MatchData::new(RuleVariable::Args, "k", b"v".to_vec())],
+            None,
+        );
+        let charged = 100_000 - tx.computed.rule_budget.remaining();
+        assert!(
+            charged >= size_of::<MatchedRule>(),
+            "the record's slot is charged: {charged}"
+        );
+        assert_eq!(tx.matched_rules().len(), 1);
+        tx.computed.rule_budget.arm(10, 0);
+        tx.record_match(rule(2), Vec::new(), None);
+        assert_eq!(tx.matched_rules().len(), 1, "a record that does not fit is not made");
+        assert!(tx.rule_evaluation_stopped_by_memory_budget());
     }
 
     #[test]

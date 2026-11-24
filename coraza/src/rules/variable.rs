@@ -29,7 +29,8 @@ use crate::collection::MatchData;
 // Re-exported for `rules` and `transaction::ctl`, which import it from here.
 pub(crate) use crate::utils::lowercase_like_go;
 use crate::{
-    collection::{Map, MatchLocation, MatchRef, Single},
+    body_processors::budget::{RuleBudget, push_growth},
+    collection::{IndexedValue, Map, MatchLocation, MatchRef, Single},
     types::RuleVariable,
 };
 
@@ -185,8 +186,12 @@ impl VariableSpec {
     }
 
     /// Return borrowed matches so non-matching rule evaluations avoid copying values.
-    pub(crate) fn get_match_refs<'a>(&'a self, collection: Option<CollectionView<'a>>) -> Vec<MatchRef<'a>> {
-        self.get_match_refs_filter(collection, |_, _| false)
+    pub(crate) fn get_match_refs<'a>(
+        &'a self,
+        collection: Option<CollectionView<'a>>,
+        budget: &RuleBudget,
+    ) -> Vec<MatchRef<'a>> {
+        self.get_match_refs_filter(collection, |_, _| false, budget)
     }
 
     /// Return matches after excluding transaction-local targets before count aggregation.
@@ -196,17 +201,23 @@ impl VariableSpec {
         collection: Option<CollectionView<'_>>,
         excluded: impl FnMut(RuleVariable, &str) -> bool,
     ) -> Vec<MatchData> {
-        self.get_match_refs_filter(collection, excluded)
+        self.get_match_refs_filter(collection, excluded, &RuleBudget::default())
             .into_iter()
             .map(MatchRef::into_owned)
             .collect()
     }
 
     /// Return borrowed matches after excluding transaction-local targets before count aggregation.
+    ///
+    /// The list grows by doubling, and under a rule budget every growth is charged before it is made (see
+    /// [`RuleBudget::charge_scratch_growth`]): a collection of any number of values, which no argument limit bounds
+    /// for `MULTIPART_PART_HEADERS`, cannot make a list larger than the budget has left. A refused charge ends the
+    /// selection with the values found so far, and the budget reports the stop; the caller must check it.
     pub(crate) fn get_match_refs_filter<'a>(
         &'a self,
         collection: Option<CollectionView<'a>>,
         mut excluded: impl FnMut(RuleVariable, &str) -> bool,
+        budget: &RuleBudget,
     ) -> Vec<MatchRef<'a>> {
         let Some(collection) = collection.filter(|view| {
             view.variable() == self.variable
@@ -219,36 +230,46 @@ impl VariableSpec {
         let mut count: usize = 0;
         let count_mode = self.count;
         let has_exceptions = !self.exceptions.is_empty();
+        let armed = budget.is_armed();
         {
-            let mut record = |variable: RuleVariable, key: &'a [u8], value: &'a [u8], location: MatchLocation| {
+            let mut record = |variable: RuleVariable, key: &'a str, value: &'a [u8], location: MatchLocation| {
                 if count_mode {
                     count = count.saturating_add(1);
                 } else {
+                    if armed
+                        && matches.len() == matches.capacity()
+                        && !budget.charge_scratch_growth(push_growth(
+                            matches.len(),
+                            matches.capacity(),
+                            size_of::<MatchRef<'a>>(),
+                        ))
+                    {
+                        return;
+                    }
                     matches.push(MatchRef {
                         variable,
-                        key: String::from_utf8_lossy(key),
+                        key,
                         value: Cow::Borrowed(value),
                         location: Some(location),
                     });
                 }
             };
-            let mut keep = |variable: RuleVariable, key: &[u8]| {
-                let key_text = String::from_utf8_lossy(key);
-                let key_lower = has_exceptions.then(|| lowercase_like_go(&key_text));
-                let key_lower = key_lower.as_deref().unwrap_or(&key_text);
+            let mut keep = |variable: RuleVariable, key: &str| {
+                let key_lower = has_exceptions.then(|| lowercase_like_go(key));
+                let key_lower = key_lower.as_deref().unwrap_or(key);
                 !self
                     .exceptions
                     .iter()
                     .any(|exception| exception.matches_lowered(key_lower))
-                    && !excluded(variable, &key_text)
+                    && !excluded(variable, key)
             };
 
             match (collection, &self.key) {
                 (CollectionView::Map(map), _) => self.select(map, false, |selected| {
-                    if keep(self.variable, selected.key) {
+                    if keep(self.variable, selected.key_text) {
                         record(
                             self.variable,
-                            selected.key,
+                            selected.key_text,
                             selected.value,
                             MatchLocation::Map {
                                 source: map.variable(),
@@ -260,11 +281,11 @@ impl VariableSpec {
                     }
                 }),
                 (CollectionView::Names(variable, map), _) => self.select(map, true, |selected| {
-                    if keep(variable, selected.key) {
+                    if keep(variable, selected.key_text) {
                         // Go exposes the raw name bytes as the value, so keep them exact.
                         record(
                             variable,
-                            selected.key,
+                            selected.key_text,
                             selected.key,
                             MatchLocation::Map {
                                 source: map.variable(),
@@ -276,10 +297,10 @@ impl VariableSpec {
                     }
                 }),
                 (CollectionView::Single(single), None) => {
-                    if keep(single.variable(), b"") {
+                    if keep(single.variable(), "") {
                         record(
                             single.variable(),
-                            b"",
+                            "",
                             single.get_bytes(),
                             MatchLocation::Single {
                                 variable: single.variable(),
@@ -294,7 +315,7 @@ impl VariableSpec {
         if self.count {
             vec![MatchRef {
                 variable: self.variable,
-                key: Cow::Borrowed(&self.count_key),
+                key: &self.count_key,
                 value: Cow::Owned(count.to_string().into_bytes()),
                 location: None,
             }]
@@ -334,71 +355,20 @@ impl VariableSpec {
     /// `exact` is set for the names views: Go looks a literal names selector up as
     /// `data[key]`, without folding it (`internal/collections/named.go:129-131`), while
     /// a value view folds the selector through the map's own key.
-    fn select<'a>(&'a self, map: &'a Map, exact: bool, mut found: impl FnMut(SelectedMapValue<'a>)) {
+    fn select<'a>(&'a self, map: &'a Map, exact: bool, found: impl FnMut(IndexedValue<'a>)) {
         match &self.key {
-            Some(VariableKey::Regex(regex)) => {
-                map.iter_regex_bytes_indexed(regex)
-                    .for_each(|(entry_index, value_index, key, value)| {
-                        found(SelectedMapValue {
-                            key,
-                            value,
-                            entry_index,
-                            value_index,
-                        });
-                    });
-            },
+            Some(VariableKey::Regex(regex)) => map.iter_regex_bytes_indexed(regex).for_each(found),
+            // The parser has already folded a selector that Go folds, and the map is keyed by the folded bytes
+            // (case-insensitive) or the raw bytes (case-sensitive), so a single exact-byte lookup covers both cases
+            // and allocates nothing on this path.
             Some(VariableKey::String(key)) if !key.is_empty() && exact => {
-                select_exact(map, key, found);
+                map.iter_key_exact_indexed(key.as_bytes()).for_each(found);
             },
             Some(VariableKey::String(key)) if !key.is_empty() => {
-                map.iter_key_bytes_indexed(key.as_bytes())
-                    .for_each(|(entry_index, value_index, stored_key, value)| {
-                        found(SelectedMapValue {
-                            key: stored_key,
-                            value,
-                            entry_index,
-                            value_index,
-                        });
-                    });
+                map.iter_key_bytes_indexed(key.as_bytes()).for_each(found);
             },
-            _ => map
-                .iter_bytes_indexed()
-                .for_each(|(entry_index, value_index, key, value)| {
-                    found(SelectedMapValue {
-                        key,
-                        value,
-                        entry_index,
-                        value_index,
-                    });
-                }),
+            _ => map.iter_bytes_indexed().for_each(found),
         }
-    }
-}
-
-/// A selected map entry and its stable position in the backing map.
-struct SelectedMapValue<'a> {
-    /// Key bytes as stored in the collection.
-    key: &'a [u8],
-    /// Selected value bytes.
-    value: &'a [u8],
-    /// Index of the map entry in insertion order.
-    entry_index: usize,
-    /// Index of the value under the entry's key.
-    value_index: usize,
-}
-
-/// Visit the entries a names view stores under the exact selector `key`.
-fn select_exact<'a>(map: &'a Map, key: &str, mut found: impl FnMut(SelectedMapValue<'a>)) {
-    // The parser has already folded a selector that Go folds, and the map is keyed by the
-    // folded bytes (case-insensitive) or the raw bytes (case-sensitive), so a single
-    // exact-byte lookup covers both cases and allocates nothing on this path.
-    for (entry_index, value_index, stored, value) in map.iter_key_exact_indexed(key.as_bytes()) {
-        found(SelectedMapValue {
-            key: stored,
-            value,
-            entry_index,
-            value_index,
-        });
     }
 }
 
@@ -409,6 +379,7 @@ mod tests {
 
     use super::{CollectionView, VariableException, VariableSpec};
     use crate::{
+        body_processors::budget::RuleBudget,
         collection::{Map, Single},
         types::RuleVariable,
     };
@@ -438,12 +409,61 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_is_charged_for_each_growth_of_its_list_before_the_list_grows_and_stops_at_the_budget() {
+        use crate::collection::{MatchRef, allocation_bytes};
+
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        for index in 0..1_000 {
+            map.add(&format!("k{index}"), b"v");
+        }
+        let spec = VariableSpec::new(RuleVariable::Args);
+        let view = || Some(CollectionView::Map(&map));
+
+        // Without a budget, nothing is charged and everything is selected.
+        let unarmed = RuleBudget::default();
+        assert_eq!(spec.get_match_refs(view(), &unarmed).len(), 1_000);
+        assert!(!unarmed.is_stopped());
+
+        // With room, what is charged is what the list holds: its chunk, whatever the number of growths on the way.
+        let mut budget = RuleBudget::default();
+        budget.arm(10_000_000, 0);
+        let selected = spec.get_match_refs(view(), &budget);
+        assert_eq!(selected.len(), 1_000);
+        assert_eq!(
+            10_000_000 - budget.remaining(),
+            allocation_bytes(selected.capacity() * size_of::<MatchRef<'_>>())
+        );
+        assert!(!budget.is_stopped());
+        budget.end_rule();
+        assert_eq!(budget.remaining(), 10_000_000, "the list is given back with the rule");
+
+        // Without room, the list stops growing at the budget instead of at the end of the collection: the growth that
+        // does not fit is not made, and what was charged is never more than the budget.
+        for room in [0, 100, 5_000, 40_000, 100_000] {
+            let mut budget = RuleBudget::default();
+            budget.arm(room, 0);
+            let selected = spec.get_match_refs(view(), &budget);
+            assert!(budget.is_stopped(), "room for {room} bytes");
+            assert!(
+                selected.len() < 1_000,
+                "room for {room} bytes: {} selected",
+                selected.len()
+            );
+            assert!(
+                allocation_bytes(selected.capacity() * size_of::<MatchRef<'_>>()) <= room,
+                "room for {room} bytes: the list holds {} bytes",
+                allocation_bytes(selected.capacity() * size_of::<MatchRef<'_>>())
+            );
+        }
+    }
+
+    #[test]
     fn borrowed_matches_keep_collection_values_borrowed() {
         let mut map = Map::new_case_sensitive(RuleVariable::Args);
         map.add("id", b"value");
 
         let spec = VariableSpec::new(RuleVariable::Args);
-        let matches = spec.get_match_refs(Some(CollectionView::Map(&map)));
+        let matches = spec.get_match_refs(Some(CollectionView::Map(&map)), &RuleBudget::default());
 
         assert_eq!(matches.len(), 1);
         assert!(
@@ -455,6 +475,47 @@ mod tests {
         assert_eq!(
             matches.first().map(crate::collection::MatchRef::value),
             Some(&b"value"[..])
+        );
+    }
+
+    #[test]
+    fn the_key_of_a_selected_value_is_the_text_the_map_stores_even_when_the_name_is_not_utf8() {
+        let mut map = Map::new_case_sensitive(RuleVariable::Args);
+        map.add_bytes(b"a\xff", "1");
+        map.add_bytes(b"a\xfe", "2");
+        map.add("ok", "3");
+        let stored: Vec<&str> = map.iter().map(|(key, _)| key).collect();
+
+        let spec = VariableSpec::new(RuleVariable::Args);
+        let view = || Some(CollectionView::Map(&map));
+        let selected = spec.get_match_refs(view(), &RuleBudget::default());
+        let keys: Vec<&str> = selected.iter().map(crate::collection::MatchRef::key).collect();
+        assert_eq!(keys, ["a\u{fffd}", "a\u{fffd}", "ok"]);
+        // Each is the very text the map keeps, which no selection copies.
+        for (key, stored) in keys.iter().zip(&stored) {
+            assert!(std::ptr::eq(*key, *stored), "{key:?} was copied");
+        }
+        // The names view reports the same text, and the exact bytes as the value.
+        let names = VariableSpec::new(RuleVariable::ArgsNames);
+        let selected = names.get_match_refs(
+            Some(CollectionView::Names(RuleVariable::ArgsNames, &map)),
+            &RuleBudget::default(),
+        );
+        assert_eq!(
+            selected.first().map(crate::collection::MatchRef::key),
+            Some("a\u{fffd}")
+        );
+        assert_eq!(
+            selected.first().map(crate::collection::MatchRef::value),
+            Some(&b"a\xff"[..])
+        );
+        // A budget that fits charges the list and nothing for the keys, which are what the collection already holds.
+        let mut budget = RuleBudget::default();
+        budget.arm(1_000_000, 0);
+        let selected = spec.get_match_refs(view(), &budget);
+        assert_eq!(
+            1_000_000 - budget.remaining(),
+            crate::collection::allocation_bytes(selected.capacity() * size_of::<crate::collection::MatchRef<'_>>())
         );
     }
 

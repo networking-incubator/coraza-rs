@@ -43,9 +43,10 @@ pub use map::Map;
 #[cfg(test)]
 pub(crate) use map::keys_scanned;
 pub(crate) use map::{
-    ALLOCATION_OVERHEAD_BYTES, FIRST_INSERT_OVERHEAD_BYTES, Growth, INSERT_OVERHEAD_BYTES, KEY_COPIES_PER_INSERT,
-    KEY_RETAINED_BYTES_PER_BYTE, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes, grown_list_capacity,
-    index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
+    ALLOCATION_OVERHEAD_BYTES, FIRST_INSERT_OVERHEAD_BYTES, Growth, INSERT_OVERHEAD_BYTES, IndexedValue,
+    KEY_COPIES_PER_INSERT, KEY_RETAINED_BYTES_PER_BYTE, VALUE_ENTRY_BYTES, allocation_bytes, fold_scratch_bytes,
+    grown_list_capacity, index_capacity_for, index_growth, index_table_bytes, key_bytes, map_capacity_bytes,
+    vec_grown_capacity,
 };
 pub use single::Single;
 
@@ -69,6 +70,9 @@ pub struct MatchData {
     /// Added before 1.0 for multiphase suppression.
     pub chain_level: usize,
 }
+
+/// What a match takes in the list that holds it, which a list that doubles holds twice over at most.
+pub(crate) const MATCH_SLOT_BYTES: usize = 2 * size_of::<MatchData>();
 
 /// A stable position for fetching one selected value after its collection borrow ends.
 #[derive(Debug, Clone, Copy)]
@@ -95,8 +99,8 @@ pub(crate) enum MatchLocation {
 pub(crate) struct MatchRef<'a> {
     /// The selected variable.
     pub(crate) variable: RuleVariable,
-    /// The lossy key reported to actions and logs.
-    pub(crate) key: Cow<'a, str>,
+    /// The lossy key reported to actions and logs, which the collection stores as text and so is never copied.
+    pub(crate) key: &'a str,
     /// The original selected bytes.
     pub(crate) value: Cow<'a, [u8]>,
     /// The source position, if this match can be fetched again after releasing its borrow.
@@ -111,7 +115,7 @@ impl MatchRef<'_> {
 
     /// The lossy text key reported to rule actions and logs.
     pub(crate) fn key(&self) -> &str {
-        &self.key
+        self.key
     }
 
     /// The selected value bytes.
@@ -126,12 +130,12 @@ impl MatchRef<'_> {
 
     /// Copy this match when an operator result requires mutation of its collection.
     pub(crate) fn to_owned(&self) -> MatchData {
-        MatchData::new(self.variable, self.key.as_ref(), self.value.as_ref())
+        MatchData::new(self.variable, self.key, self.value.as_ref())
     }
 
     /// Materialize the selected match after it matters to rule evaluation.
     pub(crate) fn into_owned(self) -> MatchData {
-        MatchData::new(self.variable, self.key.into_owned(), self.value.into_owned())
+        MatchData::new(self.variable, self.key, self.value.into_owned())
     }
 
     #[cfg(test)]
