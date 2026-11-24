@@ -1777,6 +1777,197 @@ mod tests {
         );
     }
 
+    /// The documented CRS policy with both paranoia levels set to `paranoia`.
+    #[cfg(feature = "embed-crs")]
+    fn crs_generation(paranoia: u8) -> Generation {
+        crs_generation_in("On", paranoia)
+    }
+
+    /// Like `crs_generation`, with `SecRuleEngine` set to `engine`.
+    #[cfg(feature = "embed-crs")]
+    fn crs_generation_in(engine: &str, paranoia: u8) -> Generation {
+        let level = format!(
+            "SecAction \"id:900000,phase:1,pass,nolog,setvar:tx.blocking_paranoia_level={paranoia},\
+             setvar:tx.detection_paranoia_level={paranoia}\""
+        );
+        parse_generation(
+            &serde_json::json!({
+                "directives_map": {"crs": [
+                    "Include @recommended-conf",
+                    format!("SecRuleEngine {engine}"),
+                    level,
+                    "Include crs/crs-setup.conf",
+                    "Include crs/rules/*.conf"
+                ]},
+                "default_directives": "crs"
+            })
+            .to_string(),
+        )
+    }
+
+    /// One request through the CRS policy: the interrupting `(rule_id, status)` and the ids of the rules that matched.
+    #[cfg(feature = "embed-crs")]
+    fn crs_request(
+        generation: &Generation,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> (Option<(i32, u16)>, Vec<i32>) {
+        let policy = generation.select("example.com").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.process_uri(uri, if body.is_empty() { "GET" } else { "POST" }, "HTTP/1.1");
+        transaction.add_request_header("Host", "example.com");
+        transaction.add_request_header("User-Agent", "curl/8.0");
+        transaction.add_request_header("Accept", "*/*");
+        if let Some(content_type) = content_type {
+            transaction.add_request_header("Content-Type", content_type);
+            transaction.add_request_header("Content-Length", body.len().to_string());
+        }
+        if transaction.process_request_headers().is_none() {
+            transaction.process_request_body(body);
+        }
+        let matched = transaction.matched_rules().iter().map(|rule| rule.rule.id()).collect();
+        (
+            transaction
+                .interruption()
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            matched,
+        )
+    }
+
+    /// Asserts that `rule` matches and the CRS blocks the request with 403 through rule 949110.
+    #[cfg(feature = "embed-crs")]
+    fn assert_crs_blocked_by(generation: &Generation, rule: i32, uri: &str, content_type: Option<&str>, body: &[u8]) {
+        let (interruption, matched) = crs_request(generation, uri, content_type, body);
+        assert!(
+            matched.contains(&rule),
+            "{rule} must match {uri} {}, matched {matched:?}",
+            String::from_utf8_lossy(body)
+        );
+        assert_eq!(
+            interruption,
+            Some((949_110, 403)),
+            "{uri} {}, matched {matched:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    /// Asserts that the CRS lets a benign request through without scoring it.
+    #[cfg(feature = "embed-crs")]
+    fn assert_crs_passes(generation: &Generation, uri: &str, content_type: Option<&str>, body: &[u8]) {
+        let (interruption, matched) = crs_request(generation, uri, content_type, body);
+        assert_eq!(
+            interruption,
+            None,
+            "{uri} {}, matched {matched:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    /// `GET /?x=` plus `value`, every byte but an ASCII letter or digit percent-encoded.
+    #[cfg(feature = "embed-crs")]
+    fn crs_query(value: &str) -> String {
+        use std::fmt::Write as _;
+        let mut uri = String::from("/?x=");
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() {
+                uri.push(char::from(byte));
+            } else {
+                write!(uri, "%{byte:02X}").unwrap();
+            }
+        }
+        uri
+    }
+
+    /// A multipart upload of one file named `filename`.
+    #[cfg(feature = "embed-crs")]
+    fn crs_upload(filename: &str) -> Vec<u8> {
+        format!(
+            "--b\r\nContent-Disposition: form-data; name=\"f\"; filename=\"{filename}\"\r\n\
+             Content-Type: text/plain\r\n\r\nhello\r\n--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[cfg(feature = "embed-crs")]
+    const CRS_FORM: Option<&str> = Some("application/x-www-form-urlencoded");
+
+    /// The connector runs multiphase evaluation, and the shipped
+    /// `SecRuleUpdateTargetById 930120 "!ARGS_NAMES:/^json\.profile[.\w\-]*$/"` must not hide the
+    /// field's value from the rule.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_crs_inspects_the_value_of_a_json_profile_field() {
+        let generation = crs_generation(1);
+        assert_crs_blocked_by(
+            &generation,
+            930_120,
+            "/",
+            Some("application/json"),
+            br#"{"profile":".aws/credentials"}"#,
+        );
+        assert_crs_passes(&generation, "/", Some("application/json"), br#"{"profile":"alice"}"#);
+    }
+
+    /// A negated anchored `@rx` must see the whole value, not one of its lines.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_crs_negated_anchored_rules_see_the_whole_value() {
+        let pl1 = crs_generation(1);
+        // 920120: `%0a` in a file name decodes to LF under `t:urlDecodeUni`. A blocking policy refuses every upload
+        // with 413 before 920120 reads the name, so the rule is read in a policy that only detects.
+        assert_eq!(
+            crs_request(&pl1, "/upload", MULTIPART, &crs_upload("photo.jpg")).0,
+            Some((0, 413)),
+            "a blocking policy refuses an upload before the CRS sees it"
+        );
+        let detect = crs_generation_in("DetectionOnly", 1);
+        let (interruption, matched) = crs_request(&detect, "/upload", MULTIPART, &crs_upload("x' or 1=1-- %0a.jpg"));
+        assert!(matched.contains(&920_120), "920120 must match, matched {matched:?}");
+        assert!(
+            matched.contains(&949_110),
+            "the request would block, matched {matched:?}"
+        );
+        assert_eq!(interruption, None, "DetectionOnly does not interrupt");
+        let (_, matched) = crs_request(&detect, "/upload", MULTIPART, &crs_upload("photo.jpg"));
+        assert!(
+            !matched.contains(&920_120),
+            "a plain file name passes, matched {matched:?}"
+        );
+        // 933180 takes the byte path: a newline inside the call's parentheses must not hide it.
+        assert_crs_blocked_by(&pl1, 933_180, "/x", CRS_FORM, b"x=$f(%0a1)");
+        assert_crs_passes(&pl1, "/x", CRS_FORM, b"x=hello");
+
+        let pl2 = crs_generation(2);
+        assert_crs_blocked_by(&pl2, 942_200, "/login", CRS_FORM, b"q=x,0x41'%0aabc");
+        assert_crs_blocked_by(&pl2, 942_440, "/login", CRS_FORM, b"q=1;--%0a1");
+        assert_crs_passes(&pl2, "/login", CRS_FORM, b"q=hello");
+    }
+
+    /// `t:cmdLine` removes the backtick, so the obfuscated commands match the plain ones at PL1.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_crs_sees_backtick_obfuscated_commands() {
+        let generation = crs_generation(1);
+        for (rule, value) in [
+            (932_120, "Invoke`-`Expression $x"),
+            (932_120, "Get`-`Content C:\\secret.txt"),
+            (932_160, ";c``at /e``tc/pa``sswd"),
+            // 932270 takes the backtick as the byte before `~+`; the closing backtick must not hide it.
+            (932_270, "`~+`"),
+            (932_270, "a`~+1`"),
+            // 932140 needs the space directly before the keyword: the backtick between them must go.
+            (932_140, "if `exist c:\\x calc"),
+            (932_140, "for %i `in (x) `do calc"),
+            // 932130 and 932140 keep one backtick where the command needs a byte (recovered shapes).
+            (932_130, "who$(``)ami"),
+            (932_140, "for %` in (x) do calc"),
+        ] {
+            assert_crs_blocked_by(&generation, rule, &crs_query(value), None, b"");
+        }
+        assert_crs_passes(&generation, &crs_query("hello world"), None, b"");
+    }
+
     #[test]
     fn a_full_rule_data_set_leaves_no_room_for_the_built_in_files() {
         let mut rule_data = std::collections::BTreeMap::new();
