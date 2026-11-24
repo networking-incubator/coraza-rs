@@ -25,7 +25,7 @@ use config::{Config, Mode};
 use inspect::{BodyFormat, Incomplete, Inspection};
 use proxy_wasm::{
     traits::{Context, HttpContext, RootContext},
-    types::{Action, ContextType, LogLevel},
+    types::{Action, ContextType, LogLevel, Status},
 };
 
 proxy_wasm::main! {{
@@ -49,11 +49,19 @@ impl RootContext for LibperfusionRoot {
         Some(ContextType::HttpContext)
     }
 
-    /// Loads Envoy configuration, using defaults when none is supplied.
+    /// Loads Envoy configuration, using defaults when none is supplied; a host
+    /// failure rejects the configuration instead of silently running defaults.
     fn on_configure(&mut self, _plugin_configuration_size: usize) -> bool {
-        let Some(configuration) = self.get_plugin_configuration() else {
-            self.config = Config::default();
-            return true;
+        let configuration = match self.get_plugin_configuration() {
+            Ok(Some(configuration)) => configuration,
+            Ok(None) => {
+                self.config = Config::default();
+                return true;
+            },
+            Err(status) => {
+                log::error!("libperfusion: plugin configuration unavailable: {status:?}");
+                return false;
+            },
         };
         match Config::parse(&configuration) {
             Ok(config) => {
@@ -82,6 +90,8 @@ enum RequestState {
     Streaming,
     /// The request reached a terminal policy outcome.
     Done,
+    /// A reply the filter owed could not be sent; the request stays held.
+    Held,
 }
 
 /// Tracks whether response inspection is active, incomplete or terminal.
@@ -97,6 +107,8 @@ enum ResponseState {
     BlockedReleased,
     /// The response reached a terminal policy outcome.
     Done,
+    /// A rewrite or reply failed; the original response stays held.
+    Held,
 }
 
 impl ResponseState {
@@ -171,15 +183,20 @@ impl LibperfusionHttp {
     /// Sends a generic request-side rejection and marks the stream terminal.
     fn reject_request(&mut self, status: u32, message: &'static [u8]) -> Action {
         log::warn!("libperfusion: request outcome=reject status={status}");
-        self.send_http_response(
+        if let Err(error) = self.send_http_response(
             status,
             vec![
                 ("content-type", "text/plain; charset=utf-8"),
                 ("cache-control", "no-store"),
             ],
             Some(message),
-        );
-        self.request_state = RequestState::Done;
+        ) {
+            // Without a local reply only a held stream keeps the request from the upstream.
+            log::error!("libperfusion: rejection reply failed: {error:?}");
+            self.request_state = RequestState::Held;
+        } else {
+            self.request_state = RequestState::Done;
+        }
         Action::Pause
     }
 
@@ -189,43 +206,84 @@ impl LibperfusionHttp {
     }
 
     /// Rewrites held response headers before the response is released.
-    fn block_response_headers(&self) {
-        for (name, _) in self.get_http_response_headers_bytes() {
+    fn block_response_headers(&self) -> Result<(), Status> {
+        let headers = self.get_http_response_headers_bytes()?;
+        for (name, _) in headers {
             if name != ":status" {
-                self.set_http_response_header(&name, None);
+                self.set_http_response_header(&name, None)?;
             }
         }
-        self.set_http_response_header(":status", Some("502"));
-        self.set_http_response_header("content-type", Some("text/plain; charset=utf-8"));
-        self.set_http_response_header("cache-control", Some("no-store"));
+        self.set_http_response_header(":status", Some("502"))?;
+        self.set_http_response_header("content-type", Some("text/plain; charset=utf-8"))?;
+        self.set_http_response_header("cache-control", Some("no-store"))?;
+        Ok(())
     }
 
     /// Replaces the held response body with a generic message.
-    fn replace_blocked_response_body(&self, size: usize) {
-        self.set_http_response_body(0, size, b"Upstream response blocked\n");
+    fn replace_blocked_response_body(&self, size: usize) -> Result<(), Status> {
+        self.set_http_response_body(0, size, b"Upstream response blocked\n")
+    }
+
+    /// Holds the stream after a failed response rewrite so the original response is never released.
+    fn hold_response(&mut self, phase: &str, status: Status) {
+        log::error!("libperfusion: response rewrite failed phase={phase} status={status:?}");
+        self.response_state = ResponseState::Held;
     }
 
     /// Applies a response rejection and logs the terminal outcome.
-    fn apply_response_block(&mut self, size: usize) {
-        self.block_response_headers();
-        self.replace_blocked_response_body(size);
+    fn apply_response_block(&mut self, size: usize) -> Action {
+        let blocked = self
+            .block_response_headers()
+            .and_then(|()| self.replace_blocked_response_body(size));
+        if let Err(status) = blocked {
+            self.hold_response("block", status);
+            return Action::Pause;
+        }
         self.response_state = ResponseState::Done;
         log::warn!("libperfusion: response outcome=blocked status=502");
+        Action::Continue
     }
 
     /// Strips the held or released body chunk after blocking a response.
-    fn continue_blocked_response_body(&mut self, body_size: usize, end_of_stream: bool) {
-        if end_of_stream {
+    fn continue_blocked_response_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        let stripped = if end_of_stream {
             if body_size > 0 {
-                self.replace_blocked_response_body(body_size);
+                self.replace_blocked_response_body(body_size)
+            } else {
+                Ok(())
             }
         } else {
-            self.set_http_response_body(0, body_size, b"");
+            self.set_http_response_body(0, body_size, b"")
+        };
+        if let Err(status) = stripped {
+            self.hold_response("strip", status);
+            return Action::Pause;
         }
         self.response_state = ResponseState::after_blocked_body(end_of_stream);
         if end_of_stream {
             log::warn!("libperfusion: response outcome=blocked status=502");
         }
+        Action::Continue
+    }
+
+    /// Blocks the response and strips the current chunk, holding the stream when the rewrite fails.
+    fn block_response(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        self.response_state = ResponseState::BlockedHeld;
+        if let Err(status) = self.block_response_headers() {
+            self.hold_response("block", status);
+            return Action::Pause;
+        }
+        self.continue_blocked_response_body(body_size, end_of_stream)
+    }
+
+    /// Clears blocked response trailers, holding the stream when the rewrite fails.
+    fn clear_blocked_trailers(&mut self, outcome: &'static str) -> Action {
+        if let Err(status) = self.set_http_response_trailers(Vec::new()) {
+            self.hold_response("trailers", status);
+            return Action::Pause;
+        }
+        log::warn!("libperfusion: response outcome={outcome}");
+        Action::Continue
     }
 
     /// Logs detector and incomplete-inspection outcomes without request data.
@@ -266,14 +324,16 @@ impl LibperfusionHttp {
             return Action::Continue;
         };
         if self.response_state == ResponseState::BlockedHeld {
-            self.replace_blocked_response_body(body_size);
+            if let Err(status) = self.replace_blocked_response_body(body_size) {
+                self.hold_response("block", status);
+                return Action::Pause;
+            }
             self.response_state = ResponseState::Done;
             log::warn!("libperfusion: response outcome=blocked status=502");
             return Action::Continue;
         }
         if self.should_block_response() {
-            self.apply_response_block(body_size);
-            return Action::Continue;
+            return self.apply_response_block(body_size);
         }
         Self::report_inspection("response", self.response_mode(), inspection);
         self.response_state = ResponseState::Done;
@@ -296,7 +356,7 @@ impl LibperfusionHttp {
             }
             return false;
         }
-        let Some(body) = self.get_http_request_body(0, body_size) else {
+        let Ok(Some(body)) = self.get_http_request_body(0, body_size) else {
             if let Some(inspection) = self.request.as_mut() {
                 inspection.mark_incomplete(Incomplete::BodyUnavailable);
             }
@@ -318,7 +378,7 @@ impl LibperfusionHttp {
             }
             return false;
         }
-        let Some(body) = self.get_http_response_body(0, body_size) else {
+        let Ok(Some(body)) = self.get_http_response_body(0, body_size) else {
             if let Some(inspection) = self.response.as_mut() {
                 inspection.mark_incomplete(Incomplete::BodyUnavailable);
             }
@@ -331,6 +391,40 @@ impl LibperfusionHttp {
         }
         true
     }
+
+    /// Inspects request trailers, marking the inspection incomplete when the host withholds them.
+    fn inspect_request_trailers(&mut self) {
+        match self.get_http_request_trailers_bytes() {
+            Ok(trailers) => {
+                if let Some(inspection) = self.request.as_mut() {
+                    inspection.trailers(&trailers);
+                }
+            },
+            Err(status) => {
+                log::warn!("libperfusion: request trailers unavailable: {status:?}");
+                if let Some(inspection) = self.request.as_mut() {
+                    inspection.mark_incomplete(Incomplete::TrailersUnavailable);
+                }
+            },
+        }
+    }
+
+    /// Inspects response trailers, marking the inspection incomplete when the host withholds them.
+    fn inspect_response_trailers(&mut self) {
+        match self.get_http_response_trailers_bytes() {
+            Ok(trailers) => {
+                if let Some(inspection) = self.response.as_mut() {
+                    inspection.trailers(&trailers);
+                }
+            },
+            Err(status) => {
+                log::warn!("libperfusion: response trailers unavailable: {status:?}");
+                if let Some(inspection) = self.response.as_mut() {
+                    inspection.mark_incomplete(Incomplete::TrailersUnavailable);
+                }
+            },
+        }
+    }
 }
 
 impl Context for LibperfusionHttp {}
@@ -342,9 +436,14 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
 
-        let headers = self.get_http_request_headers_bytes();
         let mut inspection = Inspection::new(&self.config);
-        self.request_format = inspection.headers(&headers);
+        match self.get_http_request_headers_bytes() {
+            Ok(headers) => self.request_format = inspection.headers(&headers),
+            Err(status) => {
+                log::warn!("libperfusion: request headers unavailable: {status:?}");
+                inspection.mark_incomplete(Incomplete::HeadersUnavailable);
+            },
+        }
         let incomplete = inspection.incomplete();
         let has_detection = inspection.has_sqli() || inspection.has_xss();
         self.request_state = if inspection.is_streaming() {
@@ -379,6 +478,9 @@ impl HttpContext for LibperfusionHttp {
 
     /// Tracks buffered request bodies and inspects them when complete.
     fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        if self.request_state == RequestState::Held {
+            return Action::Pause;
+        }
         if self.request_mode() == Mode::Off || self.request_state != RequestState::Inspecting {
             return Action::Continue;
         }
@@ -427,11 +529,11 @@ impl HttpContext for LibperfusionHttp {
         if self.request_mode() == Mode::Off {
             return Action::Continue;
         }
+        if self.request_state == RequestState::Held {
+            return Action::Pause;
+        }
         if self.request_state == RequestState::Streaming {
-            let trailers = self.get_http_request_trailers_bytes();
-            if let Some(inspection) = self.request.as_mut() {
-                inspection.trailers(&trailers);
-            }
+            self.inspect_request_trailers();
             return self.finish_request();
         }
         if self.request_state == RequestState::Done {
@@ -440,10 +542,7 @@ impl HttpContext for LibperfusionHttp {
         if self.request_body_size <= self.config.max_request_body_bytes {
             let _ = self.scan_request_body(self.request_body_size);
         }
-        let trailers = self.get_http_request_trailers_bytes();
-        if let Some(inspection) = self.request.as_mut() {
-            inspection.trailers(&trailers);
-        }
+        self.inspect_request_trailers();
         self.finish_request()
     }
 
@@ -453,9 +552,14 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
 
-        let headers = self.get_http_response_headers_bytes();
         let mut inspection = Inspection::new(&self.config);
-        self.response_format = inspection.headers(&headers);
+        match self.get_http_response_headers_bytes() {
+            Ok(headers) => self.response_format = inspection.headers(&headers),
+            Err(status) => {
+                log::warn!("libperfusion: response headers unavailable: {status:?}");
+                inspection.mark_incomplete(Incomplete::HeadersUnavailable);
+            },
+        }
         let incomplete = inspection.incomplete();
         let has_detection = inspection.has_sqli() || inspection.has_xss();
         let streaming = inspection.is_streaming();
@@ -464,21 +568,28 @@ impl HttpContext for LibperfusionHttp {
         let reject_headers = has_detection && self.response_mode() == Mode::Block
             || incomplete.is_some() && self.reject_incomplete(self.response_mode());
         if reject_headers && streaming && !end_of_stream {
-            self.response_state = ResponseState::Done;
-            self.send_http_response(
+            match self.send_http_response(
                 502,
                 vec![
                     ("content-type", "text/plain; charset=utf-8"),
                     ("cache-control", "no-store"),
                 ],
                 Some(b"Upstream response blocked\n"),
-            );
-            log::warn!("libperfusion: response outcome=blocked status=502");
+            ) {
+                Ok(()) => {
+                    self.response_state = ResponseState::Done;
+                    log::warn!("libperfusion: response outcome=blocked status=502");
+                },
+                Err(status) => self.hold_response("reply", status),
+            }
             return Action::Pause;
         }
         if reject_headers {
             self.response_state = ResponseState::BlockedHeld;
-            self.block_response_headers();
+            if let Err(status) = self.block_response_headers() {
+                self.hold_response("block", status);
+                return Action::Pause;
+            }
         }
         if end_of_stream {
             return self.finish_response(0);
@@ -498,6 +609,9 @@ impl HttpContext for LibperfusionHttp {
 
     /// Tracks buffered response bodies and inspects them when complete.
     fn on_http_response_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        if self.response_state == ResponseState::Held {
+            return Action::Pause;
+        }
         if self.response_mode() == Mode::Off
             || self.response_state == ResponseState::Done
             || self.response_state == ResponseState::Streaming
@@ -510,8 +624,7 @@ impl HttpContext for LibperfusionHttp {
             self.response_state,
             ResponseState::BlockedHeld | ResponseState::BlockedReleased
         ) {
-            self.continue_blocked_response_body(body_size, end_of_stream);
-            return Action::Continue;
+            return self.continue_blocked_response_body(body_size, end_of_stream);
         }
 
         if body_size > self.config.max_response_body_bytes {
@@ -519,10 +632,7 @@ impl HttpContext for LibperfusionHttp {
                 inspection.mark_incomplete(Incomplete::BodyTooLarge);
             }
             if self.reject_incomplete(self.response_mode()) {
-                self.response_state = ResponseState::BlockedHeld;
-                self.block_response_headers();
-                self.continue_blocked_response_body(body_size, end_of_stream);
-                return Action::Continue;
+                return self.block_response(body_size, end_of_stream);
             }
             self.response_state = ResponseState::Streaming;
             if let Some(inspection) = self.response.as_ref() {
@@ -536,10 +646,7 @@ impl HttpContext for LibperfusionHttp {
         }
 
         if !self.scan_response_body(body_size) && self.reject_incomplete(self.response_mode()) {
-            self.response_state = ResponseState::BlockedHeld;
-            self.block_response_headers();
-            self.continue_blocked_response_body(body_size, end_of_stream);
-            return Action::Continue;
+            return self.block_response(body_size, end_of_stream);
         }
         self.finish_response(body_size)
     }
@@ -549,16 +656,14 @@ impl HttpContext for LibperfusionHttp {
         if self.response_mode() == Mode::Off {
             return Action::Continue;
         }
+        if self.response_state == ResponseState::Held {
+            return Action::Pause;
+        }
         if self.response_state == ResponseState::Streaming {
-            let trailers = self.get_http_response_trailers_bytes();
-            if let Some(inspection) = self.response.as_mut() {
-                inspection.trailers(&trailers);
-            }
+            self.inspect_response_trailers();
             if self.should_block_response() {
-                self.set_http_response_trailers(Vec::new());
                 self.response_state = ResponseState::Done;
-                log::warn!("libperfusion: response outcome=blocked_trailers");
-                return Action::Continue;
+                return self.clear_blocked_trailers("blocked_trailers");
             }
             if let Some(inspection) = self.response.as_ref() {
                 Self::report_inspection("response", self.response_mode(), inspection);
@@ -566,10 +671,8 @@ impl HttpContext for LibperfusionHttp {
             return Action::Continue;
         }
         if let Some(state) = self.response_state.after_blocked_trailers() {
-            self.set_http_response_trailers(Vec::new());
             self.response_state = state;
-            log::warn!("libperfusion: response outcome=blocked status=502");
-            return Action::Continue;
+            return self.clear_blocked_trailers("blocked status=502");
         }
         if self.response_state == ResponseState::Done {
             return Action::Continue;
@@ -577,12 +680,12 @@ impl HttpContext for LibperfusionHttp {
         if self.response_body_size <= self.config.max_response_body_bytes {
             let _ = self.scan_response_body(self.response_body_size);
         }
-        let trailers = self.get_http_response_trailers_bytes();
-        if let Some(inspection) = self.response.as_mut() {
-            inspection.trailers(&trailers);
-        }
+        self.inspect_response_trailers();
         if self.should_block_response() {
-            self.set_http_response_trailers(Vec::new());
+            if let Err(status) = self.set_http_response_trailers(Vec::new()) {
+                self.hold_response("trailers", status);
+                return Action::Pause;
+            }
         }
         self.finish_response(self.response_body_size)
     }

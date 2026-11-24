@@ -20,6 +20,9 @@ ahash = "0.8.12"
 clap = { version = "4.6.7", features = ["derive"] }
 glob = "=0.3.4"
 indexmap = "2.14.2"
+# Single Proxy-Wasm SDK source for both Envoy filters: the Kuadrant fork wraps
+# hostcall returns in Result so host failures can fail closed.
+proxy-wasm = { git = "https://github.com/Kuadrant/proxy-wasm-rust-sdk", rev = "6ceedbbdd07a048a65d197c9bbb1f950884561fb" }
 toml = "=1.2.1"
 
 [workspace.lints.rust]
