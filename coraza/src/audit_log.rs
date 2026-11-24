@@ -329,6 +329,16 @@ pub struct MatchedRule {
 /// Maximum message bytes included in a Coraza error log line.
 const MAX_LOG_MESSAGE: usize = 280;
 
+/// Maximum `msg_match_N` and `data_match_N` pairs the error log lists after the first match; the rest are counted.
+///
+/// Go lists every match. With audit parts `H` and `K` each of a rule's matches carries that line, so an unbounded
+/// list made the entry quadratic in the matches of one rule.
+const MAX_ERROR_LOG_EXTRA_MATCHES: usize = 8;
+
+/// Maximum request URI bytes in a Coraza error log line; Go copies it whole. Every message of a rule carries the line,
+/// so an attacker-sized URI made the entry its length times the rule's matches. Part `B` has the whole request line.
+const MAX_LOG_URI: usize = 1024;
+
 impl MatchedRule {
     /// The first expanded rule message, or an empty string when none was set.
     pub fn message(&self) -> &str {
@@ -366,6 +376,10 @@ impl MatchedRule {
     }
 
     /// Format this match as a Coraza-compatible error log line.
+    ///
+    /// Beyond the first match, the line lists the first eight matches that have a message
+    /// or data as `msg_match_N`/`data_match_N` pairs and ends with `[+N more matches]` for the others. Go lists
+    /// them all. The `[uri]` is cut at 1024 bytes and followed by `[+N uri bytes]` when it was.
     pub fn error_log(&self) -> String {
         let first = self.matches.first();
         let mut log = format!("[client {}] {}", go_quote(&self.client_ip), self.outcome());
@@ -373,16 +387,26 @@ impl MatchedRule {
         log.push(' ');
         let (message, data) = first.map_or(("", ""), |matched| (matched.message.as_str(), matched.data.as_str()));
         self.write_details(&mut log, message, data);
+        let (mut listed, mut hidden) = (0_usize, 0_usize);
         for (number, extra) in self.matches.iter().enumerate().skip(1) {
-            if !extra.message.is_empty() || !extra.data.is_empty() {
-                write!(
-                    log,
-                    " [msg_match_{number} {}] [data_match_{number} {}]",
-                    go_quote(truncated(&extra.message, MAX_LOG_MESSAGE)),
-                    go_quote(truncated(&extra.data, MAX_LOG_MESSAGE)),
-                )
-                .unwrap_or(());
+            if extra.message.is_empty() && extra.data.is_empty() {
+                continue;
             }
+            if listed == MAX_ERROR_LOG_EXTRA_MATCHES {
+                hidden += 1;
+                continue;
+            }
+            listed += 1;
+            write!(
+                log,
+                " [msg_match_{number} {}] [data_match_{number} {}]",
+                go_quote(truncated(&extra.message, MAX_LOG_MESSAGE)),
+                go_quote(truncated(&extra.data, MAX_LOG_MESSAGE)),
+            )
+            .unwrap_or(());
+        }
+        if hidden > 0 {
+            write!(log, " [+{hidden} more matches]").unwrap_or(());
         }
         log
     }
@@ -422,14 +446,12 @@ impl MatchedRule {
         for tag in &rule.tags {
             write!(log, " [tag {}]", go_quote(tag)).unwrap_or(());
         }
-        write!(
-            log,
-            " [hostname {}] [uri {}] [unique_id {}]",
-            go_quote(&self.server_ip),
-            go_quote(&self.uri),
-            go_quote(&self.transaction_id),
-        )
-        .unwrap_or(());
+        let uri = truncated(&self.uri, MAX_LOG_URI);
+        write!(log, " [hostname {}] [uri {}]", go_quote(&self.server_ip), go_quote(uri)).unwrap_or(());
+        if uri.len() < self.uri.len() {
+            write!(log, " [+{} uri bytes]", self.uri.len() - uri.len()).unwrap_or(());
+        }
+        write!(log, " [unique_id {}]", go_quote(&self.transaction_id)).unwrap_or(());
     }
 }
 
@@ -3416,14 +3438,15 @@ pub(crate) mod tests {
     use super::{
         ACTIVATION_CONNECT_TIMEOUT, ACTIVATION_RETRY_BACKOFF, ACTIVATION_RETRY_BACKOFF_MAX, AuditCopyBudget, AuditLog,
         AuditLogger, AuditMessage, AuditMessageData, AuditRequest, AuditTransaction, DEFAULT_SYSLOG_WRITE_TIMEOUT,
-        FormattedAudit, Syslog, SyslogSocket, Writer, WriterPlan, connect_deadline, connect_tcp, index_field,
-        next_backoff, prepare_builtin_writer_plan, safe_file_component, syslog_write_timeout, write_new,
+        FormattedAudit, MAX_LOG_URI, Syslog, SyslogSocket, Writer, WriterPlan, connect_deadline, connect_tcp,
+        index_field, next_backoff, prepare_builtin_writer_plan, safe_file_component, syslog_write_timeout, write_new,
     };
     use crate::{
         actions::RuleMetadata,
         collection::MatchData,
         config::WafConfig,
         types::{AuditEngineStatus, AuditLogFormat, AuditLogType, RulePhase, parse_audit_log_parts},
+        utils::strings::go_quote,
     };
 
     #[test]
@@ -4421,6 +4444,161 @@ pub(crate) mod tests {
         let formatted = matched.error_log();
         assert!(formatted.contains("[msg_match_1 \"linked\"] [data_match_1 \"second\"]"));
         assert!(!formatted.contains('\n'), "{formatted:?}");
+    }
+
+    /// A rule that matched `count` times, each with a short message and data except the `blank` ones.
+    fn matched_rule_with(count: usize, blank: &[usize]) -> super::MatchedRule {
+        let mut rule = RuleMetadata::new();
+        rule.id = 72;
+        rule.phase = RulePhase::RequestHeaders;
+        let matches = (0..count)
+            .map(|number| {
+                let mut matched = MatchData::new_empty();
+                if !blank.contains(&number) {
+                    matched.message = format!("m{number}");
+                    matched.data = format!("d{number}");
+                }
+                matched
+            })
+            .collect();
+        super::MatchedRule {
+            rule,
+            matches,
+            disruptive_action: None,
+            disruptive: false,
+            client_ip: "192.0.2.1".to_owned(),
+            server_ip: "192.0.2.2".to_owned(),
+            uri: "/path".to_owned(),
+            transaction_id: "tx-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn error_log_lists_the_first_eight_extra_matches_and_counts_the_rest() {
+        // Go lists every match; this engine stops at eight pairs so the line cannot grow with the rule's matches.
+        for (matches, listed, hidden) in [(1, 0, 0), (2, 1, 0), (9, 8, 0), (10, 8, 1), (13, 8, 4), (1000, 8, 991)] {
+            let formatted = matched_rule_with(matches, &[]).error_log();
+            assert_eq!(formatted.matches("[msg_match_").count(), listed, "{matches} matches");
+            assert_eq!(formatted.matches("[data_match_").count(), listed, "{matches} matches");
+            for number in 1..=listed {
+                assert!(
+                    formatted.contains(&format!(
+                        "[msg_match_{number} \"m{number}\"] [data_match_{number} \"d{number}\"]"
+                    )),
+                    "{matches} matches: pair {number} in {formatted}"
+                );
+            }
+            assert!(!formatted.contains("[msg_match_9 "), "{matches} matches");
+            if hidden == 0 {
+                assert!(!formatted.contains("more matches"), "{matches} matches: {formatted}");
+            } else {
+                assert!(
+                    formatted.ends_with(&format!(" [+{hidden} more matches]")),
+                    "{matches} matches: {formatted}"
+                );
+                assert_eq!(formatted.matches("more matches").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn error_log_cap_ignores_matches_without_a_message_or_data() {
+        // Only a match that would have a pair counts toward the cap and the marker; the number stays its index.
+        let formatted = matched_rule_with(12, &[2, 3, 11]).error_log();
+        assert_eq!(formatted.matches("[msg_match_").count(), 8);
+        assert!(formatted.contains("[msg_match_10 "), "{formatted}");
+        assert!(!formatted.contains("[msg_match_2 ") && !formatted.contains("[msg_match_3 "));
+        assert!(!formatted.contains("more matches"), "{formatted}");
+
+        let formatted = matched_rule_with(14, &[5]).error_log();
+        assert!(!formatted.contains("[msg_match_5 "));
+        assert!(formatted.ends_with(" [+4 more matches]"), "{formatted}");
+    }
+
+    /// Audit one rule that matches `count` arguments under parts `ABHKZ`: the formatted entry's size and the
+    /// bytes the messages' error lines hold.
+    fn audited_hk_entry(count: usize, path_len: usize) -> (usize, usize) {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(&format!(
+                "SecArgumentsLimit {count}\nSecAuditLogParts ABHKZ\n\
+                 SecRule ARGS \"@rx ^v\" \"id:1,phase:1,pass,log,auditlog,msg:'value seen',\
+                 logdata:'%{{MATCHED_VAR_NAME}}=%{{MATCHED_VAR}}'\""
+            ))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("audit-hk");
+        tx.process_uri(format!("/{}", "p".repeat(path_len)), "GET", "HTTP/1.1");
+        for index in 0..count {
+            tx.add_get_argument(format!("a{index}"), "v");
+        }
+        assert!(tx.process_request_headers().is_none());
+        assert_eq!(tx.matched_rules().first().map(|rule| rule.matches.len()), Some(count));
+        let entry = tx.audit_log();
+        assert_eq!(entry.messages.len(), count, "part K keeps one message per match");
+        let error_lines = entry.messages.iter().map(|message| message.error_message.len()).sum();
+        (entry.format(AuditLogFormat::Native).len(), error_lines)
+    }
+
+    #[test]
+    fn audit_parts_h_and_k_keep_the_entry_linear_in_the_matches_of_one_rule() {
+        let (size, lines) = audited_hk_entry(2_000, 0);
+        assert!(
+            size <= 2_000 * 1024,
+            "an entry of {size} bytes for 2000 matches, over 1 KiB each"
+        );
+        // Doubling the matches doubles the entry; one quadratic term would quadruple it.
+        let (half_size, half_lines) = audited_hk_entry(1_000, 0);
+        assert!(
+            size * 10 <= half_size * 25,
+            "{half_size} bytes for 1000 matches, {size} for 2000"
+        );
+        assert!(
+            lines * 10 <= half_lines * 25,
+            "{half_lines} error line bytes for 1000 matches, {lines} for 2000"
+        );
+    }
+
+    #[test]
+    fn audit_entry_does_not_grow_with_the_request_uri_times_the_matches() {
+        // The `[uri]` of every message's error line is cut, so a 50 KB path adds a constant per match.
+        let (short_size, short_lines) = audited_hk_entry(1_000, 0);
+        let (long_size, long_lines) = audited_hk_entry(1_000, 50_000);
+        assert!(
+            long_size <= short_size + 1_000 * 1_100 && long_lines <= short_lines + 1_000 * 1_100,
+            "{short_size} bytes with a short path, {long_size} with 50000 path bytes (error lines {short_lines}, {long_lines})"
+        );
+    }
+
+    #[test]
+    fn error_log_cuts_a_long_uri_and_keeps_a_short_one_byte_identical() {
+        let mut rule = matched_rule_with(1, &[]);
+        for uri in ["/path".to_owned(), format!("/{}", "u".repeat(MAX_LOG_URI - 1))] {
+            rule.uri = uri.clone();
+            let formatted = rule.error_log();
+            assert!(
+                formatted.contains(&format!("[uri {}] [unique_id ", go_quote(&uri))),
+                "{formatted}"
+            );
+            assert!(!formatted.contains("uri bytes]"), "{formatted}");
+        }
+        // 1025 bytes: the first 1024 stay, the marker counts the rest; the cut never splits a code point.
+        rule.uri = format!("/{}", "u".repeat(MAX_LOG_URI));
+        assert!(rule.error_log().contains(&format!(
+            "[uri \"/{}\"] [+1 uri bytes] [unique_id ",
+            "u".repeat(MAX_LOG_URI - 1)
+        )));
+        rule.uri = format!("/{}", "\u{e9}".repeat(MAX_LOG_URI));
+        let formatted = rule.error_log();
+        let kept = (MAX_LOG_URI - 1) / 2;
+        assert!(
+            formatted.contains(&format!(
+                "{}\"] [+{} uri bytes] [unique_id ",
+                "\u{e9}".repeat(kept),
+                rule.uri.len() - 1 - 2 * kept
+            )),
+            "{formatted}"
+        );
     }
 
     #[test]

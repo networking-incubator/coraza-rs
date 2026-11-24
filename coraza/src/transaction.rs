@@ -1936,12 +1936,14 @@ impl Transaction {
         let messages = if has(AuditLogPart::RulesMatched) {
             audited
                 .flat_map(|matched| {
+                    // The line is built once per rule, not once per match: it scans all of the rule's matches.
+                    let error_message = if trailer { matched.error_log() } else { String::new() };
                     matched.matches.iter().map(move |data| {
                         let rule = &matched.rule;
                         AuditMessage {
                             actionset: self.config.component_names.join(" "),
                             message: data.message.clone(),
-                            error_message: if trailer { matched.error_log() } else { String::new() },
+                            error_message: error_message.clone(),
                             rule_id: rule.id,
                             rule_message: String::new(),
                             data: AuditMessageData {
