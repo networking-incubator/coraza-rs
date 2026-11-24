@@ -691,7 +691,9 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   the whole URI in the line, and with parts `H` and `K` together that made the
   audit entry quadratic in the matches of one rule (245,930,171 bytes for 2000
   matches in the test shape) and proportional to the URI length times the
-  matches. A parser of the error line that needs every match reads part `K`.
+  matches. A parser that needs every match's expanded `msg` and `logdata` must
+  read the JSON format. Native part `K` writes only the rule text, and
+  JSONLegacy omits `logdata`.
 
 ## FTW integration
 
