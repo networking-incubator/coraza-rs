@@ -138,7 +138,8 @@ static_resources:
                                     "SecResponseBodyLimit 1048576",
                                     "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
-                                    "Include crs/rules/*.conf"
+                                    "Include crs/rules/*.conf",
+                                    "Include @crs-hardening-conf"
                                   ],
                                   "crs-pl2": [
                                     "Include @recommended-conf",
@@ -147,7 +148,8 @@ static_resources:
                                     "SecResponseBodyMimeType text/plain text/html application/json",
                                     "Include crs/crs-setup.conf",
                                     "SecAction \"id:900000,phase:1,pass,t:none,nolog,setvar:tx.blocking_paranoia_level=2\"",
-                                    "Include crs/rules/*.conf"
+                                    "Include crs/rules/*.conf",
+                                    "Include @crs-hardening-conf"
                                   ]
                                 },
                                 "default_directives": "main",
