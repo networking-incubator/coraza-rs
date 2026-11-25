@@ -28,12 +28,12 @@
 //! ([`set_plugin_configuration`]), the request header and trailer maps and the response header map
 //! ([`set_request_headers`], [`set_request_trailers`], [`set_response_headers`]), the request and response body buffers
 //! ([`set_request_body`], [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]),
-//! and what the filter did: the local replies it sent ([`local_replies`], [`local_reply_statuses`]) and the
-//! filter-state properties it published ([`published_property`]). Each test runs on its own thread, so the scripted
-//! state is isolated; call [`reset`] to clear it explicitly. A local reply is recorded and then refused with
-//! `Status::NotFound`, so every test also covers a host that cannot send it. The filter answers a response it refuses
-//! with a local reply and never rewrites one in place: replacing the response body, headers or trailers is recorded,
-//! and the test fails when it next reads the replies or the published properties (a stub cannot panic, since it is
+//! and what the filter did: log calls it attempted ([`log_messages`]), local replies it sent ([`local_replies`],
+//! [`local_reply_statuses`]) and filter-state properties it published ([`published_property`]). Each test runs on its
+//! own thread, so the scripted state is isolated; call [`reset`] to clear it explicitly. A local reply is recorded and
+//! then refused with `Status::NotFound`, so every test also covers a host that cannot send it. The filter answers a
+//! response it refuses with a local reply and never rewrites one in place: replacing the response body, headers or
+//! trailers is recorded, and the test fails on the next read of any recorded output (a stub cannot panic, since it is
 //! `extern "C"`). Everything else stays a fixed stub that reports `Status::NotFound`.
 
 // no_mangle is an attribute-level escape from the crate's unsafe-code guard. The scripted
@@ -70,6 +70,8 @@ struct Host {
     local_replies: Vec<LocalReply>,
     /// What of the response the filter rewrote in place, which it must never do.
     response_rewrites: Vec<&'static str>,
+    /// Proxy-Wasm log calls, captured even though this stub reports the host as unavailable.
+    logs: Vec<(LogLevel, String)>,
     /// How many serialized maps the filter sent that did not decode.
     malformed_maps: usize,
 }
@@ -98,6 +100,7 @@ thread_local! {
             properties: BTreeMap::new(),
             local_replies: Vec::new(),
             response_rewrites: Vec::new(),
+            logs: Vec::new(),
             malformed_maps: 0,
         })
     };
@@ -116,6 +119,7 @@ pub(crate) fn reset() {
         host.properties.clear();
         host.local_replies.clear();
         host.response_rewrites.clear();
+        host.logs.clear();
         host.malformed_maps = 0;
     });
 }
@@ -203,6 +207,11 @@ pub(crate) fn local_replies() -> Vec<LocalReply> {
     observed(|host| host.local_replies.clone())
 }
 
+/// The log calls the filter attempted, even though this host reports each call unavailable.
+pub(crate) fn log_messages() -> Vec<(LogLevel, String)> {
+    observed(|host| host.logs.clone())
+}
+
 /// Hands `data` to the SDK the way a host does: a heap allocation whose capacity equals its
 /// length, which the SDK takes ownership of with `Vec::from_raw_parts`. Empty data is left
 /// as the null pointer the SDK reads as an empty result.
@@ -239,7 +248,9 @@ fn serialize_map(map: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 #[no_mangle]
-extern "C" fn proxy_log(_level: LogLevel, _message_data: *const u8, _message_size: usize) -> Status {
+extern "C" fn proxy_log(level: LogLevel, message_data: *const u8, message_size: usize) -> Status {
+    let message = String::from_utf8_lossy(&copied(message_data, message_size)).into_owned();
+    HOST.with_borrow_mut(|host| host.logs.push((level, message)));
     Status::NotFound
 }
 
@@ -437,7 +448,7 @@ extern "C" fn proxy_set_property(
 #[cfg(test)]
 mod tests {
     use super::{
-        deserialize_map, local_replies, proxy_log, proxy_send_local_response, proxy_set_buffer_bytes,
+        deserialize_map, local_replies, log_messages, proxy_log, proxy_send_local_response, proxy_set_buffer_bytes,
         proxy_set_header_map_pairs, proxy_set_property, reset, serialize_map, BufferType, LogLevel, MapType, Status,
     };
 
@@ -490,11 +501,13 @@ mod tests {
 
     #[test]
     fn stubs_report_a_checked_missing_host_instead_of_succeeding() {
+        reset();
         assert_eq!(
             proxy_log(LogLevel::Info, std::ptr::null(), 0),
             Status::NotFound,
             "a stub must not pretend the host accepted the log"
         );
+        assert_eq!(log_messages(), [(LogLevel::Info, String::new())]);
         assert_eq!(
             proxy_set_property(std::ptr::null(), 0, std::ptr::null(), 0),
             Status::NotFound,
