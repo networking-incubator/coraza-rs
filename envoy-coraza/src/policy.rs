@@ -41,7 +41,10 @@ use coraza::{
 };
 
 use crate::{
-    config::{add_rule_data, display_name, normalize_rule_data_name, Config, UnmatchedAuthority, RULE_DATA_LIMITS},
+    config::{
+        add_rule_data, display_name, normalize_rule_data_name, Config, MissingClientAddress, UnmatchedAuthority,
+        RULE_DATA_LIMITS,
+    },
     observability::{self, Diagnostics},
 };
 
@@ -258,8 +261,12 @@ pub(crate) struct Generation {
     switches: Vec<String>,
     /// Whether a request that matched no policy was already reported at warning level.
     unmatched_reported: Cell<bool>,
+    /// Whether a request refused for a missing client address was already reported at warning level.
+    missing_client_address_reported: Cell<bool>,
     /// What happens to a request whose authority selects no policy.
     unmatched_authority: UnmatchedAuthority,
+    /// What happens when a selected request has no usable source IP address.
+    missing_client_address: MissingClientAddress,
 }
 
 /// A generation that cannot be built.
@@ -563,6 +570,10 @@ impl Generation {
     }
 
     /// Compiles with injectable bounds, for tests.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Generation validation, policy compilation and construction are one bounded pass."
+    )]
     fn compile_with_limits(config: Config, limits: CompileLimits) -> Result<Self, CompileError> {
         check_limits(&config, limits)?;
         // Resolve references first, so a name typo fails before any policy compiles.
@@ -587,6 +598,7 @@ impl Generation {
             enable_filter_state_logs,
             mut rule_data,
             unmatched_authority,
+            missing_client_address,
         } = config;
         let allow_unmatched = unmatched_authority == UnmatchedAuthority::Allow;
         let mut warnings = Vec::new();
@@ -605,6 +617,14 @@ impl Generation {
             warnings.push(
                 "envoy-coraza: unmatched_authority is \"allow\" and no default_directives is set; a request to an \
                  unlisted authority passes uninspected"
+                    .to_owned(),
+            );
+        }
+        if missing_client_address == MissingClientAddress::Allow {
+            warnings.push(
+                "envoy-coraza: missing_client_address is \"allow\"; selected requests without a usable client IP \
+                 reach policy rules with an empty REMOTE_ADDR, so rules cannot reliably identify or match the \
+                 client's actual IP"
                     .to_owned(),
             );
         }
@@ -663,7 +683,9 @@ impl Generation {
             notices,
             switches,
             unmatched_reported: Cell::new(false),
+            missing_client_address_reported: Cell::new(false),
             unmatched_authority,
+            missing_client_address,
         })
     }
 
@@ -685,6 +707,11 @@ impl Generation {
     /// Whether a request that selects no policy is refused: the generation has policies and does not allow it.
     pub(crate) fn refuses_unmatched(&self) -> bool {
         !self.policies.is_empty() && self.unmatched_authority == UnmatchedAuthority::Reject
+    }
+
+    /// Whether a selected request without a usable source IP address is refused.
+    pub(crate) fn rejects_missing_client_address(&self) -> bool {
+        self.missing_client_address == MissingClientAddress::Reject
     }
 
     /// Selects the policy for a normalized `authority`, as [`Self::select_named`] does.
@@ -714,6 +741,11 @@ impl Generation {
     /// unmatched, and one warning per request floods the log.
     pub(crate) fn first_unmatched_request(&self) -> bool {
         !self.unmatched_reported.replace(true)
+    }
+
+    /// Records a request refused for a missing client address and returns whether it is the first of this generation.
+    pub(crate) fn first_missing_client_address_request(&self) -> bool {
+        !self.missing_client_address_reported.replace(true)
     }
 
     /// Whether the legacy interruption filter-state fields are enabled.
@@ -895,6 +927,31 @@ mod tests {
             !generation.warnings().any(|warning| warning.contains("no policies")),
             "warnings were {:?}",
             generation.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn allowing_missing_client_addresses_warns_about_client_ip_rules() {
+        let allowed = parse_generation(
+            r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p",
+                "missing_client_address": "allow"}"#,
+        );
+        assert_eq!(
+            allowed.warnings().collect::<Vec<_>>(),
+            [
+                "envoy-coraza: missing_client_address is \"allow\"; selected requests without a usable client IP \
+             reach policy rules with an empty REMOTE_ADDR, so rules cannot reliably identify or match the \
+             client's actual IP"
+            ]
+        );
+
+        let default = parse_generation(r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p"}"#);
+        assert!(
+            !default
+                .warnings()
+                .any(|warning| warning.contains("missing_client_address")),
+            "default rejection has no allow-mode warning: {:?}",
+            default.warnings().collect::<Vec<_>>()
         );
     }
 

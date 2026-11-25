@@ -17,7 +17,7 @@
 //! The accepted keys are the ones the upstream connector reads at
 //! `corazawaf/coraza-proxy-wasm@b1770f5` (`wasmplugin/config.go`), plus the
 //! fork's `enable_filter_state_logs` switch and this connector's own
-//! `rule_data` and `unmatched_authority` keys.
+//! `rule_data`, `unmatched_authority` and `missing_client_address` keys.
 //!
 //! # Accepted values
 //!
@@ -46,6 +46,11 @@
 //!   It decides what happens to a request whose authority selects no policy when the configuration has policies:
 //!   `"reject"` answers 421, `"allow"` passes it uninspected. A configuration with policies and neither
 //!   `default_directives` nor `per_authority_directives` is rejected at compile time unless it is `"allow"`.
+//! * `missing_client_address` is `"reject"` (the default when absent) or `"allow"`; any other value or type is
+//!   rejected. For a selected request, `"reject"` answers 503 before the policy's rules when `source.address` is absent
+//!   or is neither a socket address nor an IP address. This refusal applies regardless of `SecRuleEngine`, including
+//!   `DetectionOnly` and `Off`. `"allow"` preserves the previous behavior, passing an empty `REMOTE_ADDR`; property
+//!   hostcall failures still fail closed.
 //! * Policy, authority and `rule_data` names are at most [`MAX_NAME_BYTES`] bytes; a configured name over the limit is
 //!   rejected rather than embedded in a log line.
 //! * The legacy flat `rules` key is unsupported. Its presence is rejected with guidance to use `directives_map` and
@@ -92,6 +97,11 @@
 //! `"unmatched_authority": "allow"`; a configuration with policies and no selector is rejected unless it does.
 //! corazawaf/coraza-proxy-wasm logs a warning and continues for such a request; the networking-incubator fork answers
 //! 500. `{"directives_map": {}}` stays the one explicit pass-through.
+//!
+//! A request that selects a policy is refused with 503 before its rules run when `source.address` is absent or is not
+//! a socket address or IP address, unless `"missing_client_address": "allow"` preserves the prior empty
+//! `REMOTE_ADDR`. The refusal applies regardless of `SecRuleEngine`, including `DetectionOnly` and `Off`; a property
+//! hostcall failure remains a separate fail-closed error.
 //!
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
@@ -186,7 +196,7 @@ use serde_json::{Map, Value};
 ///
 /// `rules` is listed so its dedicated rejection is reported rather than the generic one, and `metric_labels` is
 /// accepted for upstream compatibility.
-pub(crate) const RECOGNISED_KEYS: [&str; 9] = [
+pub(crate) const RECOGNISED_KEYS: [&str; 10] = [
     "directives_map",
     "default_directives",
     "per_authority_directives",
@@ -196,6 +206,7 @@ pub(crate) const RECOGNISED_KEYS: [&str; 9] = [
     "rules",
     "config_gzip_b64",
     "unmatched_authority",
+    "missing_client_address",
 ];
 
 /// Longest policy, authority or `rule_data` name, in bytes.
@@ -263,6 +274,16 @@ pub(crate) enum UnmatchedAuthority {
     Allow,
 }
 
+/// What happens when a selected request has no usable source IP address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MissingClientAddress {
+    /// Refuse with 503 before the policy's rules run.
+    #[default]
+    Reject,
+    /// Keep the legacy behavior and pass an empty `REMOTE_ADDR`.
+    Allow,
+}
+
 /// A validated plugin configuration.
 #[derive(Debug, Default)]
 pub(crate) struct Config {
@@ -278,6 +299,8 @@ pub(crate) struct Config {
     pub(crate) rule_data: BTreeMap<String, Vec<u8>>,
     /// What happens to a request whose authority selects no policy.
     pub(crate) unmatched_authority: UnmatchedAuthority,
+    /// What happens when a selected request has no usable source IP address.
+    pub(crate) missing_client_address: MissingClientAddress,
 }
 
 /// A configuration that cannot be used.
@@ -347,6 +370,8 @@ pub(crate) enum ConfigError {
     },
     /// `unmatched_authority` is neither `"reject"` nor `"allow"`.
     InvalidUnmatchedAuthority,
+    /// `missing_client_address` is neither `"reject"` nor `"allow"`.
+    InvalidMissingClientAddress,
     /// A `rule_data` entry breaks a bound.
     RuleData {
         /// Offending file name.
@@ -467,6 +492,7 @@ impl Display for ConfigError {
                 )
             },
             Self::InvalidUnmatchedAuthority => f.write_str("unmatched_authority must be \"reject\" or \"allow\""),
+            Self::InvalidMissingClientAddress => f.write_str("missing_client_address must be \"reject\" or \"allow\""),
             Self::RuleData { name, reason } => write!(f, "rule_data {}: {reason}", display_name(name)),
             Self::EmptyBase64 => f.write_str("config_gzip_b64 must be a non-empty base64 string"),
             Self::InvalidBase64 => f.write_str("config_gzip_b64 is not standard padded base64; use `base64 -w0`"),
@@ -567,6 +593,11 @@ impl Config {
                 None | Some(Some("reject")) => UnmatchedAuthority::Reject,
                 Some(Some("allow")) => UnmatchedAuthority::Allow,
                 Some(_) => return Err(ConfigError::InvalidUnmatchedAuthority),
+            },
+            missing_client_address: match object.get("missing_client_address").map(Value::as_str) {
+                None | Some(Some("reject")) => MissingClientAddress::Reject,
+                Some(Some("allow")) => MissingClientAddress::Allow,
+                Some(_) => return Err(ConfigError::InvalidMissingClientAddress),
             },
         };
         Ok(config)
@@ -1030,9 +1061,9 @@ mod tests {
 
     use super::{
         add_rule_data, check_json_value_count, check_rule_data_name, crc32, display_name, gzip_fixture, Config,
-        ConfigError, RuleDataLimits, UnmatchedAuthority, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES, MAX_AUTHORITIES,
-        MAX_CONFIGURATION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES, MAX_RULE_DATA_FILES,
-        MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
+        ConfigError, MissingClientAddress, RuleDataLimits, UnmatchedAuthority, GZIP_HEADER_BYTES, GZIP_TRAILER_BYTES,
+        MAX_AUTHORITIES, MAX_CONFIGURATION_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_JSON_VALUES, MAX_NAME_BYTES,
+        MAX_RULE_DATA_FILES, MAX_RULE_DATA_FILE_BYTES, RULE_DATA_LIMITS,
     };
 
     /// Parses a document that must be accepted.
@@ -1493,6 +1524,54 @@ mod tests {
             ));
             assert!(
                 error.starts_with("unmatched_authority must be \"reject\" or \"allow\""),
+                "{value} reported {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_client_address_is_a_recognized_top_level_key() {
+        for value in [r#""reject""#, r#""allow""#] {
+            let config = Config::parse(format!(r#"{{"missing_client_address": {value}}}"#).as_bytes());
+            assert!(config.is_ok(), "{value} should be accepted: {config:?}");
+        }
+    }
+
+    #[test]
+    fn missing_client_address_defaults_to_reject_and_reads_allow() {
+        assert_eq!(
+            parse(r#"{"directives_map": {}}"#).missing_client_address,
+            MissingClientAddress::Reject,
+            "absent means reject"
+        );
+        assert_eq!(
+            parse(r#"{"missing_client_address": "reject"}"#).missing_client_address,
+            MissingClientAddress::Reject
+        );
+        assert_eq!(
+            parse(r#"{"missing_client_address": "allow"}"#).missing_client_address,
+            MissingClientAddress::Allow
+        );
+    }
+
+    #[test]
+    fn missing_client_address_must_be_reject_or_allow() {
+        for value in [
+            r#""Allow""#,
+            r#""REJECT""#,
+            r#""""#,
+            r#""pass""#,
+            "true",
+            "1",
+            "null",
+            "[]",
+            "{}",
+        ] {
+            let error = parse_error(&format!(
+                r#"{{"directives_map": {{}}, "missing_client_address": {value}}}"#
+            ));
+            assert!(
+                error.starts_with("missing_client_address must be \"reject\" or \"allow\""),
                 "{value} reported {error:?}"
             );
         }

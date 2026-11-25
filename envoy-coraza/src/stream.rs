@@ -571,7 +571,18 @@ impl CorazaHttp {
         self.mark_diagnostic_change(diagnostics_before);
         let (interruption, engine_off, body_access) = match prepared {
             Ok(prepared) => prepared,
-            Err(error) => return self.reject_property_hostcall(&error),
+            Err(ConnectionMetadataError::Property(error)) => return self.reject_property_hostcall(&error),
+            Err(ConnectionMetadataError::MissingClientAddress) => {
+                log_missing_client_address(generation);
+                return self.reject_request(
+                    503,
+                    REQUEST_INCOMPLETE_BODY,
+                    TerminalOutcome::Incomplete {
+                        phase: "request-client-address",
+                        status: 503,
+                    },
+                );
+            },
         };
 
         if let Some(interruption) = interruption {
@@ -1679,15 +1690,34 @@ struct PropertyError {
     status: Status,
 }
 
+#[derive(Debug)]
+enum ConnectionMetadataError {
+    Property(PropertyError),
+    MissingClientAddress,
+}
+
+impl From<PropertyError> for ConnectionMetadataError {
+    fn from(error: PropertyError) -> Self {
+        Self::Property(error)
+    }
+}
+
 /// Reads a host property: `Ok(None)` when the host has no such property, `Err` when the hostcall itself failed.
 fn property(path: Vec<&str>) -> Result<Option<Vec<u8>>, PropertyError> {
     let dotted = path.join(".");
     hostcalls::get_property(path).map_err(|status| PropertyError { path: dotted, status })
 }
 
-fn apply_connection_metadata(tx: &mut Transaction, authority: &str) -> Result<(), PropertyError> {
+fn apply_connection_metadata(
+    tx: &mut Transaction,
+    authority: &str,
+    reject_missing_client_address: bool,
+) -> Result<(), ConnectionMetadataError> {
     let (source_addr, source_port) = connection_endpoint("source")?;
     let (destination_addr, destination_port) = connection_endpoint("destination")?;
+    if reject_missing_client_address && source_addr.is_empty() {
+        return Err(ConnectionMetadataError::MissingClientAddress);
+    }
     tx.set_remote_addr(source_addr.as_bytes());
     tx.set_remote_port(source_port);
     tx.set_server_addr(destination_addr.as_bytes());
@@ -1771,9 +1801,13 @@ fn prepare_transaction(
     authority: &str,
     headers: &[(String, Vec<u8>)],
     metadata: &RequestMetadata,
-) -> Result<(Option<Interruption>, bool, bool), PropertyError> {
+) -> Result<(Option<Interruption>, bool, bool), ConnectionMetadataError> {
+    let reject_missing_client_address = stream
+        .generation
+        .as_deref()
+        .is_none_or(Generation::rejects_missing_client_address);
     let transaction = stream.tx.get_or_insert_with(|| Box::new(policy.waf.new_transaction()));
-    apply_connection_metadata(transaction, authority)?;
+    apply_connection_metadata(transaction, authority, reject_missing_client_address)?;
     transaction.process_uri(&metadata.uri, &metadata.method, &metadata.protocol);
     for (name, value) in headers {
         transaction.add_request_header(name, value);
@@ -1997,6 +2031,18 @@ fn valid_status(status: u16) -> u16 {
         status
     } else {
         403
+    }
+}
+
+fn log_missing_client_address(generation: &Generation) {
+    if generation.first_missing_client_address_request() {
+        log_warn(
+            "envoy-coraza: source.address is missing or is not an IP address; request refused with 503 \
+             (set \"missing_client_address\": \"allow\" for listeners without an IP peer; further such \
+             requests in this configuration generation are logged at debug level)",
+        );
+    } else {
+        log_debug("envoy-coraza: source.address is missing or is not an IP address; request refused with 503");
     }
 }
 
@@ -2804,7 +2850,7 @@ mod scripted_host_tests {
 
     use proxy_wasm::{
         traits::HttpContext as _,
-        types::{Action, Status},
+        types::{Action, LogLevel, Status},
     };
 
     use super::{
@@ -3137,26 +3183,234 @@ mod scripted_host_tests {
     }
 
     #[test]
-    fn a_missing_property_keeps_its_previous_behavior() {
-        // The host reports no source address: REMOTE_ADDR is empty and the request is still inspected.
-        let mut stream = ip_deny_stream();
-        let count = script_request("a.example", "http");
-        test_hostcalls::remove_property("source.address");
-        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
-        assert!(test_hostcalls::local_reply_statuses().is_empty());
-        assert_eq!(stream.selected_policy.as_deref(), Some("p"), "the request is inspected");
-
-        // A missing port falls back to the address's own port and never loses the address.
+    fn a_missing_source_port_does_not_hide_the_client_address_from_ip_rules() {
         let mut stream = ip_deny_stream();
         let count = script_request("a.example", "http");
         test_hostcalls::remove_property("source.port");
-        test_hostcalls::remove_property("destination.port");
+
         assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
         assert_eq!(
             test_hostcalls::local_reply_statuses(),
             [403],
-            "the IP rule still denies"
+            "the REMOTE_ADDR IP rule still denies when source.port is absent"
         );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_client_address_is_rejected_before_rules_in_every_engine_mode() {
+        let source_addresses: [Option<&[u8]>; 4] = [None, Some(b""), Some(b"unix:/run/x"), Some(b"\xff")];
+        for engine in ["On", "DetectionOnly", "Off"] {
+            let config = format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine {engine}", "SecAction \"id:201,phase:1,deny,status:418\""]}},
+                    "default_directives": "p", "enable_filter_state_logs": true}}"#
+            );
+            for source_address in source_addresses {
+                let mut stream = stream(&config);
+                let count = script_request("a.example", "http");
+                if let Some(source_address) = source_address {
+                    test_hostcalls::set_property("source.address", source_address);
+                } else {
+                    test_hostcalls::remove_property("source.address");
+                }
+
+                assert_eq!(
+                    stream.on_http_request_headers(count, true),
+                    Action::Pause,
+                    "{engine}, {source_address:?}"
+                );
+                assert_eq!(
+                    test_hostcalls::local_reply_statuses(),
+                    [503],
+                    "{engine}, {source_address:?}: the client-address check precedes the phase-1 deny rule"
+                );
+                assert_eq!(
+                    stream.final_outcome,
+                    Some(TerminalOutcome::Incomplete {
+                        phase: "request-client-address",
+                        status: 503,
+                    }),
+                    "{engine}, {source_address:?}"
+                );
+                for (field, expected) in [
+                    ("inspection_complete", "false"),
+                    ("inspection_reason", "incomplete"),
+                    ("terminal_outcome", "incomplete"),
+                ] {
+                    assert_eq!(
+                        test_hostcalls::published_property(&format!("io.coraza.waf.v1.{field}")).as_deref(),
+                        Some(expected),
+                        "{engine}, {source_address:?}: {field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_client_address_refusal_logs_once_per_generation_without_request_data() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p"}"#;
+        let generation = Rc::new(
+            Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                .expect("policy compiles"),
+        );
+        let root = Rc::new(Cell::new(0));
+        for (source_address, level, expected) in [
+            (
+                None,
+                LogLevel::Warn,
+                "envoy-coraza: source.address is missing or is not an IP address; request refused with 503 (set \
+                 \"missing_client_address\": \"allow\" for listeners without an IP peer; further such requests in \
+                 this configuration generation are logged at debug level)",
+            ),
+            (
+                Some(&b"unix:/private/request.sock"[..]),
+                LogLevel::Debug,
+                "envoy-coraza: source.address is missing or is not an IP address; request refused with 503",
+            ),
+        ] {
+            let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let count = script_request("request-secret.example", "http");
+            if let Some(source_address) = source_address {
+                test_hostcalls::set_property("source.address", source_address);
+            } else {
+                test_hostcalls::remove_property("source.address");
+            }
+
+            assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [503],
+                "the log hostcall fails in this test host, but the request remains refused"
+            );
+            let logs = test_hostcalls::log_messages();
+            let diagnostics = logs
+                .iter()
+                .filter(|(_, message)| message.starts_with("envoy-coraza: source.address"))
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1);
+            let diagnostic = diagnostics.first().expect("one address-refusal diagnostic");
+            assert_eq!(diagnostic.0, level);
+            assert_eq!(diagnostic.1, expected);
+            for (_, message) in &logs {
+                assert!(!message.contains("request-secret.example"));
+                assert!(!message.contains("request.sock"));
+                assert!(!message.contains("1.2.3.4"));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_allow_keeps_empty_remote_addr_and_port_for_missing_client_addresses() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecRule REMOTE_ADDR \"@rx ^$\" \"id:201,phase:1,deny,status:418,chain\"",
+            "SecRule REMOTE_PORT \"@streq 4321\""]},
+            "default_directives": "p", "missing_client_address": "allow"}"#;
+        for source_address in [None, Some(&b""[..]), Some(&b"unix:/run/x"[..]), Some(&b"\xff"[..])] {
+            let mut stream = stream(config);
+            let count = script_request("a.example", "http");
+            test_hostcalls::set_property("source.port", &4321_u64.to_le_bytes());
+            if let Some(source_address) = source_address {
+                test_hostcalls::set_property("source.address", source_address);
+            } else {
+                test_hostcalls::remove_property("source.address");
+            }
+
+            assert_eq!(
+                stream.on_http_request_headers(count, true),
+                Action::Pause,
+                "{source_address:?}"
+            );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [418],
+                "{source_address:?}: the empty REMOTE_ADDR and separately supplied REMOTE_PORT reach policy rules"
+            );
+            assert_eq!(
+                stream.final_outcome,
+                Some(TerminalOutcome::Denied {
+                    phase: "request-headers",
+                    status: 418,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_destination_port_falls_back_to_the_destination_socket_address() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecRule SERVER_PORT \"@streq 8080\" \"id:201,phase:1,deny,status:418\""]},
+            "default_directives": "p"}"#;
+        let mut stream = stream(config);
+        let count = script_request("a.example", "http");
+        test_hostcalls::remove_property("destination.port");
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(
+            test_hostcalls::local_reply_statuses(),
+            [418],
+            "SERVER_PORT retains 8080 from destination.address when destination.port is absent"
+        );
+    }
+
+    #[test]
+    fn valid_source_addresses_preserve_socket_and_separate_port_handling() {
+        for (address, source_port, expected_port) in [
+            (b"1.2.3.4:5555".as_slice(), None, 5555_u16),
+            (b"1.2.3.4:5555".as_slice(), Some(1234_u64), 1234_u16),
+            (b"1.2.3.4".as_slice(), Some(4321_u64), 4321_u16),
+        ] {
+            let config = format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On",
+                    "SecRule REMOTE_PORT \"@streq {expected_port}\" \"id:201,phase:1,deny,status:418\""]}},
+                    "default_directives": "p"}}"#
+            );
+            let mut stream = stream(&config);
+            let count = script_request("a.example", "http");
+            test_hostcalls::set_property("source.address", address);
+            if let Some(source_port) = source_port {
+                test_hostcalls::set_property("source.port", &source_port.to_le_bytes());
+            } else {
+                test_hostcalls::remove_property("source.port");
+            }
+
+            assert_eq!(
+                stream.on_http_request_headers(count, true),
+                Action::Pause,
+                "{address:?}, {source_port:?}"
+            );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [418],
+                "{address:?}, {source_port:?}: valid client addresses reach rules with their port"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_address_missing_or_malformed_keeps_its_previous_behavior() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecRule SERVER_ADDR \"@rx ^$\" \"id:201,phase:1,deny,status:418\""]},
+            "default_directives": "p"}"#;
+        for destination_address in [None, Some(&b"unix:/run/x"[..])] {
+            let mut stream = stream(config);
+            let count = script_request("a.example", "http");
+            if let Some(destination_address) = destination_address {
+                test_hostcalls::set_property("destination.address", destination_address);
+            } else {
+                test_hostcalls::remove_property("destination.address");
+            }
+
+            assert_eq!(
+                stream.on_http_request_headers(count, true),
+                Action::Pause,
+                "{destination_address:?}"
+            );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [418],
+                "{destination_address:?}: only source.address is subject to the new rejection"
+            );
+        }
     }
 
     #[test]
@@ -3192,6 +3446,26 @@ mod scripted_host_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explicit_allow_does_not_mask_a_source_address_hostcall_failure() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecAction \"id:201,phase:1,deny,status:418\""]},
+            "default_directives": "p", "missing_client_address": "allow"}"#;
+        let mut stream = stream(config);
+        let count = script_request("a.example", "http");
+        test_hostcalls::fail_property("source.address", Status::InternalFailure);
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [503]);
+        assert_eq!(
+            stream.final_outcome,
+            Some(TerminalOutcome::Incomplete {
+                phase: "request-property-hostcall",
+                status: 503,
+            })
+        );
     }
 
     #[test]

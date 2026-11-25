@@ -111,6 +111,10 @@ each item against your policies before upgrading.
   dotted-decimal IPv4 address (`010.0.0.1`, `167772161`) is refused with 400.
   An IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) selects the entry of the
   IPv4 address it holds, and is no longer accepted as a key itself.
+* **Requests selecting a policy without a usable client IP are refused with
+  503**; Unix-domain and internal listeners that must pass such requests need
+  `"missing_client_address": "allow"`. See
+  [Required Envoy configuration](#required-envoy-configuration).
 * **`@recommended-conf` enforces**: a policy that includes it without
   `SecRuleEngine On` now blocks; see
   [Recommended baseline](#recommended-baseline-recommended-conf).
@@ -256,6 +260,25 @@ Envoy's normalization, so a path or host rule matches the normalized form, which
 is the one the backend routes on. `REJECT_REQUEST` for header names with an
 underscore refuses clients that send them on purpose; `DROP_HEADER` keeps them
 working but drops the header without a trace.
+
+For a request that selects a policy, a missing or malformed `source.address`
+now receives 503 before that policy's rules run, with
+`inspection_reason=incomplete` and `terminal_outcome=incomplete`. This gate
+applies regardless of `SecRuleEngine`, including `DetectionOnly` and `Off`.
+The filter does not derive this address from `X-Forwarded-For`. A Unix-domain or
+internal listener without an IP address can set the top-level
+`"missing_client_address": "allow"` to retain the previous behavior. This is a
+per-plugin-configuration option, so it applies to all listeners sharing that
+configuration. It emits a configure-time warning because `REMOTE_ADDR` then
+stays empty. An unnegated `@ipMatch` blocklist rule will not match an empty
+`REMOTE_ADDR` (the IP operator rejects empty input), though arbitrary rules can
+still match that empty value. Rules therefore cannot reliably identify or match
+the client's actual IP. A failure of the `source.address` property hostcall
+still fails closed with 503 in either mode. The first missing-or-malformed-address
+refusal in each configuration generation logs a warning naming `source.address`
+and suggesting the opt-out; later ones are logged at debug level. Filter-state
+v1 still reports only the generic `inspection_reason=incomplete`, which does
+not distinguish a missing address from a malformed one.
 
 ## Recommended baseline (`@recommended-conf`)
 
