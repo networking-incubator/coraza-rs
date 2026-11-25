@@ -29,6 +29,9 @@ use serde_json::Value;
 
 const MODULE: &str = "github.com/corazawaf/coraza/v3";
 const EXPORTER_DIR: &str = "coraza/tests/go_profiles/exporter";
+/// The program that reruns Go Coraza's multipart body processor over `coraza/tests/go_multipart/cases.json`. It
+/// requires the same Go Coraza as the exporter, which is what its fixture claims to be from.
+const MULTIPART_REGENERATOR_DIR: &str = "coraza/tests/go_multipart/regenerate";
 const OPERATORS_DIR: &str = "coraza/tests/go_operators";
 const PROFILES_DATA_DIR: &str = "coraza/tests/go_profiles/data";
 const PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles.json";
@@ -81,6 +84,12 @@ struct ProfileInventory {
 
 pub(crate) fn check_or_exit(args: &CheckArgs) {
     let root = workspace_root();
+    // A text check, so it runs without Go: the multipart fixture is regenerated on demand, and nothing else would
+    // notice that a bump of the exporter left it on the old Go Coraza.
+    if let Err(error) = check_regenerator_pin(&root) {
+        eprintln!("go fixture check failed: {error}");
+        std::process::exit(1);
+    }
     match resolve(&root) {
         Ok(source) => {
             if let Err(error) = check(&root, &source, args.provenance) {
@@ -113,7 +122,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn resolve(root: &Path) -> Result<Source, String> {
-    let version = pinned_version(root)?;
+    let version = pinned_version(root, EXPORTER_DIR)?;
     let cache = go_mod_cache()?;
     let module = cache.join(format!("{MODULE}@{version}"));
     if !module.is_dir() {
@@ -159,8 +168,21 @@ fn pseudo_version_revision(version: &str) -> Option<String> {
     Some(revision.to_owned())
 }
 
-fn pinned_version(root: &Path) -> Result<String, String> {
-    let path = root.join(EXPORTER_DIR).join("go.mod");
+/// Fails unless the multipart regenerator requires the Go Coraza version the exporter pins.
+fn check_regenerator_pin(root: &Path) -> Result<(), String> {
+    let exporter = pinned_version(root, EXPORTER_DIR)?;
+    let regenerator = pinned_version(root, MULTIPART_REGENERATOR_DIR)?;
+    if exporter == regenerator {
+        return Ok(());
+    }
+    Err(format!(
+        "{MULTIPART_REGENERATOR_DIR}/go.mod requires {MODULE} {regenerator}, and {EXPORTER_DIR}/go.mod pins {exporter}; \
+         set both to one version and rerun the multipart regenerator (coraza/tests/go_multipart/README.md)"
+    ))
+}
+
+fn pinned_version(root: &Path, directory: &str) -> Result<String, String> {
+    let path = root.join(directory).join("go.mod");
     let go_mod = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     for line in go_mod.lines() {
         let line = line.split("//").next().unwrap_or_default().trim();

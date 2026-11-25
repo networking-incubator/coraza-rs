@@ -74,6 +74,7 @@ updates:
     directories:
       - "/benchmarks/coraza/go"
       - "/coraza/tests/go_profiles/exporter"
+      - "/coraza/tests/go_multipart/regenerate"
     cooldown:
       default-days: 7
     schedule:

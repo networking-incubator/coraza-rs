@@ -706,6 +706,41 @@ fn admitted_cases() -> Vec<Case> {
                 b"=1\r\n\r\n1\r\n--b--\r\n",
             ),
         ),
+        // A quoted-printable part is decoded into a copy as long as what was sent, which is trimmed to what it decoded
+        // while the sent length is still reserved; the escapes change it, so it is kept and published as a second value.
+        case(
+            "multipart, a quoted-printable field with escapes",
+            "multipart",
+            "",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"f\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n",
+                b"=41=42=43=44=45=46=47=48=49=50=51=52=53=54=55=56=57=58=59=60\r\n",
+                256 * 1024,
+                b"\r\n--b--\r\n",
+            ),
+        ),
+        case(
+            "multipart, a quoted-printable file with escapes, not written",
+            "multipart",
+            "SecUploadFileLimit 0",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"u\"; filename=\"a\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n",
+                b"=41=42=43=44=45=46=47=48=49=50=51=52=53=54=55=56=57=58=59=60\r\n",
+                256 * 1024,
+                b"\r\n--b--\r\n",
+            ),
+        ),
+        case(
+            "multipart, a quoted-printable file with escapes, written",
+            "multipart",
+            "",
+            repeated(
+                b"--b\r\nContent-Disposition: form-data; name=\"u\"; filename=\"a\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n",
+                b"=41=42=43=44=45=46=47=48=49=50=51=52=53=54=55=56=57=58=59=60\r\n",
+                256 * 1024,
+                b"\r\n--b--\r\n",
+            ),
+        ),
         // The media type and the parser's markers are held while the parts are read.
         Case {
             content_type: format!(
@@ -750,7 +785,13 @@ fn the_smallest_budget_that_admits_a_body_covers_its_peak() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     for case in &admitted_cases() {
         let (budget, grown, admitted) = smallest_admitting(case, 1 << 30);
-        assert!(admitted.values > 0, "{}: {}", case.label, admitted.message);
+        // A file part is published to `FILES`, not to `ARGS_POST`, so only the others count values.
+        assert!(
+            admitted.values > 0 || case.label.contains("file"),
+            "{}: {}",
+            case.label,
+            admitted.message
+        );
         assert!(
             budget <= 4 * grown.max(1),
             "{}: a budget of {budget} for {grown} bytes of growth is wasteful",
@@ -789,6 +830,34 @@ fn a_multipart_header_block_is_reserved_before_it_is_parsed_and_a_budget_stop_is
             measured.peak_chunks <= 2 * case.body.len() + budget + SLACK,
             "budget {budget}: the peak {} grows with the header block the budget refused",
             measured.peak_chunks
+        );
+    }
+}
+
+#[test]
+fn a_budget_stop_after_a_quoted_printable_decode_error_keeps_the_strict_error() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut body = b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n=41\x01\r\n".to_vec();
+    for index in 0..200 {
+        body.extend_from_slice(
+            format!("--b\r\nContent-Disposition: form-data; name=\"f{index}\"\r\n\r\n{index}\r\n").as_bytes(),
+        );
+    }
+    body.extend_from_slice(b"--b--\r\n");
+    let case = case("multipart", "multipart", "", body);
+    // The decode error is the one Go reports, so the strict flag is set with no budget and still when a budget stops
+    // the parse.
+    assert!(measure(&case, None).strict, "no budget: the decode error is strict");
+    for budget in [4 * 1024, 16 * 1024] {
+        let measured = measure(&case, Some(budget));
+        assert!(
+            measured.message.contains("body memory budget"),
+            "budget {budget}: {}",
+            measured.message
+        );
+        assert!(
+            measured.strict,
+            "budget {budget}: the earlier decode error is still strict"
         );
     }
 }

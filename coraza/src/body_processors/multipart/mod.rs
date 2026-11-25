@@ -22,12 +22,18 @@
 
 mod media_type;
 mod parser;
+mod quoted_printable;
 
 use std::collections::LinkedList;
 
 pub(crate) use parser::Part;
 
 use crate::body_processors::budget::MemoryBudget;
+
+/// `bytes` quoted the way Go's `%q` quotes them, byte-exactly.
+fn quoted(bytes: &[u8]) -> String {
+    crate::utils::strings::go_quote_bytes(bytes)
+}
 
 /// Whether `name` is one MIME token, the shape Go's `textproto` canonicalizes. A name
 /// that holds a space is not a token, and Go keeps it as sent (go.dev/issue/34540).
@@ -172,8 +178,9 @@ fn parse_charged<'a>(
     let (parts, error) = parser.parse();
     *memory = parser.memory_left();
     let failure = error.map(|error| ParseFailure {
-        // The host's memory budget is not one of Go's reader errors.
-        strict: !error.is_budget(),
+        // The host's memory budget is not one of Go's reader errors, but a body that could not be decoded before it
+        // is: Go's reader returned that error.
+        strict: !error.is_budget() || parser.decode_failed(),
         cause: if error.is_budget() {
             FailureCause::MemoryBudget
         } else {

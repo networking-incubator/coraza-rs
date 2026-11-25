@@ -42,7 +42,9 @@ pub enum RuleVariable {
     UniqueID,
     /// `ARGS_COMBINED_SIZE` - Combined size of all arguments
     ArgsCombinedSize,
-    /// `FILES_COMBINED_SIZE` - Combined size of multipart file parts, including files skipped by the upload-file limit
+    /// `FILES_COMBINED_SIZE` - Combined size of the data of every multipart part, as Go Coraza counts it: file parts,
+    /// including files skipped by the upload-file limit, and form fields. A part decoded from quoted-printable counts
+    /// as it was sent, the larger of the sizes it publishes
     FilesCombinedSize,
     /// `FULL_REQUEST_LENGTH` - Length of the full request
     FullRequestLength,
