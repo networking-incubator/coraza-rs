@@ -481,6 +481,147 @@ mod tests {
         }
     }
 
+    /// An input, and what `base64Decode` and `base64DecodeExt` return for it.
+    type Base64Case = (&'static [u8], &'static [u8], &'static [u8]);
+
+    /// Go Coraza's results for the edge inputs: both alphabets, padding missing, extra and in the middle, white
+    /// space, invalid and non-ASCII bytes, and lengths 0 to 3 mod 4.
+    ///
+    /// The outputs come from `internal/transformations/base64decode.go` and `base64decodeext.go` of
+    /// `github.com/corazawaf/coraza/v3@v3.8.2-0.20261114225743-1cfa4f955a19`, run on each input. The same Go
+    /// functions agreed with this crate's on 23,002 further inputs, long and random ones among them.
+    const GO_EDGE_CASES: &[Base64Case] = &[
+        (b"", b"", b""),
+        (b"A", b"", b""),
+        (b"QQ", b"A", b"A"),
+        (b"QQ=", b"A", b"A"),
+        (b"QQ==", b"A", b"A"),
+        (b"QUI=", b"AB", b"AB"),
+        (b"QUJD", b"ABC", b"ABC"),
+        (b"QUJDR", b"ABC", b"ABC"),
+        (b"QUJDRA==", b"ABCD", b"ABCD"),
+        (b"QUJDREU=", b"ABCDE", b"ABCDE"),
+        (b"QUJDREVG", b"ABCDEF", b"ABCDEF"),
+        (b"+/+/", b"\xfb\xff\xbf", b"\xfb\xff\xbf"),
+        (b"-_-_", b"", b"\xfb\xff\xbf"),
+        (b"+/", b"\xfb", b"\xfb"),
+        (b"-_", b"", b"\xfb"),
+        (b"ab-_cd", b"i", b"i\xbf\xbfq"),
+        (b"ab+/cd", b"i\xbf\xbfq", b"i\xbf\xbfq"),
+        (b"Zm9v\r\nYmFy", b"foobar", b"foobar"),
+        (b"Zm9v\nYmFy", b"foobar", b"foobar"),
+        (b"Zm9v\rYmFy", b"foobar", b"foobar"),
+        (b"Zm9v YmFy", b"foo", b"foobar"),
+        (b"Zm9v\tYmFy", b"foo", b"foobar"),
+        (b"Zm9v\x0bYmFy", b"foo", b"foobar"),
+        (b"Zm9v\x0cYmFy", b"foo", b"foobar"),
+        (b"Zm9v.YmFy", b"foo", b"foobar"),
+        (b"Zm9v\xc2\x85YmFy", b"foo", b"foobar"),
+        (b"Zm9v\xc2\xa0YmFy", b"foo", b"foobar"),
+        (b"Zm9v\xa0YmFy", b"foo", b"foobar"),
+        (b"Zm9v\x85YmFy", b"foo", b"foobar"),
+        (b"Zm9v=YmFy", b"foo", b"foo"),
+        (b"Zm9v==YmFy", b"foo", b"foo"),
+        (b"Zm=9v", b"f", b"f"),
+        (b"=Zm9v", b"", b""),
+        (b"==", b"", b""),
+        (b"=", b"", b""),
+        (b" ", b"", b""),
+        (b" Zm9v", b"", b"foo"),
+        (b"Zm9v ", b"foo", b"foo"),
+        (b"Zm9v\x00YmFy", b"foo", b"foobar"),
+        (b"\x00", b"", b""),
+        (b"Zm9v\xffYmFy", b"foo", b"foobar"),
+        (b"\xff", b"", b""),
+        (b"Zm9v!YmFy", b"foo", b"foobar"),
+        (b"Zm9v@YmFy", b"foo", b"foobar"),
+        (b"Zm9v#", b"foo", b"foo"),
+        (b"Zm9v$%^&*", b"foo", b"foo"),
+        (b"Zm9v~YmFy", b"foo", b"foobar"),
+        (b"Zm9v\x7fYmFy", b"foo", b"foobar"),
+        (b"Zm9v\x80YmFy", b"foo", b"foobar"),
+        (b"Zm9v\xc3\xa9YmFy", b"foo", b"foobar"),
+        (b"Z", b"", b""),
+        (b"Zg", b"f", b"f"),
+        (b"Zg=", b"f", b"f"),
+        (b"Zg==", b"f", b"f"),
+        (b"Zg===", b"f", b"f"),
+        (b"Zm8", b"fo", b"fo"),
+        (b"Zm8=", b"fo", b"fo"),
+        (b"Zm8==", b"fo", b"fo"),
+        (b"Zm9", b"fo", b"fo"),
+        (b"Zm9v", b"foo", b"foo"),
+        (b"Zm9vY", b"foo", b"foo"),
+        (b"Zm9vYg", b"foob", b"foob"),
+        (b"Zm9vYg=", b"foob", b"foob"),
+        (b"Zm9vYg==", b"foob", b"foob"),
+        (b"Zm9vYmE", b"fooba", b"fooba"),
+        (b"Zm9vYmE=", b"fooba", b"fooba"),
+        (b"ZmZm", b"fff", b"fff"),
+        (b"ZmZmZ", b"fff", b"fff"),
+        (b"ZmZmZm", b"ffff", b"ffff"),
+        (b"ZmZmZmZ", b"fffff", b"fffff"),
+        (b"ZmZmZmZm", b"ffffff", b"ffffff"),
+        (b"AAAA", b"\x00\x00\x00", b"\x00\x00\x00"),
+        (b"AAA", b"\x00\x00", b"\x00\x00"),
+        (b"AA", b"\x00", b"\x00"),
+        (b"A", b"", b""),
+        (b"////", b"\xff\xff\xff", b"\xff\xff\xff"),
+        (b"++++", b"\xfb\xef\xbe", b"\xfb\xef\xbe"),
+        (b"____", b"", b"\xff\xff\xff"),
+        (b"----", b"", b"\xfb\xef\xbe"),
+        (b"\n", b"", b""),
+        (b"\r\n", b"", b""),
+        (b"\n\n\n", b"", b""),
+        (b"..", b"", b""),
+        (b"Z.m.9.v", b"", b"foo"),
+        (b"Z\nm\r9\nv", b"foo", b"foo"),
+        (b"Z m 9 v", b"", b"foo"),
+        (b"Z-m_9", b"", b"g\xe9\xbf"),
+        (b"Z-_=m9v", b"", b"g\xef"),
+        (b"-w==", b"", b"\xfb"),
+        (b"_w==", b"", b"\xff"),
+        (b"+w==", b"\xfb", b"\xfb"),
+        (b"/w==", b"\xff", b"\xff"),
+        (b"w", b"", b""),
+        (b"wA==", b"\xc0", b"\xc0"),
+        (b"wA=", b"\xc0", b"\xc0"),
+        (b"wA", b"\xc0", b"\xc0"),
+        (
+            b"PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+            b"<script>alert(1)</script>",
+            b"<script>alert(1)</script>",
+        ),
+        (
+            b"PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg",
+            b"<script>alert(1)</script>",
+            b"<script>alert(1)</script>",
+        ),
+        (
+            b"PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=",
+            b"<script>alert(1)</script>",
+            b"<script>alert(1)</script>",
+        ),
+        (
+            b"PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\nPHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+            b"<script>alert(1)</script>",
+            b"<script>alert(1)</script>",
+        ),
+        (
+            b"eyJwIjoieHh-IiwiYWxnIjoibm9uZSIsInR5cCI6IkpXVCJ9",
+            b"{\"p\":\"xx",
+            b"{\"p\":\"xx~\",\"alg\":\"none\",\"typ\":\"JWT\"}",
+        ),
+    ];
+
+    #[test]
+    fn base64_decoders_match_go_on_the_edge_inputs() {
+        for (input, strict, extended) in GO_EDGE_CASES {
+            assert_eq!(base64_decode(input).0, *strict, "base64Decode {input:?}");
+            assert_eq!(base64_decode_ext(input).0, *extended, "base64DecodeExt {input:?}");
+        }
+    }
+
     // Ported from: coraza/internal/transformations/base64decodeext_test.go.
     #[test]
     fn extended_base64_decoding_skips_invalid_bytes_and_accepts_url_safe() {

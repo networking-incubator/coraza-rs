@@ -29,6 +29,7 @@ use std::{cell::Cell, collections::LinkedList, mem::size_of};
 use super::{
     is_token_name,
     media_type::{self, to_lower, trim_space},
+    quoted, quoted_printable,
 };
 use crate::{
     body_processors::budget::{self, MemoryBudget},
@@ -59,6 +60,8 @@ pub(super) enum ParseError {
     Parse(String),
     /// The body exceeds one of the parser's resource budgets.
     Limit(String),
+    /// A part's quoted-printable body cannot be decoded; holds the message of Go's reader.
+    Decode(String),
     /// Reading the next part would take the parser past the memory budget the host set. That is a capacity
     /// event, not a violation of the multipart format, so it does not set the strict error.
     Budget,
@@ -82,6 +85,7 @@ impl std::fmt::Display for ParseError {
             ParseError::MalformedHeaders(msg) => write!(f, "malformed headers: {msg}"),
             ParseError::Parse(msg) => write!(f, "parse error: {msg}"),
             ParseError::Limit(msg) => write!(f, "limit exceeded: {msg}"),
+            ParseError::Decode(msg) => f.write_str(msg),
             ParseError::Budget => write!(f, "limit exceeded: {BUDGET_MESSAGE}"),
         }
     }
@@ -97,6 +101,8 @@ impl ParseError {
             Self::MissingColon(line) => Self::MissingColon(cut(line)),
             Self::InitialLine(line) => Self::InitialLine(cut(line)),
             Self::UnexpectedLine(line) => Self::UnexpectedLine(cut(line)),
+            // A quoted-printable error quotes the rest of its line, up to the 4096-byte line buffer and more.
+            Self::Decode(message) => Self::Decode(cut(message)),
             other => other,
         }
     }
@@ -122,6 +128,8 @@ impl ParseError {
                 "no boundary found" | "missing final boundary" => "multipart: NextPart: EOF".to_owned(),
                 _ => format!("multipart: NextPart: {message}"),
             },
+            // Go's processor returns the quoted-printable reader's error from the copy of the part, unchanged.
+            ParseError::Decode(message) => message.clone(),
             // Rust-only hardening budgets; the conformance ledger records the prefix.
             ParseError::Limit(message) => format!("malformed multipart: limit exceeded: {message}"),
             ParseError::Budget => format!("malformed multipart: limit exceeded: {BUDGET_MESSAGE}"),
@@ -181,11 +189,35 @@ pub(crate) struct Part<'a> {
     /// Whether its Content-Disposition `filename*` is quoted, which RFC 5987 forbids
     pub(crate) invalid_quoting: bool,
 
-    /// The part body data
+    /// The part body as it was sent
     pub(crate) data: &'a [u8],
+
+    /// Whether the part declared `Content-Transfer-Encoding: quoted-printable`, which Go's `NextPart` decodes the
+    /// body for (and hides from the headers; this parser keeps it there). [`MultipartParser`] decodes it as it
+    /// reads the part.
+    pub(crate) quoted_printable: bool,
+
+    /// The body decoded from quoted-printable, in place of `data`, when decoding changed it
+    pub(crate) decoded: Option<Vec<u8>>,
+
+    /// Whether decoding reached what Go's reader reports as `io.ErrUnexpectedEOF`: a `==` before a line end does,
+    /// and so does the end of a part whose body was cut or has no closing delimiter. Go's processor then flags the
+    /// strict error, unless the limit cut the body, and reads no further part.
+    pub(crate) unexpected_eof: bool,
 }
 
-impl Part<'_> {
+impl<'a> Part<'a> {
+    /// The part body as Go publishes it: decoded when the part is quoted-printable, else as it was sent.
+    pub(crate) fn body(&self) -> &[u8] {
+        self.decoded.as_deref().unwrap_or(self.data)
+    }
+
+    /// The part body as it was sent, when decoding changed it: a backend that does not decode the body acts on this
+    /// text, so the rules see it besides [`Part::body`].
+    pub(crate) fn as_sent(&self) -> Option<&'a [u8]> {
+        self.decoded.as_ref().map(|_| self.data)
+    }
+
     /// The filename and the `filename*` the part publishes, each unless it is empty.
     pub(crate) fn published_filenames(&self) -> [Option<&[u8]>; 2] {
         [self.filename.as_deref(), self.alt_filename.as_deref()].map(|name| name.filter(|name| !name.is_empty()))
@@ -199,7 +231,8 @@ impl Part<'_> {
         let encoding = self.filename_encoding.as_ref().map_or(0, |encoding| {
             allocation_bytes(encoding.charset.capacity()).saturating_add(allocation_bytes(encoding.language.capacity()))
         });
-        let list = allocation_bytes(self.headers.capacity().saturating_mul(size_of::<(String, Vec<u8>)>()));
+        let list = allocation_bytes(self.headers.capacity().saturating_mul(size_of::<(String, Vec<u8>)>()))
+            .saturating_add(optional(&self.decoded));
         self.headers
             .iter()
             .fold(list, |total, (name, value)| {
@@ -214,6 +247,9 @@ impl Part<'_> {
             .saturating_add(allocation_bytes(size_of::<Self>() + 2 * size_of::<usize>()))
     }
 }
+
+/// The header whose value selects the body's transfer encoding.
+const ENCODING_HEADER: &str = "Content-Transfer-Encoding";
 
 /// Maximum boundary length in bytes.
 ///
@@ -269,6 +305,11 @@ pub(super) struct MultipartParser<'a> {
     /// Set when a body cut by the limit ended the parse before its closing delimiter, so that parts may follow
     /// the last one read.
     cut_open: Cell<bool>,
+    /// The message of the first quoted-printable body that could not be decoded. The parts after it are read, as a
+    /// backend that does not stop there would, and the parse reports this error when it ends.
+    decode_error: Cell<Option<String>>,
+    /// Whether a body could not be decoded, kept after `parse` reports a budget stop over that error.
+    decode_failed: Cell<bool>,
 }
 
 impl<'a> MultipartParser<'a> {
@@ -285,6 +326,8 @@ impl<'a> MultipartParser<'a> {
             truncated: false,
             memory: Cell::new(MemoryBudget::default()),
             cut_open: Cell::new(false),
+            decode_error: Cell::new(None),
+            decode_failed: Cell::new(false),
         }
     }
 
@@ -302,6 +345,11 @@ impl<'a> MultipartParser<'a> {
     /// Whether the parse has a memory budget, which is when what it quotes in an error is an excerpt.
     fn is_bounded(&self) -> bool {
         self.memory.get().is_limited()
+    }
+
+    /// Whether a quoted-printable body could not be decoded, even if a budget stop was reported instead.
+    pub(super) fn decode_failed(&self) -> bool {
+        self.decode_failed.get()
     }
 
     /// Whether the parse of a body cut by the limit stopped before the closing delimiter, with no error.
@@ -348,6 +396,7 @@ impl<'a> MultipartParser<'a> {
             Some(_) => parse_truncated_part(data, total_header_bytes, &reserve),
             None => parse_part(data, total_header_bytes, &reserve).map(Some),
         };
+        let mut stopped = None;
         let kept = parsed.and_then(|part| {
             let Some(mut part) = part else {
                 return Ok(None);
@@ -355,16 +404,74 @@ impl<'a> MultipartParser<'a> {
             if let Some((dash_boundary, nl_boundary)) = truncated {
                 part.data = trim_truncated_part_data(part.data, dash_boundary, nl_boundary);
             }
+            if part.quoted_printable {
+                stopped = self.decode_body(&mut part, truncated.is_some())?;
+            }
             if self.is_bounded() {
                 self.reserve(part.owned_bytes())?;
             }
             Ok(Some(part))
         });
         self.release(held.get());
+        // The part is published as far as it was decoded, which is more than Go's processor publishes of a part
+        // whose body fails: it returns the error before it adds a field's data to `ARGS_POST`, or a file to
+        // `FILES`, and only the temporary file keeps what was decoded. Fail closed: a payload before a byte Go
+        // rejects must not be hidden from the rules, and the part counts toward `FILES_COMBINED_SIZE`. Go's
+        // processor also reads no further part. Here the parts after it are read and published, as they are what
+        // a backend that does not stop at that byte would act on, and the error is reported when the parse ends.
+        if let Some(quoted_printable::Stop::Error(message)) = stopped {
+            let first = self.decode_error.take().unwrap_or(message);
+            self.decode_error.set(Some(first));
+            self.decode_failed.set(true);
+        }
         if let Some(part) = kept? {
             parts.push_back(part);
         }
         Ok(())
+    }
+
+    /// Decodes the quoted-printable body of `part` into a copy it keeps, as Go's `NextPart` does as the part is
+    /// read, and returns why decoding stopped early, if it did. `cut` is whether the body ended inside the part.
+    ///
+    /// A decoded body is never longer than what was sent, so what the copy can take is charged before it is made
+    /// and given back once the part, which then holds the copy, is charged what it keeps.
+    fn decode_body(&self, part: &mut Part<'a>, cut: bool) -> Result<Option<quoted_printable::Stop>, ParseError> {
+        let reserved = if self.is_bounded() {
+            allocation_bytes(part.data.len())
+        } else {
+            0
+        };
+        self.reserve(reserved)?;
+        let end = if cut {
+            quoted_printable::End::UnexpectedEof
+        } else {
+            quoted_printable::End::Eof
+        };
+        let (mut decoded, stopped) = quoted_printable::decode(part.data, end);
+        // Recorded before any charge below can fail, so a budget stop still reports the malformed part as strict.
+        if matches!(stopped, Some(quoted_printable::Stop::Error(_))) {
+            self.decode_failed.set(true);
+        }
+        // A body that decoding did not change is the same text twice: keep one copy, the one in the request.
+        if decoded != part.data {
+            // The copy is as long as what was sent; it keeps only what it decoded. Trimming it allocates the decoded
+            // length beside the full buffer until the buffer is freed, so that is charged around the trim.
+            let trimmed = if self.is_bounded() {
+                allocation_bytes(decoded.len())
+            } else {
+                0
+            };
+            if let Err(error) = self.reserve(trimmed) {
+                self.release(reserved);
+                return Err(error);
+            }
+            decoded.shrink_to_fit();
+            self.release(trimmed);
+            part.decoded = Some(decoded);
+        }
+        part.unexpected_eof = stopped == Some(quoted_printable::Stop::UnexpectedEof);
+        self.release(reserved);
+        Ok(stopped)
     }
 
     /// Mark `data` as the prefix a body limit retained under `ProcessPartial`.
@@ -384,6 +491,13 @@ impl<'a> MultipartParser<'a> {
     pub(super) fn parse(&self) -> (LinkedList<Part<'a>>, Option<ParseError>) {
         let mut parts = LinkedList::new();
         let error = self.collect_parts(&mut parts).err();
+        // The first body that could not be decoded is the error Go reports, whatever the parts after it hold; only
+        // the host's memory budget, which says the parse did not read what it could not afford, is reported over it.
+        let decode = self.decode_error.take().map(ParseError::Decode);
+        let error = match (error, decode) {
+            (Some(error), _) if error.is_budget() => Some(error),
+            (error, decode) => decode.or(error),
+        };
         (parts, error)
     }
 
@@ -680,6 +794,13 @@ fn parse_part<'a>(
     // Parse headers
     let headers = parse_headers(header_data)?;
 
+    // Go's `NextPart` reads the first `Content-Transfer-Encoding` value and, when it is `quoted-printable` in any
+    // case, decodes the body (`mime/multipart/multipart.go`, go1.27.4). It then removes the header, every copy of
+    // it, from the part headers. This parser keeps them all, so that rules which match the header, CRS 922120 among
+    // them, see what they saw before the body was decoded, and a repeated copy is flagged as any repeated header.
+    let quoted_printable =
+        header(&headers, ENCODING_HEADER).is_some_and(|value| value.eq_ignore_ascii_case(b"quoted-printable"));
+
     let disposition = extract_content_disposition(&headers);
     // Go stores each part header under its canonical key, or under its raw name when it
     // holds a space (`canonicalMIMEHeaderKey`'s `noCanon` path), so only token names
@@ -698,6 +819,9 @@ fn parse_part<'a>(
         repeats_header,
         invalid_quoting: disposition.quoted_extended_filename,
         data: body_data,
+        quoted_printable,
+        decoded: None,
+        unexpected_eof: false,
     })
 }
 
@@ -844,13 +968,6 @@ fn trim_space_tab(bytes: &[u8]) -> &[u8] {
         .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
         .map_or(0, |index| index.saturating_add(1));
     rest.get(..end).unwrap_or_default()
-}
-
-/// `bytes` quoted the way Go's `%q` quotes a header line, byte-exactly: printable text
-/// stays, control characters use Go's escapes, and bytes that are not valid UTF-8 become
-/// `\xNN`.
-fn quoted(bytes: &[u8]) -> String {
-    crate::utils::strings::go_quote_bytes(bytes)
 }
 
 /// What a part's Content-Disposition header says.
@@ -2711,5 +2828,37 @@ two\r\n\
         assert_eq!(percent_decode_lenient(b"%41"), (b"A".to_vec(), false));
         assert_eq!(percent_decode_lenient(b"%ff"), (vec![0xFF], false));
         assert_eq!(percent_decode_lenient(b"plain"), (b"plain".to_vec(), false));
+    }
+
+    #[test]
+    fn a_decode_error_is_recorded_even_when_the_budget_refuses_the_trim() {
+        // A body that decoding shortens and then rejects: the trim is charged after the decode error is known.
+        let mut data = b"=41".repeat(1000);
+        data.push(0x01);
+        let mut part = MultipartParser::new(
+            "b",
+            b"--b\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nx\r\n--b--\r\n",
+        )
+        .parse_ok()
+        .unwrap()
+        .remove(0);
+        part.data = &data;
+        // Room for the copy decoding makes, none for the trim.
+        let parser =
+            MultipartParser::new("b", b"").with_memory_budget(MemoryBudget::new(Some(allocation_bytes(data.len()))));
+        let error = parser.decode_body(&mut part, false).unwrap_err();
+        assert!(error.is_budget(), "{error}");
+        assert!(
+            parser.decode_failed(),
+            "the malformed body is strict although the budget stopped the trim"
+        );
+    }
+
+    #[test]
+    fn a_bounded_decode_error_is_cut_like_a_header_line() {
+        let long = format!("quotedprintable: invalid bytes after =: {}", "\\r".repeat(4000));
+        let cut = ParseError::Decode(long).bounded().to_string();
+        assert!(cut.len() < 512, "{} bytes kept", cut.len());
+        assert!(cut.starts_with("quotedprintable: invalid bytes after =:"), "{cut}");
     }
 }

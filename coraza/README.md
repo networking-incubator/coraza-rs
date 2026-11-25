@@ -783,6 +783,29 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   what a built-in processor publishes is: output near or above the budget
   leaves the rules nothing, and the first charge of a rule stops rule
   evaluation with the 503.
+- A multipart part with `Content-Transfer-Encoding: quoted-printable` is
+  decoded as Go's `mime/multipart` does, and published twice when decoding
+  changes it: the decoded body first, as Go publishes it, then the body as it
+  was sent. A field's two values are both values of its name in `ARGS_POST` and
+  `ARGS`; a file is two temporary uploads in `FILES_TMPNAMES` and two values of
+  its name in `FILES_SIZES`. A backend that decodes the part, as Go's does, and
+  one that takes it as sent (busboy, Starlette's `MultipartParser`, PHP) act on
+  different text, so a rule reads both. The second value does not count against
+  `SecArgumentsLimit`, is charged to the body memory budget, and counts in
+  `ARGS_COMBINED_SIZE`; `FILES_COMBINED_SIZE` counts the part as it was sent. A
+  part that decoding does not change is published once. Before, the part
+  reached the rules still encoded, and a payload such as
+  `cmd=3Bcat=20/etc/passwd` matched nothing that read the decoded text. The
+  encoding header stays in `MULTIPART_PART_HEADERS`, where Go removes it, so CRS
+  rule 922120 still matches every part that names an encoding, at paranoia
+  level 1, as it did before the body was decoded. A part Go's quoted-printable
+  reader rejects (a control byte, a `=` before a bare CR, a line over 4096
+  bytes) is a body error with Go's message, published up to the failure and then
+  as sent, and the parts after it are read, where Go stops. The
+  [ledger](conformance/difference-ledger.md) lists where this deviates from Go.
+- `FILES_COMBINED_SIZE` is the size of every multipart part's data, form fields
+  included, as in Go Coraza. It counted file parts only, so a size rule such as
+  CRS 900340 saw too little of a body made mostly of fields.
 
 ## FTW integration
 

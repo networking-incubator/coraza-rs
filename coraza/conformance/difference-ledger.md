@@ -319,6 +319,112 @@ not parity claims; no shared-corpus case IDs exist yet.
   Rust-only: Go Coraza accumulates all parts' headers in
   `MULTIPART_PART_HEADERS` without a whole-body budget.
 
+## Multipart quoted-printable parts
+
+A part that declares `Content-Transfer-Encoding: quoted-printable` is decoded as
+Go's `mime/multipart.Reader.NextPart` does it (`mime/multipart/multipart.go`,
+go1.27.4): the first value of the header, in any case, selects it, and the body is
+read through `mime/quotedprintable.Reader` behind a 4096-byte line buffer. The
+decoder is `coraza/src/body_processors/multipart/quoted_printable.rs`; the Go
+results it is checked against are `coraza/tests/go_multipart/cases.json` (see its
+README). A differential run of Go's processor against this engine on 12,000
+generated bodies (one to three parts, quoted-printable text with escapes, soft
+breaks and lines near 4096 bytes, header spellings and repeats, a fifth of them cut by
+the limit), judged by the rules of that replay, found in what a quoted-printable
+part publishes only the deviations below. It found 345 other differences, each the
+same for the body with the encoding header renamed, so none is about decoding (a body
+without its closing delimiter and no limit is a body error here and a strict error
+alone in Go, and a cut inside a header line is an error in Go and none here).
+
+The deviations are all toward inspecting more than Go does, because this engine
+must never inspect less than it did before it decoded the part. Under a body
+memory budget, a part that decoding changes is charged both of its values, so a
+part that fitted the budget before can now be refused, and a refused part
+publishes neither value; the refusal stops the parse as a budget error
+(`REQBODY_ERROR`, and the stop the host reads), so the recommended configuration's
+rule 200002 denies the request and the Envoy connector refuses it with 503 rather
+than letting it through uninspected. Measured against
+the engine before decoding, over 700 attack bodies (the same payloads in a field and
+a file part, each plain, encoded, lower-case hex, split by soft breaks, after each
+byte Go's reader rejects, after a failing part, with a second encoding header, and
+near `SecArgumentsLimit`) and 14 benign ones, in 14 rule sets (CRS 4.30 at paranoia
+levels 1 to 4, with and without the recommended configuration; the same at levels 1
+and 4 with CRS rule 922120 removed; the recommended configuration alone; and the
+recommended configuration with one rule over `ARGS` that knows nothing of
+quoted-printable), no body blocked before passes now. A benign body whose
+quoted-printable fields decoding changes (measured with 499 and 999 of them) is the
+one that gains a verdict: CRS 921180 is critical and blocks on its own, so
+it returns 403 at paranoia level 3 and above where 922120 is removed (CRS at paranoia
+level 1 and above already blocked it with 922120). Without the body as it was sent, 72 and 90 of the first 318 bodies pass at
+paranoia levels 1 and 4 where 922120 is removed; and when the encoding header is hidden
+as well, 254 pass at level 1 with CRS alone.
+
+- Go removes the encoding header, every copy, from the part's headers when it
+  decodes the part, so `MULTIPART_PART_HEADERS` does not hold it and a repeated
+  copy is not flagged. This engine keeps every copy there, as it did before
+  decoding: CRS rule 922120 (`Content-Transfer-Encoding` in
+  `MULTIPART_PART_HEADERS`, paranoia level 1, critical) still blocks every
+  quoted-printable part, as it did, and a payload in a second copy of the header
+  is still a part header. A repeated encoding header sets
+  `MULTIPART_DUPLICATE_PART_HEADER` and `MULTIPART_STRICT_ERROR` as any repeated
+  header does, where Go sets neither for a part it decodes. The cost against Go
+  is that a benign quoted-printable form part scores 922120 at paranoia level 1;
+  RFC 7578 section 4.7 deprecates the header for `multipart/form-data`, and
+  browsers, curl, Go's `multipart.Writer`, Python `requests` and Node `FormData`
+  do not send it.
+- Go publishes the decoded body only. A backend that takes the body as it was sent
+  (busboy, Starlette's low-level `MultipartParser`, PHP) acts on text decoding
+  changes: `onfocus=fetch(` is not in the decoded text of ` onfocus=fetch(1) x=`,
+  because `=fe` is the byte 0xFE. This engine publishes the body as it was sent
+  after the decoded one, whenever decoding changed it:
+  - a field's second value is a value of its name in `ARGS_POST` and `ARGS`, so
+    every rule that reads them, and every rule that reads one name, sees both. The
+    first value is Go's, so `ARGS:name` first is what Go publishes. The second value
+    does not count against `SecArgumentsLimit` (counting it drops fields after the
+    first 500 that the engine read before: with 500 or more such fields and the
+    payload in the field after them, it passed where 922120 is removed), is counted by
+    `ARGS_COMBINED_SIZE`, and is charged to the body memory budget with the first: a
+    part that does not fit adds neither. A name that holds two values is also what CRS
+    921180 (HTTP parameter pollution, paranoia level 3, critical) matches; it
+    blocks on its own, so a benign body of such fields (measured with 499 and 999) blocks at
+    paranoia level 3 and above where 922120 is removed. A rule that counts `&ARGS` (920380,
+    with `tx.max_num_args`) sees the second values too.
+  - a file part is two temporary uploads in `FILES_TMPNAMES`, the decoded one first,
+    and two values of its name in `FILES_SIZES`; the second upload does not count
+    against `SecUploadFileLimit` and is written when the first is.
+  - `FILES_COMBINED_SIZE` counts the part as it was sent, the larger of the two
+    sizes, so a limit on it sees no less than before.
+  A part that decoding does not change is published once, as Go publishes it.
+- Go's processor returns a quoted-printable error before it adds the part's data
+  to `ARGS_POST`, or the file to `FILES`, `FILES_SIZES` and `FILES_NAMES`; only
+  the temporary file keeps what was decoded. It then reads no further part. This
+  engine publishes the part as far as it was decoded, then as it was sent, reports
+  the same error for the first such part (`REQBODY_PROCESSOR_ERROR_MSG` and
+  `MULTIPART_STRICT_ERROR`, as in Go), and reads the parts after it, which a
+  backend that does not stop at that byte (busboy and python-multipart read them)
+  acts on. A payload before the byte Go rejects, after it, or in a later part stays
+  visible to every rule.
+- A `==` before a line end makes Go's reader report `io.ErrUnexpectedEOF` and
+  drop the rest of the part; its processor flags `MULTIPART_STRICT_ERROR`
+  (unless `INBOUND_DATA_ERROR` is set), publishes what was decoded and reads no
+  further part. This engine flags and publishes the same, publishes the part as
+  it was sent as well, and reads the parts after it.
+- A last line without a line feed of exactly 4096 bytes is `bufio: buffer full`
+  in Go when the part ends the body and the buffer fills before the end shows,
+  and decodes in Go when the delimiter shows with the last bytes, which depends
+  on how the body is framed in reads. This engine decodes it for a part that
+  ends at its delimiter, and fails it for a body that was cut.
+
+`coraza/tests/go_multipart.rs` replays Go's results with exactly these
+differences: a rule of the replay is that the collections hold every row Go
+publishes and every row Go publishes for the same body with the encoding headers
+renamed (no part decoded), and nothing else.
+
+`FILES_COMBINED_SIZE` is the sum of every part's data, fields included, as in Go
+(`internal/bodyprocessors/multipart.go`, go-coraza 1cfa4f955a19); a part decoded
+from quoted-printable counts as it was sent, which is Go's number for the body
+with the header renamed. It is `0` when no part was read, where Go leaves it empty.
+
 ## Row format
 
 Every row has exactly five columns:

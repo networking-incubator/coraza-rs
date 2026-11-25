@@ -479,6 +479,76 @@ fn multipart_headers_are_charged_while_the_parts_are_read() {
 }
 
 #[test]
+fn a_quoted_printable_part_is_charged_for_the_copy_it_decodes() {
+    let waf = waf("");
+    let content_type = "multipart/form-data; boundary=b";
+    // A part Go's `NextPart` decodes as it reads, so the engine holds the decoded copy until the part is published,
+    // where a part it does not decode is read from the body in place. Lines of 70 bytes, as an encoder writes them:
+    // Go's reader takes no line over 4096 bytes. Each decodes to 68 (`=3D` is one byte), so the copy is a new text.
+    let sent = format!("{}=3D\r\n", "x".repeat(67)).repeat(70);
+    let decoded = format!("{}=\r\n", "x".repeat(67)).repeat(70);
+    let body =
+        |header: &str| format!("--b\r\nContent-Disposition: form-data; name=\"f\"\r\n{header}\r\n{sent}\r\n--b--\r\n");
+    let smallest = |body: String| {
+        smallest_budget(1 << 20, |budget| {
+            let mut tx = request(&waf, content_type, Some(budget));
+            tx.process_request_body(body.as_bytes());
+            !request_body_errored(&tx) && !values_of(&tx, RuleVariable::ArgsPost).is_empty()
+        })
+    };
+    let plain = smallest(body(""));
+    let quoted_printable = smallest(body("Content-Transfer-Encoding: quoted-printable\r\n"));
+    assert!(
+        quoted_printable >= plain + 4_000,
+        "decoding takes {quoted_printable} bytes, reading in place {plain}"
+    );
+
+    // Without a budget nothing is stopped, and what is published is the decoded body, then the body as sent.
+    let mut tx = request(&waf, content_type, None);
+    tx.process_request_body(body("Content-Transfer-Encoding: quoted-printable\r\n").as_bytes());
+    assert!(!request_body_errored(&tx));
+    assert_eq!(
+        values_of(&tx, RuleVariable::ArgsPost),
+        [("f".to_owned(), decoded), ("f".to_owned(), sent)]
+    );
+}
+
+#[test]
+fn a_quoted_printable_part_is_charged_for_both_values_it_publishes() {
+    let waf = waf("");
+    let content_type = "multipart/form-data; boundary=b";
+    let qp = "Content-Transfer-Encoding: quoted-printable\r\n";
+    let body = |data: &str| format!("--b\r\nContent-Disposition: form-data; name=\"f\"\r\n{qp}\r\n{data}\r\n--b--\r\n");
+    // 3,000 bytes as sent that decode to 1,000 (`=3D` is `=`), and 3,000 that decoding does not change. The first
+    // publishes the 1,000 and the 3,000 in `ARGS_POST` and in `ARGS`, the second its 3,000 in each.
+    let (changed, unchanged) = (body(&"=3D".repeat(1_000)), body(&"x".repeat(3_000)));
+    let smallest = |body: &str| {
+        smallest_budget(1 << 20, |budget| {
+            let mut tx = request(&waf, content_type, Some(budget));
+            tx.process_request_body(body.as_bytes());
+            !request_body_errored(&tx) && !values_of(&tx, RuleVariable::ArgsPost).is_empty()
+        })
+    };
+    let (needs_both, needs_one) = (smallest(&changed), smallest(&unchanged));
+    assert!(
+        needs_both >= needs_one + 2 * 1_000,
+        "two values need {needs_both} bytes, one {needs_one}"
+    );
+
+    // A part that does not fit adds neither value, and a budget that covers it adds both.
+    let mut tx = request(&waf, content_type, Some(needs_both - 1));
+    tx.process_request_body(changed.as_bytes());
+    assert!(values_of(&tx, RuleVariable::ArgsPost).is_empty());
+    let mut tx = request(&waf, content_type, Some(needs_both));
+    tx.process_request_body(changed.as_bytes());
+    let post = values_of(&tx, RuleVariable::ArgsPost);
+    assert_eq!(post.len(), 2);
+    assert_eq!(post.first().map(|(_, value)| value.len()), Some(1_000));
+    assert_eq!(post.get(1).map(|(_, value)| value.len()), Some(3_000));
+    assert_eq!(values_of(&tx, RuleVariable::Args), post);
+}
+
+#[test]
 fn a_response_body_stops_at_the_budget_and_reports_through_the_response_variables() {
     let waf = waf("");
     let leaves: Vec<String> = (0..2_000).map(|index| format!("\"k{index}\":\"v{index}\"")).collect();

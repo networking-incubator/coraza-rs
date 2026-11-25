@@ -4308,9 +4308,10 @@ payload\r\n\
                 "Content-Disposition: form-data; name=\"upload\"; filename=\"legacy.txt\"; filename*=UTF-8'en'payload.txt"
             )
         );
+        // The field `message` (`hello`, 5 bytes) counts as Go counts it, with the file's 7.
         assert_eq!(
             tx.get_variable(RuleVariable::FilesCombinedSize, None).as_deref(),
-            Some("7")
+            Some("12")
         );
         assert_eq!(
             tx.get_variable(RuleVariable::MultipartStrictError, None).as_deref(),
