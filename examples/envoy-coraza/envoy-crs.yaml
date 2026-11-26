@@ -113,6 +113,7 @@ static_resources:
                                     "SecResponseBodyAccess Off",
                                     "SecRule RESPONSE_HEADERS:x-deny-response \"@streq yes\" \"id:105,phase:4,deny,status:502\""
                                   ],
+                                  "engine-off": ["SecRuleEngine Off"],
                                   "recommended": [
                                     "Include @recommended-conf",
                                     "SecRuleEngine On",
@@ -152,7 +153,7 @@ static_resources:
                                 },
                                 "default_directives": "main",
                                 "enable_filter_state_logs": true,
-                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "recommended.local": "recommended", "redir.local": "redirect", "p4.local": "phase4", "crs.local": "crs", "crs2.local": "crs-pl2"}
+                                "per_authority_directives": {"reject.local": "reject", "off.local": "response-off", "engineoff.local": "engine-off", "recommended.local": "recommended", "redir.local": "redirect", "p4.local": "phase4", "crs.local": "crs", "crs2.local": "crs-pl2"}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

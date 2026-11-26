@@ -16,7 +16,7 @@
 //!
 //! `cargo test` links this `cdylib` crate into a native lib-test harness, but the Proxy-Wasm
 //! SDK declares its hostcalls as `extern "C"` imports that only a Proxy-Wasm host provides.
-//! These `#[no_mangle]` definitions satisfy the native linker with stubs that report
+//! These `#[no_mangle]` definitions satisfy the native linker with stubs that default to
 //! `Status::NotFound`, the same checked failure the previous out-of-repo
 //! `/tmp/envoy-coraza-test-hostcalls.o` shim returned, so no test fabricates host data.
 //! The signatures mirror the SDK's `extern "C"` blocks exactly; the WASM build is
@@ -28,13 +28,14 @@
 //! ([`set_plugin_configuration`]), the request header and trailer maps and the response header map
 //! ([`set_request_headers`], [`set_request_trailers`], [`set_response_headers`]), the request and response body buffers
 //! ([`set_request_body`], [`set_response_body`]), a property value or failure ([`set_property`], [`fail_property`]),
-//! and what the filter did: log calls it attempted ([`log_messages`]), local replies it sent ([`local_replies`],
-//! [`local_reply_statuses`]) and filter-state properties it published ([`published_property`]). Each test runs on its
-//! own thread, so the scripted state is isolated; call [`reset`] to clear it explicitly. A local reply is recorded and
-//! then refused with `Status::NotFound`, so every test also covers a host that cannot send it. The filter answers a
-//! response it refuses with a local reply and never rewrites one in place: replacing the response body, headers or
-//! trailers is recorded, and the test fails on the next read of any recorded output (a stub cannot panic, since it is
-//! `extern "C"`). Everything else stays a fixed stub that reports `Status::NotFound`.
+//! property-write success ([`set_property_success`]), and what the filter did: log calls it attempted
+//! ([`log_messages`]), local replies it sent ([`local_replies`], [`local_reply_statuses`]) and filter-state properties
+//! it published ([`published_property`]). Each test runs on its own thread, so the scripted state is isolated; call
+//! [`reset`] to clear it explicitly. A local reply is recorded and then refused with `Status::NotFound`, so every test
+//! also covers a host that cannot send it. The filter answers a response it refuses with a local reply and never
+//! rewrites one in place: replacing the response body, headers or trailers is recorded, and the test fails on the next
+//! read of any recorded output (a stub cannot panic, since it is `extern "C"`). Property writes and all other
+//! hostcalls default to `Status::NotFound`.
 
 // no_mangle is an attribute-level escape from the crate's unsafe-code guard. The scripted
 // host also needs unsafe blocks to read and write the SDK's FFI pointers; each carries its
@@ -64,6 +65,8 @@ struct Host {
     response_body: Option<Vec<u8>>,
     /// Filter-state properties the filter published, by dotted path.
     published: BTreeMap<String, String>,
+    /// Whether property publication succeeds; disabled by default to exercise telemetry failures.
+    property_write_succeeds: bool,
     /// Dotted property path to its scripted value or failure status.
     properties: BTreeMap<String, Result<Vec<u8>, Status>>,
     /// The local replies the filter sent, in order.
@@ -97,6 +100,7 @@ thread_local! {
             response_headers: None,
             response_body: None,
             published: BTreeMap::new(),
+            property_write_succeeds: false,
             properties: BTreeMap::new(),
             local_replies: Vec::new(),
             response_rewrites: Vec::new(),
@@ -116,12 +120,18 @@ pub(crate) fn reset() {
         host.response_headers = None;
         host.response_body = None;
         host.published.clear();
+        host.property_write_succeeds = false;
         host.properties.clear();
         host.local_replies.clear();
         host.response_rewrites.clear();
         host.logs.clear();
         host.malformed_maps = 0;
     });
+}
+
+/// Makes `proxy_set_property` report success while continuing to capture published values.
+pub(crate) fn set_property_success(success: bool) {
+    HOST.with_borrow_mut(|host| host.property_write_succeeds = success);
 }
 
 /// Scripts the plugin configuration buffer, or its absence with `None`.
@@ -429,7 +439,7 @@ extern "C" fn proxy_set_property(
     value_data: *const u8,
     value_size: usize,
 ) -> Status {
-    // Published values are remembered for the tests to read, and the host still reports the property missing.
+    // Capture values for assertions regardless of the scripted property-write status.
     if path_size > 0 && value_size > 0 {
         // SAFETY: the SDK passes the serialized path and the value it owns for the duration of the call.
         let (path, value) = unsafe {
@@ -442,7 +452,13 @@ extern "C" fn proxy_set_property(
         let value = String::from_utf8_lossy(value).into_owned();
         HOST.with_borrow_mut(|host| host.published.insert(path, value));
     }
-    Status::NotFound
+    HOST.with_borrow(|host| {
+        if host.property_write_succeeds {
+            Status::Ok
+        } else {
+            Status::NotFound
+        }
+    })
 }
 
 #[cfg(test)]

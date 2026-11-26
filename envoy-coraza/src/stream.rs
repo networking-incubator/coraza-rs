@@ -93,7 +93,7 @@ pub(crate) enum TerminalOutcome {
     Unsupported(&'static str),
     /// A WAF rule interrupted a request or response.
     Denied { phase: &'static str, status: u16 },
-    /// An incomplete body was rejected.
+    /// The request or response could not be fully inspected.
     Incomplete { phase: &'static str, status: u16 },
     /// A host or policy body ceiling was reached.
     BodyTooLarge { phase: &'static str, status: u16 },
@@ -130,6 +130,25 @@ impl TerminalOutcome {
             Self::InvalidAuthority { .. } => "invalid_authority",
             Self::UpstreamFailureOrCancellation => "upstream_failure_or_cancellation",
             Self::Completed => "complete",
+        }
+    }
+
+    fn decision_phase(&self) -> &'static str {
+        match self {
+            Self::Unsupported("response-upgrade" | "response-content-encoding") => "response-headers",
+            Self::UnmatchedAuthority
+            | Self::UnmatchedAuthorityRefused
+            | Self::EngineOff
+            | Self::InvalidAuthority { .. }
+            | Self::Unsupported(_) => "request-headers",
+            Self::Denied { phase, .. }
+            | Self::Incomplete { phase, .. }
+            | Self::BodyTooLarge { phase, .. }
+            | Self::BodyPartiallyInspected { phase }
+            | Self::BodyMemoryBudgetStopped { phase }
+            | Self::RetainedBodyBudgetExhausted { phase }
+            | Self::InvalidLifecycle { phase, .. } => phase,
+            Self::UpstreamFailureOrCancellation | Self::Completed => "none",
         }
     }
 
@@ -428,15 +447,92 @@ impl CorazaHttp {
         }
     }
 
-    fn record_interruption(&mut self, interruption: &Interruption, phase: InterruptionPhase) {
+    fn log_connector_decision(&mut self, refused: bool, outcome: &TerminalOutcome, status: u16) {
+        if matches!(outcome, TerminalOutcome::Denied { .. }) {
+            return;
+        }
+        let hint = match outcome {
+            TerminalOutcome::Incomplete {
+                phase: "request-client-address",
+                ..
+            } => Some("set_missing_client_address_allow"),
+            TerminalOutcome::UnmatchedAuthorityRefused => Some("set_unmatched_authority_allow"),
+            _ => None,
+        };
+        let first_of_kind = self.generation.as_ref().is_some_and(|generation| match outcome {
+            TerminalOutcome::Incomplete {
+                phase: "request-client-address",
+                ..
+            } => generation.first_missing_client_address_request(),
+            TerminalOutcome::UnmatchedAuthority | TerminalOutcome::UnmatchedAuthorityRefused => {
+                generation.first_unmatched_request()
+            },
+            _ => false,
+        });
+        self.emit_connector_decision(observability::ConnectorDecision {
+            refused,
+            outcome: outcome.inspection_reason(),
+            phase: outcome.decision_phase(),
+            status,
+            hint,
+            first_of_kind,
+        });
+    }
+
+    fn emit_connector_decision(&mut self, decision: observability::ConnectorDecision) {
+        let failed = self
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.diagnostics().connector_decision(decision));
+        self.telemetry_publish_failed |= failed;
+    }
+
+    fn request_body_was_uninspected(&self, final_outcome: &TerminalOutcome) -> bool {
+        self.request_body_failed
+            || match self.unread_request_body {
+                UnreadRequestBody::Passed => true,
+                UnreadRequestBody::Pending => final_outcome == &TerminalOutcome::Completed,
+                UnreadRequestBody::Absent => false,
+            }
+    }
+
+    fn log_passed_terminal(&mut self) {
+        if self.request_mode == RequestMode::Replied || self.response_mode == ResponseMode::Refused {
+            return;
+        }
+        if self
+            .final_outcome
+            .as_ref()
+            .is_some_and(|outcome| self.request_body_was_uninspected(outcome))
+        {
+            self.emit_connector_decision(observability::ConnectorDecision {
+                refused: false,
+                outcome: "request_body_not_inspected",
+                phase: "request-body",
+                status: 0,
+                hint: None,
+                first_of_kind: false,
+            });
+            return;
+        }
+        let outcome = match self.outcome.as_ref() {
+            Some(
+                outcome @ (TerminalOutcome::UnmatchedAuthority
+                | TerminalOutcome::EngineOff
+                | TerminalOutcome::BodyPartiallyInspected { .. }),
+            ) => Some(outcome.clone()),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            self.log_connector_decision(false, &outcome, 0);
+        }
+    }
+
+    fn record_interruption(&mut self, interruption: &Interruption, phase: InterruptionPhase, status: u16) {
         if let (Some(generation), Some(transaction)) = (self.generation.as_deref(), self.tx.as_deref()) {
-            if observability::interruption(
-                generation.enable_filter_state_logs(),
-                transaction,
-                interruption,
-                phase,
-                generation.diagnostics(),
-            ) {
+            if generation.enable_filter_state_logs()
+                && observability::interruption(transaction, interruption, phase, status, generation.diagnostics())
+            {
                 self.telemetry_publish_failed = true;
             }
         }
@@ -573,7 +669,6 @@ impl CorazaHttp {
             Ok(prepared) => prepared,
             Err(ConnectionMetadataError::Property(error)) => return self.reject_property_hostcall(&error),
             Err(ConnectionMetadataError::MissingClientAddress) => {
-                log_missing_client_address(generation);
                 return self.reject_request(
                     503,
                     REQUEST_INCOMPLETE_BODY,
@@ -592,6 +687,7 @@ impl CorazaHttp {
             self.lifecycle.bypass_request();
             self.request_mode = RequestMode::Uninspected;
             self.outcome = Some(TerminalOutcome::EngineOff);
+            self.finish_once(TerminalOutcome::EngineOff);
             return Action::Continue;
         }
         if metadata.method.eq_ignore_ascii_case("CONNECT") || has_upgrade(headers) {
@@ -615,28 +711,12 @@ impl CorazaHttp {
     /// allows that or has no policies.
     fn unmatched_authority(&mut self, generation: &Generation) -> Action {
         if generation.refuses_unmatched() {
-            if generation.first_unmatched_request() {
-                log_warn(
-                    "envoy-coraza: no authority policy matched; request refused with 421 (set \
-                     \"unmatched_authority\": \"allow\" to pass such requests uninspected; further such requests in \
-                     this configuration generation are logged at debug level)",
-                );
-            } else {
-                log_debug("envoy-coraza: no authority policy matched; request refused with 421");
-            }
             return self.reject_request(421, REQUEST_INCOMPLETE_BODY, TerminalOutcome::UnmatchedAuthorityRefused);
         }
         self.lifecycle.bypass_request();
         self.request_mode = RequestMode::Uninspected;
         self.outcome = Some(TerminalOutcome::UnmatchedAuthority);
-        if generation.first_unmatched_request() {
-            log_warn(
-                "envoy-coraza: no authority policy matched; request passed uninspected \
-                 (further such requests in this configuration generation are logged at debug level)",
-            );
-        } else {
-            log_debug("envoy-coraza: no authority policy matched; request passed uninspected");
-        }
+        self.finish_once(TerminalOutcome::UnmatchedAuthority);
         Action::Continue
     }
 
@@ -1361,13 +1441,14 @@ impl CorazaHttp {
     ) -> Action {
         let (status, location) = interruption_reply(interruption);
         self.request_mode = RequestMode::Replied;
-        self.record_interruption(interruption, state_phase);
+        self.record_interruption(interruption, state_phase, status);
         self.finish_once(TerminalOutcome::Denied { phase, status });
         self.send_refusal(status, location, REQUEST_BLOCK_BODY)
     }
 
     fn reject_request(&mut self, status: u16, body: &[u8], outcome: TerminalOutcome) -> Action {
         self.request_mode = RequestMode::Replied;
+        self.log_connector_decision(true, &outcome, status);
         self.finish_once(outcome);
         self.send_refusal(status, None, body)
     }
@@ -1402,6 +1483,7 @@ impl CorazaHttp {
         outcome: TerminalOutcome,
     ) -> Action {
         self.response_mode = ResponseMode::Refused;
+        self.log_connector_decision(true, &outcome, status);
         self.finish_once(outcome);
         self.send_refusal(status, location, body)
     }
@@ -1423,7 +1505,7 @@ impl CorazaHttp {
         state_phase: InterruptionPhase,
     ) -> Action {
         let (status, location) = interruption_reply(interruption);
-        self.record_interruption(interruption, state_phase);
+        self.record_interruption(interruption, state_phase, status);
         self.refuse_response(
             status,
             location,
@@ -1452,6 +1534,7 @@ impl CorazaHttp {
             log_error("envoy-coraza: transaction finalization failed");
         }
         self.mark_diagnostic_change(diagnostics_before);
+        self.log_passed_terminal();
         self.publish_terminal();
     }
 
@@ -1464,12 +1547,7 @@ impl CorazaHttp {
         // conservatively. One that had not come yet can still be released only after a response that completed: a
         // refusal's local reply ends the stream, and the filter holds whatever of the request still arrives after it.
         // A body a processor failed on, which no rule denied, is reported as not inspected too.
-        let request_body_unread = self.request_body_failed
-            || match self.unread_request_body {
-                UnreadRequestBody::Passed => true,
-                UnreadRequestBody::Pending => final_outcome == TerminalOutcome::Completed,
-                UnreadRequestBody::Absent => false,
-            };
+        let request_body_unread = self.request_body_was_uninspected(&final_outcome);
         let inspection_complete = matches!(
             final_outcome,
             TerminalOutcome::Completed | TerminalOutcome::Denied { .. }
@@ -1489,7 +1567,6 @@ impl CorazaHttp {
             final_outcome.terminal_name()
         };
         if observability::health(
-            generation.enable_filter_state_logs(),
             HealthState {
                 inspection_complete,
                 inspection_reason: reason,
@@ -1592,6 +1669,11 @@ impl CorazaHttp {
 
     fn incomplete_outcome(&self) -> TerminalOutcome {
         match (self.lifecycle.request, self.lifecycle.response) {
+            // No status was observed by this context and it sent no local reply.
+            (RequestStage::New, ResponseStage::Waiting) => TerminalOutcome::Incomplete {
+                phase: "request-not-started",
+                status: 0,
+            },
             (RequestStage::Headers | RequestStage::Body, _) => TerminalOutcome::Incomplete {
                 phase: "request-body-aborted",
                 status: 503,
@@ -2034,28 +2116,8 @@ fn valid_status(status: u16) -> u16 {
     }
 }
 
-fn log_missing_client_address(generation: &Generation) {
-    if generation.first_missing_client_address_request() {
-        log_warn(
-            "envoy-coraza: source.address is missing or is not an IP address; request refused with 503 \
-             (set \"missing_client_address\": \"allow\" for listeners without an IP peer; further such \
-             requests in this configuration generation are logged at debug level)",
-        );
-    } else {
-        log_debug("envoy-coraza: source.address is missing or is not an IP address; request refused with 503");
-    }
-}
-
 fn log_error(message: &str) {
     hostcalls::log(LogLevel::Error, message).unwrap_or_default();
-}
-
-fn log_warn(message: &str) {
-    hostcalls::log(LogLevel::Warn, message).unwrap_or_default();
-}
-
-fn log_debug(message: &str) {
-    hostcalls::log(LogLevel::Debug, message).unwrap_or_default();
 }
 
 #[cfg(test)]
@@ -2849,14 +2911,14 @@ mod scripted_host_tests {
     use std::{cell::Cell, rc::Rc};
 
     use proxy_wasm::{
-        traits::HttpContext as _,
-        types::{Action, LogLevel, Status},
+        traits::{Context as _, HttpContext as _},
+        types::{Action, Status},
     };
 
     use super::{
-        CorazaHttp, Interruption, InterruptionPhase, TerminalOutcome, MAX_HEADER_COUNT, MAX_REQUEST_BODY_BYTES,
-        MAX_RESPONSE_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES, REQUEST_BLOCK_BODY, RESPONSE_BLOCK_BODY,
-        RESPONSE_INCOMPLETE_BODY, UNSUPPORTED_BODY,
+        CorazaHttp, Interruption, InterruptionPhase, RequestStage, ResponseStage, TerminalOutcome, MAX_HEADER_COUNT,
+        MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BODY_BYTES, MAX_ROOT_RETAINED_BODY_BYTES, REQUEST_BLOCK_BODY,
+        RESPONSE_BLOCK_BODY, RESPONSE_INCOMPLETE_BODY, UNSUPPORTED_BODY,
     };
     use crate::{config::Config, policy::Generation, test_hostcalls};
 
@@ -2899,6 +2961,53 @@ mod scripted_host_tests {
         test_hostcalls::set_property("source.port", &5555_u64.to_le_bytes());
         test_hostcalls::set_property("destination.address", b"10.0.0.1:8080");
         test_hostcalls::set_property("destination.port", &8080_u64.to_le_bytes());
+    }
+
+    /// Scripts a request rejected for its content encoding and returns its warning lines.
+    fn content_encoding_warnings(generation: &Rc<Generation>, root: &Rc<Cell<usize>>, authority: &str) -> Vec<String> {
+        let mut stream = CorazaHttp::new(Some(Rc::clone(generation)), Rc::clone(root));
+        let count = script_request(authority, "http");
+        test_hostcalls::set_request_headers(&[
+            (":authority", authority.as_bytes()),
+            (":scheme", b"http"),
+            (":method", b"GET"),
+            (":path", b"/secret"),
+            ("content-encoding", b"gzip"),
+        ]);
+
+        assert_eq!(stream.on_http_request_headers(count + 1, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [415]);
+        warning_messages()
+    }
+
+    /// The warning-level log calls from the last scripted request.
+    fn warning_messages() -> Vec<String> {
+        test_hostcalls::log_messages()
+            .into_iter()
+            .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// Scripts a known-host request rejected for its missing client address.
+    fn missing_client_address_warnings(generation: &Rc<Generation>, root: &Rc<Cell<usize>>) -> Vec<String> {
+        let mut stream = CorazaHttp::new(Some(Rc::clone(generation)), Rc::clone(root));
+        let count = script_request("known.example", "http");
+        test_hostcalls::remove_property("source.address");
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [503]);
+        warning_messages()
+    }
+
+    /// Scripts a request for an authority with no policy.
+    fn unmatched_authority_warnings(generation: &Rc<Generation>, root: &Rc<Cell<usize>>) -> Vec<String> {
+        let mut stream = CorazaHttp::new(Some(Rc::clone(generation)), Rc::clone(root));
+        let count = script_request("request-secret.example", "http");
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [421]);
+        warning_messages()
     }
 
     /// The policy an `authority` request over `scheme` selects.
@@ -3247,34 +3356,21 @@ mod scripted_host_tests {
     }
 
     #[test]
-    fn missing_client_address_refusal_logs_once_per_generation_without_request_data() {
+    fn connector_rejection_diagnostics_are_rate_limited_and_do_not_include_request_data() {
         let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p"}"#;
         let generation = Rc::new(
             Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
                 .expect("policy compiles"),
         );
         let root = Rc::new(Cell::new(0));
-        for (source_address, level, expected) in [
-            (
-                None,
-                LogLevel::Warn,
-                "envoy-coraza: source.address is missing or is not an IP address; request refused with 503 (set \
-                 \"missing_client_address\": \"allow\" for listeners without an IP peer; further such requests in \
-                 this configuration generation are logged at debug level)",
-            ),
-            (
-                Some(&b"unix:/private/request.sock"[..]),
-                LogLevel::Debug,
-                "envoy-coraza: source.address is missing or is not an IP address; request refused with 503",
-            ),
-        ] {
+        let mut warnings = Vec::new();
+        for _ in 0..2 {
+            warnings.extend(content_encoding_warnings(&generation, &root, "request-secret.example"));
+        }
+        for _ in 0..6 {
             let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
             let count = script_request("request-secret.example", "http");
-            if let Some(source_address) = source_address {
-                test_hostcalls::set_property("source.address", source_address);
-            } else {
-                test_hostcalls::remove_property("source.address");
-            }
+            test_hostcalls::remove_property("source.address");
 
             assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
             assert_eq!(
@@ -3283,20 +3379,418 @@ mod scripted_host_tests {
                 "the log hostcall fails in this test host, but the request remains refused"
             );
             let logs = test_hostcalls::log_messages();
-            let diagnostics = logs
-                .iter()
-                .filter(|(_, message)| message.starts_with("envoy-coraza: source.address"))
-                .collect::<Vec<_>>();
-            assert_eq!(diagnostics.len(), 1);
-            let diagnostic = diagnostics.first().expect("one address-refusal diagnostic");
-            assert_eq!(diagnostic.0, level);
-            assert_eq!(diagnostic.1, expected);
-            for (_, message) in &logs {
+            warnings.extend(
+                logs.iter()
+                    .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                    .map(|(_, message)| message.clone()),
+            );
+            for (_, message) in logs {
                 assert!(!message.contains("request-secret.example"));
-                assert!(!message.contains("request.sock"));
                 assert!(!message.contains("1.2.3.4"));
             }
         }
+        assert_eq!(
+            warnings,
+            [
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=2)",
+                "envoy-coraza: refused (outcome=incomplete phase=request-client-address status=503 count=3 \
+                 hint=set_missing_client_address_allow)",
+                "envoy-coraza: refused (outcome=incomplete phase=request-client-address status=503 count=4 \
+                 hint=set_missing_client_address_allow)",
+                "envoy-coraza: refused (outcome=incomplete phase=request-client-address status=503 count=8 \
+                 hint=set_missing_client_address_allow)",
+            ],
+            "the first actionable warning survives unrelated decisions and later warnings stay sampled"
+        );
+        assert!(
+            warnings.iter().all(|message| {
+                !message.contains("request-secret.example")
+                    && !message.contains("/secret")
+                    && !message.contains("1.2.3.4")
+            }),
+            "decision warnings contain no request data"
+        );
+    }
+
+    #[test]
+    fn a_new_generation_rearms_first_kind_warnings_independently() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]},
+            "per_authority_directives": {"known.example": "p"}}"#;
+        let generation = || {
+            Rc::new(
+                Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                    .expect("policy compiles"),
+            )
+        };
+        let old_generation = generation();
+        let root = Rc::new(Cell::new(0));
+        let mut old_warnings = Vec::new();
+
+        old_warnings.extend(content_encoding_warnings(&old_generation, &root, "known.example"));
+        old_warnings.extend(content_encoding_warnings(&old_generation, &root, "known.example"));
+        old_warnings.extend(unmatched_authority_warnings(&old_generation, &root));
+        old_warnings.extend(content_encoding_warnings(&old_generation, &root, "known.example"));
+        old_warnings.extend(missing_client_address_warnings(&old_generation, &root));
+        assert!(
+            unmatched_authority_warnings(&old_generation, &root).is_empty(),
+            "the old generation has already logged its first unmatched-authority decision"
+        );
+        assert!(
+            missing_client_address_warnings(&old_generation, &root).is_empty(),
+            "the old generation has already logged its first missing-address rejection"
+        );
+        assert_eq!(
+            old_warnings,
+            [
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=2)",
+                "envoy-coraza: refused (outcome=unmatched_authority phase=request-headers status=421 count=3 \
+                 hint=set_unmatched_authority_allow)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=4)",
+                "envoy-coraza: refused (outcome=incomplete phase=request-client-address status=503 count=5 \
+                 hint=set_missing_client_address_allow)",
+            ],
+            "the old generation logs first-of-kind warnings and then stays sampled"
+        );
+
+        let new_generation = generation();
+        let mut new_warnings = Vec::new();
+        new_warnings.extend(content_encoding_warnings(&new_generation, &root, "known.example"));
+        new_warnings.extend(content_encoding_warnings(&new_generation, &root, "known.example"));
+        new_warnings.extend(unmatched_authority_warnings(&new_generation, &root));
+        new_warnings.extend(content_encoding_warnings(&new_generation, &root, "known.example"));
+        new_warnings.extend(missing_client_address_warnings(&new_generation, &root));
+        assert!(
+            unmatched_authority_warnings(&new_generation, &root).is_empty(),
+            "the new generation logs unmatched authority only once between samples"
+        );
+        assert!(
+            missing_client_address_warnings(&new_generation, &root).is_empty(),
+            "the new generation logs missing address only once between samples"
+        );
+        assert_eq!(
+            new_warnings, old_warnings,
+            "both independent first-of-kind warnings re-arm in a new generation, at non-power-of-two counts"
+        );
+        assert!(
+            new_warnings
+                .iter()
+                .all(|message| !message.contains("request-secret.example")),
+            "decision warnings contain no request data"
+        );
+    }
+
+    #[test]
+    fn request_content_encoding_rejection_logs_actual_status_at_powers_of_two() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess On"]},
+            "default_directives": "p"}"#;
+        let generation = Rc::new(
+            Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                .expect("policy compiles"),
+        );
+        let root = Rc::new(Cell::new(0));
+        let mut warnings = Vec::new();
+        for _ in 0..4 {
+            let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let count = script_request("request-secret.example", "http");
+            test_hostcalls::set_request_headers(&[
+                (":authority", b"request-secret.example"),
+                (":scheme", b"http"),
+                (":method", b"GET"),
+                (":path", b"/secret"),
+                ("content-encoding", b"gzip"),
+            ]);
+
+            assert_eq!(stream.on_http_request_headers(count + 1, true), Action::Pause);
+            assert_eq!(test_hostcalls::local_reply_statuses(), [415]);
+            warnings.extend(
+                test_hostcalls::log_messages()
+                    .into_iter()
+                    .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                    .map(|(_, message)| message),
+            );
+        }
+        assert_eq!(
+            warnings,
+            [
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=2)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=4)",
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|message| !message.contains("request-secret.example") && !message.contains("/secret")),
+            "the decision log contains no request data"
+        );
+    }
+
+    #[test]
+    fn response_refusal_logs_the_local_reply_status_without_request_data() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecResponseBodyAccess On",
+            "SecResponseBodyMimeType text/plain"]}, "default_directives": "p"}"#;
+        let mut stream = stream(config);
+        let count = script_request("request-secret.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        test_hostcalls::set_response_headers(&[
+            (":status", b"200"),
+            ("content-type", b"text/plain"),
+            ("content-encoding", b"gzip"),
+        ]);
+
+        assert_eq!(stream.on_http_response_headers(3, false), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [502]);
+        let warnings = test_hostcalls::log_messages()
+            .into_iter()
+            .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+            .map(|(_, message)| message)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            ["envoy-coraza: refused (outcome=unsupported phase=response-headers status=502 count=1)"]
+        );
+        assert!(
+            !warnings
+                .first()
+                .expect("one warning")
+                .contains("request-secret.example"),
+            "the decision log contains no request data"
+        );
+    }
+
+    #[test]
+    fn policy_rule_denials_keep_log_policy_and_do_not_dilute_connector_decisions() {
+        let config = r#"{
+            "directives_map": {
+                "guard": ["SecRuleEngine On", "SecRequestBodyAccess On"],
+                "request-log": ["SecRuleEngine On",
+                    "SecRule REQUEST_URI \"@streq /\" \"id:201,phase:1,deny,status:413,log,msg:'request-log'\""],
+                "request-nolog": ["SecRuleEngine On",
+                    "SecRule REQUEST_URI \"@streq /\" \"id:202,phase:1,deny,status:413,nolog,msg:'request-nolog'\""],
+                "response-log": ["SecRuleEngine On",
+                    "SecRule RESPONSE_STATUS \"@streq 200\" \"id:203,phase:3,deny,status:502,log,msg:'response-log'\""],
+                "response-nolog": ["SecRuleEngine On",
+                    "SecRule RESPONSE_STATUS \"@streq 200\" \"id:204,phase:3,deny,status:502,nolog,msg:'response-nolog'\""]
+            },
+            "default_directives": "guard",
+            "per_authority_directives": {
+                "request-log.example": "request-log",
+                "request-nolog.example": "request-nolog",
+                "response-log.example": "response-log",
+                "response-nolog.example": "response-nolog"
+            }
+        }"#;
+        let generation = Rc::new(
+            Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                .expect("policies compile"),
+        );
+        let root = Rc::new(Cell::new(0));
+
+        for (authority, response, status, logged) in [
+            ("request-log.example", false, 413, true),
+            ("request-nolog.example", false, 413, false),
+            ("response-log.example", true, 502, true),
+            ("response-nolog.example", true, 502, false),
+        ] {
+            let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let count = script_request(authority, "http");
+            if response {
+                assert_eq!(
+                    stream.on_http_request_headers(count, true),
+                    Action::Continue,
+                    "{authority}"
+                );
+                test_hostcalls::set_response_headers(&[(":status", b"200")]);
+                assert_eq!(stream.on_http_response_headers(1, true), Action::Pause, "{authority}");
+            } else {
+                assert_eq!(
+                    stream.on_http_request_headers(count, true),
+                    Action::Pause,
+                    "{authority}"
+                );
+            }
+            assert_eq!(test_hostcalls::local_reply_statuses(), [status], "{authority}");
+
+            let warnings = test_hostcalls::log_messages()
+                .into_iter()
+                .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>();
+            assert!(
+                warnings
+                    .iter()
+                    .all(|message| !message.starts_with("envoy-coraza: refused (")),
+                "{authority}: policy denial is not a connector decision: {warnings:?}"
+            );
+            assert_eq!(
+                !warnings.is_empty(),
+                logged,
+                "{authority}: the rule's log/nolog action still controls rule logs"
+            );
+        }
+
+        assert_eq!(
+            content_encoding_warnings(&generation, &root, "guard.example"),
+            ["envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)"],
+            "policy-rule denials do not consume the connector decision sample"
+        );
+    }
+
+    #[test]
+    fn unmatched_authority_passes_publish_early_and_log_at_powers_of_two() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]},
+            "per_authority_directives": {"known.example": "p"}, "unmatched_authority": "allow"}"#;
+        let generation = Rc::new(
+            Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                .expect("policy compiles"),
+        );
+        let root = Rc::new(Cell::new(0));
+        let mut warnings = Vec::new();
+        warnings.extend(content_encoding_warnings(&generation, &root, "known.example"));
+        warnings.extend(content_encoding_warnings(&generation, &root, "known.example"));
+        for _ in 0..6 {
+            let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let count = script_request("request-secret.example", "http");
+
+            assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+            assert!(
+                stream.lifecycle.finalized,
+                "the bypass is finalized before the callback returns"
+            );
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+                Some("unmatched_authority")
+            );
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome").as_deref(),
+                Some("uninspected")
+            );
+            warnings.extend(
+                test_hostcalls::log_messages()
+                    .into_iter()
+                    .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                    .map(|(_, message)| message),
+            );
+        }
+        assert_eq!(
+            warnings,
+            [
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=2)",
+                "envoy-coraza: passed (outcome=unmatched_authority phase=request-headers status=0 count=3)",
+                "envoy-coraza: passed (outcome=unmatched_authority phase=request-headers status=0 count=4)",
+                "envoy-coraza: passed (outcome=unmatched_authority phase=request-headers status=0 count=8)",
+            ]
+        );
+        assert!(
+            warnings.iter().all(|message| {
+                !message.contains("request-secret.example")
+                    && !message.contains("known.example")
+                    && !message.contains("/secret")
+            }),
+            "the decision log contains no request data"
+        );
+    }
+
+    #[test]
+    fn unmatched_authority_refusal_uses_one_rate_limited_decision_warning() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]},
+            "per_authority_directives": {"known.example": "p"}}"#;
+        let generation = Rc::new(
+            Generation::compile(Config::parse(config.as_bytes()).expect("configuration parses"))
+                .expect("policy compiles"),
+        );
+        let root = Rc::new(Cell::new(0));
+        let mut warnings = Vec::new();
+        warnings.extend(content_encoding_warnings(&generation, &root, "known.example"));
+        warnings.extend(content_encoding_warnings(&generation, &root, "known.example"));
+        for _ in 0..6 {
+            let mut stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let count = script_request("request-secret.example", "http");
+
+            assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+            assert_eq!(test_hostcalls::local_reply_statuses(), [421]);
+            warnings.extend(
+                test_hostcalls::log_messages()
+                    .into_iter()
+                    .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                    .map(|(_, message)| message),
+            );
+        }
+        assert_eq!(
+            warnings,
+            [
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=1)",
+                "envoy-coraza: refused (outcome=unsupported phase=request-headers status=415 count=2)",
+                "envoy-coraza: refused (outcome=unmatched_authority phase=request-headers status=421 count=3 \
+                 hint=set_unmatched_authority_allow)",
+                "envoy-coraza: refused (outcome=unmatched_authority phase=request-headers status=421 count=4 \
+                 hint=set_unmatched_authority_allow)",
+                "envoy-coraza: refused (outcome=unmatched_authority phase=request-headers status=421 count=8 \
+                 hint=set_unmatched_authority_allow)",
+            ]
+        );
+        assert!(
+            warnings.iter().all(|message| {
+                !message.contains("request-secret.example")
+                    && !message.contains("known.example")
+                    && !message.contains("/secret")
+            }),
+            "the decision log contains no request data"
+        );
+    }
+
+    #[test]
+    fn engine_off_publishes_and_logs_before_the_request_callback_returns() {
+        let mut engine_off = stream(r#"{"directives_map": {"p": ["SecRuleEngine Off"]}, "default_directives": "p"}"#);
+        let count = script_request("a.example", "http");
+
+        assert_eq!(engine_off.on_http_request_headers(count, false), Action::Continue);
+        assert!(engine_off.lifecycle.finalized);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
+            Some("engine_off")
+        );
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome").as_deref(),
+            Some("uninspected")
+        );
+        assert_eq!(
+            test_hostcalls::log_messages()
+                .into_iter()
+                .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>(),
+            ["envoy-coraza: passed (outcome=engine_off phase=request-headers status=0 count=1)"]
+        );
+        assert_eq!(
+            engine_off.on_http_request_body(3, true),
+            Action::Continue,
+            "the early finalization preserves the bypassed request mode"
+        );
+        assert_eq!(engine_off.on_http_response_headers(0, true), Action::Continue);
+    }
+
+    #[test]
+    fn a_failed_connector_log_sets_the_published_telemetry_flag_without_property_failures() {
+        let mut stream = stream(r#"{"directives_map": {"p": ["SecRuleEngine Off"]}, "default_directives": "p"}"#);
+        let count = script_request("a.example", "http");
+        test_hostcalls::set_property_success(true);
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        assert!(stream.telemetry_publish_failed);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.telemetry_publish_failed").as_deref(),
+            Some("true"),
+            "the failed decision log sets the published flag while property writes succeed"
+        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=engine_off phase=request-headers status=0 count=1)"]
+        );
     }
 
     #[test]
@@ -3785,6 +4279,19 @@ mod scripted_host_tests {
             Some(TerminalOutcome::BodyMemoryBudgetStopped { phase: "request-body" }),
             "{content_type}"
         );
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: refused (outcome=body_memory_budget_stopped phase=request-body status=503 count=1)"],
+            "{content_type}: one connector decision reports the stopped body and actual reply status"
+        );
+        let logs = test_hostcalls::log_messages();
+        assert!(stream.on_done());
+        drop(stream);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "{content_type}: on_done and Drop do not emit the decision again"
+        );
     }
 
     /// Runs the request body of `stream`, whose headers wait for it, through the engine as `on_http_request_body`
@@ -3817,6 +4324,19 @@ mod scripted_host_tests {
             Some(TerminalOutcome::RetainedBodyBudgetExhausted { phase: "request-body" })
         );
         assert_eq!(root.get(), others);
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: refused (outcome=retained_body_budget_exhausted phase=request-body status=503 count=1)"],
+            "one connector decision reports the retained-body refusal and actual reply status"
+        );
+        let logs = test_hostcalls::log_messages();
+        assert!(stream.on_done());
+        drop(stream);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "on_done and Drop do not emit the decision again"
+        );
 
         // The same bytes with a processor that keeps no copy go to the engine, with nothing to parse in.
         let (mut stream, _) = stream_beside(&probe_policy, others);
@@ -3891,6 +4411,19 @@ mod scripted_host_tests {
         assert_eq!(
             test_hostcalls::published_property("io.coraza.waf.v1.inspection_reason").as_deref(),
             Some("body_memory_budget_stopped")
+        );
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: refused (outcome=body_memory_budget_stopped phase=response-body status=502 count=1)"],
+            "one connector decision reports the stopped response and actual reply status"
+        );
+        let logs = test_hostcalls::log_messages();
+        assert!(stream.on_done());
+        drop(stream);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "on_done and Drop do not emit the decision again"
         );
 
         // The same body with room to parse in is forwarded, and a body that is not JSON is a body error that the
@@ -4289,15 +4822,30 @@ mod scripted_host_tests {
         "default_directives": "p", "enable_filter_state_logs": true}"#;
 
     /// Scripts the headers of a POST whose body follows in `frames` (size, end of stream), runs the stream through
-    /// them, then answers `status`; returns the request actions and the published reason, outcome and completeness.
-    fn post_in_frames(config: &str, frames: &[(usize, bool)], status: &[u8]) -> (Vec<Action>, [Option<String>; 3]) {
-        let mut post = stream(config);
+    /// them, then answers `status`; returns the stream, callback actions, and published reason, outcome and
+    /// completeness.
+    fn post_in_frames(
+        config: &str,
+        frames: &[(usize, bool)],
+        status: &[u8],
+    ) -> (CorazaHttp, Vec<Action>, [Option<String>; 3]) {
+        post_in_stream(stream(config), frames, status, "a.example", "/")
+    }
+
+    /// Scripts a stream over its supplied host and runs it through `status`.
+    fn post_in_stream(
+        mut post: CorazaHttp,
+        frames: &[(usize, bool)],
+        status: &[u8],
+        authority: &str,
+        path: &str,
+    ) -> (CorazaHttp, Vec<Action>, [Option<String>; 3]) {
         test_hostcalls::reset();
         let headers: [(&str, &[u8]); 5] = [
-            (":authority", b"a.example"),
+            (":authority", authority.as_bytes()),
             (":scheme", b"http"),
             (":method", b"POST"),
-            (":path", b"/"),
+            (":path", path.as_bytes()),
             ("content-type", b"application/octet-stream"),
         ];
         test_hostcalls::set_request_headers(&headers);
@@ -4316,9 +4864,9 @@ mod scripted_host_tests {
         }
         if test_hostcalls::local_reply_statuses().is_empty() {
             test_hostcalls::set_response_headers(&[(":status", status)]);
-            post.on_http_response_headers(1, true);
+            actions.push(post.on_http_response_headers(1, true));
         }
-        (actions, published())
+        (post, actions, published())
     }
 
     /// The reason, outcome and completeness the stream published.
@@ -4332,10 +4880,121 @@ mod scripted_host_tests {
         [reason, outcome, complete].map(|value| Some(value.to_owned()))
     }
 
+    #[test]
+    fn an_unstarted_stream_is_incomplete_on_done_and_drop() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p"}"#;
+        let mut on_done = stream(config);
+        test_hostcalls::reset();
+        assert_eq!(on_done.lifecycle.request, RequestStage::New);
+        assert_eq!(on_done.lifecycle.response, ResponseStage::Waiting);
+
+        assert!(on_done.on_done());
+
+        assert_eq!(published(), health("incomplete", "incomplete", "false"));
+        assert_eq!(
+            on_done.final_outcome,
+            Some(TerminalOutcome::Incomplete {
+                phase: "request-not-started",
+                status: 0,
+            })
+        );
+        assert!(
+            test_hostcalls::local_reply_statuses().is_empty(),
+            "ending before request headers does not invent a local reply"
+        );
+        let logs = test_hostcalls::log_messages();
+        let health_after_done = published();
+
+        assert!(on_done.on_done());
+        drop(on_done);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "later finalizers do not log twice"
+        );
+        assert_eq!(published(), health_after_done, "later finalizers do not change health");
+        assert!(
+            test_hostcalls::local_reply_statuses().is_empty(),
+            "ending before request headers does not send a local reply"
+        );
+
+        let dropped = stream(config);
+        test_hostcalls::reset();
+        assert_eq!(dropped.lifecycle.request, RequestStage::New);
+        assert_eq!(dropped.lifecycle.response, ResponseStage::Waiting);
+        drop(dropped);
+        assert_eq!(published(), health("incomplete", "incomplete", "false"));
+        assert!(
+            test_hostcalls::local_reply_statuses().is_empty(),
+            "Drop only publishes an incomplete inspection state"
+        );
+    }
+
+    #[test]
+    fn additive_health_is_published_without_the_legacy_switch() {
+        let mut stream = stream(r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p"}"#);
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200")]);
+        assert_eq!(stream.on_http_response_headers(1, true), Action::Continue);
+
+        let generation = stream
+            .generation
+            .as_ref()
+            .expect("the stream has a generation")
+            .generation_id()
+            .to_string();
+        for (field, expected) in [
+            ("inspection_complete", "true"),
+            ("inspection_reason", "complete"),
+            ("policy_generation", generation.as_str()),
+            ("request_body_truncated", "false"),
+            ("response_body_truncated", "false"),
+            ("terminal_outcome", "completed"),
+            ("telemetry_publish_failed", "true"),
+        ] {
+            assert_eq!(
+                test_hostcalls::published_property(&format!("io.coraza.waf.v1.{field}")).as_deref(),
+                Some(expected),
+                "{field}"
+            );
+        }
+        for field in ["event", "rule_id", "phase", "action", "status"] {
+            assert_eq!(
+                test_hostcalls::published_property(&format!("io.coraza.waf.{field}")),
+                None,
+                "legacy {field} remains absent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_legacy_switch_does_not_suppress_health_on_a_refusal() {
+        let mut stream = stream(
+            r#"{"directives_map": {"p": ["SecRuleEngine On",
+                "SecAction \"id:1,phase:1,deny,status:403\""]}, "default_directives": "p"}"#,
+        );
+        let count = script_request("a.example", "http");
+
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Pause);
+        assert_eq!(test_hostcalls::local_reply_statuses(), [403]);
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.terminal_outcome").as_deref(),
+            Some("denied")
+        );
+        assert_eq!(test_hostcalls::published_property("io.coraza.waf.status"), None);
+    }
+
     /// [`BODY_OFF`]'s phase-3 rule, on a policy that inspects only a 1-byte prefix of the request body.
     const BODY_CUT: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyLimit 1",
         "SecRequestBodyLimitAction ProcessPartial",
-        "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502\""]},
+        "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502,log\""]},
+        "default_directives": "p", "enable_filter_state_logs": true}"#;
+
+    /// [`BODY_CUT`]'s phase-3 rule with logging disabled.
+    const BODY_CUT_NOLOG: &str = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyLimit 1",
+        "SecRequestBodyLimitAction ProcessPartial",
+        "SecRule RESPONSE_STATUS \"@streq 201\" \"id:6,phase:3,deny,status:502,nolog\""]},
         "default_directives": "p", "enable_filter_state_logs": true}"#;
 
     /// Whether the stream answered with one local reply, of `status`.
@@ -4345,8 +5004,12 @@ mod scripted_host_tests {
 
     #[test]
     fn a_response_phase_denial_after_an_unread_request_body_reports_both() {
-        let (actions, published) = post_in_frames(BODY_OFF, &[(3, true)], b"201");
-        assert_eq!(actions, [Action::Continue, Action::Continue], "the body is not held");
+        let (_, actions, published) = post_in_frames(BODY_OFF, &[(3, true)], b"201");
+        assert_eq!(
+            actions,
+            [Action::Continue, Action::Continue, Action::Pause],
+            "the body passes and the denied response stays held"
+        );
         assert!(refused_with(502), "the denial refuses the response");
         assert_eq!(
             published,
@@ -4354,17 +5017,282 @@ mod scripted_host_tests {
             "the body reached the backend unread, and the stream was denied"
         );
         // As a truncated body is reported beside the same denial.
-        let (_, published) = post_in_frames(BODY_CUT, &[(3, true)], b"201");
+        let (_, _, published) = post_in_frames(BODY_CUT, &[(3, true)], b"201");
         assert!(refused_with(502), "the denial refuses the response");
         assert_eq!(published, health("body_partially_inspected", "denied", "false"));
         // Without the denial, the unread body is reported beside the completed stream.
-        let (_, published) = post_in_frames(BODY_OFF, &[(3, true)], b"200");
+        let (_, _, published) = post_in_frames(BODY_OFF, &[(3, true)], b"200");
         assert!(test_hostcalls::local_reply_statuses().is_empty(), "nothing is refused");
         assert_eq!(published, health("request_body_not_inspected", "completed", "false"));
         // A response-phase denial before any body byte came ends the stream, so none of the body reaches the backend.
-        let (_, published) = post_in_frames(BODY_OFF, &[], b"201");
+        let (_, _, published) = post_in_frames(BODY_OFF, &[], b"201");
         assert!(refused_with(502), "the denial refuses the response");
         assert_eq!(published, health("denied", "denied", "true"));
+    }
+
+    #[test]
+    fn partial_request_body_response_denials_keep_rule_log_policy_and_never_log_passed() {
+        for (config, expect_rule_log, call_on_done) in [(BODY_CUT, true, true), (BODY_CUT_NOLOG, false, false)] {
+            let (mut post, actions, actual_health) = post_in_frames(config, &[(3, true)], b"201");
+
+            assert_eq!(actions, [Action::Pause, Action::Continue, Action::Pause]);
+            assert_eq!(test_hostcalls::local_reply_statuses(), [502]);
+            assert_eq!(actual_health, health("body_partially_inspected", "denied", "false"));
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.v1.request_body_truncated").as_deref(),
+                Some("true")
+            );
+            assert_eq!(
+                post.outcome,
+                Some(TerminalOutcome::BodyPartiallyInspected { phase: "request-body" })
+            );
+            let denied = TerminalOutcome::Denied {
+                phase: "response-headers",
+                status: 502,
+            };
+            assert_eq!(post.final_outcome, Some(denied.clone()));
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.phase").as_deref(),
+                Some("http_response_headers")
+            );
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.status").as_deref(),
+                Some("502")
+            );
+
+            let warnings = warning_messages();
+            assert_eq!(warnings.len(), usize::from(expect_rule_log));
+            assert!(
+                warnings.iter().all(|message| {
+                    !message.starts_with("envoy-coraza: passed (") && !message.starts_with("envoy-coraza: refused (")
+                }),
+                "a policy-rule denial is not a connector decision: {warnings:?}"
+            );
+            let logs = test_hostcalls::log_messages();
+            let health_after_denial = published();
+
+            if call_on_done {
+                assert!(post.on_done());
+                assert_eq!(post.final_outcome, Some(denied));
+            }
+            drop(post);
+            assert_eq!(test_hostcalls::log_messages(), logs, "finalizers do not log twice");
+            assert_eq!(test_hostcalls::local_reply_statuses(), [502], "one local reply is sent");
+            assert_eq!(
+                published(),
+                health_after_denial,
+                "finalizers preserve partial-inspection health"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partially_inspected_pass_has_one_fixed_decision_log_line() {
+        let (_, actions, published) = post_in_frames(BODY_CUT, &[(3, true)], b"200");
+        assert_eq!(actions, [Action::Pause, Action::Continue, Action::Continue]);
+        assert_eq!(published, health("body_partially_inspected", "completed", "false"));
+        let warnings = test_hostcalls::log_messages()
+            .into_iter()
+            .filter(|(level, _)| *level == proxy_wasm::types::LogLevel::Warn)
+            .map(|(_, message)| message)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            ["envoy-coraza: passed (outcome=body_partially_inspected phase=request-body status=0 count=1)"]
+        );
+    }
+
+    #[test]
+    fn a_partial_request_pass_can_end_upstream_failed_without_a_local_reply_or_duplicate_log() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess On",
+            "SecRequestBodyLimit 1", "SecRequestBodyLimitAction ProcessPartial"]}, "default_directives": "p"}"#;
+        let mut post = stream(config);
+        test_hostcalls::reset();
+        let headers: [(&str, &[u8]); 5] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", b"/"),
+            ("content-type", b"application/octet-stream"),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+
+        assert_eq!(post.on_http_request_headers(headers.len(), false), Action::Pause);
+        let body = b"benign";
+        test_hostcalls::set_request_body(body);
+        assert_eq!(
+            post.on_http_request_body(body.len(), true),
+            Action::Continue,
+            "ProcessPartial lets the request body continue past this filter"
+        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+
+        // No response headers arrive; on_done is the SDK's unclassified reset/cancellation ending.
+        assert!(post.on_done());
+        let expected_health = health("body_partially_inspected", "upstream_failure_or_cancellation", "false");
+        assert_eq!(published(), expected_health);
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=body_partially_inspected phase=request-body status=0 count=1)"]
+        );
+
+        let logs = test_hostcalls::log_messages();
+        assert!(post.on_done());
+        drop(post);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "later finalizers do not log twice"
+        );
+        assert_eq!(
+            published(),
+            expected_health,
+            "later finalizers preserve terminal health"
+        );
+        assert!(
+            test_hostcalls::local_reply_statuses().is_empty(),
+            "an upstream ending does not invent a local reply"
+        );
+    }
+
+    #[test]
+    fn an_xml_processor_failure_pass_keeps_its_reason_when_upstream_ends_later() {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On",
+            "SecRule REQUEST_HEADERS:Content-Type \"@contains xml\" \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"",
+            "SecRequestBodyLimit 24", "SecRequestBodyLimitAction ProcessPartial"]}, "default_directives": "p"}"#;
+        let mut post = stream(config);
+        test_hostcalls::reset();
+        let headers: [(&str, &[u8]); 5] = [
+            (":authority", b"a.example"),
+            (":scheme", b"http"),
+            (":method", b"POST"),
+            (":path", b"/"),
+            ("content-type", b"application/xml"),
+        ];
+        test_hostcalls::set_request_headers(&headers);
+        script_connection_properties();
+
+        assert_eq!(post.on_http_request_headers(headers.len(), false), Action::Pause);
+        let body = b"<r><i>x</i>&p;</r><i>attack</i><i>attack</i>";
+        test_hostcalls::set_request_body(body);
+        assert_eq!(post.on_http_request_body(body.len(), true), Action::Continue);
+        assert!(post.request_body_failed);
+        assert_eq!(
+            post.outcome,
+            Some(TerminalOutcome::BodyPartiallyInspected { phase: "request-body" })
+        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+
+        assert!(post.on_done());
+        assert_eq!(
+            test_hostcalls::published_property("io.coraza.waf.v1.request_body_truncated").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            published(),
+            health(
+                "request_body_not_inspected",
+                "upstream_failure_or_cancellation",
+                "false"
+            )
+        );
+        assert_eq!(post.final_outcome, Some(TerminalOutcome::UpstreamFailureOrCancellation));
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=request_body_not_inspected phase=request-body status=0 count=1)"],
+            "the decision reports the local body-inspection result, not the later upstream ending"
+        );
+
+        let logs = test_hostcalls::log_messages();
+        assert!(post.on_done());
+        drop(post);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "on_done and Drop do not log a completed finalization twice"
+        );
+        assert!(test_hostcalls::local_reply_statuses().is_empty());
+    }
+
+    /// Runs a scripted response whose configured body limit permits a partial pass.
+    fn partially_inspected_response_pass() -> (CorazaHttp, Rc<Cell<usize>>) {
+        let config = r#"{"directives_map": {"p": ["SecRuleEngine On", "SecRequestBodyAccess Off",
+            "SecResponseBodyAccess On", "SecResponseBodyMimeType text/plain", "SecResponseBodyLimit 3",
+            "SecResponseBodyLimitAction ProcessPartial"]}, "default_directives": "p"}"#;
+        let (mut stream, root) = stream_beside(config, 0);
+        let count = script_request("a.example", "http");
+        assert_eq!(stream.on_http_request_headers(count, true), Action::Continue);
+        test_hostcalls::set_response_headers(&[(":status", b"200"), ("content-type", b"text/plain")]);
+        assert_eq!(stream.on_http_response_headers(2, false), Action::Pause);
+        let body = b"benign";
+        test_hostcalls::set_response_body(body);
+
+        assert_eq!(stream.on_http_response_body(body.len(), true), Action::Continue);
+        assert!(
+            test_hostcalls::local_reply_statuses().is_empty(),
+            "ProcessPartial permits this response"
+        );
+        assert_eq!(
+            stream.outcome,
+            Some(TerminalOutcome::BodyPartiallyInspected { phase: "response-body" })
+        );
+        assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+        assert!(stream.lifecycle.finalized);
+        assert!(stream.tx.is_none());
+        assert!(stream.response_body_truncated);
+        assert_eq!(root.get(), 0, "finalization releases the response-body lease");
+        for (field, expected) in [
+            ("inspection_complete", "false"),
+            ("inspection_reason", "body_partially_inspected"),
+            ("response_body_truncated", "true"),
+            ("terminal_outcome", "completed"),
+        ] {
+            assert_eq!(
+                test_hostcalls::published_property(&format!("io.coraza.waf.v1.{field}")).as_deref(),
+                Some(expected),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=body_partially_inspected phase=response-body status=0 count=1)"]
+        );
+        (stream, root)
+    }
+
+    #[test]
+    fn a_response_process_partial_pass_logs_and_finalizes_once_before_on_done_or_drop() {
+        let (mut stream, root) = partially_inspected_response_pass();
+        let logs = test_hostcalls::log_messages();
+
+        assert!(stream.on_done());
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "on_done does not log or finalize twice"
+        );
+        assert_eq!(stream.final_outcome, Some(TerminalOutcome::Completed));
+        assert!(stream.lifecycle.finalized);
+        assert!(stream.tx.is_none());
+        assert_eq!(root.get(), 0);
+        drop(stream);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "Drop does not log or finalize twice"
+        );
+
+        let (stream, root) = partially_inspected_response_pass();
+        let logs = test_hostcalls::log_messages();
+        drop(stream);
+        assert_eq!(
+            test_hostcalls::log_messages(),
+            logs,
+            "Drop alone does not log or finalize twice"
+        );
+        assert_eq!(root.get(), 0);
     }
 
     #[test]
@@ -4452,23 +5380,87 @@ mod scripted_host_tests {
     #[test]
     fn an_empty_last_data_frame_is_an_empty_body_and_not_an_unread_one() {
         // HTTP/2 can end a request with an empty DATA frame after headers without END_STREAM.
-        let (actions, published) = post_in_frames(BODY_OFF, &[(0, true)], b"200");
-        assert_eq!(actions, [Action::Continue, Action::Continue], "nothing is held");
+        let (_, actions, published) = post_in_frames(BODY_OFF, &[(0, true)], b"200");
+        assert_eq!(
+            actions,
+            [Action::Continue, Action::Continue, Action::Continue],
+            "nothing is held"
+        );
         assert_eq!(published, health("complete", "completed", "true"), "an empty body");
+        assert!(warning_messages().is_empty(), "an empty body is not logged as unread");
         // Bytes in an earlier frame stay unread when the last one is empty.
-        let (_, published) = post_in_frames(BODY_OFF, &[(3, false), (0, true)], b"200");
+        let (_, _, published) = post_in_frames(BODY_OFF, &[(3, false), (0, true)], b"200");
         assert_eq!(
             published,
             health("request_body_not_inspected", "completed", "false"),
             "bytes went through"
         );
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=request_body_not_inspected phase=request-body status=0 count=1)"]
+        );
         // A response that completes while the body may still come is not reported as having seen it.
-        let (_, published) = post_in_frames(BODY_OFF, &[], b"200");
+        let (_, _, published) = post_in_frames(BODY_OFF, &[], b"200");
         assert_eq!(
             published,
             health("request_body_not_inspected", "completed", "false"),
             "the body had not ended"
         );
+        assert_eq!(
+            warning_messages(),
+            ["envoy-coraza: passed (outcome=request_body_not_inspected phase=request-body status=0 count=1)"]
+        );
+    }
+
+    #[test]
+    fn passed_uninspected_request_bodies_are_sampled_without_request_data_or_duplicate_logs() {
+        let config = Config::parse(BODY_OFF.as_bytes()).expect("configuration is valid");
+        let generation = Rc::new(Generation::compile(config).expect("policy compiles"));
+        let root = Rc::new(Cell::new(0));
+
+        for count in 1_u64..=8 {
+            let stream = CorazaHttp::new(Some(Rc::clone(&generation)), Rc::clone(&root));
+            let (mut post, actions, published) =
+                post_in_stream(stream, &[(3, true)], b"200", "request-secret.example", "/secret");
+            assert_eq!(
+                actions,
+                [Action::Continue, Action::Continue, Action::Continue],
+                "the request passes without a local reply"
+            );
+            assert!(
+                test_hostcalls::local_reply_statuses().is_empty(),
+                "reporting an unread body does not add a local reply"
+            );
+            assert_eq!(published, health("request_body_not_inspected", "completed", "false"));
+
+            let warnings = warning_messages();
+            let expected = if count.is_power_of_two() {
+                vec![format!(
+                    "envoy-coraza: passed (outcome=request_body_not_inspected phase=request-body status=0 count={count})"
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(warnings, expected, "decision {count}");
+            if count == 1 {
+                let logs = test_hostcalls::log_messages();
+                assert!(
+                    logs.iter().all(|(_, message)| {
+                        !message.contains("request-secret.example")
+                            && !message.contains("/secret")
+                            && !message.contains("xxx")
+                    }),
+                    "the decision log contains no request data"
+                );
+                assert!(post.on_done());
+                drop(post);
+                assert_eq!(
+                    test_hostcalls::log_messages(),
+                    logs,
+                    "on_done and Drop do not log a completed stream twice"
+                );
+            }
+        }
     }
 
     /// Runs a POST of `body` to `path`, with `headers` after its pseudo-headers, through the stream to a 200 response
@@ -4854,12 +5846,29 @@ mod scripted_host_tests {
                 passed(),
                 "{name}: well formed"
             );
-            assert_eq!(post_with(&default_on, "/", headers, cut), unread(), "{name}");
-            assert_eq!(
-                post_with(&detection_only, "/", headers, cut),
-                unread(),
-                "{name}: DetectionOnly"
+            assert!(
+                warning_messages().is_empty(),
+                "{name}: a fully inspected body has no uninspected-pass decision"
             );
+            for (config, engine) in [(&default_on, "On"), (&detection_only, "DetectionOnly")] {
+                assert_eq!(post_with(config, "/", headers, cut), unread(), "{name}: {engine}");
+                assert_eq!(
+                    test_hostcalls::published_property("io.coraza.waf.v1.request_body_truncated").as_deref(),
+                    Some("false"),
+                    "{name}: {engine} failed without a configured body cut"
+                );
+                assert_eq!(
+                    warning_messages(),
+                    ["envoy-coraza: passed (outcome=request_body_not_inspected phase=request-body status=0 count=1)"],
+                    "{name}: {engine}"
+                );
+                assert!(
+                    warning_messages()
+                        .iter()
+                        .all(|message| !message.contains("attack") && !message.contains("a.example")),
+                    "{name}: decision warning contains no request data"
+                );
+            }
             // A rule that denies on the error refuses first, and is reported as any denial is.
             assert_eq!(
                 post_with(&backstop, "/", headers, cut),
@@ -4884,31 +5893,48 @@ mod scripted_host_tests {
             ))
         };
         let partial = || (vec![], health("body_partially_inspected", "completed", "false"));
+        let default_cut = cut_xml("");
         let detection_only_cut = cut_xml(r#", "SecRuleEngine DetectionOnly""#);
-        for (body, expected, name) in [
+        for (body, expected, decision_reason, name) in [
             (
                 &b"<r><i>x</i>&p;</r><i>attack</i><i>attack</i>"[..],
                 unread(),
+                "request_body_not_inspected",
                 "a syntax error in the prefix",
             ),
             (
                 b"<r><i>x</i><i>benign benign</i><i>attack</i>",
                 partial(),
+                "body_partially_inspected",
                 "a prefix that parses",
             ),
             (
                 b"<r><![CDATA[benign benign benign]]></r>",
                 unread(),
+                "request_body_not_inspected",
                 "a cut in a CDATA section",
             ),
         ] {
             let name = format!("{} ({name})", String::from_utf8_lossy(body));
-            assert_eq!(post_with(&cut_xml(""), "/", xml, body), expected, "{name}");
-            assert_eq!(
-                post_with(&detection_only_cut, "/", xml, body),
-                expected,
-                "{name}: DetectionOnly"
-            );
+            for (config, engine) in [(&default_cut, "On"), (&detection_only_cut, "DetectionOnly")] {
+                assert_eq!(post_with(config, "/", xml, body), expected, "{name}: {engine}");
+                assert_eq!(
+                    test_hostcalls::published_property("io.coraza.waf.v1.request_body_truncated").as_deref(),
+                    Some("true"),
+                    "{name}: {engine} used the configured body cut"
+                );
+                assert_eq!(
+                    warning_messages(),
+                    [format!(
+                        "envoy-coraza: passed (outcome={decision_reason} phase=request-body status=0 count=1)"
+                    )],
+                    "{name}: {engine}"
+                );
+                assert!(
+                    warning_messages().iter().all(|message| !message.contains("attack")),
+                    "{name}: decision warning contains no request body data"
+                );
+            }
         }
         assert_eq!(
             post_with(
@@ -4984,22 +6010,34 @@ mod scripted_host_tests {
         // long chunked upload) reaches the backend only when it is complete, and is inspected then.
         let default_on = r#"{"directives_map": {"p": ["SecRuleEngine On"]}, "default_directives": "p",
             "enable_filter_state_logs": true}"#;
-        let (actions, published) = post_in_frames(default_on, &[(3, false), (3, false), (3, true)], b"200");
+        let (_, actions, published) = post_in_frames(default_on, &[(3, false), (3, false), (3, true)], b"200");
         assert_eq!(
             actions,
-            [Action::Pause, Action::Pause, Action::Pause, Action::Continue],
+            [
+                Action::Pause,
+                Action::Pause,
+                Action::Pause,
+                Action::Continue,
+                Action::Continue,
+            ],
             "held to the end"
         );
         assert_eq!(published, health("complete", "completed", "true"), "inspected whole");
         // A body over the 16 MiB the host buffers is refused rather than passed on.
-        let (actions, _) = post_in_frames(default_on, &[(MAX_REQUEST_BODY_BYTES + 1, false)], b"200");
+        let (_, actions, _) = post_in_frames(default_on, &[(MAX_REQUEST_BODY_BYTES + 1, false)], b"200");
         assert_eq!(actions, [Action::Pause, Action::Pause], "refused");
         assert_eq!(test_hostcalls::local_reply_statuses(), [413], "too large");
         // `SecRequestBodyAccess Off` passes every frame on as it comes.
-        let (actions, _) = post_in_frames(BODY_OFF, &[(3, false), (3, false), (3, true)], b"200");
+        let (_, actions, _) = post_in_frames(BODY_OFF, &[(3, false), (3, false), (3, true)], b"200");
         assert_eq!(
             actions,
-            [Action::Continue, Action::Continue, Action::Continue, Action::Continue],
+            [
+                Action::Continue,
+                Action::Continue,
+                Action::Continue,
+                Action::Continue,
+                Action::Continue,
+            ],
             "streamed"
         );
     }
@@ -5385,7 +6423,47 @@ mod scripted_host_tests {
 
     /// The legacy interruption properties of rule 1 redirecting with 302 in `phase`.
     fn redirect_properties(phase: &str) -> [Option<String>; 4] {
-        ["1", phase, "redirect", "302"].map(|value| Some(value.to_owned()))
+        redirect_properties_with_status(phase, "302")
+    }
+
+    /// The legacy interruption properties of rule 1 redirecting with `status` in `phase`.
+    fn redirect_properties_with_status(phase: &str, status: &str) -> [Option<String>; 4] {
+        [
+            "1".to_owned(),
+            phase.to_owned(),
+            "redirect".to_owned(),
+            status.to_owned(),
+        ]
+        .map(Some)
+    }
+
+    #[test]
+    fn interruption_status_matches_the_local_reply_in_filter_state() {
+        for (configured_status, reply_status) in [(100_u16, 403_u16), (204, 204)] {
+            let config = format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On",
+                    "SecAction \"id:1,phase:1,deny,status:{configured_status}\""]}},
+                    "default_directives": "p", "enable_filter_state_logs": true}}"#
+            );
+            let mut stream = stream(&config);
+            let count = script_request("a.example", "http");
+
+            assert_eq!(
+                stream.on_http_request_headers(count, true),
+                Action::Pause,
+                "status {configured_status}"
+            );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [u32::from(reply_status)],
+                "status {configured_status}"
+            );
+            assert_eq!(
+                test_hostcalls::published_property("io.coraza.waf.status").as_deref(),
+                Some(reply_status.to_string().as_str()),
+                "status {configured_status}"
+            );
+        }
     }
 
     #[test]
@@ -5435,8 +6513,8 @@ mod scripted_host_tests {
             );
             assert_eq!(
                 legacy_interruption(),
-                redirect_properties("http_request_headers"),
-                "{target:?}: the interruption properties keep the rule's redirect and status"
+                redirect_properties_with_status("http_request_headers", "403"),
+                "{target:?}: the interruption properties report the local reply status"
             );
         }
     }
@@ -5483,8 +6561,8 @@ mod scripted_host_tests {
             );
             assert_eq!(
                 legacy_interruption(),
-                redirect_properties("http_response_headers"),
-                "{target:?}: the interruption properties keep the rule's redirect and status"
+                redirect_properties_with_status("http_response_headers", &status.to_string()),
+                "{target:?}: the interruption properties report the local reply status"
             );
         }
     }

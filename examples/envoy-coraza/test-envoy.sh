@@ -354,6 +354,12 @@ check_status 200 "$status" 'byte-exact benign pass-through'
 cmp --silent "$temp_dir/expected-pass" "$temp_dir/pass" || fail 'benign request body changed in transit'
 require_access_log 'path=/echo coraza_observability event=- rule_id=- phase=- action=- status=- reason=body_partially_inspected outcome=completed complete=false generation=1 request_truncated=true response_truncated=false telemetry_failed=false' 0
 
+before=$(access_log_count)
+status=$(request "$temp_dir/engine-off" --header 'Host: engineoff.local' http://127.0.0.1:10001/echo)
+check_status 200 "$status" 'engine-off pass-through'
+require_access_log 'path=/echo coraza_observability event=- rule_id=- phase=- action=- status=- reason=engine_off outcome=uninspected complete=false generation=1 request_truncated=false response_truncated=false telemetry_failed=false' \
+    "$before"
+
 status=$(request "$temp_dir/expect-pass" --expect100-timeout 1 --request POST \
     --header 'Expect: 100-continue' --header 'content-type: application/octet-stream' \
     --data-binary "@$temp_dir/expected-pass" http://127.0.0.1:10001/echo)
