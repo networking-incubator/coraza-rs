@@ -49,7 +49,9 @@ See "Multipart quoted-printable parts" in `../../conformance/difference-ledger.m
 `regenerate/main.go` runs Go's processor on the `body` of every case and rewrites
 the `go` and `raw` parts of `cases.json`; the bodies are the input and stay as they
 are. To add a case, append `{"name": ..., "cut": false, "body": "<hex>"}` and run it. It
-needs the pinned module in the Go module cache and Go 1.27.3 or newer:
+needs the pinned module in the Go module cache and the toolchain its `go.mod` names
+(Go 1.27.4; the results also depend on the toolchain's `mime/multipart` and
+`mime/quotedprintable`, so `GOTOOLCHAIN=local` and that version are the pin):
 
 ```sh
 cd coraza/tests/go_multipart/regenerate
@@ -64,7 +66,10 @@ variables it fills.
 `regenerate/go.mod` requires the Go Coraza version `../go_profiles/exporter/go.mod`
 pins, and `cargo xtask go-fixtures-check` (part of `make test`) fails when the two
 differ: bump both, with the exporter's refresh steps in `docs/ci.md`, and run the
-command above.
+command above. `cargo xtask go-fixtures-check --require-go`, which `make
+go-harness-check` runs, and `--provenance` also run the program on a scratch copy of
+`cases.json` and fail unless it equals the checked-in file, so results left on an
+earlier Go Coraza or toolchain fail there.
 
 ## Attribution
 

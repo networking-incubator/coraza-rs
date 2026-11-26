@@ -30,9 +30,10 @@ jobs:
       - name: Set up Go toolchain
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          # The fixture exporter pins the newest Go Coraza revision and therefore
-          # the highest toolchain requirement; the benchmark module runs fine on it.
-          go-version-file: coraza/tests/go_profiles/exporter/go.mod
+          # The multipart regenerator pins the toolchain its fixture was produced
+          # on, which is the highest requirement here: the fixture check reruns it
+          # and compares bytes. The exporter and the benchmark module run fine on it.
+          go-version-file: coraza/tests/go_multipart/regenerate/go.mod
           cache: false
 
       - name: Record Go toolchain

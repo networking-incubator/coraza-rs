@@ -2,7 +2,7 @@
 // below `github.com/corazawaf/coraza/v3/` import its internal body processor.
 module github.com/corazawaf/coraza/v3/internal/multipartfixture
 
-go 1.27.3
+go 1.27.4
 
 require github.com/corazawaf/coraza/v3 v3.8.2-0.20261114225743-1cfa4f955a19
 

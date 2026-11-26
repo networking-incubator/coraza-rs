@@ -402,13 +402,24 @@ as well, 254 pass at level 1 with CRS alone.
   the same error for the first such part (`REQBODY_PROCESSOR_ERROR_MSG` and
   `MULTIPART_STRICT_ERROR`, as in Go), and reads the parts after it, which a
   backend that does not stop at that byte (busboy and python-multipart read them)
-  acts on. A payload before the byte Go rejects, after it, or in a later part stays
-  visible to every rule.
+  acts on. A payload before the byte Go rejects, or in a later part, is visible
+  to every rule. A payload after that byte in the same part is visible only as
+  it was sent, encoded: `ok\x01=3Bcat=20/etc/passwd` matches no rule for
+  `cat /etc/passwd`. python-multipart's `FormParser` (what
+  `python_multipart.parse_form` and `create_form_parser` build) decodes the whole
+  part with `binascii.a2b_qp`, which does not stop at the byte, so its
+  application receives `ok\x01;cat /etc/passwd`, which no rule saw decoded. The
+  engine refuses such a body under the recommended configuration (rule 200002 on
+  the body error, or 200003 on the strict error) and under CRS 922120 at
+  paranoia level 1 (the encoding header is a part header); a policy with
+  neither, such as custom rules or CRS with 922120 removed and no recommended
+  configuration, does not catch it.
 - A `==` before a line end makes Go's reader report `io.ErrUnexpectedEOF` and
   drop the rest of the part; its processor flags `MULTIPART_STRICT_ERROR`
   (unless `INBOUND_DATA_ERROR` is set), publishes what was decoded and reads no
   further part. This engine flags and publishes the same, publishes the part as
-  it was sent as well, and reads the parts after it.
+  it was sent as well, and reads the parts after it. The rest of the part is
+  visible only as sent, as after a byte Go rejects (above).
 - A last line without a line feed of exactly 4096 bytes is `bufio: buffer full`
   in Go when the part ends the body and the buffer fills before the end shows,
   and decodes in Go when the delimiter shows with the last bytes, which depends

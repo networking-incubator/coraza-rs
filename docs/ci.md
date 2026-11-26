@@ -138,12 +138,18 @@ where downloaded tool integrity is enforced.
   which requires the same Go Coraza as the exporter. After bumping the exporter's
   `require`, set the same version in `coraza/tests/go_multipart/regenerate/go.mod` (the
   `go-coraza` Dependabot group bumps both) and rerun it: `cargo xtask go-fixtures-check`
-  fails when the two versions differ, with or without Go, in `make test` as well.
+  fails when the two versions differ, with or without Go, in `make test` as well. With
+  `--require-go` (what `make go-harness-check` passes) or `--provenance` it also runs the
+  regenerator on a scratch copy of `cases.json` and fails unless the bytes equal the
+  checked-in file, so a bump of both versions that leaves the results on the old Go
+  Coraza, or a toolchain that publishes something else, fails in the `go-harness` job.
+  The `go` line of the regenerator's `go.mod` is the toolchain the results were produced
+  on, and that job installs it from there (`go-version-file`).
 - `cargo xtask go-fixtures-check --provenance` also regenerates
   both profile JSON documents with the matching default and multiphase tags and
   byte-compares them, so a same-inventory edit to rules or expected results
-  fails. It needs the exporter's pinned Go 1.27.3 toolchain, which the `go-harness` setup does not
-  install (that job runs `GOTOOLCHAIN=local` with an older Go), so it is a
+  fails. It needs the exporter's pinned Go 1.27.3 toolchain, which the `go-harness` job does not
+  run (it installs the multipart regenerator's Go 1.27.4 with `GOTOOLCHAIN=local`), so it is a
   manual/pre-release step and not part of `make test` or `make go-harness-check`.
 - `ftw-smoke`: runs the FTW runner in strict conformance mode against the
   checked-in smoke rules and test directory. Exact rule, file, test case and
@@ -154,10 +160,10 @@ where downloaded tool integrity is enforced.
 Six modules have their own `go.mod` — `ftw-runner`, `benchmarks/coraza/go`,
 `benchmarks/coraza/coordinator`, `coraza/tests/go_profiles/exporter`,
 `coraza/tests/go_multipart/regenerate` and `xtask/tools` — and none is part of the
-Cargo workspace. Only `benchmarks/coraza/go` is pinned by the `go-harness` job's
-setup step; the exporter and the multipart regenerator require a newer Go than that
-job installs, so the exporter is built on demand by the fixture regeneration command
-and the regenerator is run by hand.
+Cargo workspace. The `go-harness` job's setup step installs the toolchain the
+multipart regenerator's `go.mod` names, the newest requirement of the three; the
+exporter is built on demand by the fixture regeneration command, and
+`go-fixtures-check --require-go` (in `make go-harness-check`) runs the regenerator.
 
 ### `supply-chain`
 
