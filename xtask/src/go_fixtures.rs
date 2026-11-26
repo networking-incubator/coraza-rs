@@ -32,6 +32,8 @@ const EXPORTER_DIR: &str = "coraza/tests/go_profiles/exporter";
 /// The program that reruns Go Coraza's multipart body processor over `coraza/tests/go_multipart/cases.json`. It
 /// requires the same Go Coraza as the exporter, which is what its fixture claims to be from.
 const MULTIPART_REGENERATOR_DIR: &str = "coraza/tests/go_multipart/regenerate";
+/// The results the regenerator rewrites: what Go Coraza's multipart body processor publishes for each body.
+const MULTIPART_CASES_FILE: &str = "coraza/tests/go_multipart/cases.json";
 const OPERATORS_DIR: &str = "coraza/tests/go_operators";
 const PROFILES_DATA_DIR: &str = "coraza/tests/go_profiles/data";
 const PROFILES_FILE: &str = "coraza/tests/go_profiles/profiles.json";
@@ -53,10 +55,15 @@ const MULTIPHASE_BUILD_TAG: &str = "coraza.rule.multiphase_evaluation";
 
 #[derive(Args)]
 pub(crate) struct CheckArgs {
-    /// Fail when the Go toolchain or the pinned module is unavailable.
+    /// Fail when the Go toolchain or the pinned module is unavailable, and byte-compare the multipart fixture with a
+    /// fresh run of its regenerator.
+    ///
+    /// The regenerator needs the toolchain its `go.mod` pins (`go` line), so it runs only here and with
+    /// `--provenance`; see docs/ci.md.
     #[arg(long)]
     require_go: bool,
-    /// Re-run the profile exporter and byte-compare its output with the vendored document.
+    /// Re-run the profile exporter and the multipart regenerator and byte-compare their output with the vendored
+    /// documents.
     ///
     /// Needs the exporter's pinned Go toolchain, so it is not part of the default check; see docs/ci.md.
     #[arg(long)]
@@ -95,6 +102,14 @@ pub(crate) fn check_or_exit(args: &CheckArgs) {
             if let Err(error) = check(&root, &source, args.provenance) {
                 eprintln!("go fixture check failed: {error}");
                 std::process::exit(1);
+            }
+            // The pin check above compares two `go.mod` versions, so a bump of both passes it with the old results.
+            if args.require_go || args.provenance {
+                if let Err(error) = check_multipart_cases(&root, &source) {
+                    eprintln!("go fixture check failed: {error}");
+                    std::process::exit(1);
+                }
+                println!("Verified {MULTIPART_CASES_FILE}: a fresh run of its regenerator reproduces it.");
             }
         },
         Err(error) if args.require_go || args.provenance => {
@@ -178,6 +193,56 @@ fn check_regenerator_pin(root: &Path) -> Result<(), String> {
     Err(format!(
         "{MULTIPART_REGENERATOR_DIR}/go.mod requires {MODULE} {regenerator}, and {EXPORTER_DIR}/go.mod pins {exporter}; \
          set both to one version and rerun the multipart regenerator (coraza/tests/go_multipart/README.md)"
+    ))
+}
+
+/// Fails unless re-running the multipart regenerator over a scratch copy of `cases.json` gives the checked-in bytes:
+/// the results are still what the pinned Go Coraza, on the toolchain the regenerator's `go.mod` requires, publishes.
+fn check_multipart_cases(root: &Path, source: &Source) -> Result<(), String> {
+    let pinned = root.join(MULTIPART_CASES_FILE);
+    let scratch = std::env::temp_dir().join(format!("coraza-go-multipart-{}", std::process::id()));
+    fs::create_dir_all(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
+    let fresh = scratch.join("cases.json");
+    let result = fs::copy(&pinned, &fresh)
+        .map_err(|error| format!("{}: {error}", fresh.display()))
+        .and_then(|_| run_regenerator(&root.join(MULTIPART_REGENERATOR_DIR), &fresh, &scratch))
+        .and_then(|()| {
+            let expected = fs::read(&pinned).map_err(|error| format!("{}: {error}", pinned.display()))?;
+            let actual = fs::read(&fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
+            if expected == actual {
+                return Ok(());
+            }
+            Err(format!(
+                "{} does not match what Go Coraza {} publishes; rerun the multipart regenerator in {} (steps in \
+                 coraza/tests/go_multipart/README.md) and review the diff",
+                relative(root, &pinned),
+                source.version,
+                MULTIPART_REGENERATOR_DIR,
+            ))
+        });
+    drop(fs::remove_dir_all(&scratch));
+    result
+}
+
+fn run_regenerator(regenerator: &Path, cases: &Path, scratch: &Path) -> Result<(), String> {
+    let output = Command::new("go")
+        .args(["run", "."])
+        .arg(cases)
+        .arg(scratch)
+        .env("GOWORK", "off")
+        .env("GOPROXY", "off")
+        .env("GOTOOLCHAIN", "local")
+        .current_dir(regenerator)
+        .output()
+        .map_err(|error| format!("run the multipart regenerator in {}: {error}", regenerator.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "run the multipart regenerator in {}: {}\nit needs the Go toolchain its go.mod requires and the pinned module in \
+         the Go module cache (`go mod download` in that directory)",
+        regenerator.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
     ))
 }
 

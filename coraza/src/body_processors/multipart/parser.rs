@@ -1369,6 +1369,10 @@ fn first_delimiter_nl(data: &[u8], marker_start: usize, marker: &[u8]) -> Option
 /// `nl` is the line ending of the body's first delimiter: Go's part reader ends a part
 /// where such a line ending is followed by the marker, so a marker behind another line
 /// ending stays part of the body.
+///
+/// Kept out of line: inlined into [`MultipartParser::parse`], the per-byte scan spills registers to the stack, which
+/// costs about 6 % more instructions on a 1 `MiB` upload.
+#[inline(never)]
 fn find_next_boundary(data: &[u8], marker: &[u8], table: &[usize], nl: &[u8]) -> Option<(usize, usize)> {
     let marker_pos = find_subsequence_where(data, marker, table, |data, start| {
         is_delimiter_candidate(data, start, marker, nl)

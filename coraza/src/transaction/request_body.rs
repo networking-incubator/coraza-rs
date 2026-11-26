@@ -664,7 +664,10 @@ fn set_file_sizes(sizes: &mut Map, name: &[u8], size: u64, second: Option<usize>
     sizes.set_index(name, 0, size.to_string());
     match second {
         Some(second) => sizes.set_index(name, 1, second.to_string()),
-        None => sizes.truncate_values(name, 1),
+        // Only an earlier decoded part leaves a second size, and then some name holds two values: no lookup, so no
+        // lowercase copy of a name with uppercase letters, for a body that decodes nothing.
+        None if sizes.value_count() > sizes.len() => sizes.truncate_values(name, 1),
+        None => {},
     }
 }
 
@@ -2662,7 +2665,7 @@ mod multipart_tests {
     fn files_combined_size_counts_field_data_as_go_does() {
         // Go's processor adds a field's length to the running total as well as a file's
         // (`internal/bodyprocessors/multipart.go:175-183`, go-coraza 1cfa4f955a19), so a size rule such as
-        // CRS 900340 sees every part's bytes, not only the files'. Each value below is what Go's processor sets.
+        // CRS 920410 sees every part's bytes, not only the files'. Each value below is what Go's processor sets.
         let field = |name: &str, data: &str| {
             format!("--b\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{data}\r\n")
         };

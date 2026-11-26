@@ -801,11 +801,16 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   level 1, as it did before the body was decoded. A part Go's quoted-printable
   reader rejects (a control byte, a `=` before a bare CR, a line over 4096
   bytes) is a body error with Go's message, published up to the failure and then
-  as sent, and the parts after it are read, where Go stops. The
+  as sent, and the parts after it are read, where Go stops. What follows the
+  failing byte in that part is visible only as sent, encoded: a backend that
+  decodes the whole part (python-multipart's `FormParser`) acts on text that no
+  rule sees decoded. The recommended configuration's rules 200002 and 200003 and
+  CRS rule 922120 refuse such a body; a policy with none of them does not. The
   [ledger](conformance/difference-ledger.md) lists where this deviates from Go.
 - `FILES_COMBINED_SIZE` is the size of every multipart part's data, form fields
   included, as in Go Coraza. It counted file parts only, so a size rule such as
-  CRS 900340 saw too little of a body made mostly of fields.
+  CRS 920410 (limit set by 900350) saw too little of a body made mostly of
+  fields.
 
 ## FTW integration
 
