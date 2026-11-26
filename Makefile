@@ -183,6 +183,7 @@ lint-extra:
 	taplo format --check '**/*.toml'
 	actionlint -ignore 'specifying action "\$$/.+" in invalid format because ref is missing'
 	shellcheck $$(git ls-files '*.sh') .hooks/pre-commit
+	.github/scripts/release-tag.test.sh
 
 audit:
 	cargo audit
@@ -278,7 +279,7 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint       clippy + rustfmt check + license header check"
-	@echo "  lint-extra typos + taplo + actionlint + shellcheck"
+	@echo "  lint-extra typos + taplo + actionlint + shellcheck + release tag test"
 	@echo "  audit      cargo audit + cargo deny"
 	@echo "  coverage-check  enforce 90% line / 80% region coverage"
 	@echo "  fmt        format with rustfmt"

@@ -38,7 +38,7 @@ This repository uses GitHub Actions to block risky changes early.
   baseline without the CRS, and the same Envoy settings and request
   normalization cases.
 - Meta-lint: `make lint-extra` (typos, taplo over `**/*.toml`, actionlint,
-  shellcheck); the downloaded tools are version- and checksum-pinned, see
+  shellcheck, and the release tag test); the downloaded tools are version- and checksum-pinned, see
   [Lint tool trust](#lint-tool-trust).
 - Feature matrix: test and lint each feature combo with `cargo-hack`; the job
   fetches the pinned CRS release first so `envoy-coraza`'s `embed-crs` feature
@@ -83,7 +83,8 @@ regression promotion.
 
 ### Lint tool trust
 
-`make lint-extra` runs `typos`, `taplo`, `actionlint` and `shellcheck`.
+`make lint-extra` runs `typos`, `taplo`, `actionlint` and `shellcheck`, then
+`.github/scripts/release-tag.test.sh`.
 
 - `typos`, `taplo` and `actionlint` are GitHub release binaries in the
   `meta-lint` job. `.github/workflows/tests.yaml` pins each version and the
@@ -285,11 +286,27 @@ stages the results as
 assets and packages each into a scratch Docker image
 (`ghcr.io/networking-incubator/coraza-rs` and `...-crs`, usable directly as
 Envoy `WASMPlugin` images) tagged `nightly` and `nightly-YYYYMMDD` for
-nightlies, or `vX.Y.Z` for manual releases (`latest` only when the released
-tag is the newest final one, so an older backported tag or a prerelease tag
-cannot move it backwards). GitHub releases are marked as prereleases for any
-semver prerelease tag (`vX.Y.Z-rc.N`, and the nightlies) and as regular
-releases for final `vX.Y.Z` tags.
+nightlies, or the pushed tag for manual releases. On a tag push the workflow
+runs `.github/scripts/release-tag.sh`, which exports `GORELEASER_CURRENT_TAG`
+(the pushed tag, so GoReleaser never picks a different tag on the same commit)
+and `PUSH_LATEST`. Only the highest final `vX.Y.Z` tag gets
+`PUSH_LATEST=true`: it alone becomes GitHub's Latest release and moves the
+image `latest` tags, so an older backported tag or a prerelease tag cannot move
+them backwards. A tag that is not strict semver (`vX.Y.Z` or
+`vX.Y.Z-prerelease`, no build metadata, no leading zeros) fails the run before
+anything is published. GitHub releases are marked as prereleases for any semver
+prerelease tag (`vX.Y.Z-rc.N`, and the nightlies) and as regular releases for
+final `vX.Y.Z` tags.
+
+To promote a release candidate, push the final `vX.Y.Z` tag on the same commit
+as `vX.Y.Z-rc.N`; the final tag is released, not the RC. A tag push runs the
+workflow and GoReleaser configuration of the tagged commit, so this works only
+for an RC commit that already has this release workflow: an RC tagged before it
+(such as `v0.0.3-rc.2`) is promoted by tagging the final release on a later
+commit. Releases are
+immutable, so a tag cannot be re-released after a failed run: push a new tag.
+`.github/scripts/release-tag.test.sh` (run by `make lint-extra`) covers the tag
+shapes.
 
 OSS GoReleaser has no nightly mode (Pro-only), so the nightly workflow passes
 the dated tag (`v0.0.0-nightly.YYYYMMDD`) to GoReleaser via the

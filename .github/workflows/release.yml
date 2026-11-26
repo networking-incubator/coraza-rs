@@ -95,29 +95,28 @@ jobs:
       # OSS GoReleaser has no nightly support (Pro-only), so the nightly tag is
       # passed to GoReleaser via GORELEASER_CURRENT_TAG instead: GoReleaser
       # creates the tag (at this commit) and the release when publishing, and
-      # an existing same-day tag is never moved. Manual releases use the pushed
-      # vX.Y.Z tag directly (GoReleaser detects it from the checkout).
+      # an existing same-day tag is never moved. Tag pushes set it to the
+      # pushed tag in the next step.
       - name: Set nightly tag for GoReleaser
         if: github.event_name != 'push'
         run: echo "GORELEASER_CURRENT_TAG=v0.0.0-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
 
-      # Only the newest final vX.Y.Z release may publish the shared `latest`
-      # image tags, so a delayed or backported older tag — or any prerelease
-      # tag (vX.Y.Z-rc.N, which sort before their final tag) — cannot move
-      # them backwards.
-      - name: Check whether to publish latest image tags
+      # Pin GoReleaser to the pushed tag and decide `latest` (see
+      # .github/scripts/release-tag.sh). Without GORELEASER_CURRENT_TAG,
+      # GoReleaser releases the highest tag at HEAD, and git ranks vX.Y.Z-rc.N
+      # above vX.Y.Z, so tagging a final release on its RC commit would
+      # re-release the RC. Only the highest strict-semver final tag may take
+      # `latest` (the GitHub Latest release and the image tags); prereleases,
+      # backports and non-semver tags (which fail the run) cannot.
+      - name: Resolve release tag
         if: github.event_name == 'push'
         run: |
-          newest="$(git tag --list 'v[0-9]*' | grep -v -- '-' | sort -V | tail -1)"
-          if [ "$newest" = "${GITHUB_REF_NAME}" ]; then
-            echo "PUSH_LATEST=true" >> "$GITHUB_ENV"
-          else
-            echo "PUSH_LATEST=false" >> "$GITHUB_ENV"
-          fi
+          tags="$(git tag --list 'v*')"
+          .github/scripts/release-tag.sh "$GITHUB_REF_NAME" <<<"$tags" >> "$GITHUB_ENV"
 
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: "~> v2"
+          version: "v2.20.3"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
