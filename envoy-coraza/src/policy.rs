@@ -556,6 +556,40 @@ fn truncate_message(message: &str) -> Cow<'_, str> {
     Cow::Owned(truncated)
 }
 
+/// What a configuration leaves uninspected or unidentifiable, as warnings. Policies that no request can select are an
+/// error, unless `unmatched_authority` is `"allow"`.
+fn selection_warnings(config: &Config) -> Result<Vec<String>, CompileError> {
+    let allow_unmatched = config.unmatched_authority == UnmatchedAuthority::Allow;
+    let mut warnings = Vec::new();
+    if config.directives_map.is_empty() {
+        warnings.push("envoy-coraza: no policies configured; every request passes uninspected".to_owned());
+    } else if config.default_directives.is_none() && config.per_authority_directives.is_empty() {
+        if !allow_unmatched {
+            return Err(CompileError::NoSelector);
+        }
+        warnings.push(
+            "envoy-coraza: policies are configured but no default_directives or per_authority_directives \
+             selects one; every request passes uninspected"
+                .to_owned(),
+        );
+    } else if config.default_directives.is_none() && allow_unmatched {
+        warnings.push(
+            "envoy-coraza: unmatched_authority is \"allow\" and no default_directives is set; a request to an \
+             unlisted authority passes uninspected"
+                .to_owned(),
+        );
+    }
+    if config.missing_client_address == MissingClientAddress::Allow {
+        warnings.push(
+            "envoy-coraza: missing_client_address is \"allow\"; selected requests without a usable client IP \
+             reach policy rules with an empty REMOTE_ADDR, so rules cannot reliably identify or match the \
+             client's actual IP"
+                .to_owned(),
+        );
+    }
+    Ok(warnings)
+}
+
 impl Generation {
     /// Compiles every configured policy into one generation.
     ///
@@ -570,10 +604,6 @@ impl Generation {
     }
 
     /// Compiles with injectable bounds, for tests.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Generation validation, policy compilation and construction are one bounded pass."
-    )]
     fn compile_with_limits(config: Config, limits: CompileLimits) -> Result<Self, CompileError> {
         check_limits(&config, limits)?;
         // Resolve references first, so a name typo fails before any policy compiles.
@@ -591,6 +621,7 @@ impl Generation {
             }
         }
 
+        let mut warnings = selection_warnings(&config)?;
         let Config {
             directives_map,
             default_directives,
@@ -600,34 +631,6 @@ impl Generation {
             unmatched_authority,
             missing_client_address,
         } = config;
-        let allow_unmatched = unmatched_authority == UnmatchedAuthority::Allow;
-        let mut warnings = Vec::new();
-        if directives_map.is_empty() {
-            warnings.push("envoy-coraza: no policies configured; every request passes uninspected".to_owned());
-        } else if default_directives.is_none() && per_authority_directives.is_empty() {
-            if !allow_unmatched {
-                return Err(CompileError::NoSelector);
-            }
-            warnings.push(
-                "envoy-coraza: policies are configured but no default_directives or per_authority_directives \
-                 selects one; every request passes uninspected"
-                    .to_owned(),
-            );
-        } else if default_directives.is_none() && allow_unmatched {
-            warnings.push(
-                "envoy-coraza: unmatched_authority is \"allow\" and no default_directives is set; a request to an \
-                 unlisted authority passes uninspected"
-                    .to_owned(),
-            );
-        }
-        if missing_client_address == MissingClientAddress::Allow {
-            warnings.push(
-                "envoy-coraza: missing_client_address is \"allow\"; selected requests without a usable client IP \
-                 reach policy rules with an empty REMOTE_ADDR, so rules cannot reliably identify or match the \
-                 client's actual IP"
-                    .to_owned(),
-            );
-        }
         let unlisted = builtin_rule_data(&mut rule_data)?;
         let diagnostics = Arc::new(Diagnostics::default());
         let source: Arc<dyn RuleData> = Arc::new(CountingRuleData::new(

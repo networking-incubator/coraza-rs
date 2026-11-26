@@ -117,6 +117,14 @@ each item against your policies before upgrading.
   503**; Unix-domain and internal listeners that must pass such requests need
   `"missing_client_address": "allow"`. See
   [Required Envoy configuration](#required-envoy-configuration).
+* **A configuration without a policy key is rejected**, so Envoy refuses it
+  instead of loading a filter that inspects nothing. A document with only
+  settings (`missing_client_address`, `unmatched_authority`,
+  `enable_filter_state_logs`, `rule_data`, `metric_labels`), for example one
+  whose policy key is misspelled, loaded before and passed every request
+  uninspected. For a filter that is meant to inspect nothing, add
+  `"directives_map": {}`; see
+  [Empty or missing configuration](#empty-or-missing-configuration).
 * **`@recommended-conf` enforces**: a policy that includes it without
   `SecRuleEngine On` now blocks; see
   [Recommended baseline](#recommended-baseline-recommended-conf).
@@ -192,8 +200,12 @@ load, so Envoy NACKs the update and keeps the previous configuration. Envoy
 creates a fresh root context for each configuration update (LDS or ECDS), so the
 filter cannot tell a first load from a reload, and accepting blank input would
 let a cleared configuration disable inspection. The one deliberate way to run
-an uninspected filter is an explicit recognised key, such as
-`{"directives_map": {}}`, which the filter accepts and logs as a warning.
+an uninspected filter is an explicit `{"directives_map": {}}`, which the filter
+accepts and logs as a warning. A document whose recognised keys are all settings
+(`unmatched_authority`, `missing_client_address`, `enable_filter_state_logs`,
+`rule_data`, `metric_labels`) is rejected too: it needs one of `directives_map`,
+`default_directives` or `per_authority_directives`, so a misspelled policy key
+beside a setting cannot load as a filter that inspects nothing.
 
 A configuration with policies but neither `default_directives` nor
 `per_authority_directives` is rejected: nothing could select its policies. Add
@@ -277,7 +289,9 @@ For a request that selects a policy, a missing or malformed `source.address`
 now receives 503 before that policy's rules run, with
 `inspection_reason=incomplete` and `terminal_outcome=incomplete`. This gate
 applies regardless of `SecRuleEngine`, including `DetectionOnly` and `Off`.
-The filter does not derive this address from `X-Forwarded-For`. A Unix-domain or
+`source.address` itself comes from `X-Forwarded-For` when Envoy's
+`use_remote_address` is `false`; the filter never falls back to that header, or
+to any other, when the address is missing. A Unix-domain or
 internal listener without an IP address can set the top-level
 `"missing_client_address": "allow"` to retain the previous behavior. This is a
 per-plugin-configuration option, so it applies to all listeners sharing that

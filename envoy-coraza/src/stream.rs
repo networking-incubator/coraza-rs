@@ -3307,7 +3307,13 @@ mod scripted_host_tests {
 
     #[test]
     fn a_missing_or_malformed_client_address_is_rejected_before_rules_in_every_engine_mode() {
-        let source_addresses: [Option<&[u8]>; 4] = [None, Some(b""), Some(b"unix:/run/x"), Some(b"\xff")];
+        let source_addresses: [Option<&[u8]>; 5] = [
+            None,
+            Some(b""),
+            Some(b"unix:/run/x"),
+            Some(b"\xff"),
+            Some(b"[fe80::1%eth0]:80"),
+        ];
         for engine in ["On", "DetectionOnly", "Off"] {
             let config = format!(
                 r#"{{"directives_map": {{"p": ["SecRuleEngine {engine}", "SecAction \"id:201,phase:1,deny,status:418\""]}},
@@ -3876,6 +3882,44 @@ mod scripted_host_tests {
                 test_hostcalls::local_reply_statuses(),
                 [418],
                 "{address:?}, {source_port:?}: valid client addresses reach rules with their port"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_and_ipv4_mapped_source_addresses_reach_the_rules_instead_of_the_refusal() {
+        // A parse that stopped accepting one of these forms would answer 503 to every such client.
+        for (address, source_port, operator) in [
+            (&b"[2001:db8::1]:443"[..], None, "@ipMatch 2001:db8::/32"),
+            (&b"2001:db8::1"[..], Some(4321_u64), "@streq 2001:db8::1"),
+            (&b"[::ffff:1.2.3.4]:80"[..], None, "@ipMatch 1.2.3.4"),
+            (&b"[::1]:80"[..], None, "@streq ::1"),
+            // A numeric zone is accepted and dropped; a named one is refused (above).
+            (&b"[fe80::1%2]:80"[..], None, "@streq fe80::1"),
+        ] {
+            let config = format!(
+                r#"{{"directives_map": {{"p": ["SecRuleEngine On",
+                    "SecRule REMOTE_ADDR \"{operator}\" \"id:201,phase:1,deny,status:418\""]}},
+                    "default_directives": "p"}}"#
+            );
+            let mut stream = stream(&config);
+            let count = script_request("a.example", "http");
+            test_hostcalls::set_property("source.address", address);
+            if let Some(source_port) = source_port {
+                test_hostcalls::set_property("source.port", &source_port.to_le_bytes());
+            } else {
+                test_hostcalls::remove_property("source.port");
+            }
+
+            assert_eq!(
+                stream.on_http_request_headers(count, true),
+                Action::Pause,
+                "{address:?}"
+            );
+            assert_eq!(
+                test_hostcalls::local_reply_statuses(),
+                [418],
+                "{address:?}: the rule saw the client address, which a 503 refusal would not let it"
             );
         }
     }
