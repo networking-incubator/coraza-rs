@@ -25,9 +25,11 @@
 //!   configuration update and never calls `on_configure` twice on one root, so a load cannot tell a first load from a
 //!   reload; accepting blank input would let a cleared configuration be acknowledged as "inspect nothing". The
 //!   rejection makes Envoy keep the previous configuration. A document whose top level is not an object, or an object
-//!   with none of the recognised keys below (so `{}` or only misspelled keys), is rejected for the same reason. The one
-//!   deliberate way to configure an uninspected filter is an explicit recognised key such as `{"directives_map": {}}`,
-//!   which is accepted and logged as a warning.
+//!   with none of the recognised keys below (so `{}` or only misspelled keys), is rejected for the same reason, and so
+//!   is one whose recognised keys all hold settings (see [`POLICY_KEYS`]): a misspelled policy key beside
+//!   `missing_client_address` would otherwise load as a filter that inspects nothing. The one deliberate way to
+//!   configure an uninspected filter is an explicit `{"directives_map": {}}`, which is accepted and logged as a
+//!   warning.
 //! * `directives_map` is an object of policy name to an array of directives, or to a single scalar, which becomes a
 //!   one-element list. Array elements are coerced with [`scalar_text`]: strings, numbers, booleans and `null`
 //!   contribute their text; an array or object anywhere in a policy's directive list is rejected, naming the policy and
@@ -72,9 +74,9 @@
 //!   decompressed document is rejected, and so is one that itself holds `config_gzip_b64`, rather than nested. Exactly
 //!   one gzip member is accepted: its deflate stream must end where its trailer begins, and nothing may follow the
 //!   trailer.
-//! * Unknown keys are ignored in a plain document, as long as at least one recognised key is present: control planes
-//!   may add their own keys, so only a document with no recognised key at all is rejected. The recognised keys are
-//!   [`RECOGNISED_KEYS`].
+//! * Unknown keys are ignored in a plain document, as long as at least one policy key is present: control planes may
+//!   add their own keys, so only a document with no policy key is rejected. The recognised keys are
+//!   [`RECOGNISED_KEYS`], and the policy keys among them [`POLICY_KEYS`].
 //!
 //! # Known divergences from upstream
 //!
@@ -130,8 +132,8 @@
 //!   one skipped by an include budget, is rejected with the policy name and the first skipped diagnostic. Upstream
 //!   would compile the rest of the policy and serve it; a policy that silently loses a rule line is a fail-open, so
 //!   this build keeps strict compilation.
-//! * Unlike upstream, non-objects and objects with no recognised key are rejected so a reload cannot replace an
-//!   enforcing generation with an empty one.
+//! * Unlike upstream, non-objects, objects with no recognised key and objects with no policy key are rejected so a
+//!   reload cannot replace an enforcing generation with an empty one.
 //! * A present `directives_map` or `per_authority_directives` that is not an object is rejected. Upstream's `ForEach`
 //!   on `null` iterates once and on an array iterates its elements, so such a document does something rather than
 //!   nothing; rejecting it is stricter, not "treating it as absent". A non-object `rule_data` is read as empty instead:
@@ -220,6 +222,19 @@ pub(crate) const RECOGNISED_KEYS: [&str; 10] = [
     "config_gzip_b64",
     "unmatched_authority",
     "missing_client_address",
+];
+
+/// The [`RECOGNISED_KEYS`] that can carry a policy; the others only configure how a policy is applied. A plain
+/// document needs one of them, or it would load as a generation with no policy that inspects nothing.
+///
+/// `rules` is listed so its dedicated rejection is reported, and `config_gzip_b64` because the document it wraps is
+/// checked in its turn.
+pub(crate) const POLICY_KEYS: [&str; 5] = [
+    "directives_map",
+    "default_directives",
+    "per_authority_directives",
+    "rules",
+    "config_gzip_b64",
 ];
 
 /// Longest policy, authority or `rule_data` name, in bytes.
@@ -399,6 +414,8 @@ pub(crate) enum ConfigError {
     },
     /// The top-level object holds none of the [`RECOGNISED_KEYS`].
     NoRecognisedKey,
+    /// The top-level object holds none of the [`POLICY_KEYS`], only keys that configure how a policy is applied.
+    NoPolicyKey,
     /// The plugin configuration is empty, whitespace-only or missing.
     BlankConfiguration,
     /// A decompressed `config_gzip_b64` document is blank.
@@ -415,6 +432,15 @@ pub(crate) enum ConfigError {
     MixedEncodings,
     /// A decompressed document itself holds `config_gzip_b64`.
     NestedCompression,
+}
+
+/// Writes that the configuration holds none of `keys`, as `what` says, and which keys they are.
+fn write_missing_keys(f: &mut Formatter<'_>, what: &str, keys: &[&str]) -> fmt::Result {
+    write!(
+        f,
+        "plugin configuration has {what} ({}); check for a misspelled key",
+        keys.join(", ")
+    )
 }
 
 impl Display for ConfigError {
@@ -485,11 +511,8 @@ impl Display for ConfigError {
             Self::NotAnObject { found } => {
                 write!(f, "plugin configuration must be a JSON object, not {found}")
             },
-            Self::NoRecognisedKey => write!(
-                f,
-                "plugin configuration has none of the recognised keys ({}); check for a misspelled key",
-                RECOGNISED_KEYS.join(", ")
-            ),
+            Self::NoRecognisedKey => write_missing_keys(f, "none of the recognised keys", &RECOGNISED_KEYS),
+            Self::NoPolicyKey => write_missing_keys(f, "no policy key", &POLICY_KEYS),
             Self::BlankConfiguration => write!(
                 f,
                 "plugin configuration is blank or missing; supply one of the recognised keys ({}), for example \
@@ -577,12 +600,15 @@ impl Config {
 
     /// Parses a non-blank document into its top-level object.
     ///
-    /// A non-object document and an object with no recognised key are rejected:
-    /// either would otherwise become a generation that inspects nothing.
+    /// A non-object document, an object with no recognised key and one with no policy key are rejected: each would
+    /// otherwise become a generation that inspects nothing.
     fn parse_object(bytes: &[u8]) -> Result<Map<String, Value>, ConfigError> {
         check_json_value_count(bytes)?;
         match serde_json::from_slice(bytes).map_err(ConfigError::InvalidJson)? {
-            Value::Object(object) if RECOGNISED_KEYS.iter().any(|key| object.contains_key(*key)) => Ok(object),
+            Value::Object(object) if POLICY_KEYS.iter().any(|key| object.contains_key(*key)) => Ok(object),
+            Value::Object(object) if RECOGNISED_KEYS.iter().any(|key| object.contains_key(*key)) => {
+                Err(ConfigError::NoPolicyKey)
+            },
             Value::Object(_) => Err(ConfigError::NoRecognisedKey),
             other => Err(ConfigError::NotAnObject { found: kind(&other) }),
         }
@@ -1127,7 +1153,9 @@ mod tests {
         let rule_data = (0..count)
             .map(|index| (format!("file{index}.txt"), serde_json::Value::String("x".to_owned())))
             .collect::<serde_json::Map<_, _>>();
-        serde_json::json!({"rule_data": rule_data}).to_string().into_bytes()
+        serde_json::json!({"directives_map": {}, "rule_data": rule_data})
+            .to_string()
+            .into_bytes()
     }
 
     #[test]
@@ -1276,15 +1304,15 @@ mod tests {
             "absent is false"
         );
         assert!(
-            parse(r#"{"enable_filter_state_logs": true}"#).enable_filter_state_logs,
+            parse(r#"{"directives_map": {}, "enable_filter_state_logs": true}"#).enable_filter_state_logs,
             "true"
         );
         assert!(
-            !parse(r#"{"enable_filter_state_logs": "true"}"#).enable_filter_state_logs,
+            !parse(r#"{"directives_map": {}, "enable_filter_state_logs": "true"}"#).enable_filter_state_logs,
             "a string is not a boolean, so the switch stays off"
         );
         assert!(
-            !parse(r#"{"enable_filter_state_logs": 1}"#).enable_filter_state_logs,
+            !parse(r#"{"directives_map": {}, "enable_filter_state_logs": 1}"#).enable_filter_state_logs,
             "a number is not a boolean"
         );
     }
@@ -1388,8 +1416,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_alongside_a_recognised_key_are_ignored() {
-        let config = parse(r#"{"unknown": {"nested": true}, "enable_filter_state_logs": true}"#);
+    fn unknown_keys_alongside_a_policy_key_are_ignored() {
+        let config = parse(r#"{"unknown": {"nested": true}, "directives_map": {}, "enable_filter_state_logs": true}"#);
         assert!(config.directives_map.is_empty(), "no policy is configured");
         assert!(config.enable_filter_state_logs, "known keys are still read");
     }
@@ -1513,9 +1541,9 @@ mod tests {
             assert_eq!(config.unmatched_authority, expected, "{value:?}");
         }
         assert_eq!(
-            parse(r#"{"unmatched_authority": "allow"}"#).unmatched_authority,
+            parse(r#"{"directives_map": {}, "unmatched_authority": "allow"}"#).unmatched_authority,
             UnmatchedAuthority::Allow,
-            "the key is recognised on its own"
+            "the key is read beside an explicit pass-through"
         );
     }
 
@@ -1545,8 +1573,63 @@ mod tests {
     #[test]
     fn missing_client_address_is_a_recognized_top_level_key() {
         for value in [r#""reject""#, r#""allow""#] {
-            let config = Config::parse(format!(r#"{{"missing_client_address": {value}}}"#).as_bytes());
+            let config =
+                Config::parse(format!(r#"{{"directives_map": {{}}, "missing_client_address": {value}}}"#).as_bytes());
             assert!(config.is_ok(), "{value} should be accepted: {config:?}");
+        }
+    }
+
+    #[test]
+    fn a_document_whose_recognised_keys_only_hold_settings_is_rejected() {
+        // A misspelled policy key beside a settings key must not load as a filter that inspects nothing, which is
+        // what the recognised-key check exists to stop. Every settings key, alone and together, and inside the
+        // `config_gzip_b64` wrapper.
+        let settings = [
+            r#""missing_client_address": "reject""#,
+            r#""missing_client_address": "allow""#,
+            r#""unmatched_authority": "allow""#,
+            r#""enable_filter_state_logs": true"#,
+            r#""rule_data": {"data.txt": "attack\n"}"#,
+            r#""metric_labels": {"a": "b"}"#,
+        ];
+        let misspelled = r#""directive_map": {"p": []}, "default_directive": "p", "unknown": 1"#;
+        let mut documents: Vec<String> = settings.iter().map(|setting| format!("{{{setting}}}")).collect();
+        documents.extend(settings.iter().map(|setting| format!("{{{setting}, {misspelled}}}")));
+        documents.push(format!("{{{}}}", settings[..4].join(", ")));
+        for document in documents {
+            for input in [document.clone(), compressed(&document)] {
+                let error = Config::parse(input.as_bytes()).unwrap_err();
+                assert!(matches!(error, ConfigError::NoPolicyKey), "{input} reported {error:?}");
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("plugin configuration has no policy key (directives_map"),
+                    "message was {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_policy_key_satisfies_the_document_check_on_its_own() {
+        // The explicit pass-through, a name that is only resolved when compiling, and a legacy key that has its own
+        // rejection: none is the "no policy key" error.
+        for (document, expected) in [
+            (r#"{"directives_map": {}}"#, None),
+            (r#"{"default_directives": "p"}"#, None),
+            (r#"{"per_authority_directives": {}}"#, None),
+            (r#"{"rules": []}"#, Some("rules is no longer supported")),
+        ] {
+            let result = Config::parse(document.as_bytes());
+            match expected {
+                None => assert!(result.is_ok(), "{document} reported {result:?}"),
+                Some(message) => assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().starts_with(message)),
+                    "{document} reported {result:?}"
+                ),
+            }
         }
     }
 
@@ -1558,11 +1641,11 @@ mod tests {
             "absent means reject"
         );
         assert_eq!(
-            parse(r#"{"missing_client_address": "reject"}"#).missing_client_address,
+            parse(r#"{"directives_map": {}, "missing_client_address": "reject"}"#).missing_client_address,
             MissingClientAddress::Reject
         );
         assert_eq!(
-            parse(r#"{"missing_client_address": "allow"}"#).missing_client_address,
+            parse(r#"{"directives_map": {}, "missing_client_address": "allow"}"#).missing_client_address,
             MissingClientAddress::Allow
         );
     }
@@ -1641,7 +1724,8 @@ mod tests {
 
     #[test]
     fn rule_data_is_read_as_file_bytes() {
-        let config = parse(r#"{"rule_data": {"data.txt": "attack\nscanner\n", "rules/a.conf": ""}}"#);
+        let config =
+            parse(r#"{"directives_map": {}, "rule_data": {"data.txt": "attack\nscanner\n", "rules/a.conf": ""}}"#);
         assert_eq!(
             config.rule_data.get("data.txt").map(Vec::as_slice),
             Some(b"attack\nscanner\n".as_slice()),
@@ -1675,7 +1759,7 @@ mod tests {
 
     #[test]
     fn rule_data_names_that_normalize_together_are_rejected() {
-        let error = parse_error(r#"{"rule_data": {"a//b.txt": "x", "./a/b.txt": "y"}}"#);
+        let error = parse_error(r#"{"directives_map": {}, "rule_data": {"a//b.txt": "x", "./a/b.txt": "y"}}"#);
         assert!(
             error.contains("name normalizes to \"a/b.txt\""),
             "message was {error:?}"
@@ -1728,12 +1812,14 @@ mod tests {
             "message was {error:?}"
         );
 
-        let at_limit = serde_json::json!({"rule_data": {"a.txt": "a".repeat(MAX_RULE_DATA_FILE_BYTES)}});
+        let at_limit =
+            serde_json::json!({"directives_map": {}, "rule_data": {"a.txt": "a".repeat(MAX_RULE_DATA_FILE_BYTES)}});
         assert!(
             Config::parse(at_limit.to_string().as_bytes()).is_ok(),
             "exactly {MAX_RULE_DATA_FILE_BYTES} bytes are accepted"
         );
-        let over = serde_json::json!({"rule_data": {"a.txt": "a".repeat(MAX_RULE_DATA_FILE_BYTES + 1)}});
+        let over =
+            serde_json::json!({"directives_map": {}, "rule_data": {"a.txt": "a".repeat(MAX_RULE_DATA_FILE_BYTES + 1)}});
         let error = Config::parse(over.to_string().as_bytes()).unwrap_err().to_string();
         assert!(
             error.contains(&format!("over the {MAX_RULE_DATA_FILE_BYTES}-byte per-file limit")),
@@ -1748,7 +1834,7 @@ mod tests {
         for index in 0..RULE_DATA_LIMITS.total_bytes / MAX_RULE_DATA_FILE_BYTES {
             rule_data.insert(format!("f{index}.txt"), serde_json::Value::String(file.clone()));
         }
-        let at_limit = serde_json::json!({"rule_data": rule_data});
+        let at_limit = serde_json::json!({"directives_map": {}, "rule_data": rule_data});
         assert!(
             Config::parse(at_limit.to_string().as_bytes()).is_ok(),
             "exactly {} total bytes are accepted",
@@ -1756,9 +1842,13 @@ mod tests {
         );
 
         rule_data.insert("one-more.txt".to_owned(), serde_json::Value::String("a".to_owned()));
-        let error = Config::parse(serde_json::json!({"rule_data": rule_data}).to_string().as_bytes())
-            .unwrap_err()
-            .to_string();
+        let error = Config::parse(
+            serde_json::json!({"directives_map": {}, "rule_data": rule_data})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains(&format!("over the {}-byte limit", RULE_DATA_LIMITS.total_bytes)),
             "message was {error:?}"
@@ -1798,11 +1888,11 @@ mod tests {
 
     #[test]
     fn non_string_rule_data_values_are_ignored_but_named() {
-        let config = parse(r#"{"rule_data": {"data.txt": 7, "other.txt": "kept"}}"#);
+        let config = parse(r#"{"directives_map": {}, "rule_data": {"data.txt": 7, "other.txt": "kept"}}"#);
         assert_eq!(config.rule_data.len(), 1, "only string values carry bytes");
         assert!(config.rule_data.contains_key("other.txt"), "the string value is kept");
 
-        let error = Config::parse(br#"{"rule_data": {"../x": 7}}"#).unwrap_err();
+        let error = Config::parse(br#"{"directives_map": {}, "rule_data": {"../x": 7}}"#).unwrap_err();
         assert!(
             matches!(error, ConfigError::RuleData { .. }),
             "a wrong-typed value does not bypass the name check"
@@ -1842,7 +1932,7 @@ mod tests {
             "message was {error:?}"
         );
 
-        let error = Config::parse(format!(r#"{{"rule_data": {{"{over}": "x"}}}}"#).as_bytes())
+        let error = Config::parse(format!(r#"{{"directives_map": {{}}, "rule_data": {{"{over}": "x"}}}}"#).as_bytes())
             .unwrap_err()
             .to_string();
         assert!(
