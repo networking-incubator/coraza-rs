@@ -57,7 +57,8 @@
 //!   `default_directives`; it is never silently ignored.
 //! * `metric_labels` is accepted and ignored for upstream configuration compatibility; this build publishes no
 //!   Prometheus metrics.
-//! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`.
+//! * `enable_filter_state_logs` is a boolean, `false` by default; any other type also reads as `false`. It gates only
+//!   the legacy interruption filter-state properties; the additive v1 health properties are always published.
 //! * `rule_data` is this connector's additive map of file name to file bytes for the file-based operators and
 //!   `Include`. Names are bounded like the engine's in-memory rule data source: see [`RULE_DATA_LIMITS`]. A non-string
 //!   value is ignored, but its name is still validated. Every build seeds the recommended baseline as
@@ -77,9 +78,10 @@
 //!
 //! # Known divergences from upstream
 //!
-//! These are frozen by tests, not parity claims. They either reject a document
-//! that upstream would accept, or differ only in how a value is rendered; none
-//! turns a document upstream rejects into an accepted one.
+//! These configuration and runtime differences are frozen by tests, not parity
+//! claims. Some reject configurations upstream would accept or differ in how a
+//! value is rendered; none turns a document upstream rejects into an accepted
+//! one.
 //!
 //! Runtime authority lookup lowercases the request authority, strips one trailing dot of a registered name and the
 //! scheme's default port, writes an IPv6 literal in its compressed form, an IPv4-mapped one as the dotted-decimal
@@ -102,6 +104,17 @@
 //! a socket address or IP address, unless `"missing_client_address": "allow"` preserves the prior empty
 //! `REMOTE_ADDR`. The refusal applies regardless of `SecRuleEngine`, including `DetectionOnly` and `Off`; a property
 //! hostcall failure remains a separate fail-closed error.
+//!
+//! The connector publishes v1 terminal health for every stream pinned to a configured generation, including
+//! engine-off and allowed unmatched-authority bypasses before their request callback returns. Its connector-decision
+//! warnings use fixed outcome and phase strings, a numeric status, and power-of-two rate limiting per compiled
+//! generation in its root context. The first missing-client-address rejection and first unmatched-authority decision
+//! in each generation are also logged when their counts fall between those samples. Without a pinned generation,
+//! terminal health cannot be published and connector-decision warnings cannot be emitted. The warnings contain no
+//! request data.
+//! Legacy interruption `status` is the validated local-reply status: the current adapter accepts 200 through 599,
+//! including 204. A policy using `deny,status:200` still blocks the request from upstream but returns a 2xx local
+//! reply that can look successful to clients.
 //!
 //! * Duplicate JSON keys collapse before this parser sees them, and `serde_json` keeps the last value, so every key
 //!   read through `Get` or `ForEach` keeps its last duplicate, where upstream keeps the first. That covers
@@ -293,7 +306,7 @@ pub(crate) struct Config {
     pub(crate) default_directives: Option<String>,
     /// Authority to policy name.
     pub(crate) per_authority_directives: BTreeMap<String, String>,
-    /// Whether the fork's filter-state log lines are enabled.
+    /// Whether legacy interruption filter-state properties are enabled.
     pub(crate) enable_filter_state_logs: bool,
     /// File name to file bytes, for file-based rule operators.
     pub(crate) rule_data: BTreeMap<String, Vec<u8>>,

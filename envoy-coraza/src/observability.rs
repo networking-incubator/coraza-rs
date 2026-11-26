@@ -33,11 +33,30 @@ const MAX_AUDIT_LOG_BYTES: usize = 16 * 1024;
 /// Marker appended when a published log message was truncated.
 const TRUNCATION_MARKER: &str = " [truncated]";
 
-/// Counts telemetry hostcall failures and rate-limits secondary diagnostics.
+/// Fixed values for one connector-originated guard, bypass or partial-inspection decision.
+#[derive(Clone, Copy)]
+pub(crate) struct ConnectorDecision {
+    /// Whether the connector refused traffic.
+    pub(crate) refused: bool,
+    /// Closed inspection outcome.
+    pub(crate) outcome: &'static str,
+    /// Fixed phase name.
+    pub(crate) phase: &'static str,
+    /// Local reply status, or zero when a pass has no reply status.
+    pub(crate) status: u16,
+    /// Optional fixed configuration hint.
+    pub(crate) hint: Option<&'static str>,
+    /// Whether this is the first missing-address or unmatched-authority decision in the generation.
+    pub(crate) first_of_kind: bool,
+}
+
+/// Rate-limits connector decisions and telemetry hostcall failure diagnostics.
 #[derive(Debug, Default)]
 pub(crate) struct Diagnostics {
     /// Count of observed telemetry hostcall failures.
     failures: AtomicU64,
+    /// Count of connector decisions, shared by every stream of one generation.
+    connector_decisions: AtomicU64,
 }
 
 impl Diagnostics {
@@ -49,6 +68,38 @@ impl Diagnostics {
             if hostcalls::log(LogLevel::Error, &message).is_err() {
                 self.failures.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Emits a bounded, request-data-free connector decision at per-generation counts 1, 2, 4, 8, and so on.
+    ///
+    /// Returns whether the log hostcall failed so the stream can publish that telemetry failure.
+    pub(crate) fn connector_decision(&self, decision: ConnectorDecision) -> bool {
+        let count = self
+            .connector_decisions
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if !decision.first_of_kind && count != 1 && !count.is_power_of_two() {
+            return false;
+        }
+        let action = if decision.refused { "refused" } else { "passed" };
+        let message = match decision.hint {
+            Some(hint) => {
+                format!(
+                    "envoy-coraza: {action} (outcome={} phase={} status={} count={count} hint={hint})",
+                    decision.outcome, decision.phase, decision.status
+                )
+            },
+            None => format!(
+                "envoy-coraza: {action} (outcome={} phase={} status={} count={count})",
+                decision.outcome, decision.phase, decision.status
+            ),
+        };
+        if hostcalls::log(LogLevel::Warn, &message).is_err() {
+            self.hostcall_failure("connector decision log");
+            true
+        } else {
+            false
         }
     }
 
@@ -85,16 +136,13 @@ impl InterruptionPhase {
 
 /// Publishes the PR #20 interruption properties before local replies or response rewriting.
 pub(crate) fn interruption(
-    enabled: bool,
     transaction: &Transaction,
     interruption: &Interruption,
     phase: InterruptionPhase,
+    status: u16,
     diagnostics: &Diagnostics,
 ) -> bool {
     let mut failed = false;
-    if !enabled {
-        return false;
-    }
 
     let matched = transaction
         .matched_rules()
@@ -105,15 +153,7 @@ pub(crate) fn interruption(
         ("rule_id", interruption.rule_id.to_string()),
         ("phase", phase.state().to_owned()),
         ("action", interruption.action.clone()),
-        (
-            "status",
-            if interruption.status == 0 {
-                403
-            } else {
-                interruption.status
-            }
-            .to_string(),
-        ),
+        ("status", status.to_string()),
     ];
     if let Some(matched) = matched {
         if let Some(severity) = matched.severity() {
@@ -161,10 +201,7 @@ pub(crate) struct HealthState<'a> {
 }
 
 /// Publishes the additive v1 fields; failures do not affect enforcement.
-pub(crate) fn health(enabled: bool, state: HealthState<'_>, diagnostics: &Diagnostics) -> bool {
-    if !enabled {
-        return state.telemetry_publish_failed;
-    }
+pub(crate) fn health(state: HealthState<'_>, diagnostics: &Diagnostics) -> bool {
     let mut failed = state.telemetry_publish_failed;
     let fields = [
         ("inspection_complete", state.inspection_complete.to_string()),
@@ -247,7 +284,7 @@ fn sanitize_audit(input: &str, limit: usize, input_truncated: bool) -> String {
             break;
         }
         if character == '\n' {
-            sanitized.push(character);
+            sanitized.push_str("\\n");
         } else if character.is_control() {
             write!(sanitized, "\\u{{{:x}}}", character as u32).unwrap_or(());
         } else {
@@ -262,7 +299,9 @@ fn sanitize_audit(input: &str, limit: usize, input_truncated: bool) -> String {
 
 /// Returns the escaped byte length for one audit character.
 fn sanitized_char_len(character: char) -> usize {
-    if character.is_control() && character != '\n' {
+    if character == '\n' {
+        2
+    } else if character.is_control() {
         let value = character as u32;
         let digits = if value <= 0xF {
             1
@@ -327,11 +366,12 @@ fn category(tags: &[String]) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use coraza::types::AuditLogFormat;
+    use coraza::types::{AuditLogFormat, AuditLogPart};
+    use proxy_wasm::types::LogLevel;
 
     use super::{
-        audit_message, bounded, category, sanitize_audit, InterruptionPhase, MAX_AUDIT_LOG_BYTES, MAX_ERROR_LOG_BYTES,
-        TRUNCATION_MARKER,
+        audit_log, audit_message, bounded, category, sanitize_audit, Diagnostics, InterruptionPhase,
+        MAX_AUDIT_LOG_BYTES, MAX_ERROR_LOG_BYTES, TRUNCATION_MARKER,
     };
 
     #[test]
@@ -379,10 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn audit_log_sanitizing_is_bounded_and_escapes_controls_except_section_newlines() {
+    fn audit_log_sanitizing_is_bounded_and_escapes_all_controls() {
         assert_eq!(
             sanitize_audit("header\nbody\u{0007}", MAX_AUDIT_LOG_BYTES, false),
-            "header\nbody\\u{7}"
+            "header\\nbody\\u{7}"
         );
         assert_eq!(
             sanitize_audit("header", MAX_AUDIT_LOG_BYTES, true),
@@ -391,6 +431,27 @@ mod tests {
         let control_heavy = sanitize_audit(&"\u{0007}".repeat(MAX_AUDIT_LOG_BYTES * 10), MAX_AUDIT_LOG_BYTES, false);
         assert!(control_heavy.len() <= MAX_AUDIT_LOG_BYTES);
         assert!(control_heavy.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn native_audit_proxy_log_escapes_request_body_line_feeds() {
+        crate::test_hostcalls::reset();
+        let mut entry = audit_entry(0);
+        entry.parts = vec![AuditLogPart::Header, AuditLogPart::RequestBody, AuditLogPart::EndMarker];
+        entry.transaction.request.body = "first line\nsecond line".to_owned();
+
+        audit_log(&entry, AuditLogFormat::Native, &Diagnostics::default());
+
+        let lines = crate::test_hostcalls::log_messages()
+            .into_iter()
+            .filter(|(level, _)| *level == LogLevel::Critical)
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "one audit entry produces one proxy_log call");
+        assert!(
+            lines.iter().all(|(_, line)| !line.contains('\n')),
+            "the serialized entry stays on one proxy_log line: {lines:?}"
+        );
+        assert!(lines.iter().any(|(_, line)| line.contains("first line\\nsecond line")));
     }
 
     #[test]

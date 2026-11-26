@@ -246,9 +246,9 @@ pub(crate) struct Generation {
     authority_policies: BTreeMap<String, String>,
     /// Fallback policy name, absent when the configuration names none.
     default_policy: Option<String>,
-    /// Whether the fork's filter-state log lines are enabled.
+    /// Whether legacy interruption filter-state properties are enabled.
     enable_filter_state_logs: bool,
-    /// Shared rate-limited diagnostics for telemetry failures.
+    /// Shared rate-limited diagnostics for telemetry failures and connector decisions.
     diagnostics: Arc<Diagnostics>,
     /// Monotonic plugin configuration generation identifier.
     generation_id: u64,
@@ -259,9 +259,9 @@ pub(crate) struct Generation {
     notices: Vec<String>,
     /// Configure-time details, one per rule that switches the rule engine or request body access off.
     switches: Vec<String>,
-    /// Whether a request that matched no policy was already reported at warning level.
+    /// Whether an unmatched-authority decision has already received its actionable warning.
     unmatched_reported: Cell<bool>,
-    /// Whether a request refused for a missing client address was already reported at warning level.
+    /// Whether a missing-client-address rejection has already received its actionable warning.
     missing_client_address_reported: Cell<bool>,
     /// What happens to a request whose authority selects no policy.
     unmatched_authority: UnmatchedAuthority,
@@ -735,15 +735,12 @@ impl Generation {
         self.switches.iter().map(String::as_str)
     }
 
-    /// Records that a request matched no policy and returns whether it is the first one of this generation.
-    ///
-    /// Only the first is worth a warning: with no default policy every request of an unconfigured authority is
-    /// unmatched, and one warning per request floods the log.
+    /// Records an unmatched-authority decision and returns whether it is the first in this generation.
     pub(crate) fn first_unmatched_request(&self) -> bool {
         !self.unmatched_reported.replace(true)
     }
 
-    /// Records a request refused for a missing client address and returns whether it is the first of this generation.
+    /// Records a missing-client-address rejection and returns whether it is the first in this generation.
     pub(crate) fn first_missing_client_address_request(&self) -> bool {
         !self.missing_client_address_reported.replace(true)
     }
@@ -899,25 +896,6 @@ mod tests {
             ["envoy-coraza: no policies configured; every request passes uninspected"],
             "an empty generation warns that nothing is inspected"
         );
-    }
-
-    #[test]
-    fn only_the_first_unmatched_request_of_a_generation_is_reported() {
-        let generation =
-            parse_generation(r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}}"#);
-        assert!(
-            generation.first_unmatched_request(),
-            "the first unmatched request is reported"
-        );
-        for _ in 0..3 {
-            assert!(
-                !generation.first_unmatched_request(),
-                "later ones are not reported again"
-            );
-        }
-        let fresh =
-            parse_generation(r#"{"directives_map": {"p": []}, "per_authority_directives": {"a.example": "p"}}"#);
-        assert!(fresh.first_unmatched_request(), "each generation reports once");
     }
 
     #[test]

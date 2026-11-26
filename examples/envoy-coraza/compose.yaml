@@ -13,6 +13,9 @@ services:
       - /etc/envoy/envoy.yaml
       - --log-level
       - warning
+      # Flush file access logs within require_access_log's 2s polling window.
+      - --file-flush-interval-msec
+      - "100"
     depends_on:
       - backend
     ports:

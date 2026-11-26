@@ -55,9 +55,11 @@ each item against your policies before upgrading.
   * charges each buffered body against the root context's 64 MiB body budget
     (see [Body memory budget](#body-memory-budget)).
 
-  The filter writes no log line for these refusals. Envoy's access log shows
-  the status, and with `enable_filter_state_logs` the health properties show
-  the reason (see the harness's
+  The connector emits bounded, rate-limited decision warnings for refusals it
+  originates. Policy-rule denials, including rule-based 413 responses, follow
+  the rule's `log`/`nolog` action and do not add connector-decision lines.
+  Envoy's access log shows the status, and the v1 health properties show the
+  reason regardless of `enable_filter_state_logs` (see the harness's
   [observability notes](../examples/envoy-coraza/README.md#observability)).
   To let a host's bodies through uninspected, write `SecRequestBodyAccess Off`
   in its policy, or serve the endpoints that need it from a host of their own
@@ -173,6 +175,15 @@ each item against your policies before upgrading.
   HTTP-status-based monitoring no longer sees the rule's status (such as 403)
   for a gRPC call refused on its response.
   See [Refused responses](#refused-responses).
+* **Legacy interruption `status` now reports the effective local-reply
+  status when `enable_filter_state_logs` is enabled.** The optional
+  `io.coraza.waf.status` property reports the validated status passed to Envoy
+  for the local reply, not the raw configured interruption status. An invalid
+  status (for example, 100), or a redirect whose target cannot form a
+  `Location` value, falls back to 403 and reports 403. The existing validator
+  accepts 200–599, including 204. A rule using `deny,status:200` still prevents
+  the request from reaching the upstream but returns a 2xx reply that can look
+  successful to clients or success-based monitoring.
 
 ## Empty or missing configuration
 
@@ -250,16 +261,17 @@ sets every row marked "set", and its harness fails when one of them is missing.
 | `per_connection_buffer_limit_bytes`, route `request_body_buffer_limit` | listener, cluster, route | at least the largest `SecRequestBodyLimit` in use, at most 16 MiB (16 MiB, set) | Envoy answers 413 or 500 itself at its 1 MiB default |
 | `max_request_headers_kb` | connection manager | its default, 60 | a 1 MiB cookie header costs seconds of CPU |
 | `accept_http_10` | connection manager `http_protocol_options` | off, its default | with an unmodified CRS tree, HTTP/1.0 request lines also match CRS rule 905110 |
-| Wasm log level | Envoy `--component-log-level` | `wasm` at `warn` or more verbose | rule lines, the configure-time warnings and each policy's `enforces` line with its count of rules that switch the rule engine or request body access off, all logged at `warn`, are dropped; the lines naming those rules are logged at `info`; audit lines are logged at `critical`, so only `off` drops them |
+| Wasm log level | Envoy `--component-log-level` | `wasm` at `warn` or more verbose | rule lines, configure-time warnings, rate-limited connector-decision lines and each policy's `enforces` line with its count of rules that switch the rule engine or request body access off, all logged at `warn`, are dropped; the lines naming those rules are logged at `info`; audit lines are logged at `critical`, so only `off` drops them |
 
 `REMOTE_ADDR` is only as trustworthy as `use_remote_address` and
 `xff_num_trusted_hops`: without them, every rule keyed on the client address,
-an allowlist or a blocklist alike, and the client address in every log line are
-whatever the client writes in `X-Forwarded-For`. The rules see the request after
-Envoy's normalization, so a path or host rule matches the normalized form, which
-is the one the backend routes on. `REJECT_REQUEST` for header names with an
-underscore refuses clients that send them on purpose; `DROP_HEADER` keeps them
-working but drops the header without a trace.
+an allowlist or a blocklist alike, and any client address a rule or audit log
+records are whatever the client writes in `X-Forwarded-For`. Connector-decision
+lines deliberately contain no client address or other request data. The rules
+see the request after Envoy's normalization, so a path or host rule matches the
+normalized form, which is the one the backend routes on. `REJECT_REQUEST` for
+header names with an underscore refuses clients that send them on purpose;
+`DROP_HEADER` keeps them working but drops the header without a trace.
 
 For a request that selects a policy, a missing or malformed `source.address`
 now receives 503 before that policy's rules run, with
@@ -274,11 +286,65 @@ stays empty. An unnegated `@ipMatch` blocklist rule will not match an empty
 `REMOTE_ADDR` (the IP operator rejects empty input), though arbitrary rules can
 still match that empty value. Rules therefore cannot reliably identify or match
 the client's actual IP. A failure of the `source.address` property hostcall
-still fails closed with 503 in either mode. The first missing-or-malformed-address
-refusal in each configuration generation logs a warning naming `source.address`
-and suggesting the opt-out; later ones are logged at debug level. Filter-state
-v1 still reports only the generic `inspection_reason=incomplete`, which does
-not distinguish a missing address from a malformed one.
+still fails closed with 503 in either mode. The first such rejection in each
+generation is logged even when its decision count is not a power of two;
+subsequent connector decisions use the shared sample. These warnings identify a
+missing or malformed address by phase and status and carry the fixed hint
+`set_missing_client_address_allow`; they never include request data.
+Filter-state v1 still reports only the generic `inspection_reason=incomplete`,
+which does not distinguish a missing address from a malformed one.
+
+## Observability
+
+The additive `io.coraza.waf.v1.*` health properties are published for every
+stream pinned to a configured generation; a context without one cannot publish
+terminal health or emit generation-scoped connector-decision warnings.
+`enable_filter_state_logs` (false by default) gates only the legacy
+`io.coraza.waf.*` interruption properties. The filter finalizes and publishes
+the allowed `SecRuleEngine Off` and `unmatched_authority=allow` bypasses before
+their request-header callbacks return, so their state is available to Envoy's
+access logger. A context finalized before request headers reach this filter is
+reported as `inspection_complete=false`, `inspection_reason=incomplete`,
+`terminal_outcome=incomplete`; this classification sends no local reply and
+infers no reply status. A reset or other stream ending that reaches `on_done`
+still publishes terminal state there, after Envoy has written its access-log
+line; those late properties cannot appear in that line. No `on_log` hook is
+used.
+
+Connector decisions are written at `Warn` using fixed values only:
+`envoy-coraza: <passed|refused> (outcome=<reason> phase=<phase> status=<status> count=<n> [hint=<fixed-hint>])`.
+The square brackets mark an optional template suffix; emitted lines contain no
+brackets, and omit `hint=` when there is no fixed hint.
+The hints are mnemonics, not JSON keys: `set_missing_client_address_allow`
+means the top-level setting `"missing_client_address": "allow"`, and
+`set_unmatched_authority_allow` means `"unmatched_authority": "allow"`.
+The counter is shared by streams pinned to one compiled generation in its root
+context; separate root contexts count independently, so this is not a
+cluster-wide limit. It emits at counts 1, 2, 4, 8, and so on; the first
+missing-client-address rejection and first unmatched-authority decision in each
+generation are also logged when their counts fall between those samples. A
+local refusal uses its reply status; `status=0` means a pass had no local-reply
+status. Unmatched-authority, engine-off and partially inspected passes are
+logged too, as are passed request bodies that were not inspected. A `passed`
+warning records the connector's local decision to allow traffic past this
+filter, with the shown inspection outcome; it does not confirm end-to-end
+delivery or successful transaction finalization. A stream can still end with
+`terminal_outcome=upstream_failure_or_cancellation` after a reset/cancellation,
+or report `inspection_reason=finalization_error` and `terminal_outcome=error` if
+finalization fails. Policy-rule denials remain governed by Coraza's
+`log`/`nolog` actions; they do not produce connector-decision lines or consume
+this counter. Connector lines contain no authority, path, header, body or other
+request data.
+
+When published, legacy `io.coraza.waf.status` reports the validated status
+passed to Envoy for the local reply; see the
+[upgrade note](#upgrade-notes-behaviour-changes) for fallback behavior.
+
+All serialized audit formats pass through the control-character sanitizer
+before Proxy-Wasm logging; literal line feeds are escaped as the two characters
+`\n`, so one audit entry stays on one log line. Native-format text appends
+` [truncated]` when cut. The existing 16 KiB output bound and configured audit
+parts remain in force.
 
 ## Recommended baseline (`@recommended-conf`)
 
@@ -447,7 +513,7 @@ macro brings into a target (see
 `/login?next=%{ARGS_GET.next}` cannot split the reply's headers, and an empty
 target is what a macro that expands to nothing leaves. For such a target the
 client gets 403 while the legacy interruption properties keep the engine's
-`action=redirect` and the rule's status.
+`action=redirect` and report the actual reply `status=403`.
 
 Envoy's own reply to a request the filter still holds, such as the 408 of
 `request_timeout` or `stream_idle_timeout`, reaches the client as Envoy wrote

@@ -99,8 +99,14 @@ before reusing these files with other policies. For the request body:
   now buffers and inspects request bodies. It holds a streaming request body
   (gRPC streaming, a long chunked upload) until it ends, and refuses what
   earlier builds streamed through uninspected; the reason is the
-  `inspection_reason` health property (see [Observability](#observability)),
-  and the filter logs no line for any of these:
+  `inspection_reason` health property (see [Observability](#observability)).
+  Logging depends on the source of the refusal. Connector-originated guards,
+  including the 16 MiB and retained-body budgets, argument limits and
+  content-encoding checks, use bounded `Warn` decision logs sampled at counts
+  1, 2, 4, 8, and so on per compiled generation, so an individual occurrence
+  may have no connector log line. Policy-rule denials do not add
+  connector-decision lines; Coraza's `log`/`nolog` action controls their rule
+  logging. Engine-generated interruptions are not connector decisions either.
   * 413 for a body of `SecRequestBodyLimit` bytes or more under the default
     `SecRequestBodyLimitAction Reject` in `SecRuleEngine On` (`denied`), and for
     one over 16 MiB (`body_too_large`). A 20 MB upload to `off.local` that
@@ -161,8 +167,11 @@ the same schema as the plain form.
 The harness explicitly enables `enable_filter_state_logs`. Its access logger
 reads the legacy interruption properties through the exact one-element paths
 `wasm.io.coraza.waf.<field>` and the additive health properties through
-`wasm.io.coraza.waf.v1.<field>`. The switch defaults to `false`; when disabled,
-neither property namespace is published.
+`wasm.io.coraza.waf.v1.<field>`. The switch defaults to `false` and gates only
+the legacy interruption properties; all seven bounded v1 health fields are
+published for every stream pinned to a configured generation. A context
+without one cannot publish terminal health or emit generation-scoped
+connector-decision warnings.
 
 Legacy interruption state is published before the local reply:
 `event`, `rule_id`, `phase`, `action`, `status`, and, when the matched rule is
@@ -170,7 +179,11 @@ available, `severity`, `category`, and `client_ip`. The category is the first
 case-sensitive `attack-` tag with a valid lowercase suffix, or `other`. Values
 come from the Coraza interruption and matched rule; no request body or matched
 variable is exported. The two namespaces stay separate so health does not alter
-the PR #20 fields.
+the PR #20 fields. `status` is the validated status actually sent in the local
+reply; the current validator accepts 200–599, including 204. A policy rule
+using `deny,status:200` still prevents the request from reaching the upstream,
+but returns a 2xx local reply that can look successful to clients or
+success-based monitoring.
 
 Health values are bounded strings: `inspection_complete`, `inspection_reason`,
 decimal `policy_generation`, `request_body_truncated`,
@@ -189,28 +202,71 @@ failure/cancellation endings, so they share the stable value
 
 This build does not publish Envoy/Prometheus counters or gauges. It publishes
 only the optional PR #20 interruption filter-state properties, additive bounded
-health filter-state properties, and bounded error/audit log lines. The standalone
-harness checks the formatted health state and audit/error logs; there is no
-`stats_tags` configuration or Prometheus metric assertion.
+health filter-state properties, and bounded error/audit/decision log lines. The
+standalone harness checks the formatted health state and audit/error logs;
+there is no `stats_tags` configuration or Prometheus metric assertion.
 
-Telemetry hostcall failures do not change enforcement. Diagnostics use fixed
-operation names and emit at failure counts 1, 2, 4, 8, and so on. Selected
-Coraza audit records are opt-in through `SecAuditEngine`; the connector writes
-the configured audit format through Proxy-Wasm logging with existing parts and
-relevance selection, control-character escaping, a 16 KiB output cap, and an
-explicit truncation marker. The harness opts into `RelevantOnly` and checks its
-audit log callback. Native audit sinks remain unavailable in the WASM filter.
-When JSON, JSONLegacy, or OCSF output exceeds the cap, it keeps a bounded
-serialized prefix and appends the plain-text marker, so the result may not parse
-as JSON. Parser-compatible truncation remains an open follow-up.
+Telemetry hostcall failures do not change enforcement. Failure diagnostics use
+fixed operation names and emit at failure counts 1, 2, 4, 8, and so on.
+Connector-originated decisions also emit bounded `Warn` lines at counts 1, 2,
+4, 8, and so on. Their counter is shared by streams pinned to one compiled
+generation in its root context; separate root contexts count independently, so
+this is not a cluster-wide limit. The first missing-client-address rejection
+and first unmatched-authority decision in each generation are logged even if
+their counts fall between those samples; later decisions use the shared
+rate-limit counter. Lines contain only the passed/refused result, a closed
+outcome, a fixed phase, a numeric status and count, plus an optional fixed
+configuration hint; they never contain request data. A status of `0` means a
+pass had no local reply. Passed decisions include unmatched-authority,
+engine-off, partially inspected and request-body-not-inspected traffic. A
+`passed` warning records the connector's local decision to allow traffic past
+this filter, with the shown inspection outcome; it does not confirm end-to-end
+delivery or successful transaction finalization. A stream can still end with
+`terminal_outcome=upstream_failure_or_cancellation` after a reset/cancellation,
+or report `inspection_reason=finalization_error` and `terminal_outcome=error` if
+finalization fails. The hints are mnemonics, not JSON syntax:
+`set_missing_client_address_allow` means the top-level setting
+`"missing_client_address": "allow"`, and `set_unmatched_authority_allow` means
+`"unmatched_authority": "allow"`. Policy-rule denials do not produce
+connector-decision lines or consume that counter: Coraza's rule-level
+`log`/`nolog` actions continue to govern their logs.
+
+Engine-off and allowed unmatched-authority streams publish health before their
+request-header callback returns, so an access log can read those states.
+A stream that ends before request headers reach this filter publishes
+`inspection_complete=false`, `inspection_reason=incomplete`, and
+`terminal_outcome=incomplete`; this records the uninspected stream without
+sending a local reply or inferring a status. Streams that finish through
+`on_done`, including resets before completion, still publish terminal state
+there, after Envoy has written the access-log line; that late state cannot
+appear in that line. No `on_log` hook is used.
+
+Selected Coraza audit records are opt-in through `SecAuditEngine`; the connector
+writes the configured audit format through Proxy-Wasm logging with existing
+parts and relevance selection, control-character escaping, a 16 KiB output
+cap, and format-specific truncation. All serialized formats pass through the
+control-character sanitizer before Proxy-Wasm logging; literal line feeds are
+escaped as the two characters `\n`, keeping each entry to one proxy-log line.
+Native-format output appends the text suffix ` [truncated]` when cut. The
+harness opts into `RelevantOnly` and checks its audit log callback. Native
+audit sinks remain unavailable in the WASM filter.
+
+JSON, JSONLegacy, and OCSF use bounded formatters that keep reduced output valid
+JSON within the cap. They mark reductions with `"truncated": true` for JSON and
+JSONLegacy, or `"unmapped": {"truncated": true}` for OCSF; request details are
+reduced before matched-rule messages. If a record needs truncation but the limit
+cannot fit the marker (18 bytes for JSON/JSONLegacy, 31 for OCSF), the formatter
+returns an empty result. The connector's 16 KiB cap is above both limits.
 
 The standalone harness observed a formatted v1 health record on an allowed
-stream. Its HCM log capture did not
-produce per-request lines for local replies, so formatter visibility of the
-PR #20 interruption properties and per-stream isolation across deny/allow
-streams remain unproven. A no-Wasm Envoy control showed the same access-log
-capture limitation, so the cause is unresolved in the harness. Keep that part
-of the Stage E host gate open.
+stream; `test-envoy.sh` also checks that an engine-off pass has
+`reason=engine_off outcome=uninspected complete=false generation=1
+request_truncated=false response_truncated=false telemetry_failed=false` in its
+access-log line. Its HCM log capture did not produce per-request lines for local
+replies, so formatter visibility of the PR #20 interruption properties and
+per-stream isolation across deny/allow streams remain unproven. A no-Wasm Envoy
+control showed the same access-log capture limitation, so the cause is
+unresolved in the harness. Keep that part of the Stage E host gate open.
 
 The standalone harness also does not prove the Istio 1.30.5 or 1.30.7 proxy
 configuration; those host runs remain separate evidence requirements.
