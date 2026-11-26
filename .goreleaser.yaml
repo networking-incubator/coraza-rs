@@ -22,10 +22,11 @@ git:
 
 release:
   # Any semver prerelease tag (vX.Y.Z-rc.N, and the nightly v0.0.0-nightly.*)
-  # publishes as a prerelease that never becomes latest; final vX.Y.Z tags
-  # publish as regular latest releases.
+  # publishes as a prerelease that never becomes latest. A final vX.Y.Z tag
+  # becomes the GitHub Latest release only when the release workflow set
+  # PUSH_LATEST=true (it is the highest final tag), so a backport cannot move it.
   prerelease: auto
-  make_latest: "{{ if contains .Tag \"-\" }}false{{ else }}true{{ end }}"
+  make_latest: "{{ if and (not .Prerelease) (eq (envOrDefault \"PUSH_LATEST\" \"false\") \"true\") }}true{{ else }}false{{ end }}"
   replace_existing_artifacts: true
   extra_files:
     - glob: release-artifacts/coraza-rs.wasm
@@ -37,8 +38,9 @@ changelog:
 # Tag conventions used by both image variants:
 # - nightly run (tag v0.0.0-nightly.YYYYMMDD): v0.0.0-nightly.YYYYMMDD,
 #   nightly, nightly-YYYYMMDD
-# - manual release (tag vX.Y.Z): vX.Y.Z, and latest only for the newest
-#   final tag (PUSH_LATEST is set by the release workflow)
+# - manual release (tag vX.Y.Z[-pre]): the tag itself, and latest only for the
+#   highest final tag (PUSH_LATEST=true is set by the release workflow; unset
+#   means no latest)
 dockers_v2:
   - id: coraza-rs
     dockerfile: Dockerfile.goreleaser
@@ -48,7 +50,7 @@ dockers_v2:
       - "{{ .Tag }}"
       - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
       - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
-      - "{{ if and (not (contains .Tag \"-\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+      - "{{ if and (not .Prerelease) (eq (envOrDefault \"PUSH_LATEST\" \"false\") \"true\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs.wasm
     build_args:
@@ -64,7 +66,7 @@ dockers_v2:
       - "{{ .Tag }}"
       - "{{ if contains .Tag \"nightly\" }}nightly{{ end }}"
       - "{{ if contains .Tag \"nightly\" }}nightly-{{ .Now.Format \"20060102\" }}{{ end }}"
-      - "{{ if and (not (contains .Tag \"-\")) (eq (envOrDefault \"PUSH_LATEST\" \"true\") \"true\") }}latest{{ end }}"
+      - "{{ if and (not .Prerelease) (eq (envOrDefault \"PUSH_LATEST\" \"false\") \"true\") }}latest{{ end }}"
     extra_files:
       - release-artifacts/coraza-rs-crs.wasm
     build_args:
