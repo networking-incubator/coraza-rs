@@ -23,6 +23,15 @@ extend-ignore-re = [
   'base `557ba71` was',
   # Byte-identical Go Coraza fixture, verified by go-fixtures-check --provenance.
   'check wether they are triggered or not',
+  # Rule 10932235 of coraza/crs-hardening.conf holds the operator of CRS rule 932235 verbatim (a test in envoy-coraza
+  # compares the two): its command-name alternations ("repor?t", "(?:nam|sav)e") are not prose. Only that line is skipped.
+  '(?m)^    SecRule REQUEST_HEADERS:User-Agent "@rx \(\?i\)\(\?:b\[.*$',
+  # Random file content in envoy-coraza/testdata/crs-hardening-gate.json, base64 wrapped at 76 columns (the JSON text holds
+  # each line break as \\n or \\r\\n). An unwrapped value is skipped as one long base64 blob; the wrapped lines are not.
+  '(?:[A-Za-z0-9+/]{76}(?:\\\\r)?\\\\n)+[A-Za-z0-9+/=]*',
+  # Random bytes of a Rails session cookie from the review's corpus (percent-encoded base64), in coraza/src/seclang.rs and in
+  # the gate fixture: "Ba" before an escape is not prose.
+  'keBa%2F3DUaEoBJ',
 ]
 
 [default.extend-identifiers]

