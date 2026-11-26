@@ -225,9 +225,89 @@ reconnects and re-sends one frame after a write failure, so such a sink may
 receive an entry twice. `Transaction::process_logging` remains as an alias, so
 it also removes temporary upload files and returns their cleanup errors.
 Dropping a transaction calls `finish` and ignores its error.
-`Parser::on_error_log` provides a synchronous callback for matched rules with
-the `log` action; use `MatchedRule::error_log` to format the
-Coraza-compatible line.
+`Parser::on_error_log` provides a synchronous callback for rules with the `log`
+action and engine-originated stops; use `MatchedRule::error_log` to format the
+Coraza-compatible line. Engine stops in `On` and `DetectionOnly` are synthetic
+events with rule ID `0` and a `coraza-rs/engine/<state>` tag. Read them through
+`Transaction::engine_events()`; they are kept out of `matched_rules()` and are
+appended after rule messages in selected audit parts H/K. The transaction keeps
+the first 16 events individually; further stops update one final
+`EventsOmitted` summary with their count, so `engine_events()` contains at most 17
+entries. The callback reports the first 16 individually and emits the summary
+once when the limit is first exceeded; that log explicitly says at least one
+event was omitted and that the final count may be higher. Later excess stops
+update the exact, saturated public and audit count without another callback.
+Callback consumers filtering to `rule_id > 0` will miss these new engine-stop
+lines, whose ID is `0`.
+The summary's `rule.status` is `0` to mean not applicable: it is a count, not an
+HTTP stop status. `AuditMessage::provenance` alone classifies synthetic events
+and summaries; IDs, `rule_message`, tags and raw text are content, not markers.
+An unmarked record remains ordinary even if those values mimic engine output.
+The marker is public and forgeable by trusted in-process callers, not an
+authenticity boundary. Audit messages append the public
+`coraza-rs/engine/Enforced` tag when an individually retained event actually
+interrupts. If the enforcing event falls beyond the detail cap, the
+`EventsOmitted` audit summary instead gets
+`coraza-rs/engine/EnforcedStopOmitted` and says that the enforcing detail is
+among those omitted; it does not claim the summary itself caused the stop.
+`Off` emits no engine event or callback.
+Unbounded Native part K writes the `coraza-rs/engine/<state>` label for each
+individual event and writes the summary's count beside its `EventsOmitted`
+label. Bounded Native formatting copies a limited view and then applies its
+existing byte hard-cut; it does not pin H/K lines, so any of them may be
+truncated or absent. In `DetectionOnly` they describe the would-be stop without
+changing the existing interruption behavior. The stop and event are stored
+before the callback runs.
+An `@inspectFile` or `@rbl` saturation keeps the triggering rule ID on the
+interruption; its synthetic `OperatorNotInspected` event uses ID `0`, and the
+event itself is not a rule match. A non-chained multi-value triggering rule may
+retain matches from earlier values; per-match actions are skipped for the
+refused value and rule evaluation stops. The interruption keeps its existing
+500 status and data.
+Typed audit records expose each synthetic event's state in `data.tags` and
+`data.raw` even without part `K`; an enforced event or an enforcing omitted
+summary also carries its corresponding marker tag in `data.tags`. Built-in
+formatters still honor the selected parts.
+The event copies no matched values, client/server addresses, or URI. For
+correlation, it includes at most 128 bytes of the caller-supplied transaction ID;
+longer IDs are truncated at a UTF-8 boundary and suffixed with `...` in the
+event only, leaving `Transaction::id()` unchanged. Normal rule matches keep the
+full caller-supplied ID. This event-only bound also applies when rule evaluation
+exhausts its memory budget; use the containing audit transaction for full request
+context. With `SecAuditEngine RelevantOnly`,
+an engine event makes the transaction relevant when
+`SecAuditLogRelevantStatus` is unset. When that status filter is configured, it
+remains authoritative and can exclude the transaction despite the event; the
+selected audit parts still determine what built-in formatters serialize. When
+the detail cap is reached, the summary preserves the total number of additional
+stops, not each omitted stop's state. If the enforcing stop is omitted, the
+summary also says so and bounded JSON-family output pins that summary rather
+than an earlier would-be event. Otherwise, bounded output pins the actual
+enforcing event when it is retained; its explicit marker distinguishes it from
+earlier ID-zero events. Without an enforced ID, the existing fallback remains
+the last real rule message, or the first engine event when there are no rule
+messages. The `EventsOmitted` count is next priority when a second message fits,
+including after producer metadata is dropped; if only one message fits, the
+pinned cause wins. If only the truncation marker fits, no messages remain (the
+marker needs 18 bytes for JSON/JSONLegacy and 31 for OCSF, with smaller limits
+producing empty output). The record is marked truncated whenever content is
+reduced.
+Reduced JSON and JSONLegacy engine identities keep the complete state prefix
+and shorten only the description when the budget allows; if the prefix itself
+does not fit, the event is omitted. OCSF has no `error_message`; H-only OCSF
+uses `enrichments[].name` for its visible identity. With part `K`, JSON and
+OCSF give the complete state label in `data.raw` priority; synthetic
+`data.tags` entries are copied whole or omitted, not prefix-truncated. With both
+H and K, JSON retains the compact H identity when its complete state fits too.
+H-only JSON and H-only OCSF formatter copies do not charge for or serialize
+synthetic `data.tags`/`data.raw`; JSONLegacy uses message text and has no
+structured tags. Reduction can drop tags and other event details, and a tight
+limit may shorten text identities. Machine consumers should check the returned
+truncation flag (or serialized marker) and inspect visible identity text;
+missing tags do not prove that no engine event occurred. For a hand-built real
+message whose data identity is absent, bounded JSON preserves the legacy
+compact `error_message` fallback when a long error line is reduced, even when H
+is not selected.
 
 `finish` also removes temporary upload files unless `SecUploadKeepFiles` keeps
 them: `On` keeps all files and `RelevantOnly` keeps them only when a matched
@@ -257,14 +337,17 @@ above). Body capture is bounded by the configured request and response body
 limits. Review the selected parts and storage permissions before enabling audit
 logging for sensitive traffic.
 
-The error line of a rule (`MatchedRule::error_log`, and part `H`'s per-message
-error line) cuts the first match's `msg` and `data` at 280 bytes, as Go does,
+The error line of a rule match or engine stop (`MatchedRule::error_log`, and
+part `H`'s per-message error line) cuts the first message's `msg` and `data` at
+280 bytes, as Go does,
 and the request `[uri]` at 1 KiB, followed by `[+N uri bytes]` when it was cut
 (the whole request line stays in part `B`). For the other matches that have a
 message or data it lists the first eight `[msg_match_N ...] [data_match_N ...]`
 pairs and, when more remain, ends with `[+N more matches]`. Go lists every pair
-and the whole URI. Part `K` still lists every match. Every message of a rule
-carries this line, so without these limits `H` and `K` together made the entry
+and the whole URI. Part `K` still lists every rule match. It lists individual
+engine events up to the 16-event detail limit, then one `EventsOmitted` summary
+instead of per-stop labels. Every retained message carries this line, so
+without these limits `H` and `K` together made the entry
 quadratic in the matches of one rule and, with a long URI, the URI length times
 the matches. With them each line has a bounded size and the entry grows
 linearly with the rule's matches Q (about 0.8 KB per match in the test shape,
@@ -477,19 +560,39 @@ earlier factory. A registered operator must be `Send` and `Sync`.
   `audit_log_custom_format` fields (hidden from generated docs). This pre-1.0 API
   addition breaks exhaustive struct literals and patterns; literals now need
   `..Default::default()` and patterns need `..` to remain forward compatible.
-- `AuditMessage` has two new public fields (hidden from generated docs):
-  `rule_id: i32`, which bounded audit formatting uses to keep the interrupting
-  rule's message, and `rule_message: String`, which a reduced bounded record
-  uses to name the rule of a message that has part `H` but no part `K`. Neither
-  is serialised in a record that fits. This pre-1.0 addition breaks code that
-  builds an `AuditMessage` with every field named. Set the new fields, or end
-  the literal with `..AuditMessage::default()` (the type implements `Default`)
-  when a fixture needs no distinct `rule_id`.
+- `AuditMessage` exposes hidden `rule_id`, `rule_message`, and
+  `provenance: Option<AuditMessageProvenance>` fields. The typed marker is the
+  only synthetic-event classification: `None` is ordinary; `EngineEvent` and
+  `EventsOmitted` carry enforcement state. `rule_id` supports bounded cause
+  selection; `rule_message` retains H-only rule text or an event's visible
+  identity. The marker itself is not serialized. Text, IDs, tags and raw content
+  that merely resemble engine output remain ordinary. Trusted in-process callers
+  can forge the marker, so it is not an authenticity boundary. Engine state
+  remains in `AuditMessageData.tags` and `.raw` even without `K`; built-in
+  formatters still honor selected parts. `Enforced` marks a retained enforcing
+  event; `EnforcedStopOmitted` marks a summary containing the enforcing stop.
+  JSONLegacy and OCSF may render the visible identity in their message/name
+  fields. Bounded Native output has a separate final hard-cut and can omit these
+  messages. Adding `provenance` breaks exhaustive struct literals; use
+  `..AuditMessage::default()` for ordinary fixtures:
+
+  ```rust
+  let message = AuditMessage {
+      message: "rule message".to_owned(),
+      ..AuditMessage::default()
+  };
+  ```
 - `AuditTransaction` has a new public field, `interruption_rule_id:
-  Option<i32>`: the id of the rule whose disruptive action interrupted the
-  transaction, which bounded formatters use to keep that rule's message when
-  they drop messages. This pre-1.0 addition breaks exhaustive struct literals
-  and patterns. A literal must initialise it or end with
+  Option<i32>`: the ID associated with an enforced interruption. An engine-only
+  stop uses `Some(0)`; a fail-closed host-operator refusal may retain its source
+  rule ID. `DetectionOnly` leaves it `None` because no interruption was
+  enforced. Bounded JSON-family formatters use it to retain the cause when its
+  message is available; when an engine cause is among omitted details, they
+  retain the truthful omission summary instead. With no enforced ID they
+  preserve the legacy last non-synthetic-rule fallback, or keep the first engine
+  event when there are no rule messages. Native's final hard-cut can still omit
+  these messages. This pre-1.0 addition breaks exhaustive struct literals and
+  patterns. A literal must initialise it or end with
   `..AuditTransaction::default()` (the type implements `Default`); a pattern
   that does not need it should end with `..`.
 - `Operator` now requires `Send + Sync`.

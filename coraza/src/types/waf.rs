@@ -336,7 +336,7 @@ pub enum AuditLogPart {
     RequestBodyAlternative = b'I',
     /// J: Uploaded files information (multipart/form-data)
     UploadedFiles = b'J',
-    /// K: List of matched rules
+    /// K: Matched rules and engine-originated stop events
     RulesMatched = b'K',
     /// Z: Final boundary, end of entry (mandatory)
     EndMarker = b'Z',

@@ -52,6 +52,15 @@ use crate::{
 /// Next process-local suffix for concurrent audit log filenames.
 static NEXT_AUDIT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Visible audit tag used to distinguish the engine event that enforced an interruption.
+pub(crate) const ENGINE_ENFORCED_TAG: &str = "coraza-rs/engine/Enforced";
+/// Visible audit tag used when the enforcing engine event fell beyond the individual-detail cap.
+pub(crate) const ENGINE_ENFORCED_OMITTED_TAG: &str = "coraza-rs/engine/EnforcedStopOmitted";
+/// State tag for the bounded aggregate of engine stops beyond the individual-detail cap.
+pub(crate) const ENGINE_EVENTS_OMITTED_TAG: &str = "coraza-rs/engine/EventsOmitted";
+/// Honest bounded description when the exact count and its qualifiers do not fit.
+const ENGINE_EVENTS_OMITTED_FALLBACK: &str = "additional engine stop details omitted";
+
 /// How long an internal caller waits before retrying a failed audit activation.
 ///
 /// A failed sink may recover without an explicit [`AuditLogger::activate`], so the
@@ -78,8 +87,9 @@ pub struct AuditLog {
     pub parts: AuditLogParts,
     /// The transaction fields captured for this entry; custom code can see fields beyond `parts`.
     pub transaction: AuditTransaction,
-    /// What the rules with `auditlog` that matched have to say: one per value they
-    /// matched with part `K`, or one per rule with only part `H`
+    /// What logged rule matches and engine-originated stops have to say: one per
+    /// rule-match value and retained engine event/summary with part `K`, or one
+    /// per logged item with only part `H`.
     pub messages: Vec<AuditMessage>,
 }
 
@@ -184,8 +194,9 @@ pub struct AuditTransaction {
     pub highest_severity: String,
     /// Whether a disruptive action interrupted the transaction
     pub is_interrupted: bool,
-    /// The id of the rule whose disruptive action interrupted the transaction, if one did. Formatters that
-    /// have to drop messages keep this rule's, since logging rules can match after it.
+    /// The ID associated with the enforced interruption. An engine-only stop uses `Some(0)`; a fail-closed
+    /// `@inspectFile`/`@rbl` refusal can retain its source rule ID. `DetectionOnly` and other unenforced stops use
+    /// `None`. Bounded formatters use this ID to retain the corresponding cause when available.
     pub interruption_rule_id: Option<i32>,
 }
 
@@ -254,40 +265,116 @@ pub struct AuditProducer {
     pub rulesets: Vec<String>,
 }
 
-/// One message of an [`AuditLog`].
+/// One rule-match or engine-stop message of an [`AuditLog`].
 #[derive(Debug, Clone, Default)]
 pub struct AuditMessage {
     /// `SecComponentSignature`s, space-separated
     pub actionset: String,
-    /// The rule's `msg`, as expanded for this match
+    /// The expanded rule or engine-stop message for part `K`; empty when `K` is not selected. Part `H` carries its
+    /// visible text in [`AuditMessage::error_message`], with an H-only compact identity in `rule_message`.
     pub message: String,
-    /// The rule's error log line, with part `H`
+    /// The rule-match or engine-stop error log line, with part `H`.
     pub error_message: String,
-    /// The rule and match
+    /// The rule-match or synthetic engine-stop data.
     pub data: AuditMessageData,
-    /// The id of the rule behind this message, which bounded formatting uses to keep the interrupting
-    /// rule's message. It is never written out, and it is set even when `data` is not (part `H` without `K`).
+    /// The id behind this message, which bounded formatting uses to keep the interrupting item. Engine stops use
+    /// `0`. It is never written out, and it is set even when `data` is not (part `H` without `K`).
     #[doc(hidden)]
     pub rule_id: i32,
-    /// The rule's first expanded `msg`, kept only for a message with part `H` and without `K`, which has no
-    /// `data`. A reduced bounded record writes it beside `rule_id`, as the error log text's own prefix may not
-    /// fit. It is never written out in a record that fits.
+    /// Compact identity retained for bounded audit formatting. A real rule with `H` but not `K` stores its first
+    /// expanded `msg`; explicitly marked engine events keep their visible state-prefixed identity here. Reduced H-only
+    /// JSON writes that identity in `error_message`; selected K data remains in `data.raw` and `data.msg`.
     #[doc(hidden)]
     pub rule_message: String,
+    /// Typed provenance for synthetic engine records. Unmarked messages are ordinary, regardless of their text.
+    #[doc(hidden)]
+    pub provenance: Option<AuditMessageProvenance>,
 }
 
-/// The rule and match behind an [`AuditMessage`].
+/// Typed classification for engine-generated audit messages.
+///
+/// This public marker is forgeable by trusted in-process callers; it is not an authenticity boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditMessageProvenance {
+    /// An individual engine stop; `enforced` means it caused the enforced interruption.
+    EngineEvent { enforced: bool },
+    /// The aggregate for stops beyond the individual detail cap.
+    EventsOmitted { enforced_stop_omitted: bool },
+}
+
+impl AuditMessage {
+    /// A visible engine state label; `max_bytes` bounds parsing to the remaining copy budget.
+    fn engine_state_tag(&self, max_bytes: usize) -> Option<&str> {
+        const ENGINE_TAG_PREFIX: &str = "coraza-rs/engine/";
+        match self.provenance? {
+            AuditMessageProvenance::EventsOmitted { .. } => self
+                .rule_message
+                .strip_prefix(ENGINE_EVENTS_OMITTED_TAG)
+                .filter(|suffix| suffix.starts_with(": "))
+                .map(|_| ENGINE_EVENTS_OMITTED_TAG),
+            AuditMessageProvenance::EngineEvent { .. } => {
+                let identity = self.rule_message.strip_prefix(ENGINE_TAG_PREFIX)?;
+                let prefix_end = utf8_boundary(identity, max_bytes);
+                let (state, _) = identity.get(..prefix_end)?.split_once(": ")?;
+                if state.is_empty() {
+                    return None;
+                }
+                let tag_end = ENGINE_TAG_PREFIX.len().checked_add(state.len())?;
+                self.rule_message.get(..tag_end)
+            },
+        }
+    }
+
+    /// The visible content for an explicitly marked synthetic event.
+    fn engine_identity(&self) -> Option<&str> {
+        self.is_engine_event()
+            .then_some(self.rule_message.as_str())
+            .filter(|identity| !identity.is_empty())
+    }
+
+    /// Whether this message came from a synthetic engine stop, not a real ID-0 rule.
+    fn is_engine_event(&self) -> bool {
+        self.provenance.is_some()
+    }
+
+    /// Whether this synthetic event is the bounded aggregate of excess engine stops.
+    fn is_events_omitted_summary(&self) -> bool {
+        matches!(self.provenance, Some(AuditMessageProvenance::EventsOmitted { .. }))
+    }
+
+    /// Whether this retained engine event's disruptive action actually interrupted the transaction.
+    fn is_enforced_engine_event(&self) -> bool {
+        matches!(
+            self.provenance,
+            Some(AuditMessageProvenance::EngineEvent { enforced: true })
+        )
+    }
+
+    /// Whether an omitted engine detail, rather than one of the retained events, enforced the stop.
+    fn is_enforced_stop_omitted_summary(&self) -> bool {
+        matches!(
+            self.provenance,
+            Some(AuditMessageProvenance::EventsOmitted {
+                enforced_stop_omitted: true
+            })
+        )
+    }
+}
+
+/// The rule-match or engine-stop data behind an [`AuditMessage`].
 #[derive(Debug, Clone, Default)]
 pub struct AuditMessageData {
     /// The rule's file
     pub file: String,
     /// The rule's line
     pub line: usize,
-    /// The rule's id
+    /// The rule's id, or `0` for an engine stop.
     pub id: i32,
     /// The rule's `rev`
     pub rev: String,
-    /// The rule's `msg`, as expanded for this match
+    /// The expanded rule or engine-stop message for part `K`; empty when `K` is not selected. For H-only entries,
+    /// see [`AuditMessage::error_message`] and `rule_message`.
     pub msg: String,
     /// The rule's `logdata`, as expanded for this match
     pub data: String,
@@ -299,18 +386,19 @@ pub struct AuditMessageData {
     pub maturity: u8,
     /// The rule's `accuracy`; 0 if unset
     pub accuracy: u8,
-    /// The rule's tags
+    /// The rule's tags; synthetic engine stops retain their state tag even without part `K`. An enforced event adds
+    /// `coraza-rs/engine/Enforced`, or `coraza-rs/engine/EnforcedStopOmitted` when its detail was summarized.
     pub tags: Vec<String>,
-    /// The rule's directives, its chain's included
+    /// The rule's directives, its chain's included; engine stops use their state label even without part `K`.
     pub raw: String,
 }
 
 #[derive(Debug, Clone)]
-/// A rule match recorded for connector logs and audit entries.
+/// A logged rule match or synthetic engine stop recorded for connector logs and audit entries.
 pub struct MatchedRule {
-    /// The rule as compiled; its raw text includes all chain links.
+    /// The rule as compiled; its raw text includes all chain links, or synthetic engine-stop metadata.
     pub rule: RuleMetadata,
-    /// Values matched by the rule and its chain.
+    /// Values matched by the rule and its chain, or one engine-stop message.
     pub matches: Vec<MatchData>,
     /// The selected disruptive action, if any.
     pub disruptive_action: Option<&'static str>,
@@ -322,7 +410,8 @@ pub struct MatchedRule {
     pub server_ip: String,
     /// Request URI when the match occurred.
     pub uri: String,
-    /// Transaction identifier.
+    /// Transaction identifier. Normal rule matches keep the caller's full ID; synthetic engine events copy at most
+    /// 128 bytes and suffix overlong IDs with `...`.
     pub transaction_id: String,
 }
 
@@ -340,7 +429,7 @@ const MAX_ERROR_LOG_EXTRA_MATCHES: usize = 8;
 const MAX_LOG_URI: usize = 1024;
 
 impl MatchedRule {
-    /// The first expanded rule message, or an empty string when none was set.
+    /// The first expanded rule or engine-stop message, or an empty string when none was set.
     pub fn message(&self) -> &str {
         self.first_with_message().map_or("", |matched| &matched.message)
     }
@@ -355,12 +444,12 @@ impl MatchedRule {
         self.first_with_message().map_or("", |matched| &matched.data)
     }
 
-    /// The ID of the matched rule.
+    /// The rule ID, or `0` for an engine-originated stop.
     pub fn rule_id(&self) -> i32 {
         self.rule.id
     }
 
-    /// The severity configured on the matched rule, if any.
+    /// The configured rule severity, or `CRITICAL` for an engine-originated stop.
     pub fn severity(&self) -> Option<crate::types::RuleSeverity> {
         self.rule.severity
     }
@@ -375,7 +464,7 @@ impl MatchedRule {
         self.matches.iter().find(|matched| !matched.message.is_empty())
     }
 
-    /// Format this match as a Coraza-compatible error log line.
+    /// Format this rule match or engine stop as a Coraza-compatible error log line.
     ///
     /// Beyond the first match, the line lists the first eight matches that have a message
     /// or data as `msg_match_N`/`data_match_N` pairs and ends with `[+N more matches]` for the others. Go lists
@@ -480,11 +569,11 @@ fn escape_log_message(text: &str) -> String {
     escaped
 }
 
-/// Callback used to emit rules with the `log` action.
+/// Callback used to emit rules with the `log` action and retained engine events/summaries.
 #[derive(Clone)]
 pub(crate) struct ErrorLog(Arc<ErrorLogCallback>);
 
-/// Thread-safe callback invoked for each matching logged rule.
+/// Thread-safe callback invoked for each matching logged rule and retained engine event or summary.
 type ErrorLogCallback = dyn Fn(&MatchedRule) + Send + Sync;
 
 impl ErrorLog {
@@ -493,7 +582,7 @@ impl ErrorLog {
         Self(Arc::new(log))
     }
 
-    /// Invoke the callback for a matched rule.
+    /// Invoke the callback for a logged rule match, retained engine event, or overflow summary.
     pub(crate) fn write(&self, matched: &MatchedRule) {
         (self.0)(matched);
     }
@@ -545,7 +634,8 @@ impl AuditLog {
     ///
     /// This hidden connector seam leaves [`AuditLog::format`] unchanged. Native output copies a temporary
     /// view of at most `max_bytes` of text and `ceil(max_bytes / 64)` collection entries before formatting,
-    /// and is cut at `max_bytes`.
+    /// then is cut at `max_bytes`. Its final hard-cut does not pin H/K message lines, so it does not guarantee
+    /// that any such line survives.
     ///
     /// The JSON formats are never cut mid-token: the output is always one valid JSON document of at most
     /// `max_bytes` bytes, carrying the same data as [`AuditLog::format`] when that fits (the bytes can differ:
@@ -554,10 +644,38 @@ impl AuditLog {
     /// with `"truncated": true` (`JSON` and `JSONLegacy`) or `"unmapped": {"truncated": true}` (OCSF). Their
     /// copy is bounded by `max_bytes` too, whatever the entry holds: text, and entries at most half as many as
     /// bytes, since an entry takes at least three bytes of output. Reduction keeps what an investigation needs
-    /// first: the matched rules, with their ids and messages, outlast the request's headers, URI and bodies,
-    /// and the rule that interrupted the transaction outlasts the other rules. A document too small for even
-    /// the marker (31 bytes for OCSF, 18 for the others) is empty. Control characters are escaped, so the
-    /// output is one line.
+    /// first: logged rule matches and engine events, with their ids and messages, outlast the request's headers,
+    /// URI and bodies. The enforced interruption's matching message is pinned when present. For ID-zero engine stops,
+    /// typed `AuditMessage::provenance` pins an enforced event; when the enforcing detail fell beyond the 16-event cap,
+    /// the typed `EventsOmitted` summary is pinned instead and explicitly reports that the enforcing detail was
+    /// omitted. The summary is not itself presented as the cause. A host-operator refusal can keep its nonzero source
+    /// rule ID; its typed enforcing event or omission summary is pinned ahead of even an audited same-ID source-rule
+    /// message. If no marked cause is available, a nonzero
+    /// interruption ID first uses its last matching audited message, then the existing first-engine-event fallback,
+    /// then the last message.
+    /// With no enforced ID, the previous fallback is preserved: the last non-synthetic rule message, or the first
+    /// engine event when there are no rule messages. When a different message is pinned, the `EventsOmitted` count is
+    /// next priority when a second message fits, including after compacting the producer; if only one fits, the pinned
+    /// message wins. `DetectionOnly` keeps `interruption_rule_id` as `None`, so this record cannot identify an exact
+    /// would-be rule when that differs from the fallback. Reduced JSON and JSONLegacy engine identities preserve the
+    /// complete state prefix while shortening ordinary descriptions; if the prefix itself cannot fit, the event is
+    /// omitted. An omission summary keeps its full count and enforcement clause when they fit, otherwise it uses the
+    /// fixed text `additional engine stop details omitted` or is omitted. Native part-K summary copies apply the same
+    /// all-or-fixed-text rule before their separate final hard cut; the summary's part-H error line is copied whole or
+    /// omitted.
+    /// Compact JSON-family formatting retries the complete summary, then that fixed text, before dropping it. OCSF has
+    /// no `error_message`; H-only OCSF uses `enrichments[].name` for its visible identity. A retained reduced H-only
+    /// OCSF engine event keeps its complete state-and-delimiter prefix there; if that prefix does not fit, the event
+    /// is omitted rather than emitted without a name. When `K` is selected, JSON and OCSF give the complete state
+    /// label in `data.raw` priority; synthetic `data.tags` entries are copied whole or omitted. With both `H` and `K`,
+    /// JSON retains the compact H identity when its complete state fits too.
+    /// H-only JSON and H-only OCSF formatter copies do not charge for, or serialize, synthetic `data.tags` and
+    /// `data.raw`; `JSONLegacy` uses visible message text and has no structured tags. Other event details may be
+    /// omitted or their text identity may be shortened.
+    /// Consumers should check the returned truncation flag or serialized marker and inspect visible identity text,
+    /// rather than infer event absence from missing tags. Native's final hard-cut does not carry this pinning
+    /// guarantee. A document too small for even the marker (31 bytes for OCSF, 18 for the others) is empty and carries
+    /// no messages. Control characters are escaped, so the output is one line.
     #[doc(hidden)]
     pub fn format_bounded(&self, format: AuditLogFormat, max_bytes: usize) -> (String, bool) {
         if format != AuditLogFormat::Native {
@@ -579,10 +697,17 @@ impl AuditLog {
     /// of: the request's text has a pool of its own, apart from the messages' pool, which is shared by all of
     /// them, so a short message leaves its unused bytes to the others and request padding takes none of them.
     /// Only a real overflow shrinks the next attempt, in this order: the request's text (URI, headers, bodies,
-    /// arguments), then the text each message may keep, then the number of messages. Dropped messages are the
-    /// later ones, except the one whose rule interrupted the transaction, which is always kept. A record that
-    /// still does not fit is reduced to its transaction id and pinned message, and one that cannot fit even
-    /// then becomes a bare marker. The result is reported cut only when content was reduced.
+    /// arguments), then the text each message may keep, then the number of messages. The existing pinned
+    /// evidence wins, including a typed enforcing event or omission summary over an earlier same-ID source rule;
+    /// when a second message fits, the `EventsOmitted` count is kept before other messages. With no enforced ID, the
+    /// last real rule message is pinned, or the first engine event if no rule message exists. At the compact fallback,
+    /// the formatter tries the pinned evidence with the full summary, then with its fixed omission text, then the
+    /// pinned evidence alone; one that cannot fit even then becomes a bare marker. The result is reported cut only
+    /// when content was reduced.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Retries keep marker, cause, and omitted-summary priorities under one byte limit."
+    )]
     fn format_json_bounded(&self, format: AuditLogFormat, max_bytes: usize) -> (String, bool) {
         /// The smallest text each message keeps before messages themselves are dropped.
         const MIN_MESSAGE_BYTES: usize = 32;
@@ -592,15 +717,13 @@ impl AuditLog {
             request_bytes: max_bytes,
             message_bytes: max_bytes,
             message_each: None,
+            summary_each: None,
             // Every message is at least three bytes of output, so a record that fits holds fewer than this.
             message_count: total.min(AuditCopyBudget::generous(max_bytes).items_left),
             reduced: false,
         };
         let mut shrunk = false;
-        loop {
-            let mut budget = AuditCopyBudget::generous(max_bytes);
-            let view = self.bounded_copy_planned(format, &mut budget, Some(plan));
-            let truncated = shrunk || budget.truncated;
+        let render = |view: &AuditLog, truncated| {
             let mut document = match format {
                 AuditLogFormat::JsonLegacy => view.json_legacy(),
                 AuditLogFormat::Ocsf => view.ocsf(),
@@ -609,8 +732,59 @@ impl AuditLog {
             if truncated {
                 mark_truncated(&mut document, format);
             }
-            let text = escape_json_controls(&document.to_string());
+            escape_json_controls(&document.to_string())
+        };
+        let try_compact_plan = |compact_plan: AuditShrinkPlan, expected_messages: Option<usize>| {
+            let mut budget = AuditCopyBudget::generous(max_bytes);
+            let view = self.bounded_copy_planned(format, &mut budget, Some(compact_plan), AuditCompaction::Compact);
+            if expected_messages.is_some_and(|expected| view.messages.len() != expected) {
+                return None;
+            }
+            let compact = render(&view, true);
+            (compact.len() <= max_bytes).then_some(compact)
+        };
+        let summary_floor_for = |index: usize| {
+            self.messages.get(index).and_then(|message| {
+                reduced_summary_fallback_bytes(
+                    message,
+                    format,
+                    self.parts.contains(&AuditLogPart::RulesMatched),
+                    max_bytes,
+                )
+            })
+        };
+        loop {
+            let mut budget = AuditCopyBudget::generous(max_bytes);
+            let view = self.bounded_copy_planned(format, &mut budget, Some(plan), AuditCompaction::Full);
+            let retained_messages = view.messages.len();
+            let truncated = shrunk || budget.truncated;
+            let text = render(&view, truncated);
             if text.len() <= max_bytes {
+                if truncated
+                    && retained_messages == 1
+                    && total > 1
+                    && let Some(summary_index) = self.messages.iter().position(AuditMessage::is_events_omitted_summary)
+                    && Some(summary_index)
+                        != AuditCopyBudget::pinned_message_index(&self.messages, self.transaction.interruption_rule_id)
+                {
+                    let mut pair_plan = plan;
+                    pair_plan.request_bytes = 0;
+                    pair_plan.message_count = 2;
+                    pair_plan.reduced = true;
+
+                    let compact_pair = |pair_plan| try_compact_plan(pair_plan, Some(2));
+
+                    if let Some(pair) = compact_pair(pair_plan) {
+                        return (pair, true);
+                    }
+
+                    if let Some(summary_each) = summary_floor_for(summary_index) {
+                        pair_plan.summary_each = Some(summary_each);
+                        if let Some(pair) = compact_pair(pair_plan) {
+                            return (pair, true);
+                        }
+                    }
+                }
                 return (text, truncated);
             }
             shrunk = true;
@@ -639,20 +813,66 @@ impl AuditLog {
                     .unwrap_or(usize::MAX)
                     .clamp(1, plan.message_count - 1);
             } else {
-                // Even one message does not fit beside the record's own metadata, which a huge producer entry
-                // can fill. Keep what identifies the record and the rule that mattered, and drop the rest.
-                let mut budget = AuditCopyBudget::generous(max_bytes);
-                let mut view = self.bounded_copy_planned(format, &mut budget, Some(plan));
-                view.compact();
-                let mut document = match format {
-                    AuditLogFormat::JsonLegacy => view.json_legacy(),
-                    AuditLogFormat::Ocsf => view.ocsf(),
-                    _ => view.json(),
-                };
-                mark_truncated(&mut document, format);
-                let compact = escape_json_controls(&document.to_string());
-                if compact.len() <= max_bytes {
-                    return (compact, true);
+                // Drop metadata, then retry the cause with its summary before falling back to the cause alone.
+                let summary_index = self.messages.iter().position(AuditMessage::is_events_omitted_summary);
+                let keep_summary = total > 1 && summary_index.is_some();
+                let compact_counts = if keep_summary { [2, 1] } else { [1, 0] };
+                let pinned =
+                    AuditCopyBudget::pinned_message_index(&self.messages, self.transaction.interruption_rule_id);
+                let shrink_engine_identity = (format == AuditLogFormat::JsonLegacy
+                    || (format == AuditLogFormat::Json
+                        && self.parts.contains(&AuditLogPart::Trailer)
+                        && !self.parts.contains(&AuditLogPart::RulesMatched)))
+                    && pinned
+                        .and_then(|index| self.messages.get(index))
+                        .is_some_and(AuditMessage::is_engine_event);
+                let shrink_summary = summary_index.is_some();
+                let summary_fallback_bytes = summary_index.and_then(summary_floor_for);
+                let identity_prefix_bytes = pinned
+                    .and_then(|index| self.messages.get(index))
+                    .filter(|_| shrink_engine_identity)
+                    .and_then(|message| reduced_engine_identity_prefix_bytes(message, max_bytes));
+                let shrink_compact_message = shrink_engine_identity || shrink_summary;
+                for message_count in compact_counts {
+                    if message_count == 0 {
+                        break;
+                    }
+                    let mut message_each = None;
+                    loop {
+                        let mut compact_plan = plan;
+                        compact_plan.message_count = message_count;
+                        if shrink_engine_identity {
+                            compact_plan.message_each = message_each;
+                        }
+                        if shrink_summary {
+                            compact_plan.summary_each = message_each;
+                        }
+                        if let Some(compact) = try_compact_plan(compact_plan, None) {
+                            return (compact, true);
+                        }
+                        if !shrink_compact_message {
+                            break;
+                        }
+                        let summary_selected =
+                            summary_index.is_some_and(|index| message_count > 1 || Some(index) == pinned);
+                        let minimum_message_each = if summary_selected {
+                            summary_fallback_bytes.or(identity_prefix_bytes)
+                        } else {
+                            identity_prefix_bytes
+                        };
+                        let Some(minimum_message_each) = minimum_message_each else {
+                            break;
+                        };
+                        let current = message_each.unwrap_or_else(|| max_bytes / message_count.max(1));
+                        if current <= minimum_message_each {
+                            break;
+                        }
+                        let next = (current / 2).max(minimum_message_each);
+                        if next == current {
+                            break;
+                        }
+                        message_each = Some(next);
+                    }
                 }
                 let minimal = bare_truncation_marker(format);
                 let fits = minimal.len() <= max_bytes;
@@ -661,29 +881,9 @@ impl AuditLog {
         }
     }
 
-    /// Drops what is not needed to identify the record and its pinned rule: the producer, the request, the
-    /// response and the connection's text, and the rules' tags. The transaction id, the interruption and the
-    /// messages stay.
-    fn compact(&mut self) {
-        let transaction = &mut self.transaction;
-        transaction.producer = None;
-        transaction.response = None;
-        transaction.request = AuditRequest::default();
-        transaction.timestamp.clear();
-        transaction.client_ip.clear();
-        transaction.host_ip.clear();
-        transaction.server_id.clear();
-        transaction.highest_severity.clear();
-        // The rules' tags are optional too: one-byte tags still cost an array entry each, which OCSF escapes a
-        // second time inside the enrichment's `data` string, so thousands of them can outweigh the whole budget.
-        for message in &mut self.messages {
-            message.data.tags.clear();
-        }
-    }
-
     /// Copies only the fields used by `format`, within `budget`.
     fn bounded_copy(&self, format: AuditLogFormat, budget: &mut AuditCopyBudget) -> Self {
-        self.bounded_copy_planned(format, budget, None)
+        self.bounded_copy_planned(format, budget, None, AuditCompaction::Full)
     }
 
     /// Copies only the fields used by `format`, within `budget`, or within `plan` when there is one.
@@ -700,7 +900,9 @@ impl AuditLog {
         format: AuditLogFormat,
         budget: &mut AuditCopyBudget,
         plan: Option<AuditShrinkPlan>,
+        compaction: AuditCompaction,
     ) -> Self {
+        let compact = compaction == AuditCompaction::Compact;
         let mut request_pool = plan.map(|plan| AuditCopyBudget::generous(plan.request_bytes));
         let native = format == AuditLogFormat::Native;
         let native_headers = native && self.parts.contains(&AuditLogPart::RequestHeaders);
@@ -709,10 +911,13 @@ impl AuditLog {
         let native_response_body = native && self.parts.contains(&AuditLogPart::IntermediaryResponseBody);
         let native_files = native && self.parts.contains(&AuditLogPart::UploadedFiles);
         let native_trailer = native && self.parts.contains(&AuditLogPart::Trailer);
-        let native_rules = native && self.parts.contains(&AuditLogPart::RulesMatched);
+        let rules_selected = self.parts.contains(&AuditLogPart::RulesMatched);
+        let native_rules = native && rules_selected;
         let native_header = native && self.parts.contains(&AuditLogPart::Header);
         let parts = if native {
             budget.sequence(&self.parts, |_, part| *part)
+        } else if rules_selected {
+            vec![AuditLogPart::RulesMatched]
         } else {
             Vec::new()
         };
@@ -721,7 +926,7 @@ impl AuditLog {
         let legacy = format == AuditLogFormat::JsonLegacy;
         let ocsf = format == AuditLogFormat::Ocsf;
         let transaction = &self.transaction;
-        let timestamp = if json || legacy || native_header {
+        let timestamp = if !compact && (json || legacy || native_header) {
             budget.string(&transaction.timestamp)
         } else {
             String::new()
@@ -732,24 +937,24 @@ impl AuditLog {
         } else {
             String::new()
         };
-        let client_ip = if json || legacy || ocsf || native_header {
+        let client_ip = if !compact && (json || legacy || ocsf || native_header) {
             budget.string(&transaction.client_ip)
         } else {
             String::new()
         };
         let client_port = transaction.client_port;
-        let host_ip = if json || legacy || ocsf || native_header {
+        let host_ip = if !compact && (json || legacy || ocsf || native_header) {
             budget.string(&transaction.host_ip)
         } else {
             String::new()
         };
         let host_port = transaction.host_port;
-        let server_id = if json || ocsf {
+        let server_id = if !compact && (json || ocsf) {
             budget.string(&transaction.server_id)
         } else {
             String::new()
         };
-        let highest_severity = if json || ocsf {
+        let highest_severity = if !compact && (json || ocsf) {
             budget.string(&transaction.highest_severity)
         } else {
             String::new()
@@ -765,74 +970,81 @@ impl AuditLog {
             None => &mut *budget,
         };
         let request = &transaction.request;
-        let bounded_request = AuditRequest {
-            method: if !native || native_headers {
-                request_budget.string(&request.method)
-            } else {
-                String::new()
-            },
-            protocol: if json || ocsf || native_headers {
-                request_budget.string(&request.protocol)
-            } else {
-                String::new()
-            },
-            uri: if !native || native_headers {
-                request_budget.string(&request.uri)
-            } else {
-                String::new()
-            },
-            http_version: if json || legacy {
-                request_budget.string(&request.http_version)
-            } else {
-                String::new()
-            },
-            headers: if json || legacy || ocsf || native_headers {
-                request_budget.headers(&request.headers)
-            } else {
-                None
-            },
-            body: if json || native_request_body {
-                request_budget.string(&request.body)
-            } else {
-                String::new()
-            },
-            files: if json || ocsf || native_files {
-                request_budget.files(&request.files)
-            } else {
-                None
-            },
-            length: if json || ocsf { request.length } else { 0 },
-            args: if ocsf {
-                request_budget.args(&request.args)
-            } else {
-                Vec::new()
-            },
+        let bounded_request = if compact {
+            AuditRequest::default()
+        } else {
+            AuditRequest {
+                method: if !native || native_headers {
+                    request_budget.string(&request.method)
+                } else {
+                    String::new()
+                },
+                protocol: if json || ocsf || native_headers {
+                    request_budget.string(&request.protocol)
+                } else {
+                    String::new()
+                },
+                uri: if !native || native_headers {
+                    request_budget.string(&request.uri)
+                } else {
+                    String::new()
+                },
+                http_version: if json || legacy {
+                    request_budget.string(&request.http_version)
+                } else {
+                    String::new()
+                },
+                headers: if json || legacy || ocsf || native_headers {
+                    request_budget.headers(&request.headers)
+                } else {
+                    None
+                },
+                body: if json || native_request_body {
+                    request_budget.string(&request.body)
+                } else {
+                    String::new()
+                },
+                files: if json || ocsf || native_files {
+                    request_budget.files(&request.files)
+                } else {
+                    None
+                },
+                length: if json || ocsf { request.length } else { 0 },
+                args: if ocsf {
+                    request_budget.args(&request.args)
+                } else {
+                    Vec::new()
+                },
+            }
         };
 
-        let response = transaction.response.as_ref().map(|response| AuditResponse {
-            protocol: if json || legacy || native_response_headers {
-                request_budget.string(&response.protocol)
-            } else {
-                String::new()
-            },
-            status: if json || legacy || ocsf || native_response_headers {
-                response.status
-            } else {
-                0
-            },
-            headers: if json || legacy || ocsf || native_response_headers {
-                request_budget.headers(&response.headers)
-            } else {
-                None
-            },
-            body: if json || native_response_body {
-                request_budget.string(&response.body)
-            } else {
-                String::new()
-            },
-        });
+        let response = (!compact)
+            .then_some(transaction.response.as_ref())
+            .flatten()
+            .map(|response| AuditResponse {
+                protocol: if json || legacy || native_response_headers {
+                    request_budget.string(&response.protocol)
+                } else {
+                    String::new()
+                },
+                status: if json || legacy || ocsf || native_response_headers {
+                    response.status
+                } else {
+                    0
+                },
+                headers: if json || legacy || ocsf || native_response_headers {
+                    request_budget.headers(&response.headers)
+                } else {
+                    None
+                },
+                body: if json || native_response_body {
+                    request_budget.string(&response.body)
+                } else {
+                    String::new()
+                },
+            });
 
-        let producer = if json || legacy || ocsf {
+        let producer = if !compact && (json || legacy || ocsf) {
             transaction
                 .producer
                 .as_ref()
@@ -864,11 +1076,21 @@ impl AuditLog {
         let messages = if message_mode == AuditMessageCopy::None {
             Vec::new()
         } else if let Some(plan) = plan {
-            budget.planned_messages(&self.messages, message_mode, plan, transaction.interruption_rule_id)
+            budget.planned_messages(
+                &self.messages,
+                message_mode,
+                plan,
+                AuditMessageSelection {
+                    interruption_rule_id: transaction.interruption_rule_id,
+                    trailer_selected: self.parts.contains(&AuditLogPart::Trailer),
+                    rules_selected,
+                    compaction,
+                },
+            )
         } else {
             let mut mode = message_mode;
             budget.sequence(&self.messages, |budget, message| {
-                let copied = budget.message(message, mode);
+                let copied = budget.message(message, mode, rules_selected);
                 mode = mode.after_first();
                 copied
             })
@@ -993,6 +1215,13 @@ impl AuditLog {
                 AuditLogPart::RulesMatched => {
                     for message in &self.messages {
                         out.push_str(&escape(&message.data.raw));
+                        if message.is_events_omitted_summary()
+                            && message.data.raw == ENGINE_EVENTS_OMITTED_TAG
+                            && !message.data.msg.is_empty()
+                        {
+                            out.push_str(": ");
+                            out.push_str(&escape(&message.data.msg));
+                        }
                         out.push('\n');
                     }
                 },
@@ -1074,11 +1303,13 @@ impl AuditLog {
                 .iter()
                 .map(|message| {
                     let data = &message.data;
+                    let include_engine_state =
+                        self.parts.contains(&AuditLogPart::RulesMatched) || !message.is_engine_event();
                     json!({
                         "actionset": message.actionset,
                         "message": message.message,
                         "error_message": message.error_message,
-                        "data": message_data_json(data),
+                        "data": message_data_json(data, include_engine_state),
                     })
                 })
                 .collect();
@@ -1175,8 +1406,15 @@ impl AuditLog {
             },
             "type_uid": 600_102,
             "enrichments": self.messages.iter().map(|message| json!({
-                "data": message_data_json(&message.data).to_string(),
-                "name": message.data.msg,
+                "data": message_data_json(
+                    &message.data,
+                    self.parts.contains(&AuditLogPart::RulesMatched) || !message.is_engine_event(),
+                )
+                .to_string(),
+                "name": message
+                    .engine_identity()
+                    .filter(|_| message.data.msg.is_empty())
+                    .unwrap_or(&message.data.msg),
                 "value": message.data.data,
             })).collect::<Vec<_>>(),
             "http_request": {
@@ -1245,7 +1483,11 @@ impl AuditLog {
             );
         }
 
-        let messages: Vec<&str> = self.messages.iter().map(|m| m.message.as_str()).collect();
+        let messages: Vec<&str> = self
+            .messages
+            .iter()
+            .map(|message| message.engine_identity().unwrap_or(&message.message))
+            .collect();
         if tx.producer.is_some() || !messages.is_empty() {
             let producer = tx.producer.clone().unwrap_or_default();
             let producers: Vec<&str> = std::iter::once(producer.connector.as_str())
@@ -1277,7 +1519,7 @@ impl AuditLog {
 }
 
 /// The data of a message, as Go Coraza writes it in JSON.
-fn message_data_json(data: &AuditMessageData) -> Value {
+fn message_data_json(data: &AuditMessageData, include_engine_state: bool) -> Value {
     json!({
         "file": data.file,
         "line": data.line,
@@ -1289,8 +1531,8 @@ fn message_data_json(data: &AuditMessageData) -> Value {
         "ver": data.ver,
         "maturity": data.maturity,
         "accuracy": data.accuracy,
-        "tags": data.tags,
-        "raw": data.raw,
+        "tags": if include_engine_state { data.tags.as_slice() } else { &[] },
+        "raw": if include_engine_state { data.raw.as_str() } else { "" },
     })
 }
 
@@ -1311,7 +1553,7 @@ enum AuditMessageCopy {
     Native {
         /// Copy the message's error log text for part H.
         error: bool,
-        /// Copy the matched rule text for part K.
+        /// Copy rule text or a synthetic engine-stop label for part K.
         raw: bool,
     },
 }
@@ -1338,11 +1580,36 @@ struct AuditShrinkPlan {
     message_bytes: usize,
     /// Text bytes one message may take from the shared ones; unlimited until the record has overflowed.
     message_each: Option<usize>,
-    /// Messages kept: the interrupting one (or the last) and the first others.
+    /// Text bytes the compact retry gives an omission summary; `None` first tries its full text.
+    summary_each: Option<usize>,
+    /// Messages kept: the enforced interruption's message or compatible fallback, then the overflow summary when
+    /// another slot fits, then the first remaining messages.
     message_count: usize,
     /// Whether an earlier attempt overflowed, so this one is reduced in some way: a record that fits whole is
-    /// left as it is, and only a reduced one gets its interrupting rule's identity written compactly.
+    /// left as it is, and only a reduced one gets its pinned rule or engine event's identity written compactly.
     reduced: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+/// Whether a bounded formatter copies metadata before or after compacting its view.
+enum AuditCompaction {
+    /// Keep fields through the first bounded formatting attempt.
+    Full,
+    /// Omit producer/request metadata before copying the selected message.
+    Compact,
+}
+
+/// Selection semantics needed while retaining messages from a reduced record.
+#[derive(Clone, Copy)]
+struct AuditMessageSelection {
+    /// Public audit interruption ID used to pin the existing cause.
+    interruption_rule_id: Option<i32>,
+    /// Whether part H is selected for synthetic compact JSON identity; real-rule fallback stays part of the baseline.
+    trailer_selected: bool,
+    /// Whether part K is selected for structured synthetic identity.
+    rules_selected: bool,
+    /// Whether the bounded view drops producer/request metadata before formatting.
+    compaction: AuditCompaction,
 }
 
 /// Limits owned strings and collection entries while preparing an audit formatter view.
@@ -1400,6 +1667,114 @@ impl AuditCopyBudget {
         value.get(..end).unwrap_or_default().to_owned()
     }
 
+    /// Copies a complete identity field or omits it, never leaving a partial label.
+    fn complete_string(&mut self, value: &str) -> String {
+        if value.len() > self.bytes_left {
+            self.truncated = true;
+            String::new()
+        } else {
+            self.string(value)
+        }
+    }
+
+    /// Copies a whole omission summary, or a fixed statement that withholds its exact count.
+    fn summary_text(&mut self, message: &AuditMessage, value: &str) -> String {
+        if !message.is_events_omitted_summary() || value.len() <= self.bytes_left {
+            return self.string(value);
+        }
+        self.truncated = true;
+        self.complete_string(ENGINE_EVENTS_OMITTED_FALLBACK)
+    }
+
+    /// Copies a synthetic event's identity without cutting its complete state-and-delimiter prefix.
+    fn state_first_engine_identity(&mut self, message: &AuditMessage) -> String {
+        let Some(identity) = message.engine_identity() else {
+            return String::new();
+        };
+        let Some(state) = message.engine_state_tag(self.bytes_left) else {
+            if message.is_events_omitted_summary() && identity.len() > self.bytes_left {
+                self.truncated = true;
+                return self.complete_string(ENGINE_EVENTS_OMITTED_FALLBACK);
+            }
+            return self.complete_string(identity);
+        };
+        let prefix_len = state.len().saturating_add(2);
+        let Some(prefix) = identity.get(..prefix_len) else {
+            self.truncated = true;
+            return String::new();
+        };
+        if message.is_events_omitted_summary() {
+            if identity.len() <= self.bytes_left {
+                return self.string(identity);
+            }
+            self.truncated = true;
+            let required = prefix.len().saturating_add(ENGINE_EVENTS_OMITTED_FALLBACK.len());
+            if required > self.bytes_left {
+                return String::new();
+            }
+            let mut copied = self.string(prefix);
+            copied.push_str(&self.string(ENGINE_EVENTS_OMITTED_FALLBACK));
+            return copied;
+        }
+        let mut copied = self.complete_string(prefix);
+        if !copied.is_empty() {
+            copied.push_str(&self.string(identity.get(prefix_len..).unwrap_or_default()));
+        }
+        copied
+    }
+
+    /// Copies a compact engine identity without cutting its state prefix.
+    fn compact_engine_identity(&mut self, message: &AuditMessage) -> String {
+        let Some((identity, shortened)) = reduced_engine_identity(message, self.bytes_left) else {
+            self.truncated = true;
+            return String::new();
+        };
+        self.truncated |= shortened;
+        self.string(&identity)
+    }
+
+    /// Reserves the synthetic state label before copying descriptive message text.
+    fn engine_state_fields(&mut self, message: &AuditMessage, compaction: AuditCompaction) -> (Vec<String>, String) {
+        let Some(state) = message.engine_state_tag(self.bytes_left) else {
+            return (Vec::new(), String::new());
+        };
+        let raw = if message.data.raw == state {
+            self.complete_string(state)
+        } else {
+            if !message.data.raw.is_empty() {
+                self.truncated = true;
+            }
+            String::new()
+        };
+        if compaction == AuditCompaction::Compact {
+            return (Vec::new(), raw);
+        }
+        let mut tags = Vec::new();
+        match message.data.tags.first() {
+            Some(tag) if tag == state && tag.len() <= self.bytes_left && self.items_left > 0 => {
+                self.item_count(1);
+                tags.push(self.string(tag));
+            },
+            Some(tag) if tag == state || !tag.is_empty() => self.truncated = true,
+            _ => {},
+        }
+        if !tags.is_empty()
+            && let Some(tag) = message
+                .data
+                .tags
+                .get(1)
+                .filter(|tag| tag.as_str() == ENGINE_ENFORCED_TAG || tag.as_str() == ENGINE_ENFORCED_OMITTED_TAG)
+        {
+            if tag.len() <= self.bytes_left && self.items_left > 0 {
+                self.item_count(1);
+                tags.push(self.string(tag));
+            } else {
+                self.truncated = true;
+            }
+        }
+        (tags, raw)
+    }
+
     /// Reserves up to the remaining number of collection entries.
     fn item_count(&mut self, len: usize) -> usize {
         let count = len.min(self.items_left);
@@ -1417,118 +1792,393 @@ impl AuditCopyBudget {
         values.iter().take(count).map(|value| copy(self, value)).collect()
     }
 
+    /// Chooses the message to pin before copying: enforced ID, or the compatible no-ID fallback.
+    fn pinned_message_index(messages: &[AuditMessage], interrupting: Option<i32>) -> Option<usize> {
+        let pinned = match interrupting {
+            Some(0) => messages
+                .iter()
+                .position(AuditMessage::is_enforced_engine_event)
+                .or_else(|| messages.iter().position(AuditMessage::is_enforced_stop_omitted_summary))
+                // Preserve the historical fallback for caller-built/legacy ID-zero messages.
+                .or_else(|| messages.iter().position(AuditMessage::is_engine_event))
+                .or_else(|| {
+                    messages
+                        .iter()
+                        .rposition(|message| message.rule_id == 0 || message.data.id == 0)
+                }),
+            Some(id) => messages
+                .iter()
+                .position(AuditMessage::is_enforced_engine_event)
+                .or_else(|| messages.iter().position(AuditMessage::is_enforced_stop_omitted_summary))
+                .or_else(|| {
+                    messages
+                        .iter()
+                        .rposition(|message| message.rule_id == id || message.data.id == id)
+                })
+                // Preserve engine-stop context; it does not identify the interrupted rule.
+                .or_else(|| messages.iter().position(AuditMessage::is_engine_event)),
+            None => messages
+                .iter()
+                .rposition(|message| !message.is_engine_event())
+                .or_else(|| messages.iter().position(AuditMessage::is_engine_event)),
+        };
+        pinned.or_else(|| messages.len().checked_sub(1))
+    }
+
     /// Copies the messages `plan` keeps out of one shared pool.
     ///
-    /// Only the kept messages are visited and copied. They are the one whose rule interrupted the
-    /// transaction (the last message when none did), found without copying, and the first of the others: the
-    /// first matches say how the request started to go wrong, and a logging rule that runs after the
-    /// interruption must not displace it. The pinned message is copied first, so it has its text however the
-    /// pool is used.
+    /// Only kept messages are copied. The enforced ID or compatible no-ID fallback stays first priority; the
+    /// `EventsOmitted` summary is retained next when another message fits, before the first remaining messages.
+    /// Without an enforced ID, the fallback remains the last real rule message, or the first engine event when no
+    /// rule messages exist. `DetectionOnly` has no public would-be ID, so the exact would-be rule cannot be promised.
+    /// Native does not run this plan and uses its separate final hard-cut.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The bounded selection keeps cause, summary, budgets, and chronological order coordinated."
+    )]
     fn planned_messages(
         &mut self,
         messages: &[AuditMessage],
         mode: AuditMessageCopy,
         plan: AuditShrinkPlan,
-        interrupting: Option<i32>,
+        selection: AuditMessageSelection,
     ) -> Vec<AuditMessage> {
         let kept = plan.message_count.min(messages.len());
         if kept < messages.len() {
             self.truncated = true;
         }
-        let pinned = interrupting
-            .and_then(|id| {
-                messages
-                    .iter()
-                    .rposition(|message| message.rule_id == id || message.data.id == id)
-            })
-            // Without an interruption the last message is the one kept, as the one most likely to be the blocking
-            // rule's.
-            .or_else(|| messages.len().checked_sub(1))
-            .filter(|_| kept > 0);
-        let mut pool = Self::generous(plan.message_bytes);
-        // The message written first is the first one kept: the first of them, unless only the pinned one is.
-        let head_count = kept - usize::from(pinned.is_some());
-        let first = if head_count == 0 { pinned } else { Some(0) };
-        let reduced = plan.reduced;
-        let mut copy_one = |index: usize| {
-            let before = pool.bytes_left;
-            pool.bytes_left = before.min(plan.message_each.unwrap_or(usize::MAX));
-            let allowed = pool.bytes_left;
-            let mode = if Some(index) == first { mode } else { mode.after_first() };
-            let copy = messages.get(index).map(|message| {
-                if reduced && Some(index) == pinned {
-                    pool.pinned_message(message, mode)
-                } else {
-                    pool.message(message, mode)
-                }
-            });
-            pool.bytes_left = before - (allowed - pool.bytes_left);
-            copy
+        let pinned = Self::pinned_message_index(messages, selection.interruption_rule_id).filter(|_| kept > 0);
+        let summary = if kept > 1 {
+            messages
+                .iter()
+                .position(AuditMessage::is_events_omitted_summary)
+                .filter(|index| Some(*index) != pinned)
+        } else {
+            None
         };
-        let pinned_copy = pinned.and_then(&mut copy_one);
-        let mut out: Vec<AuditMessage> = (0..messages.len())
-            .filter(|index| Some(*index) != pinned)
-            .take(head_count)
-            .filter_map(&mut copy_one)
-            .collect();
-        if let (Some(index), Some(copy)) = (pinned, pinned_copy) {
-            // Back in its place among the others, which are the first ones.
-            let position = index.min(out.len());
-            out.insert(position, copy);
+        let mut selected = Vec::with_capacity(kept);
+        if let Some(index) = pinned {
+            selected.push(index);
         }
+        if let Some(index) = summary {
+            selected.push(index);
+        }
+        for index in 0..messages.len() {
+            if Some(index) == pinned || Some(index) == summary {
+                continue;
+            }
+            if selected.len() >= kept {
+                break;
+            }
+            selected.push(index);
+        }
+
+        let first = selected.iter().copied().min();
+        let mut pool = Self::generous(plan.message_bytes);
+        let reduced = plan.reduced;
+        let mut copy_one =
+            |index: usize| {
+                let message = messages.get(index)?;
+                let before = pool.bytes_left;
+                let copy_mode = if Some(index) == first { mode } else { mode.after_first() };
+                let h_only_ocsf_engine = selection.trailer_selected
+                    && !selection.rules_selected
+                    && matches!(copy_mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment)
+                    && message.data.msg.is_empty()
+                    && message.is_engine_event();
+                let h_only_json_engine = selection.trailer_selected
+                    && !selection.rules_selected
+                    && copy_mode == AuditMessageCopy::Json
+                    && message.is_engine_event();
+                let legacy_engine = copy_mode == AuditMessageCopy::Legacy && message.is_engine_event();
+                let identity_prefix_len = message
+                    .engine_state_tag(before)
+                    .map_or(0, |state| state.len().saturating_add(2));
+                let identity_floor = if message.is_events_omitted_summary() {
+                    identity_prefix_len.saturating_add(ENGINE_EVENTS_OMITTED_FALLBACK.len())
+                } else {
+                    identity_prefix_len
+                };
+                let compact_identity_prefix_bytes = if (h_only_json_engine || legacy_engine) && reduced {
+                    reduced_engine_identity_prefix_bytes(message, before)
+                } else {
+                    None
+                };
+                let identity_bytes_before = message.engine_identity().map_or(0, str::len).saturating_add(
+                    message
+                        .data
+                        .data
+                        .len()
+                        .saturating_add(if copy_mode == AuditMessageCopy::Ocsf {
+                            message.message.len()
+                        } else {
+                            0
+                        }),
+                );
+                let compact_h_ocsf_identity = h_only_ocsf_engine && (reduced || identity_bytes_before > before);
+                let compact_h_json_identity = h_only_json_engine && reduced;
+                let compact_h_legacy_identity = legacy_engine && reduced;
+                let compact_h_text_identity = compact_h_json_identity || compact_h_legacy_identity;
+                // The omission count gets the remaining text pool before ordinary detail.
+                let compact_summary =
+                    selection.compaction == AuditCompaction::Compact && message.is_events_omitted_summary();
+                let allowance = if compact_summary {
+                    match plan.summary_each {
+                        None => usize::MAX,
+                        Some(each) if compact_h_ocsf_identity => each.max(identity_floor),
+                        Some(each) if compact_h_text_identity => each.max(compact_identity_prefix_bytes.unwrap_or(0)),
+                        Some(each) => each,
+                    }
+                } else if Some(index) == summary {
+                    usize::MAX
+                } else if compact_h_ocsf_identity {
+                    plan.message_each
+                        .unwrap_or_else(|| before / kept.max(1))
+                        .max(identity_floor)
+                } else if compact_h_text_identity {
+                    plan.message_each
+                        .unwrap_or_else(|| before / kept.max(1))
+                        .max(compact_identity_prefix_bytes.unwrap_or(0))
+                } else if Some(index) == pinned && message.is_engine_event() {
+                    usize::MAX
+                } else {
+                    plan.message_each.unwrap_or(usize::MAX)
+                };
+                pool.bytes_left = before.min(allowance);
+                let allowed = pool.bytes_left;
+                if compact_h_ocsf_identity && pool.bytes_left < identity_prefix_len {
+                    pool.truncated = true;
+                    return None;
+                }
+                if compact_h_text_identity && compact_identity_prefix_bytes.is_none() {
+                    pool.truncated = true;
+                    return None;
+                }
+                if compact_h_legacy_identity && pool.bytes_left < identity_prefix_len {
+                    pool.truncated = true;
+                    return None;
+                }
+                let compact_h_identity = reduced
+                    && mode == AuditMessageCopy::Json
+                    && selection.trailer_selected
+                    && message.is_engine_event();
+                let unlabeled_ocsf_k_summary = reduced
+                    && selection.rules_selected
+                    && matches!(copy_mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment)
+                    && message.is_events_omitted_summary()
+                    && message.data.msg.is_empty()
+                    && message.engine_state_tag(before).is_none();
+                let copy = if !unlabeled_ocsf_k_summary
+                    && ((reduced && (Some(index) == pinned || compact_h_identity || compact_h_legacy_identity))
+                        || compact_h_ocsf_identity)
+                {
+                    pool.pinned_message_with_compaction(message, copy_mode, selection)
+                } else {
+                    pool.message_with_state_priority(message, copy_mode, selection, reduced)
+                };
+                pool.bytes_left = before - (allowed - pool.bytes_left);
+                if (compact_h_json_identity && copy.error_message.is_empty())
+                    || (h_only_json_engine && message.is_events_omitted_summary() && copy.error_message.is_empty())
+                    || (compact_h_legacy_identity && copy.message.is_empty())
+                    || (legacy_engine && message.is_events_omitted_summary() && copy.message.is_empty())
+                    || (compact_h_ocsf_identity && copy.rule_message.is_empty())
+                    || (reduced
+                        && selection.rules_selected
+                        && matches!(copy_mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment)
+                        && message.is_events_omitted_summary()
+                        && copy.data.msg.is_empty()
+                        && copy.rule_message.is_empty())
+                {
+                    pool.truncated = true;
+                    return None;
+                }
+                Some(copy)
+            };
+        let mut copied = Vec::with_capacity(selected.len());
+        for index in selected {
+            if let Some(copy) = copy_one(index) {
+                copied.push((index, copy));
+            }
+        }
+        copied.sort_unstable_by_key(|(index, _)| *index);
+        let out = copied.into_iter().map(|(_, message)| message).collect();
         self.truncated |= pool.truncated;
         self.bytes_used += pool.bytes_used;
         self.items_used += pool.items_used;
         out
     }
 
-    /// Copies the interrupting message of a reduced record, so that it still names its rule.
+    /// Copies a reduced message's compact identity, so that it still names its rule or engine state.
     ///
-    /// A message with part `H` and without `K` carries its rule only inside the error log text, behind a
-    /// prefix (the client address and the outcome) that a tight allowance is spent on before the rule's `id`
-    /// and `msg` are reached, and the legacy and OCSF documents do not write that text at all. So when the
-    /// allowance cannot hold the text, the rule's `id` and `msg` are written in a compact form instead, from
-    /// `rule_id`, which is set whether or not the message has `data`. Any other message is copied as usual.
-    fn pinned_message(&mut self, message: &AuditMessage, mode: AuditMessageCopy) -> AuditMessage {
+    /// H-only JSON carries a real rule inside its error log text, behind a prefix that a tight allowance spends
+    /// before the rule's `id` and `msg`; `JSONLegacy` and OCSF do not write that text. This compact fallback remains
+    /// part of the baseline JSON behavior even when H is not selected. A reduced synthetic event writes its
+    /// state-first identity to the selected H/K view without copying the hidden `rule_message` prefix. H-only JSON
+    /// and `JSONLegacy` keep the full state prefix and shorten only its description; if the prefix itself cannot fit,
+    /// the event is omitted. H-only JSON and OCSF omit the event's unselected K tags/raw; H-only OCSF preserves a
+    /// complete state prefix in the name or omits the event if it cannot fit. K-selected JSON keeps the raw label and
+    /// message when space permits.
+    /// Pinned-message copy with collections omitted when the caller will compact the resulting view.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The reduced identity fields differ by format but share one bounded-copy budget."
+    )]
+    fn pinned_message_with_compaction(
+        &mut self,
+        message: &AuditMessage,
+        mode: AuditMessageCopy,
+        selection: AuditMessageSelection,
+    ) -> AuditMessage {
+        let trailer_selected = selection.trailer_selected;
+        let rules_selected = selection.rules_selected;
+        let engine_event = message.is_engine_event();
+        let original_limit = self.bytes_left;
         let identity_missing = message.rule_id != 0
             && message.data.id == 0
             && message.data.msg.is_empty()
             && message.message.is_empty()
             && message.data.data.is_empty();
-        let limit = self.bytes_left;
         let needs_identity = match mode {
-            AuditMessageCopy::Json => message.error_message.len() > limit,
+            AuditMessageCopy::Json => {
+                (!engine_event && message.error_message.len() > original_limit)
+                    || (engine_event && (trailer_selected || rules_selected))
+            },
             AuditMessageCopy::Legacy | AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment => true,
             AuditMessageCopy::None | AuditMessageCopy::Native { .. } => false,
         };
-        if !identity_missing || !needs_identity {
-            return self.message(message, mode);
+        if !needs_identity || (!identity_missing && !engine_event) {
+            return self.message_with_state_priority(message, mode, selection, false);
         }
         #[cfg(test)]
         MESSAGES_COPIED.with(|copied| copied.set(copied.get() + 1));
         let mut copy = AuditMessage {
             rule_id: message.rule_id,
+            provenance: message.provenance,
             ..AuditMessage::default()
         };
+        if engine_event
+            && matches!(
+                mode,
+                AuditMessageCopy::Json | AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment
+            )
+        {
+            copy.data.severity = message.data.severity;
+        }
+        let identity = if engine_event {
+            message.engine_identity().unwrap_or_default()
+        } else {
+            &message.rule_message
+        };
+        if engine_event
+            && rules_selected
+            && matches!(
+                mode,
+                AuditMessageCopy::Json | AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment
+            )
+        {
+            (copy.data.tags, copy.data.raw) = self.engine_state_fields(message, selection.compaction);
+        }
+        if engine_event
+            && !rules_selected
+            && message.data.msg.is_empty()
+            && matches!(mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment)
+        {
+            copy.data.id = message.rule_id;
+            copy.rule_message = self.state_first_engine_identity(message);
+            return copy;
+        }
         match mode {
             AuditMessageCopy::Json => {
                 copy.data.id = message.rule_id;
-                copy.error_message = self.string(&reduced_identity(message.rule_id, &message.rule_message, limit));
+                if trailer_selected || !engine_event {
+                    if engine_event && trailer_selected && !rules_selected {
+                        copy.error_message = self.compact_engine_identity(message);
+                    } else {
+                        let compact = if message.is_events_omitted_summary() {
+                            reduced_engine_identity(message, self.bytes_left).map(|(compact, shortened)| {
+                                self.truncated |= shortened;
+                                compact
+                            })
+                        } else {
+                            Some(reduced_identity(message.rule_id, identity, self.bytes_left))
+                        };
+                        if let Some(compact) = compact {
+                            if !engine_event
+                                || !rules_selected
+                                || message
+                                    .engine_state_tag(self.bytes_left)
+                                    .is_some_and(|tag| compact.contains(tag))
+                            {
+                                copy.error_message = self.string(&compact);
+                            } else {
+                                self.truncated = true;
+                            }
+                        } else {
+                            self.truncated = true;
+                        }
+                    }
+                }
+                if engine_event && rules_selected {
+                    copy.data.msg = self.summary_text(message, &message.data.msg);
+                }
             },
             AuditMessageCopy::Legacy => {
-                copy.message = self.string(&reduced_identity(message.rule_id, &message.rule_message, limit));
+                if engine_event {
+                    copy.message = self.compact_engine_identity(message);
+                } else {
+                    copy.message = self.string(&reduced_identity(message.rule_id, identity, self.bytes_left));
+                }
             },
             _ => {
                 // OCSF names a rule by its enrichment (`id` in the data, `msg` as the name); the first message's
                 // text is written beside, and takes what the name leaves.
                 copy.data.id = message.rule_id;
-                copy.data.msg = self.string(truncated(&message.rule_message, limit / 2));
+                let limit = self.bytes_left;
+                if message.is_events_omitted_summary() && rules_selected {
+                    let name = reduced_summary_identity(message, limit / 2);
+                    if let Some((name, shortened)) = name {
+                        self.truncated |= shortened;
+                        copy.data.msg = self.complete_string(&name);
+                    } else if copy.data.raw == message.engine_state_tag(limit).unwrap_or_default()
+                        || copy
+                            .data
+                            .tags
+                            .iter()
+                            .any(|tag| Some(tag.as_str()) == message.engine_state_tag(limit))
+                    {
+                        copy.data.msg = self.summary_text(message, &message.data.msg);
+                    } else {
+                        self.truncated = true;
+                    }
+                } else {
+                    let name = truncated(identity, limit / 2);
+                    if engine_event
+                        && rules_selected
+                        && !message
+                            .engine_state_tag(limit / 2)
+                            .is_some_and(|tag| name.contains(tag))
+                    {
+                        copy.data.msg = self.summary_text(message, &message.data.msg);
+                    } else {
+                        copy.data.msg = self.string(name);
+                    }
+                }
                 if mode == AuditMessageCopy::Ocsf {
-                    copy.message = self.string(&reduced_identity(
-                        message.rule_id,
-                        &message.rule_message,
-                        self.bytes_left,
-                    ));
+                    if message.is_events_omitted_summary() {
+                        copy.message = self.compact_engine_identity(message);
+                    } else {
+                        let compact = reduced_identity(message.rule_id, identity, self.bytes_left);
+                        if engine_event
+                            && rules_selected
+                            && !message
+                                .engine_state_tag(self.bytes_left)
+                                .is_some_and(|tag| compact.contains(tag))
+                        {
+                            copy.message = self.summary_text(message, &message.message);
+                        } else {
+                            copy.message = self.string(&compact);
+                        }
+                    }
                 }
             },
         }
@@ -1604,23 +2254,69 @@ impl AuditCopyBudget {
     }
 
     /// Copies only message fields used by the selected audit format.
-    fn message(&mut self, message: &AuditMessage, mode: AuditMessageCopy) -> AuditMessage {
+    fn message(&mut self, message: &AuditMessage, mode: AuditMessageCopy, rules_selected: bool) -> AuditMessage {
+        self.message_with_state_priority(
+            message,
+            mode,
+            AuditMessageSelection {
+                interruption_rule_id: None,
+                trailer_selected: false,
+                rules_selected,
+                compaction: AuditCompaction::Full,
+            },
+            false,
+        )
+    }
+
+    /// Copies a message, giving a reduced synthetic event's selected K identity first claim on its text allowance.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "Field copy order and summary evidence share one bounded budget across audit formats."
+    )]
+    fn message_with_state_priority(
+        &mut self,
+        message: &AuditMessage,
+        mode: AuditMessageCopy,
+        selection: AuditMessageSelection,
+        reduced: bool,
+    ) -> AuditMessage {
+        let rules_selected = selection.rules_selected;
+        let compact = selection.compaction == AuditCompaction::Compact;
         #[cfg(test)]
         MESSAGES_COPIED.with(|copied| copied.set(copied.get() + 1));
         let json = mode == AuditMessageCopy::Json;
         let legacy = mode == AuditMessageCopy::Legacy;
         let ocsf = matches!(mode, AuditMessageCopy::Ocsf | AuditMessageCopy::OcsfEnrichment);
+        let engine_event = message.is_engine_event();
         let (native_error, native_raw) = match mode {
             AuditMessageCopy::Native { error, raw } => (error, raw),
             _ => (false, false),
         };
+        let engine_identity = message.engine_identity();
+        let native_summary = native_raw && message.is_events_omitted_summary();
+        let include_engine_state = rules_selected || !engine_event;
         let all_data = json || ocsf;
         let data = &message.data;
+        let reduced_ocsf_k_summary_needs_fallback = (reduced || compact)
+            && ocsf
+            && rules_selected
+            && message.is_events_omitted_summary()
+            && data.msg.is_empty()
+            && message.engine_state_tag(self.bytes_left).is_none();
+        let prioritize_engine_state = reduced && all_data && include_engine_state && engine_event;
+        let (state_tags, state_raw) = if prioritize_engine_state {
+            self.engine_state_fields(message, selection.compaction)
+        } else {
+            (Vec::new(), String::new())
+        };
         // A tight allowance, which a message's text shares with its siblings, must cut the long and the
         // duplicated fields (the rule's `raw` text, its file, `message` repeating `data.msg`) before the
         // text that says what matched, so that is copied first.
-        let msg = if all_data {
-            self.string(&data.msg)
+        let msg = if reduced_ocsf_k_summary_needs_fallback {
+            self.complete_string(ENGINE_EVENTS_OMITTED_FALLBACK)
+        } else if all_data || native_summary {
+            self.summary_text(message, &data.msg)
         } else {
             String::new()
         };
@@ -1631,7 +2327,31 @@ impl AuditCopyBudget {
         };
         // OCSF writes the text of its first message only; `OcsfEnrichment` copies the data of the others.
         let text = if json || legacy || mode == AuditMessageCopy::Ocsf {
-            self.string(&message.message)
+            if legacy && message.is_events_omitted_summary() {
+                self.state_first_engine_identity(message)
+            } else if message.is_events_omitted_summary() {
+                self.summary_text(message, &message.message)
+            } else {
+                self.string(if legacy {
+                    engine_identity.unwrap_or(&message.message)
+                } else {
+                    &message.message
+                })
+            }
+        } else {
+            String::new()
+        };
+        let rule_message = if native_summary {
+            message
+                .engine_state_tag(self.bytes_left)
+                .and_then(|tag| message.rule_message.get(..tag.len().saturating_add(2)))
+                .map_or_else(String::new, |prefix| self.string(prefix))
+        } else if ocsf && data.msg.is_empty() && !reduced_ocsf_k_summary_needs_fallback {
+            if message.is_events_omitted_summary() {
+                self.state_first_engine_identity(message)
+            } else {
+                engine_identity.map_or_else(String::new, |identity| self.string(identity))
+            }
         } else {
             String::new()
         };
@@ -1650,19 +2370,47 @@ impl AuditCopyBudget {
         } else {
             String::new()
         };
-        let tags = if all_data { self.strings(&data.tags) } else { Vec::new() };
+        let tags = if all_data && include_engine_state {
+            if prioritize_engine_state {
+                state_tags
+            } else if compact {
+                Vec::new()
+            } else {
+                self.strings(&data.tags)
+            }
+        } else {
+            Vec::new()
+        };
         let actionset = if json {
             self.string(&message.actionset)
         } else {
             String::new()
         };
         let error_message = if json || native_error {
-            self.string(&message.error_message)
+            if message.is_events_omitted_summary() {
+                self.complete_string(&message.error_message)
+            } else {
+                self.string(&message.error_message)
+            }
         } else {
             String::new()
         };
-        let raw = if all_data || native_raw {
-            self.string(&data.raw)
+        let raw = if (all_data && include_engine_state) || native_raw {
+            if prioritize_engine_state {
+                state_raw
+            } else if native_raw && engine_event {
+                match message.engine_state_tag(self.bytes_left) {
+                    Some(state) if data.raw.as_str() == state => self.complete_string(state),
+                    _ => {
+                        if !data.raw.is_empty() {
+                            self.truncated = true;
+                        }
+                        String::new()
+                    },
+                }
+            } else {
+                self.string(&data.raw)
+            }
         } else {
             String::new()
         };
@@ -1671,7 +2419,8 @@ impl AuditCopyBudget {
             message: text,
             error_message,
             rule_id: message.rule_id,
-            rule_message: String::new(),
+            rule_message,
+            provenance: message.provenance,
             data: AuditMessageData {
                 file,
                 line: if all_data { data.line } else { 0 },
@@ -1714,6 +2463,157 @@ fn reduced_identity(id: i32, msg: &str, limit: usize) -> String {
         identity.push_str("\"]");
     }
     identity
+}
+
+/// The copy budget needed to retain an engine identity's state and, for a summary, its fixed omission statement.
+///
+/// Quoting is measured incrementally so a caller-built public audit record cannot make the formatter allocate an
+/// unbounded prefix while checking a bounded view.
+fn reduced_engine_identity_prefix_bytes(message: &AuditMessage, max_bytes: usize) -> Option<usize> {
+    let Some(state) = message.engine_state_tag(max_bytes) else {
+        if message.is_events_omitted_summary() {
+            return Some(reduced_identity(message.rule_id, ENGINE_EVENTS_OMITTED_FALLBACK, max_bytes).len());
+        }
+        return reduced_engine_identity(message, max_bytes).map(|(identity, _)| identity.len());
+    };
+    let prefix_len = state.len().checked_add(2)?;
+    let prefix = message.rule_message.get(..prefix_len)?;
+    let overhead = format!("[id \"{}\"]", message.rule_id).len().saturating_add(9);
+    let quote_limit = max_bytes.saturating_sub(overhead);
+    let mut quoted_len = 0_usize;
+    let mut quoted = String::new();
+    let suffix = if message.is_events_omitted_summary() {
+        ENGINE_EVENTS_OMITTED_FALLBACK
+    } else {
+        ""
+    };
+    for character in prefix.chars().chain(suffix.chars()) {
+        quoted.clear();
+        push_go_quoted(&mut quoted, character);
+        quoted_len = quoted_len.saturating_add(quoted.len());
+        if quoted_len > quote_limit {
+            return None;
+        }
+    }
+    Some(overhead.saturating_add(quoted_len))
+}
+
+/// The text budget needed for an omission summary's fixed fallback in a reduced format.
+fn reduced_summary_fallback_bytes(
+    message: &AuditMessage,
+    format: AuditLogFormat,
+    rules_selected: bool,
+    max_bytes: usize,
+) -> Option<usize> {
+    let Some(state) = message.engine_state_tag(max_bytes) else {
+        return Some(match (format, rules_selected) {
+            (AuditLogFormat::Json, true) | (AuditLogFormat::Ocsf, _) => ENGINE_EVENTS_OMITTED_FALLBACK.len(),
+            _ => reduced_engine_identity_prefix_bytes(message, max_bytes)?,
+        });
+    };
+    Some(match (format, rules_selected) {
+        (AuditLogFormat::Ocsf, false) => state
+            .len()
+            .saturating_add(2)
+            .saturating_add(ENGINE_EVENTS_OMITTED_FALLBACK.len()),
+        (AuditLogFormat::Json | AuditLogFormat::Ocsf, true) => {
+            state.len().saturating_add(ENGINE_EVENTS_OMITTED_FALLBACK.len())
+        },
+        _ => reduced_engine_identity_prefix_bytes(message, max_bytes)?,
+    })
+}
+
+/// A complete summary identity when it fits, or one fixed statement that withholds the exact count.
+fn reduced_summary_identity(message: &AuditMessage, limit: usize) -> Option<(String, bool)> {
+    if !message.is_events_omitted_summary() {
+        return None;
+    }
+    let identity = message.engine_identity()?;
+    if identity.len() <= limit {
+        return Some((identity.to_owned(), false));
+    }
+    let Some(state) = message.engine_state_tag(limit) else {
+        return Some((
+            reduced_identity(message.rule_id, ENGINE_EVENTS_OMITTED_FALLBACK, limit),
+            true,
+        ));
+    };
+    let prefix_len = state.len().checked_add(2)?;
+    let prefix = identity.get(..prefix_len)?;
+    let fallback_len = prefix.len().saturating_add(ENGINE_EVENTS_OMITTED_FALLBACK.len());
+    if fallback_len > limit {
+        return None;
+    }
+    let mut fallback = String::with_capacity(fallback_len);
+    fallback.push_str(prefix);
+    fallback.push_str(ENGINE_EVENTS_OMITTED_FALLBACK);
+    Some((fallback, true))
+}
+
+/// Quotes a complete value and suffix only when the complete encoding fits.
+fn quoted_complete(value: &str, suffix: &str, limit: usize) -> Option<String> {
+    let mut quoted = String::new();
+    for character in value.chars().chain(suffix.chars()) {
+        push_go_quoted(&mut quoted, character);
+        if quoted.len() > limit {
+            return None;
+        }
+    }
+    Some(quoted)
+}
+
+/// Compact ID/message identity with a complete synthetic state prefix.
+fn reduced_engine_identity(message: &AuditMessage, limit: usize) -> Option<(String, bool)> {
+    let identity = message.engine_identity()?;
+    let Some(state) = message.engine_state_tag(limit) else {
+        if message.is_events_omitted_summary() {
+            return Some((
+                reduced_identity(message.rule_id, ENGINE_EVENTS_OMITTED_FALLBACK, limit),
+                true,
+            ));
+        }
+        let mut compact = format!("[id \"{}\"]", message.rule_id);
+        let room = limit.saturating_sub(compact.len().saturating_add(9));
+        compact.push_str(" [msg \"");
+        compact.push_str(&quoted_complete(identity, "", room)?);
+        compact.push_str("\"]");
+        return Some((compact, false));
+    };
+    let prefix_len = state.len().checked_add(2)?;
+    let prefix = identity.get(..prefix_len)?;
+    let description = identity.get(prefix_len..)?;
+    let mut compact = format!("[id \"{}\"]", message.rule_id);
+    let room = limit.saturating_sub(compact.len().saturating_add(9));
+    if message.is_events_omitted_summary() {
+        let (quoted, shortened) = quoted_complete(identity, "", room)
+            .map(|quoted| (quoted, false))
+            .or_else(|| quoted_complete(prefix, ENGINE_EVENTS_OMITTED_FALLBACK, room).map(|quoted| (quoted, true)))?;
+        compact.push_str(" [msg \"");
+        compact.push_str(&quoted);
+        compact.push_str("\"]");
+        return Some((compact, shortened));
+    }
+    let mut quoted = String::new();
+    for character in prefix.chars() {
+        push_go_quoted(&mut quoted, character);
+        if quoted.len() > room {
+            return None;
+        }
+    }
+    let mut shortened = false;
+    for character in description.chars() {
+        let before = quoted.len();
+        push_go_quoted(&mut quoted, character);
+        if quoted.len() > room {
+            quoted.truncate(before);
+            shortened = true;
+            break;
+        }
+    }
+    compact.push_str(" [msg \"");
+    compact.push_str(&quoted);
+    compact.push_str("\"]");
+    Some((compact, shortened))
 }
 
 /// Returns the longest UTF-8 boundary no later than `max_bytes`.
@@ -2602,9 +3502,9 @@ impl AuditLogger {
         Ok(logger)
     }
 
-    /// Whether a `RelevantOnly` audit engine logs a transaction: one where a rule with
-    /// `auditlog` matched (`audited`) is logged unless its `status` falls outside
-    /// `SecAuditLogRelevantStatus`; any other only if its status falls inside it.
+    /// Whether a `RelevantOnly` audit engine logs a transaction. A configured
+    /// `SecAuditLogRelevantStatus` filter is authoritative; without one, only a transaction
+    /// with an audited match is logged.
     pub(crate) fn is_relevant(&self, audited: bool, status: &str) -> bool {
         match &self.relevant_status {
             Some(relevant) => relevant.is_match(status),
@@ -3954,7 +4854,16 @@ pub(crate) mod tests {
             };
             for mode in [super::AuditMessageCopy::Json, super::AuditMessageCopy::Legacy] {
                 let mut budget = AuditCopyBudget::generous(32);
-                let copy = budget.pinned_message(&source, mode);
+                let copy = budget.pinned_message_with_compaction(
+                    &source,
+                    mode,
+                    super::AuditMessageSelection {
+                        interruption_rule_id: None,
+                        trailer_selected: true,
+                        rules_selected: false,
+                        compaction: super::AuditCompaction::Full,
+                    },
+                );
                 let identity = if mode == super::AuditMessageCopy::Json {
                     copy.error_message
                 } else {
@@ -3973,6 +4882,7 @@ pub(crate) mod tests {
     fn message_of(id: i32, text: usize) -> AuditMessage {
         AuditMessage {
             message: "m".repeat(text),
+            rule_id: id,
             data: AuditMessageData {
                 id,
                 msg: "m".repeat(text),
@@ -3980,6 +4890,1399 @@ pub(crate) mod tests {
             },
             ..AuditMessage::default()
         }
+    }
+
+    fn engine_event_message(message: &str) -> AuditMessage {
+        engine_event_message_with_state("Test", message)
+    }
+
+    fn engine_event_message_with_state(state: &str, message: &str) -> AuditMessage {
+        let tag = format!("coraza-rs/engine/{state}");
+        AuditMessage {
+            message: message.to_owned(),
+            error_message: format!("[id \"0\"] [msg \"{message}\"]"),
+            rule_id: 0,
+            rule_message: format!("{tag}: {message}"),
+            provenance: Some(if state == "EventsOmitted" {
+                super::AuditMessageProvenance::EventsOmitted {
+                    enforced_stop_omitted: false,
+                }
+            } else {
+                super::AuditMessageProvenance::EngineEvent { enforced: false }
+            }),
+            data: AuditMessageData {
+                id: 0,
+                msg: message.to_owned(),
+                tags: vec![tag.clone()],
+                raw: tag,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        }
+    }
+
+    fn enforced_events_omitted_audit() -> AuditLog {
+        let message_text = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                            the enforced stop is among omitted details";
+        let mut summary = engine_event_message_with_state("EventsOmitted", message_text);
+        summary.error_message.clear();
+        summary.data.tags.push(super::ENGINE_ENFORCED_OMITTED_TAG.to_owned());
+        summary.provenance = Some(super::AuditMessageProvenance::EventsOmitted {
+            enforced_stop_omitted: true,
+        });
+        AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-omitted-summary".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(901),
+                request: AuditRequest {
+                    uri: format!("/{}", "u".repeat(4096)),
+                    ..AuditRequest::default()
+                },
+                producer: Some(super::AuditProducer {
+                    connector: "c".repeat(4096),
+                    rulesets: vec!["r".repeat(4096)],
+                    ..super::AuditProducer::default()
+                }),
+                ..AuditTransaction::default()
+            },
+            messages: vec![summary],
+        }
+    }
+
+    fn h_only_enforced_events_omitted_audit() -> AuditLog {
+        const MESSAGE: &str = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                               the enforced stop is among omitted details";
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+
+        let mut audit = enforced_events_omitted_audit();
+        audit.parts = parse_audit_log_parts("AHZ").unwrap();
+        let summary = audit.messages.first_mut().unwrap();
+        summary.message.clear();
+        summary.data.msg.clear();
+        summary.error_message = format!(
+            "[client 192.0.2.1] Coraza: Warning. [file \"\"] [line \"0\"] [id \"0\"] [msg \"{MESSAGE}\"] \
+             [data \"\"] [severity \"CRITICAL\"] [ver \"\"] [maturity \"0\"] [accuracy \"0\"] [tag \"{STATE}\"]"
+        );
+        audit
+    }
+
+    fn summary_event_audit(
+        parts: &str,
+        summary_text: &str,
+        enforcement_omitted: bool,
+        source_rule_id: Option<i32>,
+    ) -> AuditLog {
+        const SOURCE_RULE_TEXT: &str = "earlier source rule";
+        let h_selected = parts.contains('H');
+        let k_selected = parts.contains('K');
+        let error_log = |id: i32, message: &str, state: Option<&str>| {
+            let tag = state.map_or_else(String::new, |state| format!(" [tag \"coraza-rs/engine/{state}\"]"));
+            format!(
+                "[client \"192.0.2.1\"] Coraza: Warning. [file \"\"] [line \"0\"] [id \"{id}\"] \
+                 [msg \"{message}\"] [data \"\"] [severity \"CRITICAL\"] [ver \"\"] [maturity \"0\"] \
+                 [accuracy \"0\"]{tag}"
+            )
+        };
+        let mut messages = Vec::with_capacity(18);
+        if let Some(id) = source_rule_id {
+            messages.push(AuditMessage {
+                message: if k_selected {
+                    SOURCE_RULE_TEXT.to_owned()
+                } else {
+                    String::new()
+                },
+                error_message: if h_selected {
+                    error_log(id, SOURCE_RULE_TEXT, None)
+                } else {
+                    String::new()
+                },
+                rule_id: id,
+                data: if k_selected {
+                    AuditMessageData {
+                        id,
+                        msg: SOURCE_RULE_TEXT.to_owned(),
+                        ..AuditMessageData::default()
+                    }
+                } else {
+                    AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            });
+        }
+        for index in 0..16 {
+            let message_text = format!("RequestBodyLimit {index}");
+            let mut event = engine_event_message_with_state("RequestBodyLimit", &message_text);
+            if !k_selected {
+                event.message.clear();
+                event.data.msg.clear();
+            }
+            event.error_message = if h_selected {
+                error_log(0, &message_text, Some("RequestBodyLimit"))
+            } else {
+                String::new()
+            };
+            messages.push(event);
+        }
+        let mut summary = engine_event_message_with_state("EventsOmitted", summary_text);
+        if !k_selected {
+            summary.message.clear();
+            summary.data.msg.clear();
+        }
+        summary.error_message = if h_selected {
+            error_log(0, summary_text, Some("EventsOmitted"))
+        } else {
+            String::new()
+        };
+        if enforcement_omitted {
+            summary.data.tags.push(super::ENGINE_ENFORCED_OMITTED_TAG.to_owned());
+            summary.provenance = Some(super::AuditMessageProvenance::EventsOmitted {
+                enforced_stop_omitted: true,
+            });
+        }
+        messages.push(summary);
+
+        AuditLog {
+            parts: parse_audit_log_parts(parts).unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-overflow-summary".to_owned(),
+                is_interrupted: enforcement_omitted || source_rule_id.is_some(),
+                interruption_rule_id: source_rule_id.or_else(|| enforcement_omitted.then_some(0)),
+                request: AuditRequest {
+                    uri: format!("/{}", "p".repeat(16 * 1024)),
+                    ..AuditRequest::default()
+                },
+                producer: Some(super::AuditProducer {
+                    connector: "c".repeat(4096),
+                    rulesets: vec!["r".repeat(4096)],
+                    ..super::AuditProducer::default()
+                }),
+                ..AuditTransaction::default()
+            },
+            messages,
+        }
+    }
+
+    fn bounded_summary_visible_fields(
+        format: AuditLogFormat,
+        document: &serde_json::Value,
+        h_only: bool,
+    ) -> Option<(Vec<String>, Option<serde_json::Value>)> {
+        match format {
+            AuditLogFormat::Json => {
+                let message = document.pointer("/messages/0")?;
+                let visible = [
+                    message.get("message").and_then(serde_json::Value::as_str),
+                    message.get("error_message").and_then(serde_json::Value::as_str),
+                    message.pointer("/data/msg").and_then(serde_json::Value::as_str),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+                Some((
+                    visible,
+                    if h_only {
+                        Some(message.get("data").unwrap().clone())
+                    } else {
+                        message.get("data").cloned()
+                    },
+                ))
+            },
+            AuditLogFormat::JsonLegacy => Some((
+                document
+                    .pointer("/audit_data/messages/0")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                None,
+            )),
+            AuditLogFormat::Ocsf => {
+                let enrichment = document.pointer("/enrichments/0")?;
+                let data = if h_only {
+                    Some(
+                        serde_json::from_str(enrichment.get("data").and_then(serde_json::Value::as_str).unwrap())
+                            .unwrap(),
+                    )
+                } else {
+                    enrichment
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+                };
+                let visible = if h_only {
+                    [
+                        enrichment.get("name").and_then(serde_json::Value::as_str),
+                        document.get("message").and_then(serde_json::Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect()
+                } else {
+                    [
+                        document.get("message").and_then(serde_json::Value::as_str),
+                        enrichment.get("name").and_then(serde_json::Value::as_str),
+                        data.as_ref()
+                            .and_then(|data| data.get("msg"))
+                            .and_then(serde_json::Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect()
+                };
+                Some((visible, data))
+            },
+            AuditLogFormat::Native => unreachable!(),
+        }
+    }
+
+    fn full_summary_text(format: AuditLogFormat, document: &serde_json::Value, h_only: bool) -> Option<&str> {
+        match format {
+            AuditLogFormat::Json if h_only => document
+                .pointer("/messages/0/error_message")
+                .and_then(serde_json::Value::as_str),
+            AuditLogFormat::Json => document
+                .pointer("/messages/0/data/msg")
+                .and_then(serde_json::Value::as_str),
+            AuditLogFormat::JsonLegacy => document
+                .pointer("/audit_data/messages/0")
+                .and_then(serde_json::Value::as_str),
+            AuditLogFormat::Ocsf => document
+                .pointer("/enrichments/0/name")
+                .and_then(serde_json::Value::as_str),
+            AuditLogFormat::Native => unreachable!(),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The bounded and full-fit summary matrices share format-specific identity expectations."
+    )]
+    fn assert_bounded_summary_formats(
+        audit: &AuditLog,
+        message: &str,
+        fallback: &str,
+        h_only: bool,
+        full_error: Option<&str>,
+    ) {
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+        let full_identity = format!("{STATE}: {message}");
+        let fallback_identity = format!("{STATE}: {fallback}");
+        let compact_identity = |identity: &str| format!("[id \"0\"] [msg \"{identity}\"]");
+        let acceptable = |text: &str| {
+            text.is_empty()
+                || (!h_only && (text == message || text == fallback))
+                || text == full_identity
+                || text == fallback_identity
+                || text == compact_identity(&full_identity)
+                || text == compact_identity(&fallback_identity)
+                || full_error.is_some_and(|full_error| text == full_error)
+        };
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            for max_bytes in [482, 494] {
+                let (output, truncated) = audit.format_bounded(format, max_bytes);
+                assert!(truncated, "{format:?} at {max_bytes} bytes");
+                assert!(output.len() <= max_bytes, "{format:?} at {max_bytes} bytes: {output}");
+                if output.is_empty() {
+                    continue;
+                }
+                let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(
+                    if format == AuditLogFormat::Ocsf {
+                        document.pointer("/unmapped/truncated")
+                    } else {
+                        document.get("truncated")
+                    },
+                    Some(&serde_json::Value::Bool(true)),
+                    "{format:?} carries its truncation marker: {output}"
+                );
+                let Some((visible, data)) = bounded_summary_visible_fields(format, &document, h_only) else {
+                    continue;
+                };
+                for text in visible {
+                    if h_only {
+                        assert!(
+                            acceptable(&text),
+                            "{format:?} at {max_bytes} bytes emitted partial H-only summary text {text:?}: {output}"
+                        );
+                    } else {
+                        assert!(
+                            acceptable(&text),
+                            "{format:?} at {max_bytes} bytes emitted a partial count/detail: {text:?}; {output}"
+                        );
+                    }
+                }
+                if h_only && let Some(data) = data {
+                    assert!(
+                        data.get("tags")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(Vec::is_empty),
+                        "{format:?} leaked unselected K tags: {output}"
+                    );
+                    assert_eq!(
+                        data.get("raw").and_then(serde_json::Value::as_str),
+                        Some(""),
+                        "{format:?} leaked unselected K raw data: {output}"
+                    );
+                }
+            }
+
+            let (full, truncated) = audit.format_bounded(format, 64 * 1024);
+            assert!(!truncated, "{format:?}: full summary fits");
+            let document: serde_json::Value = serde_json::from_str(&full).unwrap();
+            let summary_text = full_summary_text(format, &document, h_only);
+            if h_only {
+                assert!(
+                    summary_text.is_some_and(|text| text.contains(message)),
+                    "{format:?}: full fit retains the count and enforcement clause: {full}"
+                );
+            } else {
+                assert!(
+                    summary_text.is_some_and(|text| text.contains(message)),
+                    "{format:?}: full fit retains the exact count and enforcement clause: {full}"
+                );
+            }
+
+            if !h_only && format == AuditLogFormat::Json {
+                assert!(
+                    document
+                        .pointer("/messages/0/data/tags")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tags| {
+                            tags.iter()
+                                .any(|tag| tag.as_str() == Some(super::ENGINE_ENFORCED_OMITTED_TAG))
+                        }),
+                    "K-selected JSON includes the enforcement marker: {full}"
+                );
+            } else if !h_only && format == AuditLogFormat::Ocsf {
+                let data: serde_json::Value = serde_json::from_str(
+                    document
+                        .pointer("/enrichments/0/data")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    data.get("tags")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tags| {
+                            tags.iter()
+                                .any(|tag| tag.as_str() == Some(super::ENGINE_ENFORCED_OMITTED_TAG))
+                        }),
+                    "K-selected OCSF includes the enforcement marker: {full}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_only_ocsf_keeps_an_enforced_omission_summary_at_a_tight_reduced_budget() {
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+        const SUMMARY: &str = "1 additional engine stop event summarized after the first 16 individual events; the enforced stop is among omitted details";
+        const PLAIN_SUMMARY: &str = "1 additional engine stop event summarized after the first 16 individual events";
+        const SOURCE_RULE_ID: i32 = 901;
+
+        let audit = summary_event_audit("AHZ", SUMMARY, true, Some(SOURCE_RULE_ID));
+        let (bounded, truncated) = audit.format_bounded(AuditLogFormat::Ocsf, 1024);
+
+        assert!(truncated, "the padded real-shaped 16+1 event record is reduced");
+        assert!(bounded.len() <= 1024, "{}", bounded.len());
+        assert!(serde_json::from_str::<serde_json::Value>(&bounded).unwrap().is_object());
+        assert!(
+            bounded.contains(&format!("{STATE}: {SUMMARY}"))
+                || bounded.contains(&format!("{STATE}: {}", super::ENGINE_EVENTS_OMITTED_FALLBACK)),
+            "the omitted enforcing summary is preferred to the earlier same-ID rule and complete when retained: {bounded}"
+        );
+
+        let (full, truncated) = audit.format_bounded(AuditLogFormat::Ocsf, 64 * 1024);
+        assert!(!truncated, "the full record fits");
+        assert!(full.contains(&format!("{STATE}: {SUMMARY}")), "{full}");
+
+        let plain = summary_event_audit("AHZ", PLAIN_SUMMARY, false, None);
+        let (plain_full, truncated) = plain.format_bounded(AuditLogFormat::Ocsf, 64 * 1024);
+        assert!(!truncated, "the unmarked summary is an ordinary full-fit record");
+        assert!(
+            plain_full.contains(&format!("{STATE}: {PLAIN_SUMMARY}")),
+            "{plain_full}"
+        );
+        assert!(!plain_full.contains(super::ENGINE_ENFORCED_OMITTED_TAG), "{plain_full}");
+
+        let (tiny, truncated) = audit.format_bounded(AuditLogFormat::Ocsf, 31);
+        assert!(truncated);
+        assert_eq!(tiny, super::bare_truncation_marker(AuditLogFormat::Ocsf));
+    }
+
+    #[test]
+    fn compact_retry_keeps_a_complete_omission_summary_fallback_when_it_fits() {
+        const ENFORCED_SUMMARY: &str = "1 additional engine stop event summarized after the first 16 individual events; the enforced stop is among omitted details";
+        const PLAIN_SUMMARY: &str = "1 additional engine stop event summarized after the first 16 individual events";
+        const FALLBACK: &str = "additional engine stop details omitted";
+
+        for (parts, format, limit, summary_text, enforced, source_rule_id) in [
+            ("AKZ", AuditLogFormat::Json, 600, ENFORCED_SUMMARY, true, None),
+            ("AKZ", AuditLogFormat::Ocsf, 1000, ENFORCED_SUMMARY, true, None),
+            ("AKZ", AuditLogFormat::JsonLegacy, 600, ENFORCED_SUMMARY, true, None),
+            ("AKZ", AuditLogFormat::Json, 850, PLAIN_SUMMARY, false, None),
+            ("AKZ", AuditLogFormat::Ocsf, 1280, PLAIN_SUMMARY, false, None),
+        ] {
+            let candidate = summary_event_audit(parts, summary_text, enforced, source_rule_id);
+            let fallback = summary_event_audit(parts, FALLBACK, enforced, source_rule_id);
+            let (fallback_output, fallback_truncated) = fallback.format_bounded(format, limit);
+            assert!(fallback_truncated, "{parts} {format:?}: the long record is reduced");
+            assert!(
+                !fallback_output.is_empty() && fallback_output.len() <= limit,
+                "{parts} {format:?}: the fixed fallback fits in {limit} bytes: {fallback_output}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&fallback_output)
+                    .unwrap()
+                    .is_object()
+            );
+            assert!(
+                fallback_output.contains(FALLBACK),
+                "{parts} {format:?}: the fallback candidate keeps its visible summary: {fallback_output}"
+            );
+            assert!(
+                fallback_output.contains("coraza-rs/engine/EventsOmitted"),
+                "{parts} {format:?}: the selected K identity remains visible: {fallback_output}"
+            );
+
+            let (output, truncated) = candidate.format_bounded(format, limit);
+            assert!(truncated, "{parts} {format:?}: the long record is reduced");
+            assert!(output.len() <= limit, "{parts} {format:?}: {output}");
+            assert!(serde_json::from_str::<serde_json::Value>(&output).unwrap().is_object());
+            assert!(
+                output.contains(summary_text) || output.contains(FALLBACK),
+                "{parts} {format:?}: the summary or its complete fixed fallback is preferred to a bare marker: {output}"
+            );
+            assert!(
+                output.contains("coraza-rs/engine/EventsOmitted"),
+                "{parts} {format:?}: the selected K identity remains visible: {output}"
+            );
+            if !enforced {
+                assert!(
+                    output.contains(FALLBACK),
+                    "{parts} {format:?}: the non-pinned summary uses the full fallback at this cap: {output}"
+                );
+                assert!(
+                    !output.contains("the enforced stop is among omitted details"),
+                    "{parts} {format:?}: a plain summary does not invent an enforcement cause: {output}"
+                );
+            }
+        }
+    }
+
+    fn h_only_body_limit_overflow_audit(with_summary: bool) -> AuditLog {
+        const STATE: &str = "coraza-rs/engine/RequestBodyLimit";
+        const CAUSE: &str = "request body of 1048577 bytes exceeds the configured SecRequestBodyLimit of 1048576 bytes and processing was stopped";
+        const SUMMARY: &str = "1 additional engine stop event summarized after the first 16 individual events";
+
+        let mut audit = summary_event_audit("AHZ", SUMMARY, false, None);
+        audit.transaction.id = "tx-engine-stop".to_owned();
+        audit.transaction.is_interrupted = true;
+        audit.transaction.interruption_rule_id = Some(0);
+        audit.transaction.request = AuditRequest::default();
+        let producer = audit.transaction.producer.as_mut().unwrap();
+        producer.connector = "c".repeat(16 * 1024);
+        producer.rulesets = vec!["r".repeat(16 * 1024)];
+
+        let cause_event = audit.messages.first_mut().unwrap();
+        cause_event.rule_message = format!("{STATE}: {CAUSE}");
+        cause_event.error_message = format!("[id \"0\"] [msg \"{}\"]", cause_event.rule_message);
+        cause_event.provenance = Some(super::AuditMessageProvenance::EngineEvent { enforced: true });
+        cause_event.data.tags.push(super::ENGINE_ENFORCED_TAG.to_owned());
+        if !with_summary {
+            audit.messages.pop();
+        }
+        audit
+    }
+
+    #[test]
+    fn an_unselected_summary_does_not_starve_the_pinned_h_only_cause_identity() {
+        const STATE: &str = "coraza-rs/engine/RequestBodyLimit";
+        const IDENTITY_PREFIX: &str = "[id \"0\"] [msg \"coraza-rs/engine/RequestBodyLimit: ";
+        let with_summary = h_only_body_limit_overflow_audit(true);
+        let without_summary = h_only_body_limit_overflow_audit(false);
+
+        for (format, limits, pointer) in [
+            (AuditLogFormat::Json, [579, 613], "/messages/0/error_message"),
+            (AuditLogFormat::JsonLegacy, [481, 515], "/audit_data/messages/0"),
+        ] {
+            for limit in limits {
+                let (with, truncated) = with_summary.format_bounded(format, limit);
+                assert!(truncated, "{format:?} at {limit} bytes");
+                assert!(with.len() <= limit, "{format:?} at {limit} bytes");
+                assert_ne!(
+                    with, r#"{"truncated":true}"#,
+                    "{format:?} must keep the fitting cause despite its unselected summary"
+                );
+                let document: serde_json::Value = serde_json::from_str(&with).unwrap();
+                let identity = document.pointer(pointer).and_then(serde_json::Value::as_str).unwrap();
+                assert!(
+                    identity.starts_with(IDENTITY_PREFIX) && identity.ends_with("\"]"),
+                    "{format:?} at {limit}: the complete cause state prefix survives: {with}"
+                );
+                assert!(identity.contains(STATE), "{format:?} at {limit}: {with}");
+
+                let (without, truncated) = without_summary.format_bounded(format, limit);
+                assert!(truncated, "{format:?} no-summary control at {limit} bytes");
+                assert!(without.len() <= limit);
+                let document: serde_json::Value = serde_json::from_str(&without).unwrap();
+                let identity = document.pointer(pointer).and_then(serde_json::Value::as_str).unwrap();
+                assert!(
+                    identity.starts_with(IDENTITY_PREFIX) && identity.ends_with("\"]"),
+                    "{format:?} no-summary control at {limit}: {without}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_single_omission_summary_keeps_its_fixed_fallback_when_it_fits() {
+        const SUMMARY: &str = "987654321 additional engine stop events summarized after the first 16 individual events; the enforced stop is among omitted details";
+        const FALLBACK: &str = "additional engine stop details omitted";
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+
+        let mut h_only = h_only_enforced_events_omitted_audit();
+        h_only.transaction.id = "tx-engine-stop".to_owned();
+        let mut k_selected = enforced_events_omitted_audit();
+        k_selected.transaction.id = "tx-engine-stop".to_owned();
+
+        for (audit, format, limit) in [
+            (&h_only, AuditLogFormat::Ocsf, 786),
+            (&k_selected, AuditLogFormat::Ocsf, 990),
+            (&k_selected, AuditLogFormat::Json, 640),
+        ] {
+            assert_eq!(audit.messages.len(), 1, "the summary is the only pinned message");
+            let (output, truncated) = audit.format_bounded(format, limit);
+            assert!(truncated, "{format:?}: the long summary is reduced");
+            assert!(output.len() <= limit, "{format:?}: {output}");
+            assert!(
+                output.contains(FALLBACK),
+                "{format:?} keeps the complete fixed summary fallback: {output}"
+            );
+            assert!(
+                output.contains(STATE),
+                "{format:?} keeps the summary state identity: {output}"
+            );
+            let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+            if format == AuditLogFormat::Json {
+                assert_eq!(
+                    document
+                        .pointer("/messages/0/data/msg")
+                        .and_then(serde_json::Value::as_str),
+                    Some(FALLBACK),
+                    "K-selected JSON keeps the complete fallback message: {output}"
+                );
+            } else {
+                assert_eq!(
+                    document
+                        .pointer("/enrichments")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(1),
+                    "{format:?} keeps the pinned summary as its one enrichment: {output}"
+                );
+            }
+        }
+
+        for (audit, format, marker) in [
+            (&h_only, AuditLogFormat::Ocsf, r#"{"unmapped":{"truncated":true}}"#),
+            (&k_selected, AuditLogFormat::Json, r#"{"truncated":true}"#),
+        ] {
+            let (tiny, truncated) = audit.format_bounded(format, marker.len());
+            assert!(truncated, "{format:?} tiny control");
+            assert_eq!(tiny, marker, "{format:?} tiny control");
+            let (full, truncated) = audit.format_bounded(format, 64 * 1024);
+            assert!(!truncated, "{format:?} full-fit control");
+            assert!(full.contains(SUMMARY), "{format:?}: {full}");
+        }
+    }
+
+    #[test]
+    fn a_compacted_summary_identity_keeps_unicode_and_escapes_whole() {
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+        const MESSAGE: &str =
+            "987654321 additional engine stop events summarized after the first 16 individual events — café\0";
+        const FALLBACK: &str = "additional engine stop details omitted";
+        let summary = engine_event_message_with_state("EventsOmitted", MESSAGE);
+        let full = format!(
+            "[id \"0\"] [msg \"{STATE}: 987654321 additional engine stop events summarized after the first 16 individual events — café\\x00\"]"
+        );
+        let fallback = format!("[id \"0\"] [msg \"{STATE}: {FALLBACK}\"]");
+
+        assert_eq!(
+            super::reduced_engine_identity(&summary, fallback.len() - 1),
+            None,
+            "one byte short cannot leave a partial fallback"
+        );
+        assert_eq!(
+            super::reduced_engine_identity(&summary, fallback.len()),
+            Some((fallback.clone(), true)),
+            "the generic summary is retained whole at its exact byte limit"
+        );
+        for limit in fallback.len() + 1..full.len() {
+            assert_eq!(
+                super::reduced_engine_identity(&summary, limit),
+                Some((fallback.clone(), true)),
+                "{limit}: no decimal, UTF-8 character, or escape is prefix-truncated"
+            );
+        }
+        assert_eq!(
+            super::reduced_engine_identity(&summary, full.len()),
+            Some((full, false)),
+            "the exact count and Unicode text are retained at their exact byte limit"
+        );
+    }
+
+    #[test]
+    fn a_reduced_enforcement_summary_never_presents_one_digit_as_its_exact_count() {
+        const STATE: &str = "coraza-rs/engine/EventsOmitted";
+        const MESSAGE: &str = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                               the enforced stop is among omitted details";
+
+        let mut summary = engine_event_message_with_state("EventsOmitted", MESSAGE);
+        summary.data.tags.push(super::ENGINE_ENFORCED_OMITTED_TAG.to_owned());
+        summary.provenance = Some(super::AuditMessageProvenance::EventsOmitted {
+            enforced_stop_omitted: true,
+        });
+        let prefix = format!("[id \"0\"] [msg \"{STATE}: ");
+        let one_digit_limit = format!("{prefix}9\"]").len();
+        let exact = format!("[id \"0\"] [msg \"{STATE}: {MESSAGE}\"]");
+        let fallback = format!("[id \"0\"] [msg \"{STATE}: additional engine stop details omitted\"]");
+
+        let compact = super::reduced_engine_identity(&summary, one_digit_limit);
+
+        assert!(
+            compact
+                .as_ref()
+                .is_none_or(|(identity, _)| identity == &exact || identity == &fallback),
+            "a decimal prefix must not look like the exact omitted count: {compact:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_formats_never_render_an_omission_count_or_enforcement_clause_as_a_prefix() {
+        const MESSAGE: &str = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                               the enforced stop is among omitted details";
+        const FALLBACK: &str = "additional engine stop details omitted";
+
+        assert_bounded_summary_formats(&enforced_events_omitted_audit(), MESSAGE, FALLBACK, false, None);
+    }
+
+    #[test]
+    fn bounded_h_only_summary_keeps_its_identity_without_serializing_k_fields() {
+        const MESSAGE: &str = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                               the enforced stop is among omitted details";
+        const FALLBACK: &str = "additional engine stop details omitted";
+
+        let audit = h_only_enforced_events_omitted_audit();
+        let full_error = audit.messages.first().unwrap().error_message.clone();
+        assert_bounded_summary_formats(&audit, MESSAGE, FALLBACK, true, Some(&full_error));
+    }
+
+    #[test]
+    fn engine_identity_prefix_budget_counts_go_quoted_bytes_at_exact_fit() {
+        let source = engine_event_message_with_state("Quoted\"slash\\\t\u{7f}\u{85}é", "");
+        let identity = super::reduced_engine_identity(&source, usize::MAX).unwrap().0;
+
+        assert_eq!(
+            super::reduced_engine_identity_prefix_bytes(&source, identity.len()),
+            Some(identity.len())
+        );
+        assert_eq!(
+            super::reduced_engine_identity_prefix_bytes(&source, identity.len() - 1),
+            None,
+            "the complete quoted state prefix does not fit one byte below its exact size"
+        );
+    }
+
+    #[test]
+    fn compact_planned_copy_skips_pinned_rule_tags_before_budgeting() {
+        const RULE_ID: i32 = 4242;
+        const ERROR_MESSAGE: &str = "[id \"4242\"] [msg \"blocked\"]";
+
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AHKZ").unwrap(),
+            transaction: AuditTransaction {
+                is_interrupted: true,
+                interruption_rule_id: Some(RULE_ID),
+                producer: Some(super::AuditProducer {
+                    connector: "large producer".repeat(256),
+                    ..super::AuditProducer::default()
+                }),
+                request: AuditRequest {
+                    uri: "large request".repeat(256),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                error_message: ERROR_MESSAGE.to_owned(),
+                rule_id: RULE_ID,
+                data: AuditMessageData {
+                    id: RULE_ID,
+                    tags: vec!["unselected tag".to_owned()],
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+        let mut budget = AuditCopyBudget::generous(128);
+
+        let view = entry.bounded_copy_planned(
+            AuditLogFormat::Json,
+            &mut budget,
+            Some(super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 128,
+                message_each: None,
+                summary_each: None,
+                message_count: 1,
+                reduced: true,
+            }),
+            super::AuditCompaction::Compact,
+        );
+
+        assert!(view.transaction.producer.is_none());
+        assert!(view.transaction.request.uri.is_empty());
+        let message = view.messages.first().unwrap();
+        assert_eq!(message.error_message, ERROR_MESSAGE);
+        assert!(message.data.tags.is_empty());
+        assert_eq!(budget.items_used, 0, "omitted metadata and tags consume no item budget");
+    }
+
+    fn native_audit(parts: &str, body: &str, message: AuditMessage) -> AuditLog {
+        AuditLog {
+            parts: parse_audit_log_parts(parts).unwrap(),
+            transaction: AuditTransaction {
+                request: AuditRequest {
+                    body: body.to_owned(),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![message],
+        }
+    }
+
+    fn bounded_native_copy(audit: &AuditLog, max_bytes: usize) -> (AuditLog, bool) {
+        let mut budget = AuditCopyBudget::new(max_bytes);
+        let copy = audit.bounded_copy(AuditLogFormat::Native, &mut budget);
+        (copy, budget.truncated)
+    }
+
+    fn native_lines_without_boundaries(output: &str) -> Vec<&str> {
+        output.lines().filter(|line| !line.starts_with("--")).collect()
+    }
+
+    fn h_only_engine_event_message_with_state(state: &str, message: &str) -> AuditMessage {
+        let tag = format!("coraza-rs/engine/{state}");
+        AuditMessage {
+            error_message: format!("visible H line for {state}: {message}"),
+            rule_id: 0,
+            rule_message: format!("{tag}: {message}"),
+            provenance: Some(if state == "EventsOmitted" {
+                super::AuditMessageProvenance::EventsOmitted {
+                    enforced_stop_omitted: false,
+                }
+            } else {
+                super::AuditMessageProvenance::EngineEvent { enforced: false }
+            }),
+            data: AuditMessageData {
+                id: 0,
+                tags: vec![tag.clone()],
+                raw: tag,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        }
+    }
+
+    #[test]
+    fn k_selected_json_message_copy_does_not_charge_the_hidden_event_identity() {
+        let mut source =
+            engine_event_message_with_state("OperatorNotInspected", "host operator refused to inspect input");
+        source.error_message.clear();
+        let visible_bytes = source.message.len()
+            + source.data.msg.len()
+            + source.data.tags.iter().map(String::len).sum::<usize>()
+            + source.data.raw.len();
+        let mut budget = AuditCopyBudget::generous(visible_bytes);
+
+        let copy = budget.message(&source, super::AuditMessageCopy::Json, true);
+
+        assert!(!budget.truncated, "all serialized K fields fit exactly");
+        assert_eq!(copy.message, source.message);
+        assert_eq!(copy.data.msg, source.data.msg);
+        assert_eq!(copy.data.tags, source.data.tags);
+        assert_eq!(copy.data.raw, source.data.raw);
+        assert_eq!(
+            budget.bytes_used, visible_bytes,
+            "only serialized fields consume the budget"
+        );
+    }
+
+    #[test]
+    fn k_selected_json_pinned_message_keeps_visible_event_identity_at_its_exact_budget() {
+        let source = engine_event_message_with_state("OperatorNotInspected", "host operator refused to inspect input");
+        let visible_bytes =
+            source.data.msg.len() + source.data.raw.len() + source.data.tags.iter().map(String::len).sum::<usize>();
+        let mut budget = AuditCopyBudget::generous(visible_bytes);
+
+        let copy = budget.pinned_message_with_compaction(
+            &source,
+            super::AuditMessageCopy::Json,
+            super::AuditMessageSelection {
+                interruption_rule_id: None,
+                trailer_selected: false,
+                rules_selected: true,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+
+        assert!(
+            !budget.truncated,
+            "the visible K identity fits without the hidden prefix"
+        );
+        assert_eq!(copy.error_message, "", "K-only JSON does not synthesize part H");
+        assert_eq!(
+            copy.rule_message, "",
+            "K-only JSON does not retain a hidden identity copy"
+        );
+        assert_eq!(copy.data.msg, source.data.msg);
+        assert_eq!(copy.data.tags, source.data.tags);
+        assert_eq!(copy.data.raw, source.data.raw);
+        assert_eq!(
+            budget.bytes_used, visible_bytes,
+            "only serialized K fields consume the budget"
+        );
+    }
+
+    #[test]
+    fn h_only_json_message_copy_spends_its_exact_budget_on_visible_error_text() {
+        let source = h_only_engine_event_message_with_state("OperatorNotInspected", "refused input");
+        let mut budget = AuditCopyBudget::generous(source.error_message.len());
+
+        let copy = budget.message(&source, super::AuditMessageCopy::Json, false);
+
+        assert!(!budget.truncated, "the visible H line fits exactly");
+        assert_eq!(copy.error_message, source.error_message);
+        assert!(copy.data.tags.is_empty(), "unselected K tags are not copied");
+        assert!(copy.data.raw.is_empty(), "unselected K raw text is not copied");
+        assert_eq!(
+            budget.bytes_used,
+            source.error_message.len(),
+            "the hidden identity prefix and K fields consume no H budget"
+        );
+    }
+
+    #[test]
+    fn h_only_event_identity_is_visible_in_ocsf_and_jsonlegacy_without_copying_k_fields() {
+        let source = h_only_engine_event_message_with_state("RequestBodyLimit", "RequestBodyLimit");
+        let identity = source.engine_identity().unwrap();
+
+        for (mode, mode_name) in [
+            (super::AuditMessageCopy::Legacy, "JSONLegacy"),
+            (super::AuditMessageCopy::Ocsf, "OCSF"),
+        ] {
+            let mut budget = AuditCopyBudget::generous(identity.len());
+            let copy = budget.message(&source, mode, false);
+
+            assert!(!budget.truncated, "{mode_name}: the visible identity fits exactly");
+            assert!(
+                copy.message == identity || copy.rule_message == identity,
+                "{mode_name}: the visible identity survives: {copy:?}"
+            );
+            assert!(copy.data.tags.is_empty(), "{mode_name}: no hidden K tags");
+            assert!(copy.data.raw.is_empty(), "{mode_name}: no hidden K raw text");
+            assert_eq!(
+                budget.bytes_used,
+                identity.len(),
+                "{mode_name}: only the serialized identity consumes the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn native_bounded_copy_omits_an_unfitting_synthetic_k_label() {
+        const OUTPUT_LIMIT: usize = 260;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+        let mut event = engine_event_message_with_state("OperatorNotInspected", "host operator refused input");
+        event.error_message = "H".repeat(OUTPUT_LIMIT - (STATE.len() - 1));
+        assert!(event.is_engine_event(), "the fixture has explicit provenance");
+        let audit = native_audit("AHKZ", "", event);
+
+        let (copy, truncated) = bounded_native_copy(&audit, OUTPUT_LIMIT);
+
+        assert!(truncated, "the K label does not fit in the remaining copy budget");
+        assert_eq!(
+            copy.messages.first().unwrap().data.raw,
+            "",
+            "a genuine synthetic K label is copied whole or omitted, never prefix-truncated"
+        );
+        assert!(
+            copy.native().len() > OUTPUT_LIMIT,
+            "the assertion inspects the bounded copy before Native's separately documented final hard-cut"
+        );
+    }
+
+    #[test]
+    fn native_bounded_copy_only_appends_an_events_omitted_count_with_its_full_label() {
+        const SUMMARY_TAG: &str = "coraza-rs/engine/EventsOmitted";
+        const SUMMARY_TEXT: &str = "48 additional engine stop events summarized after the first 16 individual events";
+        let mut summary = engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT);
+        let before_raw = 300;
+        summary.error_message = "H".repeat(before_raw - summary.data.msg.len() - SUMMARY_TAG.len() - 2);
+
+        for remaining in [0, SUMMARY_TAG.len() - 1, SUMMARY_TAG.len()] {
+            let audit = native_audit("AHKZ", "", summary.clone());
+            let (copy, truncated) = bounded_native_copy(&audit, before_raw + remaining);
+            let copied_summary = copy.messages.first().unwrap();
+            let output = copy.native();
+
+            if remaining < SUMMARY_TAG.len() {
+                assert!(truncated, "the incomplete label marks the copy truncated");
+                assert_eq!(
+                    copied_summary.data.raw, "",
+                    "no-space and one-byte-short copies omit the complete state label"
+                );
+                assert!(
+                    !output.contains(SUMMARY_TEXT),
+                    "Native does not leave an orphan or partial summary line without its label: {output:?}"
+                );
+            } else {
+                assert!(!truncated, "the complete label and count fit exactly");
+                assert_eq!(copied_summary.data.raw, SUMMARY_TAG);
+                assert!(
+                    output
+                        .lines()
+                        .any(|line| line == format!("{SUMMARY_TAG}: {SUMMARY_TEXT}")),
+                    "the complete summary line survives when its label fits: {output:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_bounded_copy_omits_a_body_heavy_summary_label_before_the_final_hard_cut() {
+        const OUTPUT_LIMIT: usize = 16_384;
+        const BODY_LEN: usize = 16_000;
+        const SUMMARY_TAG: &str = "coraza-rs/engine/EventsOmitted";
+        const SUMMARY_TEXT: &str = "48 additional engine stop events summarized after the first 16 individual events";
+        let mut summary = engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT);
+        let body = "b".repeat(BODY_LEN);
+        let h_len = OUTPUT_LIMIT - BODY_LEN - summary.data.msg.len() - SUMMARY_TAG.len() - 2;
+        summary.error_message = "H".repeat(h_len);
+        let audit = native_audit("ACHKZ", &body, summary);
+
+        let (copy, truncated) = bounded_native_copy(&audit, OUTPUT_LIMIT);
+
+        assert!(
+            truncated,
+            "the complete K state label cannot fit after the body and H text"
+        );
+        assert_eq!(
+            copy.transaction.request.body.len(),
+            BODY_LEN,
+            "the body consumes the earlier budget"
+        );
+        assert_eq!(
+            copy.messages.first().unwrap().data.raw,
+            "",
+            "a body-heavy K label is omitted rather than prefix-truncated"
+        );
+        let uncut_copy_output = copy.native();
+        assert!(
+            uncut_copy_output.len() > OUTPUT_LIMIT,
+            "this is still before the final hard-cut"
+        );
+        assert!(
+            !uncut_copy_output.contains(SUMMARY_TEXT),
+            "the bounded copy does not make an orphan summary line"
+        );
+    }
+
+    #[test]
+    fn native_bounded_copy_matches_unbounded_content_when_the_cap_is_generous() {
+        const OUTPUT_LIMIT: usize = 16 * 1024;
+        const SUMMARY_TEXT: &str = "48 additional engine stop events summarized after the first 16 individual events";
+        for mut event in [
+            engine_event_message_with_state("OperatorNotInspected", "host operator refused input"),
+            engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT),
+        ] {
+            event.error_message = "H".repeat(120);
+            let audit = native_audit("AHKZ", "", event);
+            let unbounded = audit.format(AuditLogFormat::Native);
+
+            let (bounded, truncated) = audit.format_bounded(AuditLogFormat::Native, OUTPUT_LIMIT);
+
+            assert!(!truncated, "the cap leaves the native record unchanged");
+            assert_eq!(
+                native_lines_without_boundaries(&bounded),
+                native_lines_without_boundaries(&unbounded),
+                "bounded Native output matches the unbounded content apart from its random boundary"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Checks Native summary identity, final hard-cut, and bounded JSON prioritization."
+    )]
+    fn unmarked_events_omitted_lookalike_is_not_a_summary() {
+        const SUMMARY_TAG: &str = "coraza-rs/engine/EventsOmitted";
+        const CALLER_MESSAGE: &str = "caller-owned ordinary message";
+        let ordinary = AuditMessage {
+            rule_id: 0,
+            data: AuditMessageData {
+                id: 0,
+                msg: CALLER_MESSAGE.to_owned(),
+                raw: SUMMARY_TAG.to_owned(),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        assert!(
+            !ordinary.is_events_omitted_summary(),
+            "an unmarked message remains ordinary"
+        );
+        let audit = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction::default(),
+            messages: vec![ordinary],
+        };
+
+        let output = audit.format(AuditLogFormat::Native);
+        assert!(
+            output.lines().any(|line| line == SUMMARY_TAG),
+            "Native: the raw label remains unchanged: {output:?}"
+        );
+        assert!(
+            !output.contains(&format!("{SUMMARY_TAG}: {CALLER_MESSAGE}")),
+            "Native: caller data is not appended as an engine count: {output:?}"
+        );
+        let (bounded, truncated) = audit.format_bounded(AuditLogFormat::Native, 1024);
+        assert!(!truncated, "Native: the hand-built record fits");
+        assert!(
+            bounded.lines().any(|line| line == SUMMARY_TAG),
+            "Native: bounded output keeps the raw label only: {bounded:?}"
+        );
+        assert!(
+            !bounded.contains(&format!("{SUMMARY_TAG}: {CALLER_MESSAGE}")),
+            "Native: bounded output does not infer a summary from raw: {bounded:?}"
+        );
+        let padded = AuditLog {
+            parts: parse_audit_log_parts("ACKZ").unwrap(),
+            transaction: AuditTransaction {
+                request: AuditRequest {
+                    body: "p".repeat(100),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: std::iter::once(audit.messages.first().unwrap().clone())
+                .chain((0..6).map(|_| AuditMessage {
+                    data: AuditMessageData {
+                        raw: "r".repeat(80),
+                        ..AuditMessageData::default()
+                    },
+                    ..AuditMessage::default()
+                }))
+                .collect(),
+        };
+        let (reduced, truncated) = padded.format_bounded(AuditLogFormat::Native, 512);
+        assert!(truncated, "Native output hits its existing final hard-cut");
+        assert!(reduced.len() <= 512);
+        assert!(
+            reduced.lines().any(|line| line == SUMMARY_TAG),
+            "the hand-built K line remains visible before the hard-cut: {reduced:?}"
+        );
+        assert!(
+            !reduced.contains(&format!("{SUMMARY_TAG}: {CALLER_MESSAGE}")),
+            "bounded/reduced Native output does not infer a summary from raw: {reduced:?}"
+        );
+
+        let cause = AuditMessage {
+            rule_id: 900,
+            data: AuditMessageData {
+                id: 900,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let first_other = AuditMessage {
+            rule_id: 901,
+            data: AuditMessageData {
+                id: 901,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let last = AuditMessage {
+            rule_id: 902,
+            data: AuditMessageData {
+                id: 902,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let mut budget = AuditCopyBudget::generous(512);
+        let selected = budget.planned_messages(
+            &[cause, first_other, audit.messages.first().unwrap().clone(), last],
+            super::AuditMessageCopy::Json,
+            super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 512,
+                message_each: None,
+                summary_each: None,
+                message_count: 2,
+                reduced: true,
+            },
+            super::AuditMessageSelection {
+                interruption_rule_id: Some(900),
+                trailer_selected: false,
+                rules_selected: true,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+        assert_eq!(
+            selected.iter().map(|message| message.rule_id).collect::<Vec<_>>(),
+            [900, 901],
+            "the hand-built message does not get summary priority"
+        );
+    }
+
+    #[test]
+    fn a_reduced_non_pinned_h_only_event_keeps_state_beside_a_pinned_real_rule() {
+        const CAUSE_ID: i32 = 900;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+
+        let cause = AuditMessage {
+            error_message: "long pinned H line".repeat(32),
+            rule_id: CAUSE_ID,
+            rule_message: "real blocking rule".to_owned(),
+            ..AuditMessage::default()
+        };
+        let event = h_only_engine_event_message_with_state("OperatorNotInspected", "host refused input");
+        let mut budget = AuditCopyBudget::generous(512);
+
+        let copies = budget.planned_messages(
+            &[cause, event],
+            super::AuditMessageCopy::Json,
+            super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 512,
+                message_each: Some(96),
+                summary_each: None,
+                message_count: 2,
+                reduced: true,
+            },
+            super::AuditMessageSelection {
+                interruption_rule_id: Some(CAUSE_ID),
+                trailer_selected: true,
+                rules_selected: false,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+
+        assert_eq!(copies.len(), 2);
+        let pinned = copies.first().unwrap();
+        let event = copies.get(1).unwrap();
+        assert_eq!(pinned.rule_id, CAUSE_ID, "the real interruption cause stays first");
+        assert!(
+            pinned.error_message.starts_with("[id \"900\"]"),
+            "the pinned rule keeps its compact H identity: {:?}",
+            pinned.error_message
+        );
+        assert!(
+            event.error_message.starts_with(&format!("[id \"0\"] [msg \"{STATE}: ")),
+            "the non-pinned event keeps a state-first H identity when it fits: {:?}",
+            event.error_message
+        );
+        assert!(event.data.tags.is_empty());
+        assert!(event.data.raw.is_empty());
+    }
+
+    #[test]
+    fn a_tight_h_only_event_allowance_never_leaks_a_truncated_internal_k_prefix() {
+        const CAUSE_ID: i32 = 900;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+
+        let cause = AuditMessage {
+            rule_id: CAUSE_ID,
+            data: AuditMessageData {
+                id: CAUSE_ID,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let event = h_only_engine_event_message_with_state("OperatorNotInspected", "refused");
+        let mut budget = AuditCopyBudget::generous(128);
+        let copies = budget.planned_messages(
+            &[cause, event],
+            super::AuditMessageCopy::Json,
+            super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 128,
+                message_each: Some(32),
+                summary_each: None,
+                message_count: 2,
+                reduced: true,
+            },
+            super::AuditMessageSelection {
+                interruption_rule_id: Some(CAUSE_ID),
+                trailer_selected: true,
+                rules_selected: false,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+
+        assert_eq!(copies.len(), 2);
+        let event = copies.get(1).unwrap();
+        assert!(
+            event.error_message.starts_with(&format!("[id \"0\"] [msg \"{STATE}: "))
+                && event.error_message.ends_with("\"]"),
+            "the complete H-only state prefix and closing quote survive: {:?}",
+            event.error_message
+        );
+        assert!(event.data.tags.is_empty(), "no truncated tag entry is exposed");
+        assert!(event.data.raw.is_empty(), "no truncated raw prefix is exposed");
+    }
+
+    #[test]
+    fn bounded_h_only_json_keeps_a_pinned_rule_and_non_pinned_engine_event_when_they_fit() {
+        const OUTPUT_LIMIT: usize = 1536;
+        const CAUSE_ID: i32 = 900;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+
+        let cause = AuditMessage {
+            error_message: "long real-rule H line".repeat(128),
+            rule_id: CAUSE_ID,
+            rule_message: "real blocking rule".to_owned(),
+            ..AuditMessage::default()
+        };
+        let mut event = h_only_engine_event_message_with_state("OperatorNotInspected", "host refused input");
+        event.error_message = "long engine H line".repeat(128);
+        let audit = AuditLog {
+            parts: parse_audit_log_parts("AHZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-pinned-rule-and-event".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(CAUSE_ID),
+                request: AuditRequest {
+                    uri: format!("/{}", "p".repeat(16 * 1024)),
+                    ..AuditRequest::default()
+                },
+                ..AuditTransaction::default()
+            },
+            messages: vec![cause, event],
+        };
+
+        let (output, truncated) = audit.format_bounded(AuditLogFormat::Json, OUTPUT_LIMIT);
+        assert!(truncated, "the long URI and H lines force reduction");
+        assert!(output.len() <= OUTPUT_LIMIT);
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let messages = document
+            .pointer("/messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(messages.len(), 2, "{output}");
+        let pinned = messages.first().unwrap();
+        let event = messages.get(1).unwrap();
+        assert_eq!(
+            pinned.pointer("/data/id").and_then(serde_json::Value::as_i64),
+            Some(i64::from(CAUSE_ID)),
+            "the real interruption cause remains pinned: {output}"
+        );
+        assert!(
+            pinned
+                .get("error_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|line| line.starts_with("[id \"900\"]")),
+            "the pinned real rule remains named: {output}"
+        );
+        assert_eq!(
+            event.pointer("/data/id").and_then(serde_json::Value::as_i64),
+            Some(0),
+            "the non-pinned synthetic event keeps its own ID: {output}"
+        );
+        assert!(
+            event
+                .get("error_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|line| line.starts_with(&format!("[id \"0\"] [msg \"{STATE}: "))),
+            "the retained event's identity begins with its actual state: {output}"
+        );
+        assert!(
+            event
+                .pointer("/data/tags")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "H-only does not serialize the event's K tags: {output}"
+        );
+        assert_eq!(
+            event.pointer("/data/raw").and_then(serde_json::Value::as_str),
+            Some(""),
+            "H-only does not serialize the event's K raw label: {output}"
+        );
+    }
+
+    #[test]
+    fn a_reduced_h_and_k_event_keeps_state_in_each_selected_view() {
+        const CAUSE_ID: i32 = 900;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+        const EVENT_MESSAGE: &str = "host operator refused to inspect input";
+
+        let cause = AuditMessage {
+            error_message: "long pinned H line".repeat(32),
+            rule_id: CAUSE_ID,
+            rule_message: "real blocking rule".to_owned(),
+            ..AuditMessage::default()
+        };
+        let mut event = engine_event_message_with_state("OperatorNotInspected", EVENT_MESSAGE);
+        event.error_message = "long engine H line".repeat(32);
+        let mut budget = AuditCopyBudget::generous(1024);
+
+        let copies = budget.planned_messages(
+            &[cause, event],
+            super::AuditMessageCopy::Json,
+            super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 1024,
+                message_each: Some(256),
+                summary_each: None,
+                message_count: 2,
+                reduced: true,
+            },
+            super::AuditMessageSelection {
+                interruption_rule_id: Some(CAUSE_ID),
+                trailer_selected: true,
+                rules_selected: true,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+
+        assert_eq!(copies.len(), 2);
+        let event = copies.get(1).unwrap();
+        assert!(
+            event.error_message.starts_with(&format!("[id \"0\"] [msg \"{STATE}: ")),
+            "H carries the state-first identity: {:?}",
+            event.error_message
+        );
+        assert_eq!(event.data.msg, EVENT_MESSAGE, "K keeps the event message");
+        assert_eq!(event.data.raw, STATE, "K keeps the event state label");
+        assert_eq!(
+            event.data.tags,
+            [STATE],
+            "K keeps a whole structured state tag when it fits"
+        );
     }
 
     #[test]
@@ -4151,6 +6454,460 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Covers bounded identities across formats, parts, and engine modes."
+    )]
+    fn a_reduced_record_keeps_the_state_of_a_pinned_id_zero_engine_event() {
+        const OUTPUT_LIMIT: usize = 1024;
+        const STATE: &str = "coraza-rs/engine/RequestBodyLimit";
+        const MESSAGE: &str = "RequestBodyLimit";
+        let entry = |parts: &str, k_selected: bool, is_interrupted, interruption_rule_id| AuditLog {
+            parts: parse_audit_log_parts(parts).unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-engine".to_owned(),
+                is_interrupted,
+                interruption_rule_id,
+                producer: Some(super::AuditProducer {
+                    connector: "c".repeat(16 * 1024),
+                    rulesets: vec!["r".repeat(16 * 1024)],
+                    ..super::AuditProducer::default()
+                }),
+                ..AuditTransaction::default()
+            },
+            messages: vec![AuditMessage {
+                message: if k_selected { MESSAGE.to_owned() } else { String::new() },
+                error_message: format!("[id \"0\"] [msg \"{MESSAGE}\"]"),
+                rule_id: 0,
+                rule_message: format!("{STATE}: {MESSAGE}"),
+                provenance: Some(super::AuditMessageProvenance::EngineEvent {
+                    enforced: is_interrupted,
+                }),
+                data: AuditMessageData {
+                    id: 0,
+                    msg: if k_selected { MESSAGE.to_owned() } else { String::new() },
+                    tags: if is_interrupted {
+                        vec![STATE.to_owned(), super::ENGINE_ENFORCED_TAG.to_owned()]
+                    } else {
+                        vec![STATE.to_owned()]
+                    },
+                    raw: STATE.to_owned(),
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            }],
+        };
+
+        for (parts, shape, k_selected) in [("AKZ", "K-selected", true), ("AHZ", "H-only", false)] {
+            for (mode, is_interrupted, interruption_rule_id) in [("On", true, Some(0)), ("DetectionOnly", false, None)]
+            {
+                let audit = entry(parts, k_selected, is_interrupted, interruption_rule_id);
+                for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+                    let (formatted, truncated) = audit.format_bounded(format, OUTPUT_LIMIT);
+                    assert!(truncated, "{mode} {shape} {format:?}: producer forces reduction");
+                    assert!(
+                        formatted.len() <= OUTPUT_LIMIT,
+                        "{mode} {shape} {format:?}: {} bytes",
+                        formatted.len()
+                    );
+                    let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+                    let identity = format!("[id \"0\"] [msg \"{STATE}: {MESSAGE}\"]");
+                    if format == AuditLogFormat::Json && k_selected {
+                        assert_eq!(
+                            document
+                                .pointer("/messages/0/error_message")
+                                .and_then(serde_json::Value::as_str),
+                            Some(""),
+                            "{mode} {shape}: K-only output must not synthesize part H: {formatted}"
+                        );
+                        assert_eq!(
+                            document
+                                .pointer("/messages/0/data/msg")
+                                .and_then(serde_json::Value::as_str),
+                            Some(MESSAGE),
+                            "{mode} {shape}: K keeps the event message: {formatted}"
+                        );
+                        assert_eq!(
+                            document
+                                .pointer("/messages/0/data/raw")
+                                .and_then(serde_json::Value::as_str),
+                            Some(STATE),
+                            "{mode} {shape}: K keeps the synthetic state label: {formatted}"
+                        );
+                        continue;
+                    }
+                    let written_identity = match format {
+                        AuditLogFormat::Json => document
+                            .pointer("/messages/0/error_message")
+                            .and_then(serde_json::Value::as_str),
+                        AuditLogFormat::JsonLegacy => document
+                            .pointer("/audit_data/messages/0")
+                            .and_then(serde_json::Value::as_str),
+                        AuditLogFormat::Ocsf if !k_selected => document
+                            .pointer("/enrichments/0/name")
+                            .and_then(serde_json::Value::as_str),
+                        AuditLogFormat::Ocsf => document.get("message").and_then(serde_json::Value::as_str),
+                        AuditLogFormat::Native => unreachable!(),
+                    };
+                    let expected_identity = if format == AuditLogFormat::Ocsf && !k_selected {
+                        format!("{STATE}: ")
+                    } else {
+                        identity.clone()
+                    };
+                    assert_eq!(
+                        written_identity,
+                        Some(expected_identity.as_str()),
+                        "{mode} {shape} {format:?}: compact id-zero event lost its state/message: {formatted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_bounded_copy_keeps_omission_counts_whole_before_its_final_hard_cut() {
+        const SUMMARY_TAG: &str = "coraza-rs/engine/EventsOmitted";
+        const SUMMARY_TEXT: &str = "987654321 additional engine stop events summarized after the first 16 individual events; \
+                                    the enforced stop is among omitted details";
+        const FALLBACK: &str = "additional engine stop details omitted";
+        const OUTPUT_LIMIT: usize = 320;
+
+        let mut summary = engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT);
+        summary.data.tags.push(super::ENGINE_ENFORCED_OMITTED_TAG.to_owned());
+        summary.provenance = Some(super::AuditMessageProvenance::EventsOmitted {
+            enforced_stop_omitted: true,
+        });
+        let audit = native_audit("ACKZ", &"b".repeat(200), summary);
+        let exact = audit.format(AuditLogFormat::Native);
+        assert!(exact.contains(&format!("{SUMMARY_TAG}: {SUMMARY_TEXT}")));
+
+        let (copy, truncated) = bounded_native_copy(&audit, OUTPUT_LIMIT);
+        assert!(truncated, "the exact count does not fit the copy budget");
+        let summary = copy.messages.first().unwrap();
+        assert_eq!(summary.data.msg, FALLBACK);
+        assert_eq!(summary.data.raw, SUMMARY_TAG);
+        let before_hard_cut = copy.format(AuditLogFormat::Native);
+        assert!(
+            before_hard_cut.len() > OUTPUT_LIMIT,
+            "this inspects the bounded copy before Native's separate final hard cut"
+        );
+        assert!(
+            before_hard_cut.contains(&format!("{SUMMARY_TAG}: {FALLBACK}")),
+            "Native uses a fixed statement instead of a partial count: {before_hard_cut:?}"
+        );
+        assert!(!before_hard_cut.contains("987654321"));
+        assert!(!before_hard_cut.contains("the enforced stop is among omitted details"));
+
+        let h_only = h_only_enforced_events_omitted_audit();
+        let count_end = h_only
+            .messages
+            .first()
+            .unwrap()
+            .error_message
+            .find("987654321")
+            .unwrap()
+            + 1;
+        let mut budget = AuditCopyBudget::generous(count_end);
+        let copied = budget.message(
+            h_only.messages.first().unwrap(),
+            super::AuditMessageCopy::Native {
+                error: true,
+                raw: false,
+            },
+            false,
+        );
+        assert!(budget.truncated, "the H error line cannot fit whole");
+        assert!(copied.error_message.is_empty());
+        assert!(
+            !native_audit("AHZ", "", copied)
+                .format(AuditLogFormat::Native)
+                .contains("987654321"),
+            "a part-H summary is omitted instead of ending after its first count digit"
+        );
+
+        let (full_copy, full_truncated) = bounded_native_copy(&audit, 16 * 1024);
+        assert!(!full_truncated, "the full count and clause fit");
+        assert!(
+            full_copy
+                .format(AuditLogFormat::Native)
+                .contains(&format!("{SUMMARY_TAG}: {SUMMARY_TEXT}"))
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The padded overflow fixture checks all three formats, both engine modes, and one-slot priority."
+    )]
+    fn a_reduced_audit_keeps_the_events_omitted_count_after_its_pinned_rule_when_two_fit() {
+        const OUTPUT_LIMIT: usize = 2048;
+        const CAUSE_ID: i32 = 900;
+        const CAUSE_TEXT: &str = "interrupting rule 900";
+        const SUMMARY_TEXT: &str = "48 additional engine stop events summarized after the first 16 individual events";
+        const SUMMARY_TAG: &str = "coraza-rs/engine/EventsOmitted";
+
+        let cause = AuditMessage {
+            message: CAUSE_TEXT.to_owned(),
+            error_message: format!("[id \"{CAUSE_ID}\"] [msg \"{CAUSE_TEXT}\"]"),
+            rule_id: CAUSE_ID,
+            rule_message: CAUSE_TEXT.to_owned(),
+            data: AuditMessageData {
+                id: CAUSE_ID,
+                msg: CAUSE_TEXT.to_owned(),
+                raw: "SecRule ARGS:q \"@contains blocked\" \"id:900,phase:1,deny\"".to_owned(),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let mut messages = vec![cause];
+        messages.extend((0..16).map(|index| {
+            engine_event_message_with_state(
+                "OperatorNotInspected",
+                &format!("host operator refused to inspect input {index}: {}", "x".repeat(96)),
+            )
+        }));
+        messages.push(engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT));
+
+        for (mode, is_interrupted, interruption_rule_id) in
+            [("On", true, Some(CAUSE_ID)), ("DetectionOnly", false, None)]
+        {
+            let entry = AuditLog {
+                parts: parse_audit_log_parts("ABHKZ").unwrap(),
+                transaction: AuditTransaction {
+                    id: format!("tx-overflow-{mode}"),
+                    is_interrupted,
+                    interruption_rule_id,
+                    request: AuditRequest {
+                        uri: format!("/{}", "p".repeat(16 * 1024)),
+                        ..AuditRequest::default()
+                    },
+                    ..AuditTransaction::default()
+                },
+                messages: messages.clone(),
+            };
+
+            for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+                let (formatted, truncated) = entry.format_bounded(format, OUTPUT_LIMIT);
+                assert!(truncated, "{mode} {format:?}: request padding forces reduction");
+                assert!(
+                    formatted.len() <= OUTPUT_LIMIT,
+                    "{mode} {format:?}: {} bytes",
+                    formatted.len()
+                );
+                let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+                assert!(document.is_object(), "{mode} {format:?}: {formatted}");
+
+                let cause_kept = match format {
+                    AuditLogFormat::Json => document
+                        .pointer("/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message.pointer("/data/id").and_then(serde_json::Value::as_i64)
+                                    == Some(i64::from(CAUSE_ID))
+                                    && [
+                                        message.pointer("/data/msg").and_then(serde_json::Value::as_str),
+                                        message.get("message").and_then(serde_json::Value::as_str),
+                                        message.get("error_message").and_then(serde_json::Value::as_str),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|text| text.contains(CAUSE_TEXT))
+                            })
+                        }),
+                    AuditLogFormat::JsonLegacy => document
+                        .pointer("/audit_data/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .any(|message| message.as_str().is_some_and(|text| text.contains(CAUSE_TEXT)))
+                        }),
+                    AuditLogFormat::Ocsf => document
+                        .pointer("/enrichments")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|enrichments| {
+                            enrichments.iter().any(|enrichment| {
+                                let data = enrichment
+                                    .get("data")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+                                data.as_ref()
+                                    .and_then(|data| data.get("id"))
+                                    .and_then(serde_json::Value::as_i64)
+                                    == Some(i64::from(CAUSE_ID))
+                                    && enrichment
+                                        .get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|text| text.contains(CAUSE_TEXT))
+                            })
+                        }),
+                    AuditLogFormat::Native => unreachable!(),
+                };
+                assert!(
+                    cause_kept,
+                    "{mode} {format:?}: the pinned cause keeps priority: {formatted}"
+                );
+
+                let summary_kept = match format {
+                    AuditLogFormat::Json => document
+                        .pointer("/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message.pointer("/data/id").and_then(serde_json::Value::as_i64) == Some(0)
+                                    && message
+                                        .pointer("/data/msg")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|text| text == SUMMARY_TEXT)
+                            })
+                        }),
+                    AuditLogFormat::JsonLegacy => document
+                        .pointer("/audit_data/messages")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message
+                                    .as_str()
+                                    .is_some_and(|text| text.contains(SUMMARY_TAG) && text.contains(SUMMARY_TEXT))
+                            })
+                        }),
+                    AuditLogFormat::Ocsf => document
+                        .pointer("/enrichments")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|enrichments| {
+                            enrichments.iter().any(|enrichment| {
+                                let data = enrichment
+                                    .get("data")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+                                enrichment
+                                    .get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|name| name == SUMMARY_TEXT)
+                                    && data
+                                        .as_ref()
+                                        .and_then(|data| data.get("id"))
+                                        .and_then(serde_json::Value::as_i64)
+                                        == Some(0)
+                            })
+                        }),
+                    AuditLogFormat::Native => unreachable!(),
+                };
+                assert!(
+                    summary_kept,
+                    "{mode} {format:?}: the exact EventsOmitted count fits after the pinned cause: {formatted}"
+                );
+            }
+        }
+
+        let mut budget = AuditCopyBudget::generous(512);
+        let kept = budget.planned_messages(
+            &messages,
+            super::AuditMessageCopy::Json,
+            super::AuditShrinkPlan {
+                request_bytes: 0,
+                message_bytes: 512,
+                message_each: None,
+                summary_each: None,
+                message_count: 1,
+                reduced: true,
+            },
+            super::AuditMessageSelection {
+                interruption_rule_id: Some(CAUSE_ID),
+                trailer_selected: true,
+                rules_selected: true,
+                compaction: super::AuditCompaction::Full,
+            },
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept.first().map(|message| message.rule_id),
+            Some(CAUSE_ID),
+            "when one message fits, the summary cannot displace the interruption cause"
+        );
+    }
+
+    #[test]
+    fn compact_output_retries_the_events_omitted_summary_after_dropping_a_large_producer() {
+        const OUTPUT_LIMIT: usize = 2048;
+        const CAUSE_ID: i32 = 900;
+        const SUMMARY_TEXT: &str = "48 additional engine stop events summarized after the first 16 individual events";
+
+        let cause_text = "c".repeat(554);
+        let cause = AuditMessage {
+            message: cause_text.clone(),
+            error_message: format!("[id \"{CAUSE_ID}\"] [msg \"cause\"]"),
+            rule_id: CAUSE_ID,
+            rule_message: "cause".to_owned(),
+            data: AuditMessageData {
+                id: CAUSE_ID,
+                msg: cause_text,
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let mut messages = vec![cause];
+        messages.extend((0..16).map(|index| {
+            engine_event_message_with_state(
+                "OperatorNotInspected",
+                &format!("refused input {index}: {}", "x".repeat(320)),
+            )
+        }));
+        messages.push(engine_event_message_with_state("EventsOmitted", SUMMARY_TEXT));
+
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("ABHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-large-producer".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(CAUSE_ID),
+                producer: Some(super::AuditProducer {
+                    connector: "c".repeat(16 * 1024),
+                    rulesets: vec!["r".repeat(16 * 1024)],
+                    ..super::AuditProducer::default()
+                }),
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, OUTPUT_LIMIT);
+            assert!(truncated, "{format:?}: the large producer forces reduction");
+            assert!(formatted.len() <= OUTPUT_LIMIT, "{format:?}: {} bytes", formatted.len());
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            assert!(document.is_object(), "{format:?}: {formatted}");
+            assert!(
+                formatted.contains(&"c".repeat(32)),
+                "{format:?}: the pinned 554-byte cause survives compaction: {formatted}"
+            );
+            assert!(
+                formatted.contains(SUMMARY_TEXT),
+                "{format:?}: compaction should retain the exact EventsOmitted summary when it fits: {formatted}"
+            );
+        }
+
+        let (cause_only, truncated) = entry.format_bounded(AuditLogFormat::Json, 768);
+        assert!(truncated, "the large producer forces compact fallback");
+        assert!(cause_only.len() <= 768);
+        let document: serde_json::Value = serde_json::from_str(&cause_only).unwrap();
+        let kept = document
+            .pointer("/messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(kept.len(), 1, "only the pinned cause fits: {cause_only}");
+        assert_eq!(
+            kept.first()
+                .and_then(|message| message.pointer("/data/id"))
+                .and_then(serde_json::Value::as_i64),
+            Some(i64::from(CAUSE_ID)),
+            "the summary never displaces the cause when only one message fits: {cause_only}"
+        );
+        assert!(!cause_only.contains(SUMMARY_TEXT), "{cause_only}");
+    }
+
+    #[test]
     fn ocsf_is_not_charged_for_message_text_it_never_writes() {
         // OCSF writes the first message's text only; a long `message` on a later one is never serialised.
         let entry = AuditLog {
@@ -4278,6 +7035,232 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn no_enforced_id_keeps_the_last_real_rule_before_appended_engine_events() {
+        let mut messages: Vec<_> = (1..=999)
+            .map(|id| AuditMessage {
+                message: format!("rule-{id} {}", "m".repeat(200)),
+                rule_id: id,
+                rule_message: format!("rule-{id}"),
+                data: AuditMessageData {
+                    id,
+                    msg: format!("rule-{id}"),
+                    ..AuditMessageData::default()
+                },
+                ..AuditMessage::default()
+            })
+            .collect();
+        let id_zero_rule = AuditMessage {
+            message: "legitimate rule zero".to_owned(),
+            rule_id: 0,
+            rule_message: "coraza-rs/engine/RequestBodyLimit: legitimate rule zero".to_owned(),
+            data: AuditMessageData {
+                id: 0,
+                msg: "legitimate rule zero".to_owned(),
+                tags: vec!["coraza-rs/engine/RequestBodyLimit".to_owned()],
+                raw: "SecAction \"id:0,phase:1,pass\"".to_owned(),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        assert!(
+            !id_zero_rule.is_engine_event(),
+            "a legitimate ID-zero rule is not synthetic"
+        );
+        messages.push(id_zero_rule);
+        messages.push(engine_event_message("first engine stop"));
+        messages.push(engine_event_message("later engine stop"));
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-detection-only".to_owned(),
+                is_interrupted: false,
+                interruption_rule_id: None,
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated, "{format:?}: fixture must exercise reduction");
+            assert!(formatted.len() <= 4096, "{format:?}: {} bytes", formatted.len());
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            assert!(document.is_object(), "{format:?}: expected a JSON object");
+            let kept = kept_messages(format, &formatted);
+            assert!(
+                kept.iter()
+                    .any(|(id, text)| id.is_none_or(|id| id == 0) && text.starts_with("legitimate")),
+                "{format:?}: the legacy last-rule fallback was displaced: {kept:?}"
+            );
+            assert!(
+                !formatted.contains("first engine stop") && !formatted.contains("later engine stop"),
+                "{format:?}: appended events displaced prior rule evidence: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforced_id_zero_keeps_the_last_public_id_match_in_hand_built_records() {
+        const EXPECTED: &str = "last-partial";
+        let message = |text: &str, rule_id, data_id, k_selected| AuditMessage {
+            message: if k_selected { text.to_owned() } else { String::new() },
+            error_message: format!("[id \"{rule_id}\"] [msg \"{text}\"]"),
+            rule_id,
+            rule_message: text.to_owned(),
+            data: AuditMessageData {
+                id: data_id,
+                msg: if k_selected { text.to_owned() } else { String::new() },
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+
+        for (parts, k_selected) in [("AHZ", false), ("AKZ", true)] {
+            let entry = AuditLog {
+                parts: parse_audit_log_parts(parts).unwrap(),
+                transaction: AuditTransaction {
+                    id: "tx-hand-built-zero".to_owned(),
+                    is_interrupted: true,
+                    interruption_rule_id: Some(0),
+                    producer: Some(super::AuditProducer {
+                        connector: "c".repeat(16 * 1024),
+                        rulesets: vec!["r".repeat(16 * 1024)],
+                        ..super::AuditProducer::default()
+                    }),
+                    ..AuditTransaction::default()
+                },
+                messages: vec![
+                    message("ordinary-id-zero-first", 0, 0, k_selected),
+                    message("ordinary-id-zero-second", 0, 0, k_selected),
+                    message("rule-id-only-zero", 0, 7, k_selected),
+                    message(EXPECTED, 7, 0, k_selected),
+                    message("neither-id-zero", 8, 9, k_selected),
+                ],
+            };
+
+            for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+                let (formatted, truncated) = entry.format_bounded(format, 4096);
+                assert!(truncated, "{parts} {format:?}: producer forces reduction");
+                assert!(formatted.len() <= 4096, "{parts} {format:?}: {} bytes", formatted.len());
+                let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+                assert!(document.is_object(), "{parts} {format:?}: {formatted}");
+                assert_eq!(
+                    kept_messages(format, &formatted).len(),
+                    1,
+                    "{parts} {format:?}: the fixture must reduce to one pinned message: {formatted}"
+                );
+                assert!(
+                    formatted.contains(EXPECTED),
+                    "{parts} {format:?}: the last `rule_id == 0 || data.id == 0` message must remain: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("ordinary-id-zero-first")
+                        && !formatted.contains("ordinary-id-zero-second")
+                        && !formatted.contains("rule-id-only-zero")
+                        && !formatted.contains("neither-id-zero"),
+                    "{parts} {format:?}: a different hand-built message was pinned: {formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enforced_id_zero_keeps_a_hand_built_id_zero_rule_when_there_is_no_engine_event() {
+        const MESSAGE: &str = "hand-built ID zero";
+        let later_rule = |id| AuditMessage {
+            message: format!("later rule {id} {}", "m".repeat(200)),
+            rule_id: id,
+            rule_message: format!("later rule {id}"),
+            data: AuditMessageData {
+                id,
+                msg: format!("later rule {id}"),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let id_zero_rule = AuditMessage {
+            message: MESSAGE.to_owned(),
+            rule_id: 0,
+            rule_message: MESSAGE.to_owned(),
+            data: AuditMessageData {
+                id: 0,
+                msg: MESSAGE.to_owned(),
+                raw: "SecAction \"id:0,phase:1,pass\"".to_owned(),
+                ..AuditMessageData::default()
+            },
+            ..AuditMessage::default()
+        };
+        let mut messages: Vec<_> = (1..=300).map(later_rule).collect();
+        messages.insert(150, id_zero_rule);
+        assert!(
+            messages.iter().all(|message| !message.is_engine_event()),
+            "the hand-built ID-zero rule is not a synthetic event"
+        );
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-hand-built-zero".to_owned(),
+                is_interrupted: true,
+                interruption_rule_id: Some(0),
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated, "{format:?}: fixture must exercise reduction");
+            assert!(formatted.len() <= 4096, "{format:?}: {} bytes", formatted.len());
+            let kept = kept_messages(format, &formatted);
+            assert!(
+                kept.iter()
+                    .any(|(id, text)| id.is_none_or(|id| id == 0) && text.starts_with("hand-built")),
+                "{format:?}: ID-zero fallback was displaced: {kept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_engine_event_is_kept_when_there_are_no_rule_messages() {
+        let mut messages = vec![engine_event_message_with_state(
+            "First",
+            &format!("first engine stop {}", "m".repeat(200)),
+        )];
+        messages.extend((1..100).map(|index| {
+            engine_event_message_with_state(
+                &format!("Later{index}"),
+                &format!("engine stop {index} {}", "m".repeat(200)),
+            )
+        }));
+        let entry = AuditLog {
+            parts: parse_audit_log_parts("AHKZ").unwrap(),
+            transaction: AuditTransaction {
+                id: "tx-engine-only".to_owned(),
+                is_interrupted: false,
+                interruption_rule_id: None,
+                ..AuditTransaction::default()
+            },
+            messages,
+        };
+
+        for format in [AuditLogFormat::Json, AuditLogFormat::JsonLegacy, AuditLogFormat::Ocsf] {
+            let (formatted, truncated) = entry.format_bounded(format, 4096);
+            assert!(truncated, "{format:?}: fixture must exercise reduction");
+            assert!(formatted.len() <= 4096, "{format:?}: {} bytes", formatted.len());
+            let document: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+            assert!(document.is_object(), "{format:?}: expected a JSON object");
+            assert!(
+                formatted.contains("coraza-rs/engine/First"),
+                "{format:?}: no engine identity was retained: {formatted}"
+            );
+            assert!(
+                !formatted.contains("coraza-rs/engine/Later99"),
+                "{format:?}: a later engine event displaced the first: {formatted}"
+            );
+        }
+    }
+
+    #[test]
     fn a_record_full_of_rule_tags_keeps_its_identity_and_deny_rule_when_reduced() {
         // One short deny and thousands of one-byte tags: text reduction cannot remove the array entries, and
         // OCSF escapes the array again inside the enrichment's `data` string, so only dropping the tags fits.
@@ -4377,11 +7360,17 @@ pub(crate) mod tests {
             request_bytes: 16 * 1024,
             message_bytes: 16 * 1024,
             message_each: None,
+            summary_each: None,
             message_count: 100_001_usize.min(AuditCopyBudget::generous(16 * 1024).items_left),
             reduced: false,
         };
         let mut budget = AuditCopyBudget::generous(16 * 1024);
-        let view = entry.bounded_copy_planned(AuditLogFormat::Json, &mut budget, Some(plan));
+        let view = entry.bounded_copy_planned(
+            AuditLogFormat::Json,
+            &mut budget,
+            Some(plan),
+            super::AuditCompaction::Full,
+        );
         assert!(view.messages.len() <= 16 * 1024 / 2 + 1, "{}", view.messages.len());
         assert!(budget.items_used <= 16 * 1024 / 2 + 1);
         assert!(

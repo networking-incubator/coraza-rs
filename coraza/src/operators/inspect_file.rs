@@ -37,8 +37,8 @@
 //!   output and returns false on the failing status.
 //! - A non-zero exit status stays a non-match for a run that stays within [`OUTPUT_CAP`], as in Go.
 //! - The number of runs in flight in a process is capped at [`MAX_IN_FLIGHT`]. A refused run reports
-//!   [`OperatorOutcome::NotInspected`] and the rule engine interrupts with status 500 rather than treating the value as
-//!   clean.
+//!   [`OperatorOutcome::NotInspected`], records an `OperatorNotInspected` engine event (subject to the transaction's
+//!   bounded event-detail limit) and interrupts with status 500 rather than treating the value as clean.
 //! - On Unix both streams share one socket, so the combined output keeps the program's write order like Go's
 //!   `CombinedOutput`. On other platforms the streams are separate pipes and stdout is read before stderr, so an
 //!   over-cap verdict can be decided from stderr there, where Go reads the combined first byte.
@@ -59,8 +59,9 @@
 //! ends when the last write end closes. A killed program is reaped within a short
 //! grace; one stuck in uninterruptible sleep stays a zombie until the process exits
 //! rather than parking the caller past its deadline. A saturated in-flight cap is
-//! reported as an uninspected value, so the rule engine fails closed with a 500
-//! interruption.
+//! reported as an uninspected value, so the rule engine records an
+//! `OperatorNotInspected` event, or contributes to its bounded overflow summary,
+//! and fails closed with a 500 interruption.
 
 use std::{
     borrow::Cow,
@@ -607,6 +608,7 @@ mod tests {
     use crate::{
         operators::{Operator as _, OperatorEnum, OperatorOutcome, Outputs},
         transaction::Transaction,
+        types::RuleSeverity,
     };
 
     /// Report a test that cannot run because a host program is missing.
@@ -678,6 +680,197 @@ mod tests {
         output_of("/bin/sh", path.as_bytes())
     }
 
+    fn assert_refusal_event(tx: &Transaction, disruptive: bool) {
+        let events = tx.engine_events();
+        assert_eq!(events.len(), 1, "one refusal event");
+        let event = events.first().unwrap();
+        assert_eq!(event.rule_id(), 0, "engine events use reserved rule id zero");
+        assert_eq!(event.rule.status(), 500);
+        assert_eq!(event.severity(), Some(RuleSeverity::Critical));
+        assert_eq!(event.message(), "host operator refused to inspect input");
+        assert!(
+            event
+                .tags()
+                .iter()
+                .any(|tag| tag == "coraza-rs/engine/OperatorNotInspected")
+        );
+        assert_eq!(event.disruptive, disruptive);
+        assert_eq!(event.matches.len(), 1);
+        assert!(event.matches.first().unwrap().key.is_empty());
+        assert!(event.matches.first().unwrap().value.is_empty());
+        assert!(event.client_ip.is_empty());
+        assert!(event.server_ip.is_empty());
+        assert!(event.uri.is_empty());
+        assert!(event.transaction_id.len() <= 128);
+        assert!(tx.matched_rules().iter().all(|matched| matched.rule_id() != 0));
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The JSON, legacy, and OCSF formats have distinct public message shapes."
+    )]
+    fn assert_operator_audit_identity(
+        format: crate::types::AuditLogFormat,
+        output: &str,
+        k_selected: bool,
+        rule: &str,
+    ) {
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+        let document: serde_json::Value = serde_json::from_str(output).unwrap();
+        assert!(!output.contains('\0'), "{output}");
+        assert!(
+            !json_value_contains_nul(&document),
+            "serialized JSON contains a NUL in a decoded string: {output}"
+        );
+
+        match format {
+            crate::types::AuditLogFormat::Json => {
+                let messages = document.get("messages").and_then(serde_json::Value::as_array).unwrap();
+                assert_eq!(messages.len(), 2, "{output}");
+                let ordinary = messages.first().unwrap();
+                if k_selected {
+                    assert_eq!(
+                        ordinary.pointer("/data/id").and_then(serde_json::Value::as_i64),
+                        Some(967),
+                        "{output}"
+                    );
+                    assert_eq!(
+                        ordinary.get("message").and_then(serde_json::Value::as_str),
+                        Some("before operator stop"),
+                        "{output}"
+                    );
+                    assert_eq!(
+                        ordinary.pointer("/data/raw").and_then(serde_json::Value::as_str),
+                        Some(rule),
+                        "{output}"
+                    );
+                } else {
+                    assert_eq!(
+                        ordinary.get("message").and_then(serde_json::Value::as_str),
+                        Some(""),
+                        "{output}"
+                    );
+                    assert!(
+                        ordinary
+                            .get("error_message")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|line| line.contains("[id \"967\"]")),
+                        "H-only ordinary rule output is unchanged: {output}"
+                    );
+                }
+
+                let event = messages.get(1).unwrap();
+                assert_eq!(
+                    event.pointer("/data/id").and_then(serde_json::Value::as_i64),
+                    Some(0),
+                    "{output}"
+                );
+                if k_selected {
+                    assert!(
+                        event
+                            .pointer("/data/tags")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|tags| { tags.iter().any(|tag| tag.as_str() == Some(STATE)) }),
+                        "K-selected event state stays structured: {output}"
+                    );
+                } else {
+                    assert!(
+                        event
+                            .get("error_message")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|line| line.contains(STATE)),
+                        "H-only JSON error line identifies the event: {output}"
+                    );
+                }
+            },
+            crate::types::AuditLogFormat::JsonLegacy => {
+                let messages = document
+                    .pointer("/audit_data/messages")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap();
+                assert_eq!(messages.len(), 2, "{output}");
+                assert_eq!(
+                    messages.first().unwrap().as_str(),
+                    Some(if k_selected { "before operator stop" } else { "" }),
+                    "ordinary H-only/K-selected rule output stays unchanged: {output}"
+                );
+                assert!(
+                    messages
+                        .get(1)
+                        .unwrap()
+                        .as_str()
+                        .is_some_and(|message| message.contains(STATE)),
+                    "JSONLegacy identifies the synthetic event: {output}"
+                );
+            },
+            crate::types::AuditLogFormat::Ocsf => {
+                let enrichments = document
+                    .get("enrichments")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap();
+                assert_eq!(enrichments.len(), 2, "{output}");
+                let ordinary = enrichments.first().unwrap();
+                assert_eq!(
+                    ordinary
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    if k_selected { "before operator stop" } else { "" },
+                    "ordinary H-only/K-selected rule name stays unchanged: {output}"
+                );
+                if k_selected {
+                    let data: serde_json::Value = serde_json::from_str(
+                        enrichments
+                            .get(1)
+                            .unwrap()
+                            .get("data")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(
+                        data.get("tags")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|tags| { tags.iter().any(|tag| tag.as_str() == Some(STATE)) }),
+                        "K-selected event state stays structured: {output}"
+                    );
+                    let ordinary_data: serde_json::Value =
+                        serde_json::from_str(ordinary.get("data").and_then(serde_json::Value::as_str).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        ordinary_data.get("raw").and_then(serde_json::Value::as_str),
+                        Some(rule),
+                        "ordinary OCSF enrichment is unchanged"
+                    );
+                } else {
+                    assert!(
+                        enrichments
+                            .get(1)
+                            .unwrap()
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|name| name.contains(STATE)),
+                        "H-only OCSF enrichment names the engine event: {output}"
+                    );
+                }
+            },
+            crate::types::AuditLogFormat::Native => unreachable!(),
+        }
+    }
+
+    fn json_value_contains_nul(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                text.contains('\0')
+                    || serde_json::from_str::<serde_json::Value>(text)
+                        .is_ok_and(|nested| json_value_contains_nul(&nested))
+            },
+            serde_json::Value::Array(values) => values.iter().any(json_value_contains_nul),
+            serde_json::Value::Object(values) => values.values().any(json_value_contains_nul),
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+        }
+    }
+
     #[test]
     fn command_not_found_is_no_match() {
         assert!(!evaluates("/nonexistent/coraza-inspect-file-test", b"value"));
@@ -721,6 +914,7 @@ mod tests {
             1,
             "the negated rule must match on the failed run"
         );
+        assert!(tx.engine_events().is_empty(), "ordinary failures are still misses");
     }
 
     #[cfg(unix)]
@@ -1095,10 +1289,16 @@ mod tests {
         TEST_CAP.with(|cap| cap.set(None));
 
         assert_eq!(
-            interruption.map(|value| value.status),
-            Some(500),
+            interruption.map(|value| (value.rule_id, value.status, value.action, value.data)),
+            Some((
+                963,
+                500,
+                "deny".to_owned(),
+                "host operator refused to inspect input".to_owned()
+            )),
             "refusing an uninspected value must interrupt instead of reporting a clean miss"
         );
+        assert_refusal_event(&tx, true);
     }
 
     #[cfg(feature = "inspect-file")]
@@ -1125,13 +1325,16 @@ mod tests {
             panic!("a refused inspection must interrupt")
         };
         assert_eq!(
-            interruption.status, 500,
-            "the refusal uses the engine's fail-closed status"
+            (interruption.rule_id, interruption.status),
+            (964, 500),
+            "the refusal keeps the original rule attribution and status"
         );
         assert_eq!(
             interruption.action, "deny",
             "the refusal uses the engine's fail-closed action"
         );
+        assert_eq!(interruption.data, "host operator refused to inspect input");
+        assert_refusal_event(&tx, true);
     }
 
     #[cfg(feature = "inspect-file")]
@@ -1159,6 +1362,556 @@ mod tests {
         assert!(
             tx.would_be_interruption().is_some(),
             "the refusal must be visible as a would-be interruption"
+        );
+        assert_eq!(
+            tx.would_be_interruption()
+                .map(|value| (value.rule_id, value.status, value.data.as_str())),
+            Some((965, 500, "host operator refused to inspect input"))
+        );
+        assert_refusal_event(&tx, false);
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Checks the refusal, callback, and audit output in both engine modes."
+    )]
+    fn an_operator_refusal_is_logged_and_audited_without_changing_its_rule_interruption() {
+        use std::sync::{Arc, Mutex};
+
+        use super::TEST_CAP;
+        use crate::{
+            seclang::Parser,
+            types::{AuditEngineStatus, AuditLogFormat, parse_audit_log_parts},
+        };
+
+        for (engine, enforced) in [("On", true), ("DetectionOnly", false)] {
+            let logged = Arc::new(Mutex::new(Vec::new()));
+            let callback_log = Arc::clone(&logged);
+            let mut parser = Parser::new();
+            parser.config_mut().audit_engine = AuditEngineStatus::On;
+            parser.config_mut().audit_log_parts = parse_audit_log_parts("ABHKZ").unwrap();
+            parser.on_error_log(move |matched| {
+                callback_log.lock().unwrap().push((
+                    matched.rule_id(),
+                    matched.disruptive,
+                    matched.message().to_owned(),
+                    matched.tags().to_vec(),
+                    matched.rule.status(),
+                ));
+            });
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine {engine}\n\
+                     SecRule ARGS:q \"@inspectFile /bin/sh\" \
+                     \"id:968,phase:1,deny,status:403\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id("inspect-file-event");
+            tx.add_get_argument("q", b"value");
+
+            TEST_CAP.with(|cap| cap.set(Some(0)));
+            let interruption = tx.process_request_headers();
+            TEST_CAP.with(|cap| cap.set(None));
+
+            assert_refusal_event(&tx, enforced);
+            let expected = (
+                968,
+                500,
+                "deny".to_owned(),
+                "host operator refused to inspect input".to_owned(),
+            );
+            if enforced {
+                assert_eq!(
+                    interruption.map(|value| (value.rule_id, value.status, value.action, value.data)),
+                    Some(expected)
+                );
+                assert!(tx.would_be_interruption().is_none());
+            } else {
+                assert!(interruption.is_none());
+                assert_eq!(
+                    tx.would_be_interruption().map(|value| (
+                        value.rule_id,
+                        value.status,
+                        value.action.clone(),
+                        value.data.clone(),
+                    )),
+                    Some(expected)
+                );
+            }
+
+            let logged = logged.lock().unwrap();
+            assert_eq!(logged.len(), 1, "one callback for the engine event");
+            let logged_event = logged.first().unwrap();
+            assert_eq!(logged_event.0, 0, "the callback gets the synthetic rule ID");
+            assert_eq!(logged_event.1, enforced, "disruptive follows engine mode");
+            assert_eq!(logged_event.2, "host operator refused to inspect input");
+            assert_eq!(logged_event.4, 500);
+            assert!(
+                logged_event
+                    .3
+                    .iter()
+                    .any(|tag| tag == "coraza-rs/engine/OperatorNotInspected")
+            );
+            drop(logged);
+
+            let audit = tx.audit_log();
+            let audited = audit.messages.iter().find(|message| message.rule_id == 0).unwrap();
+            assert_eq!(audited.message, "host operator refused to inspect input");
+            assert!(
+                audited
+                    .data
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "coraza-rs/engine/OperatorNotInspected")
+            );
+            let document: serde_json::Value = serde_json::from_str(&audit.format(AuditLogFormat::Json)).unwrap();
+            assert!(
+                document
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap()
+                    .iter()
+                    .any(|message| {
+                        message.pointer("/data/id").and_then(serde_json::Value::as_i64) == Some(0)
+                            && message
+                                .pointer("/data/tags")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|tags| {
+                                    tags.iter()
+                                        .any(|tag| tag.as_str() == Some("coraza-rs/engine/OperatorNotInspected"))
+                                })
+                    }),
+                "the serialized audit event is visible"
+            );
+        }
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn operator_refusal_identity_is_visible_in_full_h_only_and_k_selected_json_formats() {
+        use super::TEST_CAP;
+        use crate::{seclang::Parser, types::parse_audit_log_parts};
+
+        let ordinary_rule = "SecAction \"id:967,phase:1,pass,log,auditlog,msg:'before operator stop'\"";
+        for (engine, enforced) in [("On", true), ("DetectionOnly", false)] {
+            for (parts, k_selected) in [("AHZ", false), ("AKZ", true)] {
+                let mut parser = Parser::new();
+                parser.config_mut().audit_log_parts = parse_audit_log_parts(parts).unwrap();
+                parser
+                    .from_string(&format!(
+                        "SecRuleEngine {engine}\n\
+                         {ordinary_rule}\n\
+                         SecRule ARGS:q \"@inspectFile /bin/sh\" \
+                         \"id:968,phase:1,deny,status:403\""
+                    ))
+                    .unwrap();
+                let waf = parser.into_waf().unwrap();
+                let mut tx = waf.new_transaction_with_id("inspect-file-audit-identity");
+                tx.add_get_argument("q", b"value");
+
+                TEST_CAP.with(|cap| cap.set(Some(0)));
+                let interruption = tx.process_request_headers();
+                TEST_CAP.with(|cap| cap.set(None));
+
+                if enforced {
+                    assert_eq!(
+                        interruption.map(|value| (value.rule_id, value.status)),
+                        Some((968, 500))
+                    );
+                    assert!(tx.would_be_interruption().is_none());
+                } else {
+                    assert!(interruption.is_none());
+                    assert_eq!(
+                        tx.would_be_interruption().map(|value| (value.rule_id, value.status)),
+                        Some((968, 500))
+                    );
+                }
+
+                let audit = tx.audit_log();
+                assert_eq!(
+                    audit.messages.iter().map(|message| message.rule_id).collect::<Vec<_>>(),
+                    [967, 0],
+                    "{engine} {parts}: the real operator event follows the ordinary rule"
+                );
+                for format in [
+                    crate::types::AuditLogFormat::Json,
+                    crate::types::AuditLogFormat::JsonLegacy,
+                    crate::types::AuditLogFormat::Ocsf,
+                ] {
+                    let full = audit.format(format);
+                    assert_operator_audit_identity(format, &full, k_selected, ordinary_rule);
+
+                    let (bounded, truncated) = audit.format_bounded(format, 16 * 1024);
+                    assert!(!truncated, "{engine} {parts} {format:?}: the large cap fits");
+                    assert!(bounded.len() <= 16 * 1024, "{engine} {parts} {format:?}");
+                    assert_operator_audit_identity(format, &bounded, k_selected, ordinary_rule);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "inspect-file", unix))]
+    #[test]
+    fn bounded_audit_pins_an_enforced_operator_refusal_over_its_prior_rule_match() {
+        use super::TEST_ALLOW_BEFORE_REFUSAL;
+        use crate::{seclang::Parser, types::parse_audit_log_parts};
+
+        const RULE_ID: i32 = 966;
+        const STATE: &str = "coraza-rs/engine/OperatorNotInspected";
+        if !shell_available() {
+            return skip("/bin/echo");
+        }
+
+        let mut parser = Parser::new();
+        parser.config_mut().audit_log_parts = parse_audit_log_parts("AHKZ").unwrap();
+        parser
+            .from_string(&format!(
+                "SecRuleEngine On\n\
+                 SecRule ARGS:q|ARGS:r \"@inspectFile /bin/echo\" \
+                 \"id:{RULE_ID},phase:1,deny,status:403,log,auditlog,msg:'scanner hit'\""
+            ))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("inspect-file-bounded-cause");
+        tx.process_uri(format!("/{}", "p".repeat(16 * 1024)), "GET", "HTTP/1.1");
+        tx.add_get_argument("q", b"first");
+        tx.add_get_argument("r", b"second");
+
+        TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(Some(1)));
+        let interruption = tx.process_request_headers();
+        TEST_ALLOW_BEFORE_REFUSAL.with(|remaining| remaining.set(None));
+
+        assert_eq!(
+            interruption.map(|value| (value.rule_id, value.status)),
+            Some((RULE_ID, 500)),
+            "the refusal keeps its source rule attribution"
+        );
+        assert_eq!(
+            tx.matched_rules()
+                .iter()
+                .map(crate::audit_log::MatchedRule::rule_id)
+                .collect::<Vec<_>>(),
+            [RULE_ID],
+            "the first inspected value leaves a prior match with the same source ID"
+        );
+        let audit = tx.audit_log();
+        assert_eq!(
+            audit.messages.iter().map(|message| message.rule_id).collect::<Vec<_>>(),
+            [RULE_ID, 0],
+            "the synthetic event remains after the earlier rule evidence"
+        );
+        assert_eq!(audit.transaction.interruption_rule_id, Some(RULE_ID));
+
+        let (tight, truncated) = audit.format_bounded(crate::types::AuditLogFormat::Json, 768);
+        assert!(truncated, "the long request URI forces bounded reduction");
+        assert!(tight.len() <= 768);
+        let document: serde_json::Value = serde_json::from_str(&tight).unwrap();
+        let messages = document
+            .pointer("/messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(messages.len(), 1, "{tight}");
+        assert_eq!(
+            messages
+                .first()
+                .unwrap()
+                .pointer("/data/id")
+                .and_then(serde_json::Value::as_i64),
+            Some(0),
+            "when only one message fits, the actual enforcing engine event is the cause"
+        );
+        assert!(
+            tight.contains(STATE),
+            "the retained event identity names the refusal: {tight}"
+        );
+
+        let (roomy, truncated) = audit.format_bounded(crate::types::AuditLogFormat::Json, 32 * 1024);
+        assert!(!truncated, "the larger cap retains the complete audit");
+        let document: serde_json::Value = serde_json::from_str(&roomy).unwrap();
+        assert_eq!(
+            document
+                .pointer("/messages")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|message| message.pointer("/data/id").and_then(serde_json::Value::as_i64))
+                .collect::<Vec<_>>(),
+            [Some(i64::from(RULE_ID)), Some(0)],
+            "with room for both entries, the original chronological order is preserved"
+        );
+        assert_eq!(
+            audit.transaction.interruption_rule_id,
+            Some(RULE_ID),
+            "pinning the synthetic event does not rewrite its nonzero source attribution"
+        );
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "Checks event retention, callback volume, interruption precedence, and Native output in each mode."
+    )]
+    fn repeated_saturated_rules_have_bounded_events_and_callbacks_in_every_mode() {
+        use std::sync::{Arc, Mutex};
+
+        use super::TEST_CAP;
+        use crate::{
+            seclang::Parser,
+            transaction::MAX_ENGINE_EVENT_DETAILS,
+            types::{AuditEngineStatus, AuditLogFormat, parse_audit_log_parts},
+        };
+
+        const DETAIL_LIMIT: usize = MAX_ENGINE_EVENT_DETAILS;
+        const RULE_COUNT: usize = 64;
+        let rules = (0..RULE_COUNT)
+            .map(|index| {
+                format!(
+                    "SecRule ARGS:q \"@inspectFile /bin/sh\" \"id:{},phase:1,pass\"\n",
+                    1000 + index
+                )
+            })
+            .collect::<String>();
+
+        for (engine, expected_interruption) in [
+            (
+                "DetectionOnly",
+                Some((1000, 500, "host operator refused to inspect input")),
+            ),
+            ("On", Some((1000, 500, "host operator refused to inspect input"))),
+            ("Off", None),
+        ] {
+            let logged = Arc::new(Mutex::new(Vec::new()));
+            let callback_log = Arc::clone(&logged);
+            let mut parser = Parser::new();
+            parser.config_mut().audit_engine = AuditEngineStatus::On;
+            parser.config_mut().audit_log_parts = parse_audit_log_parts("ABHKZ").unwrap();
+            parser.on_error_log(move |event| {
+                callback_log.lock().unwrap().push((
+                    event.rule_id(),
+                    event.message().to_owned(),
+                    event.tags().to_vec(),
+                    event.error_log(),
+                ));
+            });
+            parser.from_string(&format!("SecRuleEngine {engine}\n{rules}")).unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id(format!("many-saturated-{engine}"));
+            tx.add_get_argument("q", b"value");
+
+            TEST_CAP.with(|cap| cap.set(Some(0)));
+            let interruption = tx.process_request_headers();
+            TEST_CAP.with(|cap| cap.set(None));
+
+            let actual = interruption
+                .as_ref()
+                .map(|value| (value.rule_id, value.status, value.data.as_str()));
+            if engine == "DetectionOnly" {
+                assert!(interruption.is_none());
+                assert!(tx.interruption().is_none());
+                assert_eq!(
+                    tx.would_be_interruption()
+                        .map(|value| (value.rule_id, value.status, value.data.as_str(),)),
+                    expected_interruption
+                );
+                assert_eq!(tx.engine_events().len(), DETAIL_LIMIT + 1);
+                assert!(
+                    tx.engine_events().get(..DETAIL_LIMIT).is_some_and(|events| {
+                        events.iter().all(|event| {
+                            event
+                                .tags()
+                                .iter()
+                                .any(|tag| tag == "coraza-rs/engine/OperatorNotInspected")
+                        })
+                    }),
+                    "the first {DETAIL_LIMIT} saturated rules retain individual events"
+                );
+                let summary = tx.engine_events().last().unwrap();
+                assert_eq!(
+                    summary.rule.status, 0,
+                    "EventsOmitted has no HTTP status; zero means not applicable"
+                );
+                assert!(
+                    summary.tags().iter().any(|tag| tag == "coraza-rs/engine/EventsOmitted"),
+                    "overflow is explicit"
+                );
+                assert!(
+                    summary.message().contains("48 additional engine stop events"),
+                    "the final summary count is exact: {}",
+                    summary.message()
+                );
+                let logged = logged.lock().unwrap();
+                assert_eq!(logged.len(), DETAIL_LIMIT + 1);
+                assert!(
+                    logged.last().is_some_and(|event| {
+                        event.1.contains("At least 1 additional engine stop event")
+                            && event.1.contains("final count may be higher")
+                            && !event.1.contains("48 additional")
+                            && event.2.iter().any(|tag| tag == "coraza-rs/engine/EventsOmitted")
+                            && event.3.contains("coraza-rs/engine/EventsOmitted")
+                    }),
+                    "the callback records the first overflow without growing with later stops: {logged:?}"
+                );
+                drop(logged);
+                let audit = tx.audit_log();
+                assert_eq!(audit.messages.len(), DETAIL_LIMIT + 1, "audit output is bounded too");
+                assert!(
+                    audit
+                        .messages
+                        .last()
+                        .is_some_and(|message| message.message.contains("48 additional engine stop events")),
+                    "audit has the final aggregate count"
+                );
+                let document: serde_json::Value = serde_json::from_str(&audit.format(AuditLogFormat::Json)).unwrap();
+                let messages = document.get("messages").and_then(serde_json::Value::as_array).unwrap();
+                let summary = messages.last().unwrap();
+                assert_eq!(
+                    summary.get("message").and_then(serde_json::Value::as_str),
+                    Some("48 additional engine stop events summarized after the first 16 individual events")
+                );
+                assert!(
+                    summary
+                        .pointer("/data/tags")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tags| {
+                            tags.iter()
+                                .any(|tag| tag.as_str() == Some("coraza-rs/engine/EventsOmitted"))
+                        }),
+                    "serialized audit marks the aggregated evidence"
+                );
+                let mut native_k_only = audit.clone();
+                native_k_only.parts = parse_audit_log_parts("AKZ").unwrap();
+                let native = native_k_only.format(AuditLogFormat::Native);
+                let expected_count = "48 additional engine stop events summarized after the first 16 individual events";
+                assert!(
+                    native
+                        .lines()
+                        .any(|line| line.contains("coraza-rs/engine/EventsOmitted") && line.contains(expected_count)),
+                    "Native K-only output includes the bounded summary count: {native:?}"
+                );
+                let (bounded_native, native_truncated) =
+                    native_k_only.format_bounded(AuditLogFormat::Native, 16 * 1024);
+                assert!(!native_truncated, "the bounded Native K entry fits");
+                assert!(
+                    bounded_native
+                        .lines()
+                        .any(|line| line.contains("coraza-rs/engine/EventsOmitted") && line.contains(expected_count)),
+                    "bounded Native K output includes the summary count: {bounded_native:?}"
+                );
+            } else if engine == "On" {
+                assert_eq!(actual, expected_interruption);
+                assert!(tx.would_be_interruption().is_none());
+                assert_eq!(tx.engine_events().len(), 1);
+                assert_eq!(logged.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(actual, None);
+                assert!(tx.would_be_interruption().is_none());
+                assert!(tx.engine_events().is_empty());
+                assert!(logged.lock().unwrap().is_empty());
+            }
+            assert!(tx.matched_rules().is_empty(), "{engine}: refusal is not a rule match");
+        }
+
+        let mut parser = Parser::new();
+        parser
+            .from_string(&format!(
+                "SecRuleEngine DetectionOnly\n{}",
+                rules.lines().take(DETAIL_LIMIT - 1).collect::<Vec<_>>().join("\n")
+            ))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("below-event-limit");
+        tx.add_get_argument("q", b"value");
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+        assert_eq!(
+            tx.engine_events().len(),
+            DETAIL_LIMIT - 1,
+            "events below the detail limit stay individual"
+        );
+        assert!(tx.engine_events().iter().all(|event| {
+            event
+                .tags()
+                .iter()
+                .any(|tag| tag == "coraza-rs/engine/OperatorNotInspected")
+        }));
+    }
+
+    #[cfg(feature = "inspect-file")]
+    #[test]
+    fn overflow_callback_is_an_explicit_lower_bound_without_an_audit_consumer() {
+        use std::sync::{Arc, Mutex};
+
+        use super::TEST_CAP;
+        use crate::{seclang::Parser, transaction::MAX_ENGINE_EVENT_DETAILS, types::AuditEngineStatus};
+
+        const DETAIL_LIMIT: usize = MAX_ENGINE_EVENT_DETAILS;
+        const RULE_COUNT: usize = 64;
+        let rules = (0..RULE_COUNT)
+            .map(|index| {
+                format!(
+                    "SecRule ARGS:q \"@inspectFile /bin/sh\" \"id:{},phase:1,pass\"\n",
+                    1000 + index
+                )
+            })
+            .collect::<String>();
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let callback_log = Arc::clone(&logged);
+        let mut parser = Parser::new();
+        parser.config_mut().audit_engine = AuditEngineStatus::Off;
+        parser.on_error_log(move |event| {
+            callback_log
+                .lock()
+                .unwrap()
+                .push((event.rule_id(), event.message().to_owned(), event.error_log()));
+        });
+        parser
+            .from_string(&format!("SecRuleEngine DetectionOnly\n{rules}"))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        let mut tx = waf.new_transaction_with_id("many-saturated-without-audit");
+        tx.add_get_argument("q", b"value");
+        TEST_CAP.with(|cap| cap.set(Some(0)));
+        tx.process_request_headers();
+        TEST_CAP.with(|cap| cap.set(None));
+
+        let logged = logged.lock().unwrap();
+        assert_eq!(logged.len(), DETAIL_LIMIT + 1, "callbacks remain capped");
+        let callback_summary = logged.last().unwrap();
+        assert_eq!(callback_summary.0, 0);
+        assert!(
+            callback_summary.1.contains("At least 1 additional engine stop event"),
+            "the one-time callback reports a lower-bound snapshot: {}",
+            callback_summary.1
+        );
+        assert!(
+            callback_summary.1.contains("final count may be higher"),
+            "the one-time callback does not claim its count is final: {}",
+            callback_summary.1
+        );
+        assert!(
+            !callback_summary.1.contains("48 additional"),
+            "later omitted events are not included in the one-time callback: {}",
+            callback_summary.1
+        );
+        assert!(
+            callback_summary.2.contains("final count may be higher") && !callback_summary.2.contains("48 additional"),
+            "the formatted error log is an honest snapshot: {}",
+            callback_summary.2
+        );
+        drop(logged);
+        assert!(
+            tx.engine_events()
+                .last()
+                .unwrap()
+                .message()
+                .contains("48 additional engine stop events"),
+            "the retained summary keeps the exact final count"
         );
     }
 
@@ -1209,12 +1962,20 @@ mod tests {
                 Some("1"),
                 "the refused value must not run the rule's per-match actions"
             );
+            assert_refusal_event(&tx, engine == "On");
 
             if engine == "On" {
-                assert_eq!(interruption.map(|value| value.status), Some(500));
+                assert_eq!(
+                    interruption.map(|value| (value.rule_id, value.status, value.data)),
+                    Some((966, 500, "host operator refused to inspect input".to_owned()))
+                );
             } else {
                 assert!(interruption.is_none());
-                assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(500));
+                assert_eq!(
+                    tx.would_be_interruption()
+                        .map(|value| (value.rule_id, value.status, value.data.as_str())),
+                    Some((966, 500, "host operator refused to inspect input"))
+                );
             }
         }
     }
@@ -1267,16 +2028,21 @@ mod tests {
                     tx.get_variable(RuleVariable::TX, Some("chain")).is_none(),
                     "a refusal must stop chain-link evaluation ({engine})"
                 );
+                assert_refusal_event(&tx, engine == "On");
 
                 if engine == "On" {
                     let Some(interruption) = interruption else {
                         panic!("a refused inspection must interrupt")
                     };
-                    assert_eq!(interruption.status, 500);
-                    assert_eq!(interruption.rule_id, 967);
+                    assert_eq!((interruption.status, interruption.rule_id), (500, 967));
+                    assert_eq!(interruption.data, "host operator refused to inspect input");
                 } else {
                     assert!(interruption.is_none());
-                    assert_eq!(tx.would_be_interruption().map(|value| value.status), Some(500));
+                    assert_eq!(
+                        tx.would_be_interruption()
+                            .map(|value| (value.rule_id, value.status, value.data.as_str())),
+                        Some((967, 500, "host operator refused to inspect input"))
+                    );
                 }
             }
         }

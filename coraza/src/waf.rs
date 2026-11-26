@@ -64,7 +64,7 @@ pub struct Waf {
     transaction_pool: Arc<TransactionPool>,
     /// Writer shared by transactions created by this WAF.
     audit_logger: Arc<AuditLogger>,
-    /// Optional connector callback for rules with the `log` action.
+    /// Optional connector callback for logged rule matches and engine-originated stops.
     error_log: Option<ErrorLog>,
     /// Debug sink shared with transactions.
     debug_logger: Arc<dyn DebugLogger>,

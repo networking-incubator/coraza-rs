@@ -67,6 +67,10 @@ fn custom_operator_without_a_verdict_is_a_miss_even_when_negated() {
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(tx.matched_rules().len(), 1);
     assert_eq!(tx.matched_rules().first().map(|matched| matched.rule.id()), Some(3));
+    assert!(
+        tx.engine_events().is_empty(),
+        "embedder operators do not inherit the built-in host-operator fail-closed policy"
+    );
 }
 
 /// Matches every value and counts its calls.

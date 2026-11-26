@@ -89,6 +89,16 @@ adding them requires a shared-corpus fixture first.
 - Body-limit `Reject` under `SecRuleEngine DetectionOnly`. Go Coraza sets a blocking
   interruption even in detection-only mode; this port records
   `would_be_interruption` and inspects the bytes retained up to the limit.
+- Engine-originated stop evidence. A source review of pinned Go Coraza
+  `d9cc9befc2721fd217ce1660a0e91aca1157221d` found that
+  `Transaction.Interrupt` only records the interruption
+  (`internal/corazawaf/transaction.go:334-353`); error callbacks and audit
+  messages are emitted from matched rules (`:621-633`, `:1628-1674`), while
+  `RelevantOnly` requires `tx.audit` or a matching status filter (`:1445-1468`).
+  This Rust engine also emits an ID-0 callback and H/K audit event for its own
+  stops, and treats that event as `RelevantOnly` evidence when no status filter
+  is set; a configured status filter remains authoritative. This is
+  source-reviewed, not a live Go/Rust fixture comparison.
 - Zero body limits. Go Coraza refuses `SecRequestBodyLimit 0`,
   `SecRequestBodyInMemoryLimit 0` and `SecResponseBodyLimit 0` during configuration
   validation; this port accepts zero, treats any non-empty body as over the limit while

@@ -26,6 +26,8 @@
 
 mod body_buffer;
 mod ctl;
+#[cfg(test)]
+mod engine_event_tests;
 mod request_body;
 mod response_body;
 mod variables;
@@ -33,6 +35,7 @@ mod variables;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     mem::size_of,
     ops::{Deref, DerefMut, RangeInclusive},
     path::PathBuf,
@@ -49,8 +52,9 @@ pub use variables::VariableCollection;
 pub use crate::{actions::RuleMetadata, audit_log::MatchedRule};
 use crate::{
     audit_log::{
-        AuditFile, AuditLog, AuditLogCallback, AuditLogger, AuditMessage, AuditMessageData, AuditProducer,
-        AuditRequest, AuditResponse, AuditTransaction, ErrorLog, Failure, mime_type_of,
+        AuditFile, AuditLog, AuditLogCallback, AuditLogger, AuditMessage, AuditMessageData, AuditMessageProvenance,
+        AuditProducer, AuditRequest, AuditResponse, AuditTransaction, ENGINE_ENFORCED_OMITTED_TAG, ENGINE_ENFORCED_TAG,
+        ErrorLog, Failure, mime_type_of,
     },
     body_processors::{
         BodyProcessor as CustomBodyProcessor, BodyProcessorFactory,
@@ -230,10 +234,16 @@ pub struct TransactionInner {
     debug_log_level: Option<u8>,
     /// Optional connector-owned audit callback inherited from the WAF.
     audit_log_callback: Option<AuditLogCallback>,
-    /// Optional connector callback for rules with the `log` action.
+    /// Optional connector callback for logged rule matches and engine-originated stops.
     error_log: Option<ErrorLog>,
     /// Rules matched by this transaction.
     matched_rules: Vec<MatchedRule>,
+    /// Engine-originated interruptions, separate from rules matched by this transaction.
+    engine_events: Vec<MatchedRule>,
+    /// Number of engine stops summarized after the individual-event limit.
+    engine_event_overflow_count: usize,
+    /// Whether an engine stop beyond the individual-event limit enforced an interruption.
+    engine_event_overflow_enforced: bool,
     /// Transaction start time, used in audit records.
     started: SystemTime,
     /// The last phase evaluated.
@@ -434,6 +444,14 @@ const RULE_RESERVE_AFTER_STOP_BYTES: usize = 64 * 1024;
 const MAX_POOL_SIZE: usize = 16;
 /// Maximum estimated dynamic capacity retained by one WAF's transaction pool.
 const MAX_POOL_RETAINED_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum engine-stop events retained with individual details per transaction.
+pub(crate) const MAX_ENGINE_EVENT_DETAILS: usize = 16;
+/// State used for the one retained overflow summary.
+const ENGINE_EVENTS_OMITTED_STATE: &str = "EventsOmitted";
+/// Maximum bytes copied from a caller-supplied transaction ID into an engine event.
+const MAX_ENGINE_EVENT_TRANSACTION_ID_BYTES: usize = 128;
+/// Visible suffix marking a transaction ID shortened for an engine event.
+const ENGINE_EVENT_TRANSACTION_ID_TRUNCATION_MARKER: &str = "...";
 
 impl TransactionPool {
     /// Create an empty per-WAF pool.
@@ -548,6 +566,9 @@ impl TransactionInner {
         self.audit_log_callback = None;
         self.error_log = None;
         self.matched_rules = Vec::new();
+        self.engine_events = Vec::new();
+        self.engine_event_overflow_count = 0;
+        self.engine_event_overflow_enforced = false;
         self.started = std::time::UNIX_EPOCH;
         self.last_phase = None;
         self.audit_attempted = false;
@@ -798,6 +819,7 @@ impl TransactionInner {
             .matched_rules
             .capacity()
             .saturating_mul(size_of::<MatchedRule>())
+            .saturating_add(self.engine_events.capacity().saturating_mul(size_of::<MatchedRule>()))
             .saturating_add(self.finalization_errors.capacity().saturating_mul(size_of::<Failure>()))
             .saturating_add(
                 self.removed_rule_id_ranges
@@ -1001,6 +1023,9 @@ impl Transaction {
             audit_log_callback: None,
             error_log: None,
             matched_rules: Vec::new(),
+            engine_events: Vec::new(),
+            engine_event_overflow_count: 0,
+            engine_event_overflow_enforced: false,
             started,
             config,
             rules,
@@ -1237,7 +1262,7 @@ impl Transaction {
         self.audit_log_callback = Some(callback);
     }
 
-    /// Attach the connector's matched-rule callback.
+    /// Attach the connector's error-log callback for rule matches and engine events.
     pub(crate) fn set_error_log(&mut self, log: ErrorLog) {
         self.error_log = Some(log);
     }
@@ -1245,6 +1270,23 @@ impl Transaction {
     /// Rules that matched during this transaction, in evaluation order.
     pub fn matched_rules(&self) -> &[MatchedRule] {
         &self.matched_rules
+    }
+
+    /// Engine-originated interruption events, kept separate from matched rules.
+    ///
+    /// Events use rule ID `0` and are recorded in `On` and `DetectionOnly`, but not
+    /// `Off`. The first 16 events are kept individually; additional stops update one
+    /// final `EventsOmitted` summary whose message reports their count. Thus this list
+    /// holds at most 17 entries. The summary's `rule.status` is `0` (not applicable),
+    /// because it aggregates events rather than representing an HTTP stop. The error-log callback receives one overflow
+    /// snapshot: its message says at least one event was omitted and that the final count may be
+    /// higher. The retained public and audit summary continues to update with the exact
+    /// saturated count. If the enforcing stop is beyond the detail cap, the summary
+    /// identifies that its cause detail was omitted; it cannot recover that stop's state.
+    /// Event transaction IDs are copied up to 128 bytes; longer IDs are truncated at a
+    /// UTF-8 boundary and suffixed with `...`.
+    pub fn engine_events(&self) -> &[MatchedRule] {
+        &self.engine_events
     }
 
     /// Whether this transaction's WAF uses multiphase rule evaluation.
@@ -1284,6 +1326,142 @@ impl Transaction {
         }
         self.matched_rules.push(matched);
         self.computed.rule_budget.keep_pending();
+    }
+
+    /// Build an engine event without copying request values and with only a bounded ID.
+    fn make_engine_event(&self, state: &'static str, status: i32, message: &str, summary: bool) -> MatchedRule {
+        let event_message = if message.is_empty() { state } else { message };
+        let tag = format!("coraza-rs/engine/{state}");
+        let mut rule = RuleMetadata::new();
+        rule.severity = Some(RuleSeverity::Critical);
+        rule.tags.push(tag.clone());
+        // Part K writes raw rule text; this label gives synthetic events a visible K entry.
+        rule.raw = tag;
+        rule.log = true;
+        rule.audit_log = true;
+        rule.status = status;
+        rule.phase = self.last_phase.unwrap_or(RulePhase::RequestBody);
+
+        let mut matched = MatchData::new_empty();
+        matched.message.push_str(event_message);
+        let source_id = self.unique_id.get();
+        let source_id = source_id.as_ref();
+        let transaction_id = if source_id.len() <= MAX_ENGINE_EVENT_TRANSACTION_ID_BYTES {
+            source_id.to_owned()
+        } else {
+            let mut prefix_end =
+                MAX_ENGINE_EVENT_TRANSACTION_ID_BYTES - ENGINE_EVENT_TRANSACTION_ID_TRUNCATION_MARKER.len();
+            while !source_id.is_char_boundary(prefix_end) {
+                prefix_end -= 1;
+            }
+            let mut transaction_id = String::with_capacity(MAX_ENGINE_EVENT_TRANSACTION_ID_BYTES);
+            transaction_id.push_str(source_id.get(..prefix_end).unwrap_or_default());
+            transaction_id.push_str(ENGINE_EVENT_TRANSACTION_ID_TRUNCATION_MARKER);
+            transaction_id
+        };
+        MatchedRule {
+            rule,
+            matches: vec![matched],
+            disruptive_action: if summary { None } else { Some("deny") },
+            disruptive: !summary
+                && self.rule_engine == RuleEngineStatus::On
+                && self.interruption.is_none()
+                && self.last_phase != Some(RulePhase::Logging),
+            client_ip: String::new(),
+            server_ip: String::new(),
+            uri: String::new(),
+            transaction_id,
+        }
+    }
+
+    /// Update the one bounded summary record after a stop exceeds the individual-event limit.
+    fn refresh_engine_event_summary(&mut self) {
+        let count = self.engine_event_overflow_count;
+        let enforced_stop_omitted = self.engine_event_overflow_enforced;
+        let Some(message) = self
+            .engine_events
+            .get_mut(MAX_ENGINE_EVENT_DETAILS)
+            .and_then(|summary| summary.matches.first_mut())
+            .map(|matched| &mut matched.message)
+        else {
+            return;
+        };
+        message.clear();
+        write!(
+            message,
+            "{count} additional engine stop event{} summarized after the first {MAX_ENGINE_EVENT_DETAILS} individual events{}",
+            if count == 1 { "" } else { "s" },
+            if enforced_stop_omitted {
+                "; the enforced stop is among omitted details"
+            } else {
+                ""
+            },
+        )
+        .unwrap_or(());
+    }
+
+    /// The only path for engine-originated interruptions; retained event details and error-log callbacks are capped.
+    pub(crate) fn engine_stop(
+        &mut self,
+        interruption_rule_id: i32,
+        state: &'static str,
+        status: i32,
+        message: &'static str,
+    ) {
+        if self.rule_engine == RuleEngineStatus::Off {
+            self.interrupt(interruption_rule_id, "deny", status, message);
+            return;
+        }
+        let enforced = self.rule_engine == RuleEngineStatus::On
+            && self.interruption.is_none()
+            && self.last_phase != Some(RulePhase::Logging);
+        let log_index = if self.engine_events.len() < MAX_ENGINE_EVENT_DETAILS {
+            let event = self.make_engine_event(state, status, message, false);
+            self.engine_events.push(event);
+            self.engine_events.len().checked_sub(1)
+        } else if self.engine_events.len() == MAX_ENGINE_EVENT_DETAILS {
+            self.engine_event_overflow_count = 1;
+            self.engine_event_overflow_enforced = enforced;
+            let summary = self.make_engine_event(
+                ENGINE_EVENTS_OMITTED_STATE,
+                0,
+                "additional engine stop details are summarized",
+                true,
+            );
+            self.engine_events.push(summary);
+            self.refresh_engine_event_summary();
+            Some(MAX_ENGINE_EVENT_DETAILS)
+        } else {
+            self.engine_event_overflow_count = self.engine_event_overflow_count.saturating_add(1);
+            self.engine_event_overflow_enforced |= enforced;
+            self.refresh_engine_event_summary();
+            None
+        };
+        // A host log callback may panic; preserve the stop and audit event first.
+        self.interrupt(interruption_rule_id, "deny", status, message);
+        if let Some(error_log) = self.error_log.as_ref()
+            && let Some(index) = log_index
+            && let Some(event) = self.engine_events.get(index)
+        {
+            if index == MAX_ENGINE_EVENT_DETAILS {
+                // The retained summary keeps the exact count; this callback is only a first-overflow snapshot.
+                let mut snapshot = event.clone();
+                if let Some(message) = snapshot.matches.first_mut().map(|matched| &mut matched.message) {
+                    message.clear();
+                    message.push_str(if self.engine_event_overflow_enforced {
+                        "At least 1 additional engine stop event was observed at first overflow; \
+                         the enforced stop is among omitted details; this callback is a snapshot, \
+                         so the final count may be higher"
+                    } else {
+                        "At least 1 additional engine stop event was observed at first overflow; \
+                         this callback is a snapshot, so the final count may be higher"
+                    });
+                }
+                error_log.write(&snapshot);
+            } else {
+                error_log.write(event);
+            }
+        }
     }
 
     /// Reserves what recording `matched` takes beyond its matches, which the rule charged as it found them: its
@@ -1625,7 +1803,12 @@ impl Transaction {
     fn interrupt_for_rule_memory(&mut self) -> bool {
         let stopped = self.computed.rule_budget.is_stopped();
         if stopped {
-            self.interrupt(0, "deny", 503, "rule evaluation memory budget exhausted");
+            self.engine_stop(
+                0,
+                "RuleEvaluationMemoryBudget",
+                503,
+                "rule evaluation memory budget exhausted",
+            );
         }
         stopped
     }
@@ -1911,7 +2094,11 @@ impl Transaction {
                         || self.response_status.get().into_owned(),
                         |value| value.status.to_string(),
                     );
-                let audited = self.matched_rules.iter().any(|matched| matched.rule.audit_log);
+                let audited = self
+                    .matched_rules
+                    .iter()
+                    .chain(self.engine_events.iter())
+                    .any(|matched| matched.rule.audit_log);
                 logger.is_relevant(audited, &status)
             },
         };
@@ -2139,12 +2326,59 @@ impl Transaction {
             });
         }
 
-        let audited = self.matched_rules.iter().filter(|matched| matched.rule.audit_log);
+        let audit_tags = |matched: &MatchedRule, provenance: AuditMessageProvenance| {
+            let mut tags = matched.rule.tags.clone();
+            match provenance {
+                AuditMessageProvenance::EngineEvent { enforced: true } => {
+                    tags.push(ENGINE_ENFORCED_TAG.to_owned());
+                },
+                AuditMessageProvenance::EventsOmitted {
+                    enforced_stop_omitted: true,
+                } => tags.push(ENGINE_ENFORCED_OMITTED_TAG.to_owned()),
+                _ => {},
+            }
+            tags
+        };
+        let rule_matches = self
+            .matched_rules
+            .iter()
+            .filter(|matched| matched.rule.audit_log)
+            .map(|matched| (matched, None));
+        let engine_events = self
+            .engine_events
+            .iter()
+            .enumerate()
+            .filter(|(_, matched)| matched.rule.audit_log)
+            .map(|(index, matched)| {
+                let provenance = if index == MAX_ENGINE_EVENT_DETAILS {
+                    AuditMessageProvenance::EventsOmitted {
+                        enforced_stop_omitted: self.engine_event_overflow_enforced,
+                    }
+                } else {
+                    AuditMessageProvenance::EngineEvent {
+                        enforced: matched.disruptive,
+                    }
+                };
+                (matched, Some(provenance))
+            });
+        let audited = rule_matches.chain(engine_events);
+        let compact_identity = |matched: &MatchedRule, provenance: Option<AuditMessageProvenance>| match (
+            provenance,
+            matched.rule.tags.first(),
+        ) {
+            (Some(_), Some(state)) => format!("{state}: {}", matched.short_message()),
+            _ => matched.short_message(),
+        };
         let messages = if has(AuditLogPart::RulesMatched) {
             audited
-                .flat_map(|matched| {
+                .flat_map(|(matched, provenance)| {
                     // The line is built once per rule, not once per match: it scans all of the rule's matches.
                     let error_message = if trailer { matched.error_log() } else { String::new() };
+                    let rule_message = if provenance.is_some() {
+                        compact_identity(matched, provenance)
+                    } else {
+                        String::new()
+                    };
                     matched.matches.iter().map(move |data| {
                         let rule = &matched.rule;
                         AuditMessage {
@@ -2152,7 +2386,8 @@ impl Transaction {
                             message: data.message.clone(),
                             error_message: error_message.clone(),
                             rule_id: rule.id,
-                            rule_message: String::new(),
+                            rule_message: rule_message.clone(),
+                            provenance,
                             data: AuditMessageData {
                                 file: rule.file.clone(),
                                 line: rule.line,
@@ -2164,7 +2399,7 @@ impl Transaction {
                                 ver: rule.ver.clone(),
                                 maturity: rule.maturity,
                                 accuracy: rule.accuracy,
-                                tags: rule.tags.clone(),
+                                tags: provenance.map_or_else(|| rule.tags.clone(), |kind| audit_tags(matched, kind)),
                                 raw: rule.raw.clone(),
                             },
                         }
@@ -2173,11 +2408,29 @@ impl Transaction {
                 .collect()
         } else if trailer {
             audited
-                .map(|matched| AuditMessage {
-                    error_message: matched.error_log(),
-                    rule_id: matched.rule.id,
-                    rule_message: matched.short_message(),
-                    ..AuditMessage::default()
+                .map(|(matched, provenance)| {
+                    let data = if let Some(provenance) = provenance {
+                        AuditMessageData {
+                            id: matched.rule.id,
+                            severity: matched
+                                .rule
+                                .severity
+                                .map_or(-1, |severity| severity.as_int().cast_signed()),
+                            tags: audit_tags(matched, provenance),
+                            raw: matched.rule.raw.clone(),
+                            ..AuditMessageData::default()
+                        }
+                    } else {
+                        AuditMessageData::default()
+                    };
+                    AuditMessage {
+                        error_message: matched.error_log(),
+                        rule_id: matched.rule.id,
+                        rule_message: compact_identity(matched, provenance),
+                        provenance,
+                        data,
+                        ..AuditMessage::default()
+                    }
                 })
                 .collect()
         } else {
@@ -2267,12 +2520,6 @@ impl Transaction {
         self.debug_log(DebugLevel::Trace, "Transaction interruption detail", || {
             [DebugField::Text(data)]
         });
-        let interruption = Interruption {
-            rule_id,
-            action: action.to_owned(),
-            status: u16::try_from(status).unwrap_or(0),
-            data: data.to_owned(),
-        };
         match self.rule_engine {
             // The first interruption is the one enforced, and a later one must not make the audit entry
             // name a rule that was not enforced (Go Coraza overwrites it here). A first interruption in the
@@ -2281,11 +2528,23 @@ impl Transaction {
             RuleEngineStatus::On => {
                 if self.interruption.is_none() {
                     self.interruption_after_release = self.last_phase == Some(RulePhase::Logging);
-                    self.interruption = Some(interruption);
+                    self.interruption = Some(Interruption {
+                        rule_id,
+                        action: action.to_owned(),
+                        status: u16::try_from(status).unwrap_or(0),
+                        data: data.to_owned(),
+                    });
                 }
             },
             RuleEngineStatus::DetectionOnly => {
-                self.would_be_interruption.get_or_insert(interruption);
+                if self.would_be_interruption.is_none() {
+                    self.would_be_interruption = Some(Interruption {
+                        rule_id,
+                        action: action.to_owned(),
+                        status: u16::try_from(status).unwrap_or(0),
+                        data: data.to_owned(),
+                    });
+                }
             },
             RuleEngineStatus::Off => {},
         }
@@ -3181,9 +3440,13 @@ impl Drop for Transaction {
     reason = "transaction tests use fixed valid inputs"
 )]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::BTreeMap,
+        str::FromStr as _,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::{
@@ -3215,6 +3478,196 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    const POOL_RESET_VARIABLES: &[&str] = &[
+        "RESPONSE_CONTENT_TYPE",
+        "ARGS_COMBINED_SIZE",
+        "FILES_COMBINED_SIZE",
+        "FULL_REQUEST_LENGTH",
+        "INBOUND_DATA_ERROR",
+        "MATCHED_VAR",
+        "MATCHED_VAR_NAME",
+        "MULTIPART_DATA_AFTER",
+        "OUTBOUND_DATA_ERROR",
+        "QUERY_STRING",
+        "REMOTE_ADDR",
+        "REMOTE_HOST",
+        "REMOTE_PORT",
+        "REQBODY_ERROR",
+        "REQBODY_ERROR_MSG",
+        "REQBODY_PROCESSOR_ERROR",
+        "REQBODY_PROCESSOR_ERROR_MSG",
+        "REQBODY_PROCESSOR",
+        "REQUEST_BASENAME",
+        "REQUEST_BODY",
+        "REQUEST_BODY_LENGTH",
+        "REQUEST_FILENAME",
+        "REQUEST_LINE",
+        "REQUEST_METHOD",
+        "REQUEST_PROTOCOL",
+        "REQUEST_URI",
+        "REQUEST_URI_RAW",
+        "RESPONSE_BODY",
+        "RESPONSE_CONTENT_LENGTH",
+        "RESPONSE_PROTOCOL",
+        "RESPONSE_STATUS",
+        "SERVER_ADDR",
+        "SERVER_NAME",
+        "SERVER_PORT",
+        "HIGHEST_SEVERITY",
+        "STATUS_LINE",
+        "DURATION",
+        "ARGS",
+        "ARGS_GET",
+        "ARGS_POST",
+        "ARGS_PATH",
+        "FILES_SIZES",
+        "FILES_NAMES",
+        "MULTIPART_FILENAME",
+        "MULTIPART_NAME",
+        "MATCHED_VARS",
+        "FILES",
+        "REQUEST_COOKIES",
+        "REQUEST_HEADERS",
+        "RESPONSE_HEADERS",
+        "RES_BODY_PROCESSOR",
+        "FILES_TMPNAMES",
+        "TX",
+        "RULE",
+        "ENV",
+        "URLENCODED_ERROR",
+        "RESPONSE_ARGS",
+        "RESPONSE_XML",
+        "REQUEST_XML",
+        "MULTIPART_PART_HEADERS",
+        "MULTIPART_INVALID_QUOTING",
+        "MULTIPART_STRICT_ERROR",
+        "RES_BODY_ERROR",
+        "RES_BODY_ERROR_MSG",
+        "RES_BODY_PROCESSOR_ERROR",
+        "RES_BODY_PROCESSOR_ERROR_MSG",
+        "ARGUMENTS_LIMIT_REACHED",
+        "MULTIPART_DUPLICATE_PART_HEADER",
+        "MULTIPART_FILENAME_CHARSET",
+        "MULTIPART_FILENAME_LANGUAGE",
+        "URI_PARSE_ERROR",
+    ];
+
+    const POOL_RESET_RULES: &str = "SecRuleEngine On\n\
+        SecRequestBodyAccess On\n\
+        SecResponseBodyAccess On\n\
+        SecResponseBodyMimeType application/json\n\
+        SecArgumentsLimit 3\n\
+        SecRule REQUEST_HEADERS:X-Dirty \"@rx (d)(i)(r)(t)(y)\" \"id:1,phase:1,pass,capture,setvar:tx.score=+5,setenv:dirty=1,ctl:ruleRemoveById=99,ctl:requestBodyProcessor=JSON,ctl:responseBodyProcessor=JSON,ctl:auditLogParts=+E,severity:2\"\n\
+        SecRule ARGS \"@contains x\" \"id:2,phase:2,pass,log\"\n\
+        SecRule RESPONSE_ARGS \"@contains y\" \"id:3,phase:4,pass,log\"\n\
+        SecRule REQUEST_URI \"@unconditionalMatch\" \"id:4,phase:5,pass,setvar:tx.late=1\"\n";
+
+    fn public_transaction_snapshot(tx: &Transaction) -> BTreeMap<&'static str, String> {
+        let mut out = BTreeMap::new();
+        for name in POOL_RESET_VARIABLES {
+            let variable = RuleVariable::from_str(name).unwrap();
+            let value = match tx.collection(variable) {
+                Some(VariableCollection::Single(single)) => format!("{:?}", single.get_bytes()),
+                Some(VariableCollection::Map(map) | VariableCollection::Names(_, map)) => {
+                    let mut entries: Vec<_> = map.iter().map(|(key, value)| format!("{key}={value:?}")).collect();
+                    entries.sort();
+                    format!("{entries:?}")
+                },
+                None => "<none>".to_owned(),
+            };
+            out.insert(*name, value);
+        }
+        out.insert("@id", tx.id().into_owned());
+        out.insert("@rule_engine", format!("{:?}", tx.rule_engine()));
+        out.insert("@request_body_access", format!("{}", tx.request_body_access()));
+        out.insert("@response_body_access", format!("{}", tx.response_body_access()));
+        out.insert("@request_body_limit", format!("{}", tx.request_body_limit()));
+        out.insert("@response_body_limit", format!("{}", tx.response_body_limit()));
+        out.insert("@interruption", format!("{:?}", tx.interruption()));
+        out.insert("@would_be", format!("{:?}", tx.would_be_interruption()));
+        out.insert("@last_phase", format!("{:?}", tx.last_phase()));
+        out.insert("@matched_rules", format!("{}", tx.matched_rules().len()));
+        out.insert("@engine_events", format!("{}", tx.engine_events().len()));
+        out.insert("@limit_reached", format!("{}", tx.arguments_limit_reached()));
+        out.insert("@budget", format!("{:?}", tx.body_memory_budget()));
+        out.insert("@req_copy", format!("{:?}", tx.request_body_copy()));
+        out.insert("@resp_copy", format!("{:?}", tx.response_body_copy()));
+        out.insert("@req_stats", format!("{:?}", tx.request_body_stats()));
+        out.insert("@resp_stats", format!("{:?}", tx.response_body_stats()));
+        out.insert("@audit_parts", format!("{:?}", tx.audit_log().parts));
+        out
+    }
+
+    #[test]
+    fn pooled_state_matches_a_fresh_state() {
+        let mut parser = crate::seclang::Parser::new();
+        parser.config_mut().audit_engine = AuditEngineStatus::Off;
+        parser.config_mut().response_body_limit = 1;
+        parser.config_mut().response_body_limit_action = BodyLimitAction::Reject;
+        parser.from_string(POOL_RESET_RULES).unwrap();
+        let waf = parser.into_waf().unwrap();
+
+        let fresh_tx = waf.new_transaction_with_id("fresh");
+        let fresh = public_transaction_snapshot(&fresh_tx);
+        let pool = Arc::clone(fresh_tx.pool.as_ref().unwrap());
+        let config = Arc::clone(&fresh_tx.config);
+        let rules = Arc::clone(&fresh_tx.rules);
+        drop(fresh_tx);
+        assert_eq!(pool.len(), 1, "the fresh state entered the pool");
+
+        let mut dirty = waf.new_transaction_with_id("dirty");
+        assert_eq!(pool.len(), 0, "the dirty transaction reused the pooled state");
+        dirty.set_body_memory_budget(Some(1 << 20));
+        dirty.process_uri(
+            "http://u:p@[::1]:8080//a%2fb/c?x=1&x=2&a=b&c=d#frag",
+            "POST",
+            "HTTP/1.1",
+        );
+        dirty.set_remote_addr("10.0.0.1");
+        dirty.set_remote_port(1234);
+        dirty.set_server_addr("10.0.0.2");
+        dirty.set_server_port(80);
+        dirty.set_server_name("example");
+        dirty.add_path_argument("p", "x");
+        dirty.add_request_header("X-Dirty", "dirty");
+        dirty.add_request_header("Cookie", "a=b; c=d");
+        dirty.add_request_header("Content-Type", "application/json");
+        dirty.process_request_headers();
+        dirty.process_request_body(br#"{"k":"x","z":{"q":"x"}}"#);
+        dirty.add_response_header("Content-Type", "application/json");
+        dirty.process_response_headers(201, "HTTP/2");
+        assert_eq!(
+            dirty
+                .process_response_body(br#"{"y":"y"}"#)
+                .map(|interruption| (interruption.rule_id, interruption.status)),
+            Some((0, 500))
+        );
+        assert_eq!(dirty.engine_events().len(), 1, "the dirty state has an engine event");
+        assert_eq!(dirty.engine_events().first().unwrap().transaction_id, "dirty");
+        dirty.finish().unwrap();
+        assert!(dirty.matched_rules().len() >= 3, "the dirty request matched rules 1-4");
+        assert_eq!(
+            dirty.get_variable(RuleVariable::TX, Some("score")).as_deref(),
+            Some("5")
+        );
+        drop(dirty);
+        assert_eq!(pool.len(), 1, "the dirty state entered the pool");
+
+        let reused = Transaction::with_pool(config, rules, "fresh", Arc::clone(&pool));
+        assert_eq!(pool.len(), 0, "the pooled state was taken");
+        let pooled = public_transaction_snapshot(&reused);
+        let diffs: Vec<_> = fresh
+            .iter()
+            .filter(|(key, value)| pooled.get(*key) != Some(*value))
+            .map(|(key, value)| format!("{key}: fresh={value} pooled={:?}", pooled.get(*key)))
+            .collect();
+        assert!(
+            diffs.is_empty(),
+            "pooled state differs from fresh:\n{}",
+            diffs.join("\n")
+        );
     }
 
     #[test]
@@ -7125,7 +7578,7 @@ v\r\n\
         assert_eq!(
             *audits.lock().unwrap(),
             [(false, None), (false, None)],
-            "the audit record names no enforced interruption"
+            "only an enforced interruption has a public audit ID, including after phase five"
         );
     }
 

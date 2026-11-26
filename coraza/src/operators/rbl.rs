@@ -41,16 +41,18 @@
 //!   only: the TXT message and its capture are absent, and a name whose TXT lookup fails matches here where Go reports
 //!   no match.
 //! - A deadline or spawn failure reports [`OperatorOutcome::NotMatched`], as Go returns `false` from `Evaluate` on its
-//!   timeout. An in-flight refusal instead reports [`OperatorOutcome::NotInspected`], which the rule engine turns into
-//!   a 500 interruption so a negated `!@rbl` cannot pass the value through.
+//!   timeout. An in-flight refusal instead reports [`OperatorOutcome::NotInspected`], which the rule engine records as
+//!   an `OperatorNotInspected` event (subject to the transaction's bounded event-detail limit) and turns into a 500
+//!   interruption so a negated `!@rbl` cannot pass the value through.
 //!
 //! Resource bounds: the system resolver cannot be cancelled, so each lookup
 //! runs on its own thread with [`LOOKUP_STACK`] of stack and the operator gives
 //! up after [`LOOKUP_TIMEOUT`], abandoning that thread until the resolver
 //! returns. At most [`MAX_IN_FLIGHT`] lookups run at once in a process. A
 //! saturated cap reports [`OperatorOutcome::NotInspected`] and the rule engine
-//! interrupts with status 500; a thread-spawn failure or resolver failure stays
-//! a plain miss, as in Go.
+//! records an `OperatorNotInspected` event, or contributes to its bounded
+//! overflow summary, and interrupts with status 500; a thread-spawn failure or
+//! resolver failure stays a plain miss, as in Go.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -348,23 +350,51 @@ mod tests {
     fn an_exhausted_in_flight_cap_fails_closed() {
         use super::TEST_CAP;
 
-        let mut parser = Parser::new();
-        parser
-            .from_string("SecRule ARGS:q \"!@rbl example.invalid\" \"id:964,phase:1,pass\"")
-            .unwrap();
-        let waf = parser.into_waf().unwrap();
-        let mut tx = waf.new_transaction_with_id("rbl-cap");
-        tx.add_get_argument("q", b"192.0.2.1");
+        for (engine, enforced) in [("On", true), ("DetectionOnly", false)] {
+            let mut parser = Parser::new();
+            parser
+                .from_string(&format!(
+                    "SecRuleEngine {engine}\n\
+                     SecRule ARGS:q \"!@rbl example.invalid\" \"id:964,phase:1,pass\""
+                ))
+                .unwrap();
+            let waf = parser.into_waf().unwrap();
+            let mut tx = waf.new_transaction_with_id("rbl-cap");
+            tx.add_get_argument("q", b"192.0.2.1");
 
-        TEST_CAP.with(|cap| cap.set(Some(0)));
-        let interruption = tx.process_request_headers();
-        TEST_CAP.with(|cap| cap.set(None));
+            TEST_CAP.with(|cap| cap.set(Some(0)));
+            let interruption = tx.process_request_headers();
+            TEST_CAP.with(|cap| cap.set(None));
 
-        assert_eq!(
-            interruption.map(|value| value.status),
-            Some(500),
-            "refusing an uninspected value must interrupt instead of reporting a clean miss"
-        );
+            let event = tx.engine_events().first().unwrap();
+            assert_eq!(tx.engine_events().len(), 1);
+            assert_eq!(event.rule_id(), 0);
+            assert_eq!(event.rule.status(), 500);
+            assert_eq!(event.message(), "host operator refused to inspect input");
+            assert_eq!(event.tags().len(), 1, "one saturation tag");
+            assert_eq!(
+                event.tags().first().map(String::as_str),
+                Some("coraza-rs/engine/OperatorNotInspected")
+            );
+            assert_eq!(event.disruptive, enforced);
+            assert!(tx.matched_rules().is_empty());
+
+            if enforced {
+                assert_eq!(
+                    interruption.map(|value| (value.rule_id, value.status, value.data)),
+                    Some((964, 500, "host operator refused to inspect input".to_owned())),
+                    "On keeps the rule's original fail-closed interruption"
+                );
+                assert!(tx.would_be_interruption().is_none());
+            } else {
+                assert!(interruption.is_none());
+                assert_eq!(
+                    tx.would_be_interruption()
+                        .map(|value| (value.rule_id, value.status, value.data.as_str())),
+                    Some((964, 500, "host operator refused to inspect input"))
+                );
+            }
+        }
     }
 
     #[test]
@@ -406,6 +436,10 @@ mod tests {
             tx.matched_rules().len(),
             1,
             "the negated rule must match on the failed lookup"
+        );
+        assert!(
+            tx.engine_events().is_empty(),
+            "an ordinary resolver failure is still a miss, not an engine stop"
         );
     }
 

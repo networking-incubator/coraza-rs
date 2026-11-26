@@ -37,7 +37,8 @@ pub mod utils;
 pub mod waf;
 
 pub use audit_log::{
-    AuditFile, AuditLog, AuditMessage, AuditMessageData, AuditProducer, AuditRequest, AuditResponse, AuditTransaction,
+    AuditFile, AuditLog, AuditMessage, AuditMessageData, AuditMessageProvenance, AuditProducer, AuditRequest,
+    AuditResponse, AuditTransaction,
 };
 pub use body_processors::{
     BodyDirection, BodyProcessor, BodyProcessorFactory, BodyProcessorOptions, BodyProcessorOutput,

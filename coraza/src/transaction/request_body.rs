@@ -43,7 +43,7 @@ use crate::{
         index_table_bytes, key_bytes, map_capacity_bytes, vec_grown_capacity,
     },
     transformations::url_decode,
-    types::{BodyLimitAction, RulePhase},
+    types::{BodyLimitAction, RuleEngineStatus, RulePhase},
 };
 
 #[expect(
@@ -90,9 +90,11 @@ impl Transaction {
             if body.len() >= limit.saturating_sub(self.request_body_buffer.len()) {
                 self.inbound_data_error.set("1");
                 if self.config.request_body_limit_action == BodyLimitAction::Reject {
-                    self.interrupt(0, "deny", 413, "");
-                    if self.interruption.is_some() {
+                    if self.rule_engine == RuleEngineStatus::On {
                         self.request_body_buffer.refuse(body.len());
+                    }
+                    self.engine_stop(0, "RequestBodyLimit", 413, "");
+                    if self.interruption.is_some() {
                         return self.interruption.clone();
                     }
                 }
@@ -104,7 +106,7 @@ impl Transaction {
 
         if ingest_error {
             self.inbound_data_error.set("1");
-            self.interrupt(0, "deny", 500, "");
+            self.engine_stop(0, "RequestBodyBuffer", 500, "");
             // Detection-only records a would-be interruption; the body phase
             // must still evaluate its rules rather than being skipped.
             if self.interruption.is_some() {
@@ -140,7 +142,7 @@ impl Transaction {
                     self.request_body_buffer.set_inspected(length);
                 } else {
                     self.inbound_data_error.set("1");
-                    self.interrupt(0, "deny", 500, "");
+                    self.engine_stop(0, "RequestBodyBufferRead", 500, "");
                     if self.interruption.is_some() {
                         return self.interruption.clone();
                     }
@@ -156,7 +158,12 @@ impl Transaction {
             if self.interruption.is_none() {
                 self.multipart_strict_error.set("1");
                 self.inbound_data_error.set("1");
-                self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
+                self.engine_stop(
+                    0,
+                    "MultipartUploadBan",
+                    413,
+                    "multipart file uploads are unavailable on this host",
+                );
             }
         }
         self.interruption.clone()
@@ -313,7 +320,12 @@ impl Transaction {
         if published_upload {
             self.multipart_strict_error.set("1");
             self.inbound_data_error.set("1");
-            self.interrupt(0, "deny", 413, "multipart file uploads are unavailable on this host");
+            self.engine_stop(
+                0,
+                "MultipartUploadBan",
+                413,
+                "multipart file uploads are unavailable on this host",
+            );
             if self.interruption.is_some() {
                 return None;
             }

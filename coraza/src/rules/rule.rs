@@ -759,7 +759,12 @@ impl Rule {
                 .as_ref()
                 .is_some_and(RuleOperator::fails_closed_on_not_inspected)
         {
-            tx.interrupt(id, "deny", 500, "host operator refused to inspect input");
+            tx.engine_stop(
+                id,
+                "OperatorNotInspected",
+                500,
+                "host operator refused to inspect input",
+            );
             *inspection_refused = true;
             return false;
         }
