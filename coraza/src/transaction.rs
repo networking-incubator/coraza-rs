@@ -7476,6 +7476,36 @@ payload\r\n\
     }
 
     #[test]
+    fn a_rule_that_removes_and_captures_the_same_keys_for_every_value_it_matches_adds_no_credit() {
+        // Each matched value runs the actions again: the capture makes the keys, `setvar:!tx.N` removes them and gives
+        // back what they held, and the next value's capture makes them again. Unless that capture charges them, the
+        // credit grows with the number of values, which the request chooses.
+        let mut parser = crate::seclang::Parser::new();
+        let removals: String = (1..=9).map(|key| format!(",setvar:!tx.{key}")).collect();
+        parser
+            .from_string(&format!(
+                "SecRule ARGS \"@rx ^(a)\" \"id:1,phase:2,pass,nolog,capture{removals}\""
+            ))
+            .unwrap();
+        let waf = parser.into_waf().unwrap();
+        for values in [1, 10, 1_000] {
+            let mut tx = waf.new_transaction_with_id("rule-budget-capture-keys-per-value");
+            for index in 0..values {
+                tx.add_post_argument(format!("k{index}"), "a");
+            }
+            tx.computed.rule_budget.arm(1_000_000, 0);
+            let armed = tx.computed.rule_budget.remaining();
+            tx.run_phase(RulePhase::RequestBody);
+            assert!(!tx.rule_evaluation_stopped_by_memory_budget(), "{values} values");
+            assert!(
+                tx.computed.rule_budget.remaining() <= armed,
+                "{values} values: {} bytes left of {armed}, which is credit the rule never paid for",
+                tx.computed.rule_budget.remaining()
+            );
+        }
+    }
+
+    #[test]
     fn a_capture_key_recreation_refusal_stops_the_phase_and_uses_engine_mode() {
         struct RefuseCaptureRecreation(Arc<AtomicUsize>);
         impl crate::operators::Operator for RefuseCaptureRecreation {
