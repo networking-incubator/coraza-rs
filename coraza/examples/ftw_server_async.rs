@@ -29,8 +29,8 @@
 //! - Renders the target with Go's `url.ParseRequestURI(...).String()`, the form Go Coraza's middleware passes to
 //!   `ProcessURI`, instead of the raw request bytes
 //! - Sets the connection variables and processes HTTP requests through the WAF (async)
-//! - Writes Go Coraza's error log line for every matched rule with `log`, as its CRS test harness does, and answers
-//!   `/reflect` as CRS's albedo test backend
+//! - Writes error log lines for logged rule matches and engine stops, and answers `/reflect` as CRS's albedo test
+//!   backend
 //! - Supports concurrent requests via tokio
 //!
 //! Usage:
@@ -1548,8 +1548,11 @@ impl BackendResponse {
     }
 }
 
-/// Has the WAF write Go Coraza's error log line to `logfile` for each matched rule with
-/// `log`, as its CRS test harness reads it.
+/// Has the WAF write Coraza-compatible lines for logged rule matches and engine stops.
+///
+/// Engine stops produce at most 16 individual lines plus one overflow notice. That
+/// one-time notice says at least one detail was omitted and that the final count may
+/// be higher; later stops update the audit summary without another callback.
 #[expect(
     clippy::print_stderr,
     reason = "The standalone FTW server reports audit log write failures to its console."

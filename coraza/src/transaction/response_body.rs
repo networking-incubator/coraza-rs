@@ -31,7 +31,7 @@ use super::{
 use crate::{
     audit_log::Failure,
     body_processors::{BodyDirection, truncate_custom_body_text},
-    types::{BodyLimitAction, RulePhase},
+    types::{BodyLimitAction, RuleEngineStatus, RulePhase},
 };
 
 #[expect(
@@ -79,9 +79,11 @@ impl Transaction {
                 if body.len() >= limit.saturating_sub(self.response_body_buffer.len()) {
                     self.outbound_data_error.set("1");
                     if self.config.response_body_limit_action == BodyLimitAction::Reject {
-                        self.interrupt(0, "deny", 500, "");
-                        if self.interruption.is_some() {
+                        if self.rule_engine == RuleEngineStatus::On {
                             self.response_body_buffer.refuse(body.len());
+                        }
+                        self.engine_stop(0, "ResponseBodyLimit", 500, "");
+                        if self.interruption.is_some() {
                             return self.interruption.clone();
                         }
                     }
@@ -95,7 +97,7 @@ impl Transaction {
 
         if ingest_error {
             self.outbound_data_error.set("1");
-            self.interrupt(0, "deny", 500, "");
+            self.engine_stop(0, "ResponseBodyBuffer", 500, "");
             // Detection-only records a would-be interruption; the body phase
             // must still evaluate its rules rather than being skipped.
             if self.interruption.is_some() {
@@ -117,7 +119,7 @@ impl Transaction {
                 Err(error) => {
                     self.finalization_errors.push(Failure::new(&error));
                     self.outbound_data_error.set("1");
-                    self.interrupt(0, "deny", 500, "");
+                    self.engine_stop(0, "ResponseBodyBufferRead", 500, "");
                     if self.interruption.is_some() {
                         return self.interruption.clone();
                     }

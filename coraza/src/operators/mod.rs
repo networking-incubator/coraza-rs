@@ -77,9 +77,11 @@ pub enum OperatorOutcome {
     /// The operator could not inspect the input, so it has no verdict.
     ///
     /// Rules normally treat this as not matched. A refused `inspectFile` or `rbl`
-    /// run uses it to trigger the engine's fail-closed interruption; other built-in
-    /// host-operator errors remain non-matches to preserve Go behavior. It is also
-    /// available to embedder-supplied operators that need three-valued logic.
+    /// run emits an engine event (or contributes to its bounded overflow summary) and
+    /// triggers the engine's fail-closed interruption; other built-in host-operator
+    /// errors remain non-matches to preserve Go behavior. Embedder-supplied operators
+    /// can use it for three-valued logic without adopting the built-ins' fail-closed
+    /// policy.
     NotInspected,
 }
 

@@ -37,7 +37,7 @@ use coraza::{
     operators::{Operator, Outputs},
     seclang::Parser,
     transaction::{Transaction, VariableCollection},
-    types::RuleVariable,
+    types::{AuditEngineStatus, RuleSeverity, RuleVariable, parse_audit_log_parts},
     waf::Waf,
 };
 
@@ -629,6 +629,7 @@ fn fields_then(fields: usize, last: &str) -> String {
 
 #[test]
 fn a_multipart_body_the_parser_stopped_in_cannot_carry_an_unchecked_upload_past_the_ban() {
+    const UPLOAD_BAN_DATA: &str = "multipart file uploads are unavailable on this host";
     let waf = waf_rejecting_uploads("");
     let content_type = "multipart/form-data; boundary=b";
     let upload = "--b\r\nContent-Disposition: form-data; name=\"up\"; filename=\"x.txt\"\r\n\r\nPAYLOAD\r\n--b--\r\n";
@@ -638,30 +639,56 @@ fn a_multipart_body_the_parser_stopped_in_cannot_carry_an_unchecked_upload_past_
         tx.add_request_header("Content-Type", content_type);
         tx.process_request_headers();
         let interruption = tx.process_request_body(body.as_bytes());
+        let upload_ban_event = tx.engine_events().iter().any(|event| {
+            event
+                .tags()
+                .iter()
+                .any(|tag| tag == "coraza-rs/engine/MultipartUploadBan")
+        });
         (
-            interruption.map(|interruption| interruption.status),
+            interruption.map(|interruption| (interruption.status, interruption.rule_id, interruption.data)),
             request_body_errored(&tx),
             tx.request_body_stopped_by_memory_budget(),
+            upload_ban_event,
         )
     };
 
     // The published prefix holds the upload: refused, as before.
-    assert_eq!(status(&fields_then(2, upload), None), (Some(413), false, false));
+    assert_eq!(
+        status(&fields_then(2, upload), None),
+        (Some((413, 0, UPLOAD_BAN_DATA.to_owned())), false, false, true)
+    );
     // No upload anywhere and nothing stopped the parser: passes.
-    assert_eq!(status(&fields_then(2, "--b--\r\n"), None), (None, false, false));
+    assert_eq!(
+        status(&fields_then(2, "--b--\r\n"), None),
+        (None, false, false, false),
+        "the no-upload control has neither interruption nor ban event"
+    );
 
     // The reading budget runs out before the last part, which is the upload: no rule reads REQBODY_ERROR here, and
     // the body still must not pass with a part nobody looked at.
     let body = fields_then(300, upload);
-    assert_eq!(status(&body, Some(60_000)), (Some(413), true, true));
-    assert_eq!(status(&body, None), (Some(413), false, false));
+    assert_eq!(
+        status(&body, Some(60_000)),
+        (Some((413, 0, UPLOAD_BAN_DATA.to_owned())), true, true, true)
+    );
+    assert_eq!(
+        status(&body, None),
+        (Some((413, 0, UPLOAD_BAN_DATA.to_owned())), false, false, true)
+    );
     // An upload read before the budget ran out is refused at once, and the stop is still reported.
     let first = format!("{}{}", upload.replace("--b--\r\n", ""), fields_then(300, "--b--\r\n"));
-    assert_eq!(status(&first, Some(60_000)), (Some(413), false, true));
+    assert_eq!(
+        status(&first, Some(60_000)),
+        (Some((413, 0, UPLOAD_BAN_DATA.to_owned())), false, true, true)
+    );
 
     // A malformed part stops the parser the same way, in front of an upload it never reads.
     let malformed = fields_then(1, &format!("--b\r\nBad Header\r\n\r\nx\r\n{upload}"));
-    assert_eq!(status(&malformed, None), (Some(413), true, false));
+    assert_eq!(
+        status(&malformed, None),
+        (Some((413, 0, UPLOAD_BAN_DATA.to_owned())), true, false, true)
+    );
 
     // A body that is not multipart at all has no part for an upload to hide in.
     let mut tx = waf.new_transaction();
@@ -669,6 +696,10 @@ fn a_multipart_body_the_parser_stopped_in_cannot_carry_an_unchecked_upload_past_
     tx.process_request_headers();
     assert!(tx.process_request_body(upload.as_bytes()).is_none());
     assert!(request_body_errored(&tx), "the forced processor still reports it");
+    assert!(
+        tx.engine_events().is_empty(),
+        "non-multipart input emits no upload-ban event"
+    );
 }
 
 /// What `body` does to a request under `waf`, as its status and whether the body was reported as in error.
@@ -1035,6 +1066,20 @@ fn form_after_rules(
     (tx, interruption)
 }
 
+fn form_after_rules_with_id(
+    waf: &Waf,
+    size: usize,
+    budget: Option<usize>,
+    id: impl Into<String>,
+) -> (Transaction, Option<coraza::transaction::Interruption>) {
+    let mut tx = waf.new_transaction_with_id(id);
+    tx.set_body_memory_budget(budget);
+    tx.add_request_header("Content-Type", "application/x-www-form-urlencoded");
+    tx.process_request_headers();
+    let interruption = tx.process_request_body(format!("k={}", "v".repeat(size)).as_bytes());
+    (tx, interruption)
+}
+
 #[test]
 fn rules_that_would_keep_more_than_the_budget_has_left_stop_the_phase_and_nothing_runs_after_the_stop() {
     const SIZE: usize = 20_000;
@@ -1128,6 +1173,241 @@ fn in_detection_only_the_stop_is_a_recorded_would_be_interruption_and_the_phase_
         None,
         "no rule ran after the stop"
     );
+}
+
+type LoggedEngineEvent = (i32, bool, String, Vec<String>, i32, String, String);
+
+fn assert_rule_budget_stop_result(
+    tx: &Transaction,
+    interruption: Option<coraza::transaction::Interruption>,
+    enforced: bool,
+) {
+    assert!(tx.rule_evaluation_stopped_by_memory_budget(), "rule evaluation stopped");
+    assert!(!tx.request_body_stopped_by_memory_budget(), "body parsing fit");
+    assert_eq!(
+        tx.get_variable(RuleVariable::TX, Some("reached")),
+        None,
+        "nothing runs after the refused rule charge"
+    );
+    assert!(
+        tx.matched_rules().iter().all(|matched| matched.rule_id() != 0),
+        "engine events stay outside matched rules"
+    );
+    assert!(
+        (5..35).contains(&tx.matched_rules().len()),
+        "some rules recorded before exhaustion"
+    );
+    if enforced {
+        assert_eq!(
+            interruption.map(|value| (value.rule_id, value.status, value.action, value.data)),
+            Some((
+                0,
+                503,
+                "deny".to_owned(),
+                "rule evaluation memory budget exhausted".to_owned()
+            )),
+            "On returns the same rule-id-0 503"
+        );
+        assert!(tx.would_be_interruption().is_none(), "On has no would-be interruption");
+    } else {
+        assert!(interruption.is_none(), "DetectionOnly does not block");
+        assert!(
+            tx.interruption().is_none(),
+            "DetectionOnly has no enforced interruption"
+        );
+        assert_eq!(
+            tx.would_be_interruption()
+                .map(|value| (value.rule_id, value.status, value.data.as_str())),
+            Some((0, 503, "rule evaluation memory budget exhausted")),
+            "DetectionOnly preserves the would-be 503"
+        );
+    }
+}
+
+fn assert_rule_budget_stop_event(tx: &Transaction, logged: &Arc<Mutex<Vec<LoggedEngineEvent>>>, enforced: bool) {
+    let tag = "coraza-rs/engine/RuleEvaluationMemoryBudget";
+    assert_eq!(tx.engine_events().len(), 1, "one engine event");
+    let engine_event = tx.engine_events().first().unwrap();
+    assert_eq!(engine_event.rule_id(), 0, "reserved engine id");
+    assert_eq!(engine_event.rule.status(), 503, "would-be status");
+    assert_eq!(
+        engine_event.severity(),
+        Some(RuleSeverity::Critical),
+        "critical severity"
+    );
+    assert_eq!(
+        engine_event.message(),
+        "rule evaluation memory budget exhausted",
+        "event message"
+    );
+    assert!(
+        engine_event.tags().iter().any(|candidate| candidate == tag),
+        "state tag"
+    );
+    assert!(
+        !engine_event.transaction_id.is_empty() && engine_event.transaction_id.len() <= 128,
+        "the event keeps a bounded transaction ID for correlation"
+    );
+    assert_eq!(engine_event.matches.len(), 1, "one formatter message");
+    let matched = engine_event.matches.first().unwrap();
+    assert!(matched.key.is_empty(), "no copied request key");
+    assert!(matched.value.is_empty(), "no copied request value");
+    assert!(engine_event.client_ip.is_empty(), "no copied client address");
+    assert!(engine_event.server_ip.is_empty(), "no copied server address");
+    assert!(engine_event.uri.is_empty(), "no copied request URI");
+
+    let logged = logged.lock().unwrap();
+    let logged_event = logged.iter().find(|event| event.0 == 0).unwrap();
+    assert_eq!(logged_event.1, enforced, "log outcome follows engine mode");
+    assert_eq!(
+        logged_event.2, "rule evaluation memory budget exhausted",
+        "callback message"
+    );
+    assert!(
+        logged_event.3.iter().any(|candidate| candidate == tag),
+        "callback state tag"
+    );
+    assert_eq!(logged_event.4, 503, "callback status");
+    assert_eq!(
+        logged_event.5, engine_event.transaction_id,
+        "callback receives the same bounded transaction ID"
+    );
+    assert!(
+        logged_event.6.contains(&engine_event.transaction_id),
+        "formatted error log includes the transaction ID"
+    );
+    drop(logged);
+
+    let audit = tx.audit_log();
+    let audited = audit.messages.iter().find(|message| message.rule_id == 0).unwrap();
+    assert_eq!(
+        audited.message, "rule evaluation memory budget exhausted",
+        "audit message"
+    );
+    assert!(
+        audited.data.tags.iter().any(|candidate| candidate == tag),
+        "audit state tag"
+    );
+    assert!(audited.error_message.contains(tag), "audit part H state tag");
+}
+
+#[test]
+fn a_rule_memory_budget_stop_is_logged_and_audited_without_recording_body_values() {
+    const SIZE: usize = 20_000;
+    let body = format!("k={}", "v".repeat(SIZE));
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        let mut tx = request(&parse_only, "application/x-www-form-urlencoded", Some(budget));
+        tx.process_request_body(body.as_bytes());
+        !tx.request_body_stopped_by_memory_budget()
+    });
+    let (reference, _) = form_after_rules(&parse_only, SIZE, None);
+    let rules = copying_rules(40, "On");
+    let measuring_waf = waf(&rules);
+    let (unlimited, interruption) = form_after_rules(&measuring_waf, SIZE, None);
+    assert!(interruption.is_none());
+    let retained = unlimited.body_memory_bytes() - reference.body_memory_bytes();
+    assert!(retained > 40 * SIZE);
+    let budget = parse + retained / 2;
+
+    for (mode, enforced) in [("On", true), ("DetectionOnly", false)] {
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let callback_log = Arc::clone(&logged);
+        let mut parser = Parser::new();
+        parser.config_mut().audit_engine = AuditEngineStatus::On;
+        parser.config_mut().audit_log_parts = parse_audit_log_parts("ABHKZ").unwrap();
+        parser.on_error_log(move |matched| {
+            callback_log.lock().unwrap().push((
+                matched.rule_id(),
+                matched.disruptive,
+                matched.message().to_owned(),
+                matched.tags().to_vec(),
+                matched.rule.status(),
+                matched.transaction_id.clone(),
+                matched.error_log(),
+            ));
+        });
+        let rules = copying_rules(40, mode);
+        let with_rules = waf_in(parser, &rules);
+        let (tx, interruption) = form_after_rules(&with_rules, SIZE, Some(budget));
+        assert_rule_budget_stop_result(&tx, interruption, enforced);
+        assert_rule_budget_stop_event(&tx, &logged, enforced);
+        assert!(
+            tx.body_memory_bytes() <= reference.body_memory_bytes() + budget,
+            "{mode}: body memory accounting stays within its configured ceiling"
+        );
+    }
+}
+
+#[test]
+fn a_large_transaction_id_is_bounded_on_a_rule_budget_stop_without_audit_logging() {
+    const SIZE: usize = 20_000;
+    let id = format!("{}é{}", "x".repeat(124), "y".repeat(1 << 20));
+    let expected_event_id = format!("{}...", "x".repeat(124));
+    assert!(id.len() > 128, "the input crosses the event-ID byte cap");
+    assert_eq!(
+        expected_event_id.len(),
+        127,
+        "the cap's 125-byte prefix lands inside the two-byte character and backs up to byte 124"
+    );
+    let parse_only = waf("");
+    let parse = smallest_budget(1 << 30, |budget| {
+        !form_after_rules_with_id(&parse_only, SIZE, Some(budget), id.clone())
+            .0
+            .request_body_stopped_by_memory_budget()
+    });
+
+    let logged = Arc::new(Mutex::new(Vec::new()));
+    let callback_log = Arc::clone(&logged);
+    let audit_calls = Arc::new(Mutex::new(0_usize));
+    let callback_audits = Arc::clone(&audit_calls);
+    let mut parser = Parser::new();
+    parser.config_mut().audit_engine = AuditEngineStatus::Off;
+    parser.on_error_log(move |matched| {
+        callback_log.lock().unwrap().push((
+            matched.rule_id(),
+            matched.disruptive,
+            matched.message().to_owned(),
+            matched.tags().to_vec(),
+            matched.rule.status(),
+            matched.transaction_id.clone(),
+            matched.error_log(),
+        ));
+    });
+    parser.on_audit_log(move |_| {
+        *callback_audits.lock().unwrap() += 1;
+    });
+    let with_rules = waf_in(parser, &copying_rules(40, "On"));
+    let (mut tx, interruption) = form_after_rules_with_id(&with_rules, SIZE, Some(parse), id.clone());
+
+    assert_eq!(interruption.map(|value| (value.rule_id, value.status)), Some((0, 503)));
+    assert!(tx.rule_evaluation_stopped_by_memory_budget());
+    assert!(!tx.request_body_stopped_by_memory_budget());
+    assert!(tx.matched_rules().is_empty(), "no rule match copied the large ID");
+    assert_eq!(tx.id().as_ref(), id, "the transaction keeps the caller's full ID");
+    assert_eq!(tx.engine_events().len(), 1);
+    let event = tx.engine_events().first().unwrap();
+    assert_eq!(event.transaction_id, expected_event_id);
+    assert_eq!(event.transaction_id.len(), 127);
+    assert!(
+        !event.transaction_id.contains('é'),
+        "the event ID never splits a multibyte character"
+    );
+
+    let logged = logged.lock().unwrap();
+    assert_eq!(logged.len(), 1, "the engine event reaches the callback with audit Off");
+    let logged_event = logged.first().unwrap();
+    assert_eq!(logged_event.0, 0);
+    assert_eq!(logged_event.5, expected_event_id);
+    assert!(logged_event.6.contains(&expected_event_id));
+    assert!(
+        logged_event.6.len() < id.len(),
+        "the log line does not copy the caller's full ID"
+    );
+    drop(logged);
+
+    tx.finish().unwrap();
+    assert_eq!(*audit_calls.lock().unwrap(), 0, "audit Off suppresses audit callbacks");
 }
 
 /// Rules shaped as CRS's are: a capture, a `logdata` that expands what matched, scores added with `setvar`, a chain
@@ -1563,7 +1843,7 @@ fn a_stopped_transaction_runs_no_rule_of_a_later_phase_and_still_writes_its_audi
         assert_eq!(
             entry.transaction.interruption_rule_id,
             (mode == "On").then_some(0),
-            "{mode}: the stop has no rule"
+            "{mode}: only the enforced engine stop has a public interruption ID"
         );
         let stop = tx.interruption().or_else(|| tx.would_be_interruption()).unwrap();
         assert_eq!((stop.status, stop.rule_id), (503, 0), "{mode}");

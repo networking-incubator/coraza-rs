@@ -310,7 +310,7 @@ pub struct Parser {
     /// Load-time warnings, in parse order
     warnings: Vec<String>,
 
-    /// Optional callback for rules with the `log` action.
+    /// Optional callback for logged rule matches and engine-originated stops.
     error_log: Option<ErrorLog>,
 
     /// Optional host-provided debug sink.
@@ -528,7 +528,22 @@ impl Parser {
         self.compile()
     }
 
-    /// Set a callback that receives each rule with the `log` action when it matches.
+    /// Set a callback that receives logged rule matches and engine-originated stops.
+    ///
+    /// Rules are included when they have the `log` action. Engine stops in `On` and
+    /// `DetectionOnly` are synthetic events with rule ID `0` and a
+    /// `coraza-rs/engine/<state>` tag. Their transaction ID is copied up to 128 bytes
+    /// and suffixed with `...` when truncated; normal rule matches keep the full
+    /// caller-supplied ID. The first 16 stops are reported
+    /// individually; the first excess stop emits one `EventsOmitted` callback whose
+    /// message says at least one event was omitted and that the final count may be
+    /// higher. Later excess stops only update the retained transaction/audit summary,
+    /// whose count is exact up to saturation; its `rule.status` is `0` (not
+    /// applicable) because the summary is not itself an HTTP stop. The stop and
+    /// summary are stored before the callback runs. `Off` emits no engine-event
+    /// callbacks. A callback panic unwinds its caller. `On` body-limit rejects record
+    /// refused-byte stats before invoking it; in `DetectionOnly`, a panic can interrupt
+    /// normal body ingestion before those counters are complete.
     pub fn on_error_log(&mut self, log: impl Fn(&MatchedRule) + Send + Sync + 'static) {
         self.error_log = Some(ErrorLog::new(log));
     }
